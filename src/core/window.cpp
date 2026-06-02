@@ -2,8 +2,9 @@
 #include "core/logger.hpp"
 #include "rendering/vk_context.hpp"
 #include <SDL2/SDL_vulkan.h>
-#ifdef _WIN32
 #include <cstdlib>
+#ifdef __APPLE__
+#include <filesystem>
 #endif
 
 namespace wowee {
@@ -46,6 +47,29 @@ bool Window::initialize() {
     // succeeds.
 #ifdef __APPLE__
     setenv("VK_LOADER_ENABLE_PORTABILITY_DRIVERS", "1", 0 /*don't overwrite*/);
+    // Probe for MoltenVK's ICD JSON if VK_ICD_FILENAMES isn't already set.
+    // Without it the Vulkan loader can't find MoltenVK and SDL's pre-instance
+    // VK_KHR_surface check fails — the typical symptom when building with the
+    // LunarG SDK without sourcing setup-env.sh first.  Check $VULKAN_SDK
+    // (LunarG SDK) before falling back to the two common Homebrew prefixes.
+    if (!std::getenv("VK_ICD_FILENAMES")) {
+        std::string foundIcd;
+        if (const char* sdk = std::getenv("VULKAN_SDK"); sdk && *sdk) {
+            std::string candidate = std::string(sdk) + "/share/vulkan/icd.d/MoltenVK_icd.json";
+            if (std::filesystem::exists(candidate)) foundIcd = candidate;
+        }
+        if (foundIcd.empty()) {
+            for (const char* p : {
+                    "/opt/homebrew/share/vulkan/icd.d/MoltenVK_icd.json",
+                    "/usr/local/share/vulkan/icd.d/MoltenVK_icd.json"}) {
+                if (std::filesystem::exists(p)) { foundIcd = p; break; }
+            }
+        }
+        if (!foundIcd.empty()) {
+            setenv("VK_ICD_FILENAMES", foundIcd.c_str(), 1);
+            LOG_INFO("Auto-detected MoltenVK ICD: ", foundIcd);
+        }
+    }
 #endif
     bool vulkanLoaded = (SDL_Vulkan_LoadLibrary(nullptr) == 0);
 #ifdef _WIN32
@@ -62,8 +86,13 @@ bool Window::initialize() {
 #endif
     if (!vulkanLoaded) {
         LOG_ERROR("Failed to load Vulkan library: ", SDL_GetError());
+#ifdef __APPLE__
+        LOG_ERROR("On macOS, install the Vulkan loader via Homebrew:  brew install vulkan-loader");
+        LOG_ERROR("Or source the LunarG SDK setup script before running:  source $VULKAN_SDK/setup-env.sh");
+#else
         LOG_ERROR("Ensure the Vulkan runtime (vulkan-1.dll) is installed. "
                   "Install the latest GPU drivers or the Vulkan Runtime from https://vulkan.lunarg.com/");
+#endif
         SDL_Quit();
         return false;
     }
