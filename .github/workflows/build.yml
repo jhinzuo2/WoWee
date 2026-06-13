@@ -355,6 +355,10 @@ jobs:
       with:
         msystem: CLANGARM64
         update: true
+        # Disable the install cache: a restored cache carries a stale pacman DB
+        # whose signatures the older cached keyring rejects ("unknown trust"),
+        # breaking the setup -Syuu after MSYS2 rotates signing keys.
+        cache: false
         install: >-
           mingw-w64-clang-aarch64-cmake
           mingw-w64-clang-aarch64-clang
@@ -448,6 +452,8 @@ jobs:
       with:
         msystem: MINGW64
         update: false
+        # See note above: avoid the stale cached keyring/DB "unknown trust" failure.
+        cache: false
         install: >-
           mingw-w64-x86_64-cmake
           mingw-w64-x86_64-gcc
