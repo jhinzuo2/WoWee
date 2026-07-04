@@ -59,6 +59,28 @@ target_link_libraries(test_srp PRIVATE catch2_main OpenSSL::SSL OpenSSL::Crypto)
 add_test(NAME srp COMMAND test_srp)
 register_test_target(test_srp)
 
+# ── test_warden ──────────────────────────────────────────────
+add_executable(test_warden
+    test_warden.cpp
+    ${TEST_COMMON_SOURCES}
+    ${CMAKE_SOURCE_DIR}/src/auth/crypto.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/warden_crypto.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/warden_emulator.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/warden_memory.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/warden_module.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/warden_platform.cpp
+)
+target_include_directories(test_warden PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_warden SYSTEM PRIVATE ${TEST_SYSTEM_INCLUDE_DIRS})
+target_link_libraries(test_warden PRIVATE catch2_main OpenSSL::Crypto ZLIB::ZLIB)
+if(HAVE_UNICORN)
+    target_link_libraries(test_warden PRIVATE ${UNICORN_LIBRARY})
+    target_include_directories(test_warden SYSTEM PRIVATE ${UNICORN_INCLUDE_DIR})
+    target_compile_definitions(test_warden PRIVATE HAVE_UNICORN)
+endif()
+add_test(NAME warden COMMAND test_warden)
+register_test_target(test_warden)
+
 # ── test_spline ──────────────────────────────────────────────
 add_executable(test_spline
     test_spline.cpp

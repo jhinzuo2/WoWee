@@ -14,6 +14,7 @@ namespace game {
 // Forward declarations
 class WardenEmulator;
 class WardenCrypto;
+class WardenPlatformServices;
 
 /**
  * Represents Warden callback functions exported by loaded module
@@ -194,7 +195,7 @@ private:
  */
 class WardenModuleManager {
 public:
-    WardenModuleManager();
+    explicit WardenModuleManager(std::shared_ptr<WardenPlatformServices> platformServices = nullptr);
     ~WardenModuleManager();
 
     /**
@@ -247,6 +248,7 @@ private:
     std::map<std::vector<uint8_t>, std::shared_ptr<WardenModule>> modules_;
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> downloadBuffer_; // Partial downloads
     std::string cacheDirectory_;
+    std::shared_ptr<WardenPlatformServices> platformServices_;
 
     std::string getCachePath(const std::vector<uint8_t>& md5Hash);
 };

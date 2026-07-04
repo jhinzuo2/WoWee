@@ -49,6 +49,12 @@ public:
     bool initialize(const void* moduleCode, size_t moduleSize, uint32_t baseAddress = 0x400000);
 
     /**
+     * Re-copy the host-side module image into the emulated module mapping.
+     * Used after import binding/patching modifies the loaded image.
+     */
+    bool syncModuleMemory(const void* moduleCode, size_t moduleSize);
+
+    /**
      * Map Windows API function to implementation
      *
      * When emulated code calls this API, our hook will be invoked.
@@ -123,6 +129,12 @@ public:
      * Get module base address
      */
     uint32_t getModuleBase() const { return moduleBase_; }
+    uint32_t getModuleSize() const { return moduleSize_; }
+
+    /**
+     * True if the range is fully inside a currently mapped emulator region.
+     */
+    bool isRangeMapped(uint32_t address, size_t size) const;
 
     /**
      * Setup common Windows API hooks
@@ -163,6 +175,7 @@ private:
 
     // API stub dispatch: stub address -> {argCount, handler}
     struct ApiHookEntry {
+        std::string name;
         int argCount;
         std::function<uint32_t(WardenEmulator&, const std::vector<uint32_t>&)> handler;
     };
@@ -174,6 +187,10 @@ private:
     std::unordered_map<uint32_t, size_t> allocations_;
     std::map<uint32_t, size_t> freeBlocks_;  // free-list keyed by base address
     uint32_t nextHeapAddr_;
+    uint32_t lastCodeAddress_;
+    uint32_t lastCodeSize_;
+    uint32_t nextTlsIndex_;
+    std::unordered_map<uint32_t, uint32_t> tlsValues_;
 
     // Hook handles for cleanup
     std::vector<uc_hook> hooks_;
@@ -182,6 +199,23 @@ private:
     static uint32_t apiVirtualAlloc(WardenEmulator& emu, const std::vector<uint32_t>& args);
     static uint32_t apiVirtualFree(WardenEmulator& emu, const std::vector<uint32_t>& args);
     static uint32_t apiGetTickCount(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiGetSystemTimeAsFileTime(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiQueryPerformanceCounter(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiGetModuleHandleA(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiLoadLibraryA(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiFreeLibrary(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiGetProcAddress(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiGetSystemInfo(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiGetVersionExA(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiCreateToolhelp32Snapshot(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiModule32First(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiModule32Next(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiTlsAlloc(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiTlsFree(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiTlsSetValue(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiTlsGetValue(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiAddVectoredExceptionHandler(WardenEmulator& emu, const std::vector<uint32_t>& args);
+    static uint32_t apiRemoveVectoredExceptionHandler(WardenEmulator& emu, const std::vector<uint32_t>& args);
     static uint32_t apiSleep(WardenEmulator& emu, const std::vector<uint32_t>& args);
     static uint32_t apiGetCurrentThreadId(WardenEmulator& emu, const std::vector<uint32_t>& args);
     static uint32_t apiGetCurrentProcessId(WardenEmulator& emu, const std::vector<uint32_t>& args);
@@ -189,7 +223,7 @@ private:
 
     // Unicorn callbacks
     static void hookCode(uc_engine* uc, uint64_t address, uint32_t size, void* userData);
-    static void hookMemInvalid(uc_engine* uc, int type, uint64_t address, int size, int64_t value, void* userData);
+    static bool hookMemInvalid(uc_engine* uc, int type, uint64_t address, int size, int64_t value, void* userData);
 };
 
 } // namespace game

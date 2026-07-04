@@ -2793,8 +2793,9 @@ void GameHandler::handlePacket(network::Packet& packet) {
     }
 
     auto preLogicalOp = opcodeTable_.fromWire(opcode);
-    if (wardenGateSeen_ && (!preLogicalOp || *preLogicalOp != Opcode::SMSG_WARDEN_DATA)) {
-        ++wardenPacketsAfterGate_;
+    if (wardenHandler_ && wardenHandler_->wardenGateSeen() &&
+        (!preLogicalOp || *preLogicalOp != Opcode::SMSG_WARDEN_DATA)) {
+        wardenHandler_->notifyPacketAfterGate();
     }
     if (preLogicalOp && isAuthCharPipelineOpcode(*preLogicalOp)) {
         LOG_DEBUG("AUTH/CHAR RX opcode=0x", std::hex, opcode, std::dec,

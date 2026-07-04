@@ -381,6 +381,9 @@ else()
     message(STATUS "Found Unicorn Engine: ${UNICORN_LIBRARY}")
     set(HAVE_UNICORN TRUE)
 endif()
+if(ANDROID AND NOT HAVE_UNICORN)
+    message(FATAL_ERROR "Android builds must include Warden Unicorn support. Provide libunicorn and unicorn/unicorn.h.")
+endif()
 
 # GLM (header-only math library)
 find_package(glm QUIET)
@@ -545,6 +548,7 @@ set(WOWEE_SOURCES
     src/game/warden_module.cpp
     src/game/warden_emulator.cpp
     src/game/warden_memory.cpp
+    src/game/warden_platform.cpp
     src/game/transport_manager.cpp
     src/game/transport_path_repository.cpp
     src/game/transport_clock_sync.cpp
@@ -1449,6 +1453,7 @@ add_executable(world_char_probe
     src/game/warden_crypto.cpp
     src/game/warden_module.cpp
     src/game/warden_emulator.cpp
+    src/game/warden_platform.cpp
     src/core/logger.cpp
 )
 target_include_directories(world_char_probe PRIVATE

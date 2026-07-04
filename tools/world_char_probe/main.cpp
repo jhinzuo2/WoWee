@@ -19,10 +19,14 @@
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
 
@@ -84,6 +88,39 @@ std::string upperAscii(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
                    [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
     return value;
+}
+
+std::string bytesToHex(const uint8_t* data, size_t size) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < size; ++i) {
+        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(data[i]);
+    }
+    return oss.str();
+}
+
+std::string bytesToHex(const std::vector<uint8_t>& data) {
+    return data.empty() ? std::string{} : bytesToHex(data.data(), data.size());
+}
+
+std::filesystem::path wardenProbeCacheDir() {
+    if (const char* home = std::getenv("HOME")) {
+        return std::filesystem::path(home) / ".local/share/wowee/warden_cache";
+    }
+    return std::filesystem::path(".wowee_warden_cache");
+}
+
+bool writeBinaryFile(const std::filesystem::path& path, const void* data, size_t size) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) return false;
+    out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
+    return static_cast<bool>(out);
+}
+
+bool writeTextFile(const std::filesystem::path& path, const std::string& data) {
+    std::ofstream out(path);
+    if (!out) return false;
+    out << data;
+    return static_cast<bool>(out);
 }
 
 void usage() {
@@ -515,6 +552,7 @@ int probeWorld(const Options& opt, const auth::Realm& realm, const std::vector<u
                              | (static_cast<uint32_t>(dec[36]) << 24);
             wardenModuleData.clear();
             std::cerr << "Warden: MODULE_USE size=" << wardenModuleSize << "\n";
+            std::cerr << "Warden path: probe MODULE_USE requests module data via MODULE_MISSING\n";
             sendWardenPlain({game::WARDEN_CMSG_MODULE_MISSING});
             return;
         }
@@ -524,8 +562,32 @@ int probeWorld(const Options& opt, const auth::Realm& realm, const std::vector<u
             uint16_t chunkSize = static_cast<uint16_t>(dec[1]) | (static_cast<uint16_t>(dec[2]) << 8);
             if (dec.size() < 3u + chunkSize) return;
             wardenModuleData.insert(wardenModuleData.end(), dec.begin() + 3, dec.begin() + 3 + chunkSize);
+            std::cerr << "Warden path: probe MODULE_CACHE chunk=" << chunkSize
+                      << " total=" << wardenModuleData.size() << "/" << wardenModuleSize << "\n";
             if (wardenModuleSize != 0 && wardenModuleData.size() >= wardenModuleSize) {
                 std::cerr << "Warden: module complete " << wardenModuleData.size() << "\n";
+                const std::string hashHex = bytesToHex(wardenModuleHash);
+                const std::string keyHex = bytesToHex(wardenModuleKey);
+                const std::filesystem::path cacheDir = wardenProbeCacheDir();
+                std::error_code ec;
+                std::filesystem::create_directories(cacheDir, ec);
+                if (ec) {
+                    std::cerr << "Warden path: probe cache directory failed: " << ec.message() << "\n";
+                } else if (!hashHex.empty()) {
+                    const auto rawPath = cacheDir / (hashHex + ".wdn");
+                    const auto metaPath = cacheDir / (hashHex + ".meta.txt");
+                    if (writeBinaryFile(rawPath, wardenModuleData.data(), wardenModuleData.size())) {
+                        std::cerr << "Warden path: probe cached raw module " << rawPath
+                                  << " key=" << keyHex << "\n";
+                    } else {
+                        std::cerr << "Warden path: probe failed to cache raw module " << rawPath << "\n";
+                    }
+                    std::ostringstream meta;
+                    meta << "hash=" << hashHex << "\n"
+                         << "key=" << keyHex << "\n"
+                         << "raw_size=" << wardenModuleData.size() << "\n";
+                    writeTextFile(metaPath, meta.str());
+                }
                 wardenModule = std::make_shared<game::WardenModule>();
                 wardenModule->setCallbackDependencies(
                     wardenCrypto.get(),
@@ -534,21 +596,59 @@ int probeWorld(const Options& opt, const auth::Realm& realm, const std::vector<u
                         sendWardenPlain(plain);
                     });
                 wardenModule->setSessionKey(sessionKey);
-                wardenModule->load(wardenModuleData, wardenModuleHash, wardenModuleKey);
+                if (wardenModule->load(wardenModuleData, wardenModuleHash, wardenModuleKey)) {
+                    std::cerr << "Warden path: probe module loader completed; HASH_REQUEST will try module/Unicorn path\n";
+                    if (!hashHex.empty() && !ec) {
+                        const auto& decompressed = wardenModule->getDecompressedData();
+                        if (!decompressed.empty()) {
+                            const auto decompressedPath = cacheDir / (hashHex + ".decompressed.bin");
+                            writeBinaryFile(decompressedPath, decompressed.data(), decompressed.size());
+                            std::cerr << "Warden path: probe cached decompressed module " << decompressedPath << "\n";
+                        }
+                        if (const void* image = wardenModule->getModuleMemory()) {
+                            const auto imagePath = cacheDir / (hashHex + ".image.bin");
+                            writeBinaryFile(imagePath, image, wardenModule->getModuleSize());
+                            std::cerr << "Warden path: probe cached relocated image " << imagePath
+                                      << " size=" << wardenModule->getModuleSize() << "\n";
+                        }
+                    }
+                } else {
+                    std::cerr << "Warden path: probe module loader failed; HASH_REQUEST will use silence fallback\n";
+                    wardenModule.reset();
+                }
                 sendWardenPlain({game::WARDEN_CMSG_MODULE_OK});
             }
             return;
         }
 
         if (op == game::WARDEN_SMSG_HASH_REQUEST) {
-            bool handled = wardenModule && wardenModule->processPacket(dec);
+            bool handled = false;
+            if (wardenModule) {
+                std::cerr << "Warden path: probe HASH_REQUEST trying module/Unicorn processPacket path\n";
+                handled = wardenModule->processPacket(dec);
+            } else {
+                std::cerr << "Warden path: probe HASH_REQUEST has no loaded module; using silence fallback\n";
+            }
             std::cerr << "Warden: HASH_REQUEST handled=" << handled << "\n";
+            if (handled) {
+                std::cerr << "Warden path: probe HASH_REQUEST handled by module/Unicorn path\n";
+            } else {
+                std::cerr << "Warden path: probe HASH_REQUEST handled by no-response silence path\n";
+            }
             return;
         }
 
         if (wardenModule) {
+            std::cerr << "Warden path: probe non-HASH Warden packet trying module/Unicorn processPacket path\n";
             bool handled = wardenModule->processPacket(dec);
             std::cerr << "Warden: module packet handled=" << handled << "\n";
+            if (handled) {
+                std::cerr << "Warden path: probe non-HASH packet handled by module/Unicorn path\n";
+            } else {
+                std::cerr << "Warden path: probe non-HASH packet not handled by module/Unicorn path\n";
+            }
+        } else {
+            std::cerr << "Warden path: probe non-HASH Warden packet has no loaded module; no response\n";
         }
     };
 

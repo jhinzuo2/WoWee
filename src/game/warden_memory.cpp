@@ -1,4 +1,5 @@
 #include "game/warden_memory.hpp"
+#include "game/warden_platform.hpp"
 #include "core/logger.hpp"
 #include <chrono>
 #include <fstream>
@@ -8,6 +9,7 @@
 #include <filesystem>
 #include <sstream>
 #include <iomanip>
+#include <utility>
 #include <openssl/hmac.h>
 #include <openssl/evp.h>
 
@@ -27,7 +29,12 @@ static inline uint16_t readLE16(const std::vector<uint8_t>& data, size_t offset)
     return data[offset] | (uint16_t(data[offset+1]) << 8);
 }
 
-WardenMemory::WardenMemory() = default;
+WardenMemory::WardenMemory(std::shared_ptr<WardenPlatformServices> platformServices)
+    : platformServices_(std::move(platformServices)) {
+    if (!platformServices_) {
+        platformServices_ = WardenPlatformServices::defaultServices();
+    }
+}
 WardenMemory::~WardenMemory() = default;
 
 bool WardenMemory::parsePE(const std::vector<uint8_t>& fileData) {
@@ -606,95 +613,15 @@ bool WardenMemory::readMemory(uint32_t va, uint8_t length, uint8_t* outBuf) cons
     return true;
 }
 
-uint32_t WardenMemory::expectedImageSizeForBuild(uint16_t build, bool isTurtle) {
-    switch (build) {
-        case 5875:
-            // Turtle WoW uses a custom WoW.exe with different code bytes.
-            // Their warden_scans DB expects bytes from this custom exe.
-            return isTurtle ? 0x00906000 : 0x009FD000;
-        default:   return 0;          // Unknown — accept any
-    }
-}
-
-std::string WardenMemory::findWowExe(uint16_t build) const {
-    std::vector<std::string> candidateDirs;
-    if (const char* env = std::getenv("WOWEE_INTEGRITY_DIR")) {
-        if (env && *env) candidateDirs.push_back(env);
-    }
-    if (const char* home = std::getenv("HOME")) {
-        if (home && *home) {
-            candidateDirs.push_back(std::string(home) + "/Downloads");
-            candidateDirs.push_back(std::string(home) + "/Downloads/twmoa_1180");
-            candidateDirs.push_back(std::string(home) + "/twmoa_1180");
-        }
-    }
-    candidateDirs.push_back("Data/misc");
-    candidateDirs.push_back("Data/expansions/turtle/overlay/misc");
-
-    const char* candidateExes[] = { "WoW.exe", "TurtleWoW.exe", "Wow.exe" };
-
-    // Collect all candidate paths
-    std::vector<std::string> allPaths;
-    for (const auto& dir : candidateDirs) {
-        for (const char* exe : candidateExes) {
-            std::string path = dir;
-            if (!path.empty() && path.back() != '/') path += '/';
-            path += exe;
-            if (std::filesystem::exists(path)) {
-                allPaths.push_back(path);
-            }
-        }
-    }
-
-    // If we know the expected imageSize for this build, try to find a matching PE
-    uint32_t expectedSize = expectedImageSizeForBuild(build, isTurtle_);
-    if (expectedSize != 0 && allPaths.size() > 1) {
-        for (const auto& path : allPaths) {
-            std::ifstream f(path, std::ios::binary);
-            if (!f.is_open()) continue;
-            // Read PE headers to get imageSize
-            f.seekg(0, std::ios::end);
-            auto fileSize = f.tellg();
-            if (fileSize < 256) continue;
-            f.seekg(0x3C);
-            uint32_t peOfs = 0;
-            f.read(reinterpret_cast<char*>(&peOfs), 4);
-            if (peOfs + 4 + 20 + 60 > static_cast<uint32_t>(fileSize)) continue;
-            f.seekg(peOfs + 4 + 20 + 56); // OptionalHeader + 56 = SizeOfImage
-            uint32_t imgSize = 0;
-            f.read(reinterpret_cast<char*>(&imgSize), 4);
-            if (imgSize == expectedSize) {
-                LOG_INFO("WardenMemory: Matched build ", build, " to ", path,
-                         " (imageSize=0x", std::hex, imgSize, std::dec, ")");
-                return path;
-            }
-        }
-    }
-
-    // Fallback: prefer the largest PE file (modified clients like Turtle WoW are
-    // larger than vanilla, and Warden checks target the actual running client).
-    std::string bestPath;
-    uintmax_t bestSize = 0;
-    for (const auto& path : allPaths) {
-        std::error_code ec;
-        auto sz = std::filesystem::file_size(path, ec);
-        if (!ec && sz > bestSize) {
-            bestSize = sz;
-            bestPath = path;
-        }
-    }
-    return bestPath.empty() && !allPaths.empty() ? allPaths[0] : bestPath;
-}
-
 bool WardenMemory::load(uint16_t build, bool isTurtle) {
     isTurtle_ = isTurtle;
-    std::string path = findWowExe(build);
+    auto path = platformServices_->integrityImagePath(build, isTurtle);
     if (path.empty()) {
         LOG_WARNING("WardenMemory: WoW.exe not found in any candidate directory");
         return false;
     }
-    LOG_WARNING("WardenMemory: Loading PE image: ", path, " (build=", build, ")");
-    return loadFromFile(path);
+    LOG_WARNING("WardenMemory: Loading PE image: ", path.string(), " (build=", build, ")");
+    return loadFromFile(path.string());
 }
 
 bool WardenMemory::loadFromFile(const std::string& exePath) {

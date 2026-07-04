@@ -171,9 +171,9 @@ void GameHandler::handleAuthResponse(network::Packet& packet) {
 }
 
 void GameHandler::requestCharacterList() {
-    if (requiresWarden_) {
+    if (wardenHandler_ && wardenHandler_->requiresWarden()) {
         // Gate already surfaced via failure callback/chat; avoid per-frame warning spam.
-        wardenCharEnumBlockedLogged_ = true;
+        wardenHandler_->setWardenCharEnumBlockedLogged(true);
         return;
     }
 
@@ -254,7 +254,7 @@ void GameHandler::createCharacter(const CharCreateData& data) {
         return;
     }
 
-    if (requiresWarden_) {
+    if (wardenHandler_ && wardenHandler_->requiresWarden()) {
         std::string msg = "Server requires anti-cheat/Warden; character creation blocked.";
         LOG_WARNING("Blocking CMSG_CHAR_CREATE while Warden gate is active");
         if (charCreateCallback_) {

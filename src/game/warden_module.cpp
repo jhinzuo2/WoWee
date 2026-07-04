@@ -1,10 +1,12 @@
 #include "game/warden_module.hpp"
 #include "game/warden_crypto.hpp"
+#include "game/warden_platform.hpp"
 #include "auth/crypto.hpp"
 #include "core/logger.hpp"
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <utility>
 #include <zlib.h>
 #include <openssl/rsa.h>
 #include <openssl/bn.h>
@@ -259,13 +261,21 @@ void WardenModule::generateRC4Keys(uint8_t* packet) {
 bool WardenModule::processPacket(const std::vector<uint8_t>& packetData) {
     if (!loaded_ || !emulator_ || !emulator_->isInitialized() ||
         emulatedObjectAddr_ == 0 || emulatedPacketHandlerAddr_ == 0) {
+        LOG_WARNING("Warden path: module/Unicorn processPacket unavailable"
+                    " loaded=", loaded_ ? "yes" : "no",
+                    " emulator=", emulator_ ? "yes" : "no",
+                    " object=0x", std::hex, emulatedObjectAddr_,
+                    " packetHandler=0x", emulatedPacketHandlerAddr_, std::dec);
         return false;
     }
 
+    LOG_WARNING("Warden path: module/Unicorn processPacket invoking emulated PacketHandler"
+                " packetSize=", packetData.size());
     uint32_t dataAddr = emulator_->writeData(packetData.data(), packetData.size());
     uint32_t status = 0;
     uint32_t statusAddr = emulator_->writeData(&status, sizeof(status));
     if (dataAddr == 0 || statusAddr == 0) {
+        LOG_WARNING("Warden path: module/Unicorn processPacket allocation failed");
         if (dataAddr) emulator_->freeMemory(dataAddr);
         if (statusAddr) emulator_->freeMemory(statusAddr);
         return false;
@@ -275,6 +285,7 @@ bool WardenModule::processPacket(const std::vector<uint8_t>& packetData) {
                             { dataAddr, static_cast<uint32_t>(packetData.size()), statusAddr });
     emulator_->freeMemory(statusAddr);
     emulator_->freeMemory(dataAddr);
+    LOG_WARNING("Warden path: module/Unicorn processPacket completed");
     return true;
 }
 
@@ -810,6 +821,12 @@ bool WardenModule::bindAPIs() {
                         });
                     LOG_DEBUG("WardenModule: Auto-stubbed ", libraryName, "!", functionName);
                 }
+                if (resolvedAddr != 0 && !emulator_->isRangeMapped(resolvedAddr, 1)) {
+                    LOG_ERROR("WardenModule: import ", libraryName, "!", functionName,
+                              " resolved outside mapped ranges: 0x",
+                              std::hex, resolvedAddr, std::dec);
+                    resolvedAddr = 0;
+                }
             }
             #endif
 
@@ -839,8 +856,22 @@ uint32_t WardenModule::resolveExport(uint32_t ordinal) const {
 
     uint32_t rva = 0;
     std::memcpy(&rva, static_cast<const uint8_t*>(moduleMemory_) + slot, 4);
-    if (rva >= moduleSize_) return 0;
-    return moduleBase_ + rva;
+    uint32_t resolved = 0;
+    if (rva < moduleSize_) {
+        resolved = moduleBase_ + rva;
+        LOG_INFO("WardenModule: Export ordinal ", ordinal, " raw RVA=0x",
+                 std::hex, rva, " -> VA=0x", resolved, std::dec);
+    } else if (rva >= moduleBase_ && rva < moduleBase_ + moduleSize_) {
+        resolved = rva;
+        LOG_INFO("WardenModule: Export ordinal ", ordinal, " raw VA=0x",
+                 std::hex, rva, std::dec);
+    } else {
+        LOG_ERROR("WardenModule: Export ordinal ", ordinal, " points outside image: raw=0x",
+                  std::hex, rva, " module=[0x", moduleBase_, ",0x",
+                  moduleBase_ + static_cast<uint32_t>(moduleSize_), ")", std::dec);
+        return 0;
+    }
+    return resolved;
 }
 
 bool WardenModule::initializeModule() {
@@ -962,7 +993,13 @@ bool WardenModule::initializeModule() {
         // patch each IAT slot with the emulator's stub address. Must happen after
         // setupCommonAPIHooks() (which registers the stubs) and before calling the
         // module entry point (which uses the resolved imports).
-        bindAPIs();
+        if (!bindAPIs()) {
+            LOG_WARNING("WardenModule: API binding reported errors; continuing for diagnostics");
+        }
+        if (!emulator_->syncModuleMemory(moduleMemory_, moduleSize_)) {
+            LOG_ERROR("WardenModule: Failed to sync patched module image into emulator");
+            return false;
+        }
 
         {
             char addrBuf[32];
@@ -1016,23 +1053,48 @@ bool WardenModule::initializeModule() {
                 return 1;
             });
 
-        // This mirrors the start of WoW.exe's off_811434 callback table closely
-        // enough for modules that read fixed offsets from the table.
-        std::vector<uint32_t> callbackTable = {
+        // The module treats the factory input as a C++ object in ECX. The
+        // first dword must be a vtable; slots 3/4 are used as alloc/free.
+        std::vector<uint32_t> callbackVtable = {
             sendPacketStub, loadModuleStub, cryptoStub, allocStub, freeStub, saveStub, loadStub,
+        };
+        uint32_t callbackVtableAddr = emulator_->writeData(callbackVtable.data(),
+                                                           callbackVtable.size() * sizeof(uint32_t));
+        if (callbackVtableAddr == 0) {
+            LOG_ERROR("WardenModule: Failed to allocate callback vtable");
+            return false;
+        }
+
+        std::vector<uint32_t> callbackObject = {
+            callbackVtableAddr,
             0x00000001u, 0x00000003u, 0x00000007u, 0x00000009u,
             0x00000019u, 0x00000021u, 0x00000041u, 0x00000081u,
             0x00000101u, 0x00000201u, 0x00000080u, 0x40400000u
         };
-        uint32_t callbackStructAddr = emulator_->writeData(callbackTable.data(), callbackTable.size() * sizeof(uint32_t));
-        if (callbackStructAddr == 0) {
-            LOG_ERROR("WardenModule: Failed to allocate callback table");
+        uint32_t callbackObjectAddr = emulator_->writeData(callbackObject.data(),
+                                                           callbackObject.size() * sizeof(uint32_t));
+        if (callbackObjectAddr == 0) {
+            LOG_ERROR("WardenModule: Failed to allocate callback object");
             return false;
         }
+        if (!emulator_->isRangeMapped(callbackVtableAddr, callbackVtable.size() * sizeof(uint32_t)) ||
+            !emulator_->isRangeMapped(callbackObjectAddr, callbackObject.size() * sizeof(uint32_t))) {
+            LOG_ERROR("WardenModule: Callback object/vtable address is not mapped: object=0x",
+                      std::hex, callbackObjectAddr, " vtable=0x", callbackVtableAddr, std::dec);
+            return false;
+        }
+        LOG_INFO("WardenModule: Callback object mapped at 0x", std::hex,
+                 callbackObjectAddr, " vtable=0x", callbackVtableAddr,
+                 " size=", std::dec, callbackObject.size() * sizeof(uint32_t));
 
         uint32_t entryPoint = resolveExport(1);
         if (entryPoint == 0) {
             LOG_ERROR("WardenModule: Could not resolve native Warden factory export #1");
+            return false;
+        }
+        if (!emulator_->isRangeMapped(entryPoint, 1)) {
+            LOG_ERROR("WardenModule: Export #1 entry is not mapped: 0x",
+                      std::hex, entryPoint, std::dec);
             return false;
         }
 
@@ -1043,9 +1105,14 @@ bool WardenModule::initializeModule() {
         }
 
         try {
-            uint32_t objectAddr = emulator_->callFunction(entryPoint, { callbackStructAddr });
+            uint32_t objectAddr = emulator_->callThiscall(entryPoint, callbackObjectAddr, {});
             if (objectAddr == 0) {
                 LOG_ERROR("WardenModule: Warden factory returned NULL");
+                return false;
+            }
+            if (!emulator_->isRangeMapped(objectAddr, 4)) {
+                LOG_ERROR("WardenModule: Warden object address is not mapped: 0x",
+                          std::hex, objectAddr, std::dec);
                 return false;
             }
 
@@ -1054,11 +1121,24 @@ bool WardenModule::initializeModule() {
                 LOG_ERROR("WardenModule: Warden object has no vtable");
                 return false;
             }
+            if (!emulator_->isRangeMapped(vtableAddr, sizeof(uint32_t) * 4)) {
+                LOG_ERROR("WardenModule: Warden vtable address is not mapped: 0x",
+                          std::hex, vtableAddr, std::dec);
+                return false;
+            }
 
             uint32_t methods[4] = {};
             if (!emulator_->readMemory(vtableAddr, methods, sizeof(methods))) {
                 LOG_ERROR("WardenModule: Failed to read Warden vtable");
                 return false;
+            }
+
+            for (int i = 0; i < 4; ++i) {
+                if (methods[i] != 0 && !emulator_->isRangeMapped(methods[i], 1)) {
+                    LOG_ERROR("WardenModule: Warden vtable method ", i,
+                              " is not mapped: 0x", std::hex, methods[i], std::dec);
+                    return false;
+                }
             }
 
             emulatedObjectAddr_ = objectAddr;
@@ -1164,22 +1244,15 @@ bool WardenModule::initializeModule() {
 // WardenModuleManager Implementation
 // ============================================================================
 
-WardenModuleManager::WardenModuleManager() {
-    // Set cache directory
-#ifdef _WIN32
-    if (const char* appdata = std::getenv("APPDATA"))
-        cacheDirectory_ = std::string(appdata) + "\\wowee\\warden_cache";
-    else
-        cacheDirectory_ = ".\\warden_cache";
-#else
-    if (const char* home = std::getenv("HOME"))
-        cacheDirectory_ = std::string(home) + "/.local/share/wowee/warden_cache";
-    else
-        cacheDirectory_ = "./warden_cache";
-#endif
+WardenModuleManager::WardenModuleManager(std::shared_ptr<WardenPlatformServices> platformServices)
+    : platformServices_(std::move(platformServices)) {
+    if (!platformServices_) {
+        platformServices_ = WardenPlatformServices::defaultServices();
+    }
+    cacheDirectory_ = platformServices_->wardenCacheDir().string();
 
-    // Create cache directory if it doesn't exist
-    std::filesystem::create_directories(cacheDirectory_);
+    std::error_code ec;
+    std::filesystem::create_directories(cacheDirectory_, ec);
 
     LOG_INFO("WardenModuleManager: Cache directory: ", cacheDirectory_);
 }
@@ -1240,14 +1313,10 @@ bool WardenModuleManager::cacheModule(const std::vector<uint8_t>& md5Hash,
                                       const std::vector<uint8_t>& moduleData) {
     std::string cachePath = getCachePath(md5Hash);
 
-    std::ofstream file(cachePath, std::ios::binary);
-    if (!file) {
+    if (!platformServices_->writeFile(cachePath, moduleData)) {
         LOG_ERROR("WardenModuleManager: Failed to write cache: ", cachePath);
         return false;
     }
-
-    file.write(reinterpret_cast<const char*>(moduleData.data()), moduleData.size());
-    file.close();
 
     LOG_INFO("WardenModuleManager: Cached module to: ", cachePath);
     return true;
@@ -1257,23 +1326,9 @@ bool WardenModuleManager::loadCachedModule(const std::vector<uint8_t>& md5Hash,
                                            std::vector<uint8_t>& moduleDataOut) {
     std::string cachePath = getCachePath(md5Hash);
 
-    if (!std::filesystem::exists(cachePath)) {
-        return false;
-    }
+    if (!platformServices_->readFile(cachePath, moduleDataOut)) return false;
 
-    std::ifstream file(cachePath, std::ios::binary | std::ios::ate);
-    if (!file) {
-        return false;
-    }
-
-    size_t fileSize = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    moduleDataOut.resize(fileSize);
-    file.read(reinterpret_cast<char*>(moduleDataOut.data()), fileSize);
-    file.close();
-
-    LOG_INFO("WardenModuleManager: Loaded cached module (", fileSize, " bytes)");
+    LOG_INFO("WardenModuleManager: Loaded cached module (", moduleDataOut.size(), " bytes)");
     return true;
 }
 

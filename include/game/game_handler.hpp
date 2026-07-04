@@ -38,6 +38,7 @@ namespace wowee::game {
     class WardenMemory;
     class WardenModule;
     class WardenModuleManager;
+    class WardenPlatformServices;
     class PacketParsers;
     class ChatHandler;
     class MovementHandler;
@@ -638,7 +639,8 @@ public:
     void reportPlayer(uint64_t targetGuid, const std::string& reason);
     void stopCasting();
     void resetCastState();       // force-clear all cast/craft/queue state without sending packets
-    void resetWardenState();     // clear all warden module/crypto state for connect/disconnect
+    void resetWardenState();     // clear all warden handler state for connect/disconnect
+    void setWardenPlatformServices(std::shared_ptr<WardenPlatformServices> platformServices);
     void clearUnitCaches();      // clear per-unit cast states and aura caches
 
     void queryPlayerName(uint64_t guid);
@@ -3360,46 +3362,6 @@ private:
     bool pendingCharCreateResult_ = false;
     bool pendingCharCreateSuccess_ = false;
     std::string pendingCharCreateMsg_;
-    bool requiresWarden_ = false;
-    bool wardenGateSeen_ = false;
-    float wardenGateElapsed_ = 0.0f;
-    float wardenGateNextStatusLog_ = 2.0f;
-    uint32_t wardenPacketsAfterGate_ = 0;
-    bool wardenCharEnumBlockedLogged_ = false;
-    std::unique_ptr<WardenCrypto> wardenCrypto_;
-    std::unique_ptr<WardenMemory> wardenMemory_;
-    std::unique_ptr<WardenModuleManager> wardenModuleManager_;
-
-    // Warden module download state
-    enum class WardenState {
-        WAIT_MODULE_USE,     // Waiting for first SMSG (MODULE_USE)
-        WAIT_MODULE_CACHE,   // Sent MODULE_MISSING, receiving module chunks
-        WAIT_HASH_REQUEST,   // Module received, waiting for HASH_REQUEST
-        WAIT_CHECKS,         // Hash sent, waiting for check requests
-    };
-    WardenState wardenState_ = WardenState::WAIT_MODULE_USE;
-    std::vector<uint8_t> wardenModuleHash_;    // 16 bytes MD5
-    std::vector<uint8_t> wardenModuleKey_;     // 16 bytes RC4
-    uint32_t wardenModuleSize_ = 0;
-    std::vector<uint8_t> wardenModuleData_;    // Downloaded module chunks
-    std::vector<uint8_t> wardenLoadedModuleImage_; // Parsed module image for key derivation
-    std::shared_ptr<WardenModule> wardenLoadedModule_; // Loaded Warden module
-
-    // Pre-computed challenge/response entries from .cr file
-    struct WardenCREntry {
-        uint8_t seed[16];
-        uint8_t reply[20];
-        uint8_t clientKey[16];  // Encrypt key (client→server)
-        uint8_t serverKey[16]; // Decrypt key (server→client)
-    };
-    std::vector<WardenCREntry> wardenCREntries_;
-    // Module-specific check type opcodes [9]: MEM, PAGE_A, PAGE_B, MPQ, LUA, DRIVER, TIMING, PROC, MODULE
-    uint8_t wardenCheckOpcodes_[9] = {};
-
-    // Async Warden response: avoids 5-second main-loop stalls from PAGE_A/PAGE_B code pattern searches
-    std::future<std::vector<uint8_t>> wardenPendingEncrypted_;  // encrypted response bytes
-    bool wardenResponsePending_ = false;
-
     // ---- RX silence detection ----
     std::chrono::steady_clock::time_point lastRxTime_{};
     bool rxSilenceLogged_ = false;

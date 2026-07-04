@@ -4,9 +4,12 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <memory>
 
 namespace wowee {
 namespace game {
+
+class WardenPlatformServices;
 
 /**
  * Provides WoW.exe PE memory image for Warden MEM_CHECK responses.
@@ -15,7 +18,7 @@ namespace game {
  */
 class WardenMemory {
 public:
-    WardenMemory();
+    explicit WardenMemory(std::shared_ptr<WardenPlatformServices> platformServices = nullptr);
     ~WardenMemory();
 
     /** Search standard candidate dirs for WoW.exe and load it.
@@ -68,8 +71,7 @@ private:
     void patchTurtleWowBinary();
     void verifyWardenScanEntries();
     bool isTurtle_ = false;
-    std::string findWowExe(uint16_t build) const;
-    static uint32_t expectedImageSizeForBuild(uint16_t build, bool isTurtle);
+    std::shared_ptr<WardenPlatformServices> platformServices_;
 
     // Cache for searchCodePattern results to avoid repeated 5-second brute-force searches.
     // Key: hex string of seed(4)+hash(20)+patLen(1)+imageOnly(1) = 26 bytes.
