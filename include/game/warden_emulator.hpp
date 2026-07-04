@@ -62,6 +62,10 @@ public:
                      const std::string& functionName,
                      std::function<uint32_t(WardenEmulator&, const std::vector<uint32_t>&)> handler);
 
+    uint32_t hookFunction(const std::string& name,
+                          int argCount,
+                          std::function<uint32_t(WardenEmulator&, const std::vector<uint32_t>&)> handler);
+
     /**
      * Call emulated function
      *
@@ -70,6 +74,8 @@ public:
      * @return Return value from function (EAX)
      */
     uint32_t callFunction(uint32_t address, const std::vector<uint32_t>& args = {});
+
+    uint32_t callThiscall(uint32_t address, uint32_t thisPtr, const std::vector<uint32_t>& args = {});
 
     /**
      * Read memory from emulated address space

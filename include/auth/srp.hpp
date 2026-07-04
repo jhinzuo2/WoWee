@@ -36,6 +36,14 @@ public:
     // Default is false (treat hash outputs as little-endian integers).
     void setHashBigEndian(bool enabled) { hashBigEndian_ = enabled; }
 
+    // WoW SRP public keys are 32 bytes. Keep this tunable while validating
+    // private-server compatibility.
+    void setEphemeralBytes(int bytes) { ephemeralBytes_ = bytes; }
+
+    // WoW trims low-order zero bytes from S before interleaving. This is
+    // tunable for compatibility probes.
+    void setTrimSessionKeyZeros(bool enabled) { trimSessionKeyZeros_ = enabled; }
+
     // Get client public ephemeral (A) - send to server
     std::vector<uint8_t> getA() const;
 
@@ -88,6 +96,8 @@ private:
     bool initialized = false;
     bool useHashedK_ = false;
     bool hashBigEndian_ = false;
+    int ephemeralBytes_ = 32;
+    bool trimSessionKeyZeros_ = true;
 };
 
 } // namespace auth

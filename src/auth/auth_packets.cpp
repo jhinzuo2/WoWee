@@ -67,8 +67,10 @@ network::Packet LogonChallengePacket::build(const std::string& account, const Cl
 
     network::Packet packet(static_cast<uint16_t>(AuthOpcode::LOGON_CHALLENGE));
 
-    // Protocol version (e.g. 8 for WoW 3.3.5a build 12340)
-    packet.writeUInt8(info.protocolVersion);
+    // LOGON_CHALLENGE protocol version. This is 8 for Blizzard-era clients,
+    // including 1.12.x/Turtle; do not confuse it with the legacy realm/proof
+    // protocol selector stored in ClientInfo::protocolVersion.
+    packet.writeUInt8(info.logonProtocolVersion);
 
     // Payload size
     packet.writeUInt16(payloadSize);
@@ -244,8 +246,10 @@ network::Packet LogonProofPacket::buildLegacy(const std::vector<uint8_t>& A,
     } else {
         for (int i = 0; i < 20; ++i) packet.writeUInt8(0); // CRC hash
     }
-    packet.writeUInt8(0); // number of keys
-    packet.writeUInt8(0); // security flags
+    packet.writeUInt8(0); // number of telemetry keys
+    packet.writeUInt8(0); // security flag
+    LOG_WARNING("Built legacy LOGON_PROOF packet: payload=", packet.getSize(),
+                " bytes, total=", packet.getSize() + 1, " bytes");
     return packet;
 }
 
@@ -318,7 +322,7 @@ bool LogonProofResponseParser::parse(network::Packet& packet, LogonProofResponse
     // Status
     response.status = packet.readUInt8();
 
-    LOG_INFO("LOGON_PROOF response status: ", static_cast<int>(response.status));
+    LOG_WARNING("LOGON_PROOF response status: ", static_cast<int>(response.status));
 
     if (response.status != 0) {
         LOG_ERROR("LOGON_PROOF failed with status: ", static_cast<int>(response.status));

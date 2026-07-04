@@ -1166,6 +1166,9 @@ void Application::update(float deltaTime) {
             if (authHandler) {
                 authHandler->update(deltaTime);
             }
+            if (gameHandler && gameHandler->isConnected()) {
+                gameHandler->update(deltaTime);
+            }
             break;
 
         case AppState::CHARACTER_CREATION:

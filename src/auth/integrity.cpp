@@ -4,6 +4,8 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
+#include <algorithm>
+#include <cctype>
 
 namespace wowee {
 namespace auth {
@@ -109,6 +111,50 @@ bool computeIntegrityHashWin32(const std::array<uint8_t, 16>& checksumSalt,
                                std::array<uint8_t, 20>& outHash,
                                std::string& outError) {
     return computeIntegrityHashWin32WithExe(checksumSalt, clientPublicKeyA, miscDir, "WoW.exe", outHash, outError);
+}
+
+bool computeIntegrityHashFromVersionHash(const std::vector<uint8_t>& clientPublicKeyA,
+                                         const std::array<uint8_t, 20>& versionHash,
+                                         std::array<uint8_t, 20>& outHash,
+                                         std::string& outError) {
+    std::vector<uint8_t> shaIn;
+    shaIn.reserve(clientPublicKeyA.size() + versionHash.size());
+    shaIn.insert(shaIn.end(), clientPublicKeyA.begin(), clientPublicKeyA.end());
+    shaIn.insert(shaIn.end(), versionHash.begin(), versionHash.end());
+
+    const std::vector<uint8_t> finalHash = Crypto::sha1(shaIn);
+    if (finalHash.size() != outHash.size()) {
+        outError = "unexpected sha1 size";
+        return false;
+    }
+
+    std::copy(finalHash.begin(), finalHash.end(), outHash.begin());
+    return true;
+}
+
+bool getKnownClientVersionHash(uint16_t build,
+                               const std::string& os,
+                               std::array<uint8_t, 20>& outHash) {
+    auto isMac = [](std::string value) {
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value == "osx" || value == "mac";
+    };
+
+    // Values from CMaNGOS classic RealmList.cpp ExpectedRealmdClientBuilds.
+    // Build 5875 is stock vanilla 1.12.1.
+    if (build == 5875) {
+        if (isMac(os)) {
+            outHash = {{ 0x8D, 0x17, 0x3C, 0xC3, 0x81, 0x96, 0x1E, 0xEB, 0xAB, 0xF3,
+                         0x36, 0xF5, 0xE6, 0x67, 0x5B, 0x10, 0x1B, 0xB5, 0x13, 0xE5 }};
+        } else {
+            outHash = {{ 0x95, 0xED, 0xB2, 0x7C, 0x78, 0x23, 0xB3, 0x63, 0xCB, 0xDD,
+                         0xAB, 0x56, 0xA3, 0x92, 0xE7, 0xCB, 0x73, 0xFC, 0xCA, 0x20 }};
+        }
+        return true;
+    }
+
+    return false;
 }
 
 } // namespace auth

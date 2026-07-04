@@ -2,9 +2,22 @@
 #include "network/packet.hpp"
 #include "network/net_platform.hpp"
 #include "core/logger.hpp"
+#include <cstdlib>
 
 namespace wowee {
 namespace network {
+
+namespace {
+
+bool authRawDumpEnabled() {
+    static bool enabled = []() {
+        const char* raw = std::getenv("WOWEE_AUTH_RAW_DUMP");
+        return raw && *raw && std::string(raw) != "0";
+    }();
+    return enabled;
+}
+
+} // namespace
 
 TCPSocket::TCPSocket() {
     net::ensureInit();
@@ -130,6 +143,20 @@ void TCPSocket::send(const Packet& packet) {
     }
 }
 
+void TCPSocket::sendRaw(const std::vector<uint8_t>& data) {
+    if (!connected || data.empty()) return;
+
+    LOG_WARNING("AUTH RAW TX ", data.size(), "B: ",
+                core::toHexString(data.data(), data.size(), true));
+
+    ssize_t sent = net::portableSend(sockfd, data.data(), data.size());
+    if (sent < 0) {
+        LOG_ERROR("Raw send failed: ", net::errorString(net::lastError()));
+    } else if (static_cast<size_t>(sent) != data.size()) {
+        LOG_WARNING("Partial raw send: ", sent, " of ", data.size(), " bytes");
+    }
+}
+
 void TCPSocket::update() {
     if (!connected) return;
 
@@ -148,6 +175,10 @@ void TCPSocket::update() {
         if (received > 0) {
             receivedAny = true;
             LOG_DEBUG("Received ", received, " bytes from server");
+            if (authRawDumpEnabled()) {
+                LOG_WARNING("AUTH RAW RX ", received, "B: ",
+                            core::toHexString(buffer, static_cast<size_t>(received), true));
+            }
             receiveBuffer.insert(receiveBuffer.end(), buffer, buffer + received);
             continue; // keep draining
         }

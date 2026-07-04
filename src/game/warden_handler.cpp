@@ -456,6 +456,7 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
                         owner_.getSocket()->send(pkt);
                         LOG_DEBUG("Warden: Module sendPacket callback sent ", len, " bytes");
                     });
+                wardenLoadedModule_->setSessionKey(owner_.getSessionKey());
                 if (wardenLoadedModule_->load(wardenModuleData_, wardenModuleHash_, wardenModuleKey_)) { // codeql[cpp/weak-cryptographic-algorithm]
                     LOG_INFO("Warden: Module loaded successfully (image size=",
                              wardenLoadedModule_->getModuleSize(), " bytes)");
@@ -481,6 +482,12 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
             }
 
             std::vector<uint8_t> seed(decrypted.begin() + 1, decrypted.begin() + 17);
+            if (wardenLoadedModule_ && wardenLoadedModule_->processPacket(decrypted)) {
+                LOG_WARNING("Warden: HASH_REQUEST handled by native Warden module");
+                wardenState_ = WardenState::WAIT_CHECKS;
+                break;
+            }
+
             auto applyWardenSeedRekey = [&](const std::vector<uint8_t>& rekeySeed) {
                 // Derive new RC4 keys from the seed using SHA1Randx.
                 uint8_t newEncryptKey[16], newDecryptKey[16];
@@ -535,6 +542,20 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
 
                 bool isTurtle = isActiveExpansion("turtle");
                 bool isClassic = (owner_.getBuild() <= 6005) && !isTurtle;
+                const char* turtleModeEnv = std::getenv("WOWEE_WARDEN_TURTLE_NO_CR");
+                const bool turtleFallbackAllowed =
+                    turtleModeEnv && std::string(turtleModeEnv) == "fallback";
+
+                if (isTurtle && !turtleFallbackAllowed) {
+                    // Turtle closes the world connection when we send an invented HASH_RESULT.
+                    // Without a matching .cr entry, silence is safer and matches the headless
+                    // probe behavior that successfully reaches SMSG_CHAR_ENUM.
+                    LOG_WARNING("Warden: HASH_REQUEST seed=", seedHex,
+                                " — no CR match, skipping response for Turtle "
+                                "(set WOWEE_WARDEN_TURTLE_NO_CR=fallback to test legacy fallback)");
+                    wardenState_ = WardenState::WAIT_CHECKS;
+                    break;
+                }
 
                 if (!isTurtle && !isClassic) {
                     // WotLK/TBC: don't respond to HASH_REQUEST without a valid CR match.

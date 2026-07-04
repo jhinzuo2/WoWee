@@ -3,6 +3,7 @@
 #include "core/logger.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <sstream>
 #include <iomanip>
 
@@ -133,15 +134,15 @@ std::vector<uint8_t> SRP::computeAuthHash(const std::string& username,
 void SRP::computeClientEphemeral() {
     LOG_DEBUG("Computing client ephemeral");
 
-    // Generate random private ephemeral a (19 bytes = 152 bits).
+    // Generate random private ephemeral a.
     // WoW SRP-6a requires A != 0 mod N; in practice this almost never fails
-    // (probability ≈ 2^-152), but we retry to be safe. 100 attempts is far more
-    // than needed — if it fails, the RNG is broken.
+    // but we retry to be safe. 100 attempts is far more than needed — if it
+    // fails, the RNG is broken.
     static constexpr int kMaxEphemeralAttempts = 100;
-    static constexpr int kEphemeralBytes = 19; // 152 bits — matches Blizzard client
+    const int ephemeralBytes = (ephemeralBytes_ > 0 && ephemeralBytes_ <= 32) ? ephemeralBytes_ : 32;
     int attempts = 0;
     while (attempts < kMaxEphemeralAttempts) {
-        a = BigNum::fromRandom(kEphemeralBytes);
+        a = BigNum::fromRandom(ephemeralBytes);
 
         // A = g^a mod N
         A = g.modPow(a, N);
@@ -195,14 +196,29 @@ void SRP::computeSessionKey() {
 
     LOG_DEBUG("Session key S calculated");
 
-    // Interleave the session key to create K
-    // Split S into even and odd bytes, hash each half, then interleave
-    std::vector<uint8_t> S_bytes = S.toArray(true, 32);  // 32 bytes for WoW
+    // Interleave the session key to create K. WoW trims low-order zero bytes
+    // from the little-endian S value, rounded to an even boundary, before
+    // splitting into even/odd byte streams.
+    std::vector<uint8_t> S_bytes = S.toArray(true, 32);
+    size_t trim = 0;
+    while (trim < S_bytes.size() && S_bytes[trim] == 0) {
+        ++trim;
+    }
+    if (trimSessionKeyZeros_) {
+        if (trim % 2 != 0) {
+            ++trim;
+        }
+        if (trim > 0 && trim < S_bytes.size()) {
+            S_bytes.erase(S_bytes.begin(), S_bytes.begin() + static_cast<std::ptrdiff_t>(trim));
+        }
+    }
 
     std::vector<uint8_t> S1, S2;
-    for (size_t i = 0; i < 16; ++i) {
-        S1.push_back(S_bytes[i * 2]);       // Even indices
-        S2.push_back(S_bytes[i * 2 + 1]);   // Odd indices
+    S1.reserve(S_bytes.size() / 2);
+    S2.reserve(S_bytes.size() / 2);
+    for (size_t i = 0; i + 1 < S_bytes.size(); i += 2) {
+        S1.push_back(S_bytes[i]);
+        S2.push_back(S_bytes[i + 1]);
     }
 
     // Hash each half

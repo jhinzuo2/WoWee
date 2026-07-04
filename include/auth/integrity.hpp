@@ -31,5 +31,17 @@ bool computeIntegrityHashWin32WithExe(const std::array<uint8_t, 16>& checksumSal
                                       std::array<uint8_t, 20>& outHash,
                                       std::string& outError);
 
+// Computes the proof used by CMaNGOS/vMaNGOS-style strict version checks:
+//   crc_hash = SHA1(clientPublicKey || server_configured_version_hash)
+bool computeIntegrityHashFromVersionHash(const std::vector<uint8_t>& clientPublicKeyA,
+                                         const std::array<uint8_t, 20>& versionHash,
+                                         std::array<uint8_t, 20>& outHash,
+                                         std::string& outError);
+
+// Returns known client version hashes used by CMaNGOS-compatible auth servers.
+bool getKnownClientVersionHash(uint16_t build,
+                               const std::string& os,
+                               std::array<uint8_t, 20>& outHash);
+
 } // namespace auth
 } // namespace wowee

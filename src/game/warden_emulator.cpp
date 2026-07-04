@@ -174,13 +174,6 @@ bool WardenEmulator::initialize(const void* moduleCode, size_t moduleSize, uint3
 uint32_t WardenEmulator::hookAPI(const std::string& dllName,
                                  const std::string& functionName,
                                  std::function<uint32_t(WardenEmulator&, const std::vector<uint32_t>&)> handler) {
-    // Allocate address for this API stub (16 bytes each)
-    uint32_t stubAddr = nextApiStubAddr_;
-    nextApiStubAddr_ += 16;
-
-    // Store address mapping for IAT patching
-    apiAddresses_[dllName][functionName] = stubAddr;
-
     // Determine stdcall arg count from known Windows APIs so the hook can
     // clean up the stack correctly (RETN N convention).
     static const std::pair<const char*, int> knownArgCounts[] = {
@@ -197,6 +190,22 @@ uint32_t WardenEmulator::hookAPI(const std::string& dllName,
         if (functionName == name) { argCount = cnt; break; }
     }
 
+    uint32_t stubAddr = hookFunction(dllName + "!" + functionName, argCount, std::move(handler));
+
+    // Store address mapping for IAT patching
+    apiAddresses_[dllName][functionName] = stubAddr;
+
+    return stubAddr;
+}
+
+uint32_t WardenEmulator::hookFunction(
+    const std::string& name,
+    int argCount,
+    std::function<uint32_t(WardenEmulator&, const std::vector<uint32_t>&)> handler) {
+    // Allocate address for this API/callback stub (16 bytes each)
+    uint32_t stubAddr = nextApiStubAddr_;
+    nextApiStubAddr_ += 16;
+
     // Store the handler so hookCode() can dispatch to it
     apiHandlers_[stubAddr] = { argCount, std::move(handler) };
 
@@ -210,7 +219,7 @@ uint32_t WardenEmulator::hookAPI(const std::string& dllName,
     {
         char hBuf[64];
         std::snprintf(hBuf, sizeof(hBuf), "0x%X (argCount=%d)", stubAddr, argCount);
-        LOG_DEBUG("WardenEmulator: Hooked ", dllName, "!", functionName, " at ", hBuf);
+        LOG_DEBUG("WardenEmulator: Hooked ", name, " at ", hBuf);
     }
 
     return stubAddr;
@@ -269,9 +278,11 @@ uint32_t WardenEmulator::callFunction(uint32_t address, const std::vector<uint32
         LOG_DEBUG("WardenEmulator: Calling function at ", aBuf, " with ", args.size(), " args");
     }
 
-    // Get current ESP
-    uint32_t esp;
-    uc_reg_read(uc_, UC_X86_REG_ESP, &esp);
+    // Get current ESP. Restore it after the call so both stdcall and cdecl
+    // module exports can be invoked without stack drift.
+    uint32_t originalEsp;
+    uc_reg_read(uc_, UC_X86_REG_ESP, &originalEsp);
+    uint32_t esp = originalEsp;
 
     // Push arguments (stdcall: right-to-left)
     for (auto it = args.rbegin(); it != args.rend(); ++it) {
@@ -298,6 +309,7 @@ uint32_t WardenEmulator::callFunction(uint32_t address, const std::vector<uint32
     // Get return value (EAX)
     uint32_t eax;
     uc_reg_read(uc_, UC_X86_REG_EAX, &eax);
+    uc_reg_write(uc_, UC_X86_REG_ESP, &originalEsp);
 
     {
         char rBuf[32];
@@ -306,6 +318,21 @@ uint32_t WardenEmulator::callFunction(uint32_t address, const std::vector<uint32
     }
 
     return eax;
+}
+
+uint32_t WardenEmulator::callThiscall(uint32_t address, uint32_t thisPtr, const std::vector<uint32_t>& args) {
+    if (!uc_) {
+        LOG_ERROR("WardenEmulator: Not initialized");
+        return 0;
+    }
+
+    uint32_t originalEcx = 0;
+    uc_reg_read(uc_, UC_X86_REG_ECX, &originalEcx);
+    uc_reg_write(uc_, UC_X86_REG_ECX, &thisPtr);
+
+    uint32_t result = callFunction(address, args);
+    uc_reg_write(uc_, UC_X86_REG_ECX, &originalEcx);
+    return result;
 }
 
 bool WardenEmulator::readMemory(uint32_t address, void* buffer, size_t size) {
@@ -612,7 +639,10 @@ WardenEmulator::~WardenEmulator() {}
 bool WardenEmulator::initialize(const void*, size_t, uint32_t) { return false; }
 uint32_t WardenEmulator::hookAPI(const std::string&, const std::string&,
     std::function<uint32_t(WardenEmulator&, const std::vector<uint32_t>&)>) { return 0; }
+uint32_t WardenEmulator::hookFunction(const std::string&, int,
+    std::function<uint32_t(WardenEmulator&, const std::vector<uint32_t>&)>) { return 0; }
 uint32_t WardenEmulator::callFunction(uint32_t, const std::vector<uint32_t>&) { return 0; }
+uint32_t WardenEmulator::callThiscall(uint32_t, uint32_t, const std::vector<uint32_t>&) { return 0; }
 bool WardenEmulator::readMemory(uint32_t, void*, size_t) { return false; }
 bool WardenEmulator::writeMemory(uint32_t, const void*, size_t) { return false; }
 std::string WardenEmulator::readString(uint32_t, size_t) { return {}; }

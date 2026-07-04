@@ -63,14 +63,15 @@ void CharacterScreen::render(game::GameHandler& gameHandler) {
 
     // Get character list
     const auto& characters = gameHandler.getCharacters();
+    const auto worldState = gameHandler.getState();
 
     // Request character list if not available.
     // Also show a loading state while CHAR_LIST_REQUESTED is in-flight (characters may be cleared to avoid stale UI).
     if (characters.empty() &&
-        (gameHandler.getState() == game::WorldState::READY ||
-         gameHandler.getState() == game::WorldState::CHAR_LIST_REQUESTED)) {
+        (worldState == game::WorldState::READY ||
+         worldState == game::WorldState::CHAR_LIST_REQUESTED)) {
         ImGui::Text("Loading characters...");
-        if (gameHandler.getState() == game::WorldState::READY) {
+        if (worldState == game::WorldState::READY) {
             gameHandler.requestCharacterList();
         }
         ImGui::End();
@@ -79,12 +80,18 @@ void CharacterScreen::render(game::GameHandler& gameHandler) {
 
     // Handle disconnected state with no characters received
     if (characters.empty() &&
-        (gameHandler.getState() == game::WorldState::DISCONNECTED ||
-         gameHandler.getState() == game::WorldState::FAILED)) {
+        (worldState == game::WorldState::DISCONNECTED ||
+         worldState == game::WorldState::FAILED)) {
         ImGui::TextColored(ui::colors::kSoftRed, "Disconnected from server.");
         ImGui::TextWrapped("The server closed the connection before sending the character list.");
         ImGui::Spacing();
         if (ImGui::Button("Back", ImVec2(120, 36))) { if (onBack) onBack(); }
+        ImGui::End();
+        return;
+    }
+
+    if (characters.empty() && worldState != game::WorldState::CHAR_LIST_RECEIVED) {
+        ImGui::Text("Connecting to world...");
         ImGui::End();
         return;
     }

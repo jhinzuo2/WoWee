@@ -1,7 +1,10 @@
 # Warden Implementation
 
-**Status**: Partial — infrastructure complete, execution path still has stubs (`src/game/warden_module.cpp:1023,1155,1167`). The module is loaded, decrypted, and parsed, but import binding and `WardenFuncList` extraction return placeholder values; the server falls back to fake responses via `GameHandler` (`warden_module.cpp:234`).
-**WoW Version**: 3.3.5a (build 12340)
+**Status**: Partial. Module download, crypto, native-format image parsing, relocation,
+import binding scaffolding, callback stubs, and Unicorn dispatch exist. Full module
+execution is still not guaranteed for strict servers.
+**WoW Versions**: Classic/Turtle flow is the active target. Older 3.3.5a notes remain
+useful for crypto and opcode background.
 
 ---
 
@@ -14,26 +17,61 @@ return check results.
 Wowee handles this via Unicorn Engine CPU emulation — the x86 module is executed
 directly in an emulated environment with Windows API hooks, without Wine or a Windows OS.
 
+Native-client behavior confirmed in IDA:
+
+- `WoW.exe` registers a world handler for `SMSG_WARDEN_DATA` (`0x2E6`).
+- Once a Warden object is active, the main client does not compute Warden hash/check
+  responses itself; it passes the decrypted payload to the module object's packet
+  handler.
+- Outbound Warden data is emitted by a callback that builds `CMSG_WARDEN_DATA`
+  (`0x2E7`).
+- The callable entry is not the image base. Native WoW resolves export ordinal `1`,
+  calls that factory with the callback table, receives an object, then calls methods
+  from the object's vtable.
+
 ---
 
 ## Loading Pipeline (8 steps)
 
 ```
-1. MD5       - Verify module checksum matches server challenge
-2. RC4       - Decrypt module payload
-3. RSA-2048  - Verify module signature (currently uses a hardcoded placeholder modulus — see Crypto Layer below)
-4. zlib      - Decompress module
-5. Parse     - Read PE header (sections, relocations, imports)
-6. Relocate  - Apply base relocations to load address
-7. Bind      - Resolve imports (Windows API stubs + Warden callbacks)
-8. Init      - Call module entry point via Unicorn Engine
+1. MD5       - Verify encrypted module checksum matches server challenge
+2. RC4       - Decrypt module payload with the per-module key from `MODULE_USE`
+3. RSA-2048  - Verify module signature when possible
+4. zlib      - Decompress the signed payload
+5. Parse     - Decode the native Warden image format, not a normal PE header
+6. Relocate  - Apply the image-internal relocation table
+7. Bind      - Resolve image-internal import descriptors to Unicorn stubs
+8. Init      - Resolve export ordinal `1`, call the factory, and initialize the returned object
 ```
+
+---
+
+## Native Image Format Pitfalls
+
+This format is the biggest compatibility trap. It is not a PE file after decompression.
+
+- The first 0x28 bytes are a Warden image header.
+- Header fields include image size, relocation table offset/count, export table
+  offset/count/base ordinal, import table offset/count, and section count.
+- Section descriptors live after the 0x28-byte header in the compressed stream, but
+  native WoW does not copy those descriptors into the mapped image.
+- The copy stream starts after the descriptors. It uses 16-bit little-endian lengths
+  that alternate between copied bytes and zero-filled gaps.
+- Relocations live inside the mapped image, not after the copy stream. Two-byte
+  relocation entries are big-endian deltas; entries with the high bit set are
+  four-byte absolute big-endian offsets.
+- Imports live inside the mapped image as `[dllNameRva, thunkRva]` descriptors.
+  Thunks contain either a function-name RVA or an ordinal with the high bit set.
+
+Treating this as `[size][copy/data/skip][relocs][imports]` produces plausible-looking
+buffers but leaves function pointers unrelocated and causes jumps into unmapped
+addresses during module factory execution.
 
 ---
 
 ## Unicorn Engine Execution
 
-The module entry point is called inside an Unicorn x86 emulator with:
+The Warden object factory and vtable methods are called inside an Unicorn x86 emulator with:
 
 - Executable memory mapped at the module's load address
 - A simulated stack
@@ -53,8 +91,9 @@ After the first load, modules are written to disk:
 ~/.local/share/wowee/warden_cache/<MD5>.wdn
 ```
 
-The key for lookup is the MD5 of the encrypted module. On subsequent connections
-the cached decompressed module is loaded directly, skipping steps 1-4.
+The key for lookup is the MD5 of the encrypted module. The cache currently stores
+the encrypted module bytes; the module key still comes from the server's `MODULE_USE`
+packet for that session.
 
 ---
 
@@ -67,11 +106,8 @@ the cached decompressed module is loaded directly, skipping steps 1-4.
 | SHA1 | HMAC and check hashes |
 | RSA-2048 | Module signature verification |
 
-The RSA public modulus used here is a hardcoded placeholder
-(`include/game/warden_module.hpp`). The real 3.3.5a modulus lives in
-the retail `WoW.exe` `.rdata` section and must be extracted from a
-client install at runtime; until that path is implemented, signature
-verification will not match a stock Blizzard module.
+Some private-server/Turtle modules do not verify against the stock Blizzard modulus.
+Signature failure is logged but is not fatal so the module can still be parsed and tested.
 
 ---
 
@@ -79,6 +115,21 @@ verification will not match a stock Blizzard module.
 
 - `SMSG_WARDEN_DATA` = 0x2E6 — server sends module + checks
 - `CMSG_WARDEN_DATA` = 0x2E7 — client sends results
+
+---
+
+## Turtle Notes
+
+Turtle's auth/world path can accept character enumeration while Warden is still
+negotiating. Do not assume silence after `HASH_REQUEST` is always safe or always
+fatal; test against the live realm with `world_char_probe`:
+
+```bash
+WOWEE_WARDEN_WAIT_MS=8000 WOWEE_PROBE_TIMEOUT_MS=25000 scripts/probe_turtle_chars.sh "Eversong Wilds"
+```
+
+The wait period matters because the failure mode seen on Turtle was a disconnect a
+few seconds after the character list, not an immediate auth failure.
 
 ---
 
@@ -133,4 +184,4 @@ falls back to crypto-only mode (check responses are fabricated, not executed).
 
 ---
 
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-07-04

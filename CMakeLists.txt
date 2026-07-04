@@ -1420,6 +1420,53 @@ set_target_properties(auth_login_probe PROPERTIES
 )
 install(TARGETS auth_login_probe RUNTIME DESTINATION bin)
 
+# ---- Tool: world_char_probe (auth + world character enum probe) ----
+add_executable(world_char_probe
+    tools/world_char_probe/main.cpp
+    src/auth/auth_packets.cpp
+    src/auth/auth_opcodes.cpp
+    src/auth/crypto.cpp
+    src/auth/integrity.cpp
+    src/auth/big_num.cpp
+    src/auth/srp.cpp
+    src/auth/rc4.cpp
+    src/auth/vanilla_crypt.cpp
+    src/network/packet.cpp
+    src/network/socket.cpp
+    src/network/tcp_socket.cpp
+    src/network/world_socket.cpp
+    src/game/opcode_table.cpp
+    src/game/opcodes.cpp
+    src/game/world_packets.cpp
+    src/game/world_packets_social.cpp
+    src/game/world_packets_entity.cpp
+    src/game/world_packets_world.cpp
+    src/game/world_packets_economy.cpp
+    src/game/spline_packet.cpp
+    src/game/packet_parsers_tbc.cpp
+    src/game/packet_parsers_classic.cpp
+    src/game/character.cpp
+    src/game/warden_crypto.cpp
+    src/game/warden_module.cpp
+    src/game/warden_emulator.cpp
+    src/core/logger.cpp
+)
+target_include_directories(world_char_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/extern
+)
+target_link_libraries(world_char_probe PRIVATE Threads::Threads OpenSSL::Crypto ZLIB::ZLIB glm::glm
+    $<$<BOOL:${WIN32}>:ws2_32>)
+if(HAVE_UNICORN)
+    target_link_libraries(world_char_probe PRIVATE ${UNICORN_LIBRARY})
+    target_include_directories(world_char_probe PRIVATE ${UNICORN_INCLUDE_DIR})
+    target_compile_definitions(world_char_probe PRIVATE HAVE_UNICORN)
+endif()
+set_target_properties(world_char_probe PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+install(TARGETS world_char_probe RUNTIME DESTINATION bin)
+
 # ---- Tool: blp_convert (BLP ↔ PNG) ----
 add_executable(blp_convert
     tools/blp_convert/main.cpp

@@ -82,9 +82,16 @@ void UIScreenCallbackHandler::setupCallbacks() {
             clientBuild = realmBuild;
             LOG_INFO("Using realm-reported build: ", clientBuild);
         }
-        if (gameHandler_.connect(host, port, sessionKey, accountName, clientBuild, realmId)) {
-            LOG_INFO("Connected to world server, transitioning to character selection");
+        gameHandler_.setOnSuccess([this]() {
+            LOG_INFO("World authentication successful, transitioning to character selection");
             setState_(AppState::CHARACTER_SELECTION);
+        });
+        gameHandler_.setOnFailure([](const std::string& reason) {
+            LOG_ERROR("World connection failed: ", reason);
+        });
+
+        if (gameHandler_.connect(host, port, sessionKey, accountName, clientBuild, realmId)) {
+            LOG_INFO("Connected to world server, waiting for world authentication");
         } else {
             LOG_ERROR("Failed to connect to world server");
         }

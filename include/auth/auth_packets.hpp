@@ -16,7 +16,11 @@ struct ClientInfo {
     uint8_t minorVersion = 3;
     uint8_t patchVersion = 5;
     uint16_t build = 12340;  // 3.3.5a
-    uint8_t protocolVersion = 8; // SRP auth protocol version
+    // LOGON_CHALLENGE protocol byte. Blizzard clients use 8 here even for
+    // legacy 1.12.x/Turtle auth, while protocolVersion below still selects
+    // legacy realm-list/proof packet layouts.
+    uint8_t logonProtocolVersion = 8;
+    uint8_t protocolVersion = 8;
     std::string game = "WoW";
     std::string platform = "x86";
     std::string os = "Win";
@@ -61,7 +65,8 @@ class LogonProofPacket {
 public:
     static network::Packet build(const std::vector<uint8_t>& A,
                                   const std::vector<uint8_t>& M1);
-    // Legacy (protocol < 8): A(32) + M1(20) + crc(20) + number_of_keys(1). No securityFlags byte.
+    // Legacy (protocol < 8): A(32) + M1(20) + crc(20) + number_of_telemetry_keys(1)
+    // + security_flag(1). The flag is still present when zero.
     static network::Packet buildLegacy(const std::vector<uint8_t>& A,
                                        const std::vector<uint8_t>& M1);
     static network::Packet buildLegacy(const std::vector<uint8_t>& A,
