@@ -343,18 +343,22 @@ public:
     bool parseCastResult(network::Packet& packet, uint32_t& spellId, uint8_t& result) override;
     // TBC 2.4.3 SMSG_CAST_FAILED: spellId(u32) + result(u8) — WotLK added castCount(u8) prefix
     bool parseCastFailed(network::Packet& packet, CastFailedData& data) override;
-    // TBC 2.4.3 SMSG_SPELL_START: full uint64 GUIDs (WotLK uses packed GUIDs)
+    // TBC 2.4.3 SMSG_INITIAL_SPELLS: uint16 spellId + uint16 unk per entry.
+    bool parseInitialSpells(network::Packet& packet, InitialSpellsData& data) override {
+        return InitialSpellsParser::parse(packet, data, /*vanillaFormat=*/true);
+    }
+    // TBC 2.4.3 SMSG_SPELL_START: packed GUIDs + uint16 castFlags.
     bool parseSpellStart(network::Packet& packet, SpellStartData& data) override;
-    // TBC 2.4.3 SMSG_SPELL_GO: full uint64 GUIDs, no timestamp field (WotLK added one)
+    // TBC 2.4.3 SMSG_SPELL_GO: packed caster GUIDs + uint16 castFlags + timestamp.
     bool parseSpellGo(network::Packet& packet, SpellGoData& data) override;
     // TBC 2.4.3 SMSG_MAIL_LIST_RESULT: uint8 count (not uint32+uint8), no body field,
     // attachment uses uint64 itemGuid (not uint32), enchants are 7×u32 id-only (not 7×{id+dur+charges})
     bool parseMailList(network::Packet& packet, std::vector<MailMessage>& inbox) override;
-    // TBC 2.4.3 SMSG_ATTACKERSTATEUPDATE uses full uint64 GUIDs (WotLK uses packed GUIDs)
+    // TBC 2.4.3 SMSG_ATTACKERSTATEUPDATE uses packed GUIDs.
     bool parseAttackerStateUpdate(network::Packet& packet, AttackerStateUpdateData& data) override;
-    // TBC 2.4.3 SMSG_SPELLNONMELEEDAMAGELOG uses full uint64 GUIDs (WotLK uses packed GUIDs)
+    // TBC 2.4.3 SMSG_SPELLNONMELEEDAMAGELOG uses packed GUIDs.
     bool parseSpellDamageLog(network::Packet& packet, SpellDamageLogData& data) override;
-    // TBC 2.4.3 SMSG_SPELLHEALLOG uses full uint64 GUIDs (WotLK uses packed GUIDs)
+    // TBC 2.4.3 SMSG_SPELLHEALLOG uses packed GUIDs.
     bool parseSpellHealLog(network::Packet& packet, SpellHealLogData& data) override;
     // TBC 2.4.3 quest log has 4 update fields per slot (questId, state, counts, timer)
     // WotLK expands this to 5 (splits counts into two fields).

@@ -447,7 +447,9 @@ void AnimationCallbackHandler::setupCallbacks() {
                     });
                 }
             }
-            if (castAnim == 0) castAnim = rendering::anim::SPELL;
+            // TBC models may omit the legacy SPELL (2) sequence; idle is a
+            // quieter fallback than asking the renderer to play a missing anim.
+            if (castAnim == 0) castAnim = rendering::anim::STAND;
 
             // Finalization release (one-shot after cast completes)
             // Animation chosen by spell target type: AREA → SPELL_CAST_AREA,

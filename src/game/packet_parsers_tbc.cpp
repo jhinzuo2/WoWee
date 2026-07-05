@@ -695,13 +695,13 @@ bool TbcPacketParsers::parseMonsterMove(network::Packet& packet, MonsterMoveData
 
 // ============================================================================
 // TBC 2.4.3 CMSG_CAST_SPELL
-// Format: castCount(u8) + spellId(u32) + SpellCastTargets
+// Format: spellId(u32) + castCount(u8) + SpellCastTargets
 // WotLK 3.3.5a adds castFlags(u8) between spellId and targets — TBC does NOT.
 // ============================================================================
 network::Packet TbcPacketParsers::buildCastSpell(uint32_t spellId, uint64_t targetGuid, uint8_t castCount) {
     network::Packet packet(wireOpcode(LogicalOpcode::CMSG_CAST_SPELL));
-    packet.writeUInt8(castCount);
     packet.writeUInt32(spellId);
+    packet.writeUInt8(castCount);
     // No castFlags byte in TBC 2.4.3
 
     if (targetGuid != 0) {
@@ -1227,17 +1227,21 @@ bool TbcPacketParsers::parseMailList(network::Packet& packet, std::vector<MailMe
 static bool skipTbcSpellCastTargets(network::Packet& packet, uint64_t* primaryTargetGuid = nullptr) {
     if (!packet.hasRemaining(4)) return false;
 
+    constexpr uint32_t TARGET_FLAG_UNIT            = 0x00000002;
+    constexpr uint32_t TARGET_FLAG_ITEM            = 0x00000010;
+    constexpr uint32_t TARGET_FLAG_SOURCE_LOCATION = 0x00000020;
+    constexpr uint32_t TARGET_FLAG_DEST_LOCATION   = 0x00000040;
+    constexpr uint32_t TARGET_FLAG_CORPSE_ENEMY    = 0x00000200;
+    constexpr uint32_t TARGET_FLAG_GAMEOBJECT      = 0x00000800;
+    constexpr uint32_t TARGET_FLAG_TRADE_ITEM      = 0x00001000;
+    constexpr uint32_t TARGET_FLAG_STRING          = 0x00002000;
+    constexpr uint32_t TARGET_FLAG_CORPSE_ALLY     = 0x00008000;
+    constexpr uint32_t TARGET_FLAG_UNIT_MINIPET    = 0x00010000;
+
     const uint32_t targetFlags = packet.readUInt32();
 
-    // Returns false if the packed guid can't be read, otherwise reads and optionally captures it.
-    auto readPackedGuidCond = [&](uint32_t flag, bool capture) -> bool {
-        if (!(targetFlags & flag)) return true;
-        // Packed GUID: 1-byte mask + up to 8 data bytes
-        if (packet.getReadPos() >= packet.getSize()) return false;
-        uint8_t mask = packet.getData()[packet.getReadPos()];
-        size_t needed = 1;
-        for (int b = 0; b < 8; ++b) if (mask & (1u << b)) ++needed;
-        if (!packet.hasRemaining(needed)) return false;
+    auto readPackedGuid = [&](bool capture) -> bool {
+        if (!packet.hasFullPackedGuid()) return false;
         uint64_t g = packet.readPackedGuid();
         if (capture && primaryTargetGuid && *primaryTargetGuid == 0) *primaryTargetGuid = g;
         return true;
@@ -1250,54 +1254,63 @@ static bool skipTbcSpellCastTargets(network::Packet& packet, uint64_t* primaryTa
     };
 
     // Process in wire order matching cmangos-tbc SpellCastTargets::write()
-    if (!readPackedGuidCond(0x0002, true))  return false;  // UNIT
-    if (!readPackedGuidCond(0x0004, false)) return false;  // UNIT_MINIPET
-    if (!readPackedGuidCond(0x0010, false)) return false;  // ITEM
-    if (!skipFloats3(0x0020))               return false;  // SOURCE_LOCATION
-    if (!skipFloats3(0x0040))               return false;  // DEST_LOCATION
+    const uint32_t objectTargetFlags = TARGET_FLAG_UNIT | TARGET_FLAG_CORPSE_ENEMY |
+                                       TARGET_FLAG_GAMEOBJECT | TARGET_FLAG_CORPSE_ALLY |
+                                       TARGET_FLAG_UNIT_MINIPET;
+    if ((targetFlags & objectTargetFlags) && !readPackedGuid(true)) return false;
 
-    if (targetFlags & 0x1000) {  // TRADE_ITEM: uint8
-        if (packet.getReadPos() >= packet.getSize()) return false;
-        (void)packet.readUInt8();
+    if ((targetFlags & (TARGET_FLAG_ITEM | TARGET_FLAG_TRADE_ITEM)) && !readPackedGuid(false)) {
+        return false;
     }
-    if (targetFlags & 0x2000) {  // STRING: null-terminated
+
+    if (!skipFloats3(TARGET_FLAG_SOURCE_LOCATION)) return false;
+    if (!skipFloats3(TARGET_FLAG_DEST_LOCATION))   return false;
+
+    if (targetFlags & TARGET_FLAG_STRING) {
         const auto& raw = packet.getData();
         size_t pos = packet.getReadPos();
         while (pos < raw.size() && raw[pos] != 0) ++pos;
         if (pos >= raw.size()) return false;
         packet.setReadPos(pos + 1);
     }
-    if (!readPackedGuidCond(0x8200, false)) return false;  // CORPSE / PVP_CORPSE
-    if (!readPackedGuidCond(0x0800, true))  return false;  // OBJECT
 
     return true;
 }
 
 // TbcPacketParsers::parseSpellStart — TBC 2.4.3 SMSG_SPELL_START
 //
-// TBC uses full uint64 GUIDs for casterGuid and casterUnit.
-// WotLK uses packed (variable-length) GUIDs.
-// TBC also lacks the castCount byte — format:
-//   casterGuid(u64) + casterUnit(u64) + castCount(u8) + spellId(u32) + castFlags(u32) + castTime(u32)
-// Wait: TBC DOES have castCount. But WotLK removed spellId in some paths.
-// Correct TBC format (cmangos-tbc): objectGuid(u64) + casterGuid(u64) + castCount(u8) + spellId(u32) + castFlags(u32) + castTime(u32)
+// CMaNGOS TBC sends:
+//   PackedGuid(caster object/item) + PackedGuid(caster unit)
+//   + spellId(u32) + castCount(u8) + castFlags(u16) + castTime(u32)
+//   + SpellCastTargets
 // ============================================================================
 bool TbcPacketParsers::parseSpellStart(network::Packet& packet, SpellStartData& data) {
     data = SpellStartData{};
-    if (!packet.hasRemaining(22)) return false;
+    auto rem = [&]() -> size_t { return packet.getRemainingSize(); };
+    const size_t startPos = packet.getReadPos();
 
-    data.casterGuid = packet.readUInt64();   // full GUID (object)
-    data.casterUnit = packet.readUInt64();   // full GUID (caster unit)
-    data.castCount  = packet.readUInt8();
+    if (!packet.hasFullPackedGuid()) {
+        packet.setReadPos(startPos);
+        return false;
+    }
+    data.casterGuid = packet.readPackedGuid();
+    if (!packet.hasFullPackedGuid()) {
+        packet.setReadPos(startPos);
+        return false;
+    }
+    data.casterUnit = packet.readPackedGuid();
+
+    if (rem() < 11) {
+        packet.setReadPos(startPos);
+        return false;
+    }
     data.spellId    = packet.readUInt32();
-    data.castFlags  = packet.readUInt32();
+    data.castCount  = packet.readUInt8();
+    data.castFlags  = packet.readUInt16();
     data.castTime   = packet.readUInt32();
 
     // SpellCastTargets: consume ALL target payload types to keep the read position
     // aligned for any bytes the caller may parse after this (ammo, etc.).
-    // The previous code only read UNIT(0x02)/OBJECT(0x800) target GUIDs and left
-    // DEST_LOCATION(0x40)/SOURCE_LOCATION(0x20)/ITEM(0x10) bytes unconsumed,
-    // corrupting subsequent reads for every AOE/ground-targeted spell cast.
     {
         uint64_t targetGuid = 0;
         skipTbcSpellCastTargets(packet, &targetGuid);  // non-fatal on truncation
@@ -1312,26 +1325,39 @@ bool TbcPacketParsers::parseSpellStart(network::Packet& packet, SpellStartData& 
 // ============================================================================
 // TbcPacketParsers::parseSpellGo — TBC 2.4.3 SMSG_SPELL_GO
 //
-// TBC uses full uint64 GUIDs, no timestamp field after castFlags.
-// WotLK uses packed GUIDs and adds a timestamp (u32) after castFlags.
+// CMaNGOS TBC sends:
+//   PackedGuid(caster object/item) + PackedGuid(caster unit)
+//   + spellId(u32) + castFlags(u16) + timestamp(u32)
+//   + hit/miss target lists (full ObjectGuid values)
+//   + SpellCastTargets
 // ============================================================================
 bool TbcPacketParsers::parseSpellGo(network::Packet& packet, SpellGoData& data) {
     // Always reset output to avoid stale targets when callers reuse buffers.
     data = SpellGoData{};
 
+    auto rem = [&]() -> size_t { return packet.getRemainingSize(); };
     const size_t startPos = packet.getReadPos();
-    // Fixed header before hit/miss lists:
-    // casterGuid(u64) + casterUnit(u64) + castCount(u8) + spellId(u32) + castFlags(u32)
-    if (!packet.hasRemaining(25)) return false;
+    if (!packet.hasFullPackedGuid()) {
+        packet.setReadPos(startPos);
+        return false;
+    }
+    data.casterGuid = packet.readPackedGuid();
+    if (!packet.hasFullPackedGuid()) {
+        packet.setReadPos(startPos);
+        return false;
+    }
+    data.casterUnit = packet.readPackedGuid();
 
-    data.casterGuid = packet.readUInt64();   // full GUID in TBC
-    data.casterUnit = packet.readUInt64();   // full GUID in TBC
-    data.castCount  = packet.readUInt8();
-    data.spellId    = packet.readUInt32();
-    data.castFlags  = packet.readUInt32();
-    // NOTE: NO timestamp field here in TBC (WotLK added packet.readUInt32())
+    if (rem() < 10) {
+        packet.setReadPos(startPos);
+        return false;
+    }
+    data.castCount = 0;  // SMSG_SPELL_GO does not carry castCount in CMaNGOS TBC.
+    data.spellId   = packet.readUInt32();
+    data.castFlags = packet.readUInt16();
+    (void)packet.readUInt32(); // timestamp
 
-    if (packet.getReadPos() >= packet.getSize()) {
+    if (rem() < 1) {
         LOG_WARNING("[TBC] Spell go: missing hitCount after fixed fields");
         packet.setReadPos(startPos);
         return false;
@@ -1347,7 +1373,7 @@ bool TbcPacketParsers::parseSpellGo(network::Packet& packet, SpellGoData& data) 
     data.hitTargets.reserve(storedHitLimit);
     bool truncatedTargets = false;
     for (uint16_t i = 0; i < rawHitCount; ++i) {
-        if (!packet.hasRemaining(8)) {
+        if (rem() < 8) {
             LOG_WARNING("[TBC] Spell go: truncated hit targets at index ", i,
                         "/", static_cast<int>(rawHitCount));
             truncatedTargets = true;
@@ -1364,7 +1390,7 @@ bool TbcPacketParsers::parseSpellGo(network::Packet& packet, SpellGoData& data) 
     }
     data.hitCount = static_cast<uint8_t>(data.hitTargets.size());
 
-    if (packet.getReadPos() >= packet.getSize()) {
+    if (rem() < 1) {
         LOG_WARNING("[TBC] Spell go: missing missCount after hit target list");
         packet.setReadPos(startPos);
         return false;
@@ -1377,7 +1403,7 @@ bool TbcPacketParsers::parseSpellGo(network::Packet& packet, SpellGoData& data) 
     const uint8_t storedMissLimit = std::min<uint8_t>(rawMissCount, 128);
     data.missTargets.reserve(storedMissLimit);
     for (uint16_t i = 0; i < rawMissCount; ++i) {
-        if (!packet.hasRemaining(9)) {
+        if (rem() < 9) {
             LOG_WARNING("[TBC] Spell go: truncated miss targets at index ", i,
                         "/", static_cast<int>(rawMissCount));
             truncatedTargets = true;
@@ -1387,7 +1413,7 @@ bool TbcPacketParsers::parseSpellGo(network::Packet& packet, SpellGoData& data) 
         m.targetGuid = packet.readUInt64();  // full GUID in TBC
         m.missType   = packet.readUInt8();
         if (m.missType == 11) { // SPELL_MISS_REFLECT
-            if (!packet.hasRemaining(1)) {
+            if (rem() < 1) {
                 LOG_WARNING("[TBC] Spell go: truncated reflect payload at miss index ", i,
                             "/", static_cast<int>(rawMissCount));
                 truncatedTargets = true;
@@ -1450,9 +1476,10 @@ bool TbcPacketParsers::parseCastFailed(network::Packet& packet, CastFailedData& 
 // ============================================================================
 // TbcPacketParsers::parseAttackerStateUpdate — TBC 2.4.3 SMSG_ATTACKERSTATEUPDATE
 //
-// TBC uses full uint64 GUIDs for attacker and target.
-// WotLK uses packed (variable-length) GUIDs — using the WotLK reader here
-// would mis-parse TBC's GUIDs and corrupt all subsequent damage fields.
+// CMaNGOS TBC writes attacker and target as packed GUIDs:
+//   hitInfo(u32) + PackedGuid(attacker) + PackedGuid(target)
+//   + damage(u32) + subDamageCount(u8) + sub-damage entries
+//   + victimState(u32) + unknown(u32) + spellId(u32) + blocked(u32)
 // ============================================================================
 bool TbcPacketParsers::parseAttackerStateUpdate(network::Packet& packet, AttackerStateUpdateData& data) {
     data = AttackerStateUpdateData{};
@@ -1460,13 +1487,24 @@ bool TbcPacketParsers::parseAttackerStateUpdate(network::Packet& packet, Attacke
     const size_t startPos = packet.getReadPos();
     auto rem = [&]() { return packet.getRemainingSize(); };
 
-    // Fixed fields before sub-damage list:
-    // hitInfo(4) + attackerGuid(8) + targetGuid(8) + totalDamage(4) + subDamageCount(1) = 25 bytes
-    if (rem() < 25) return false;
+    if (rem() < 5) return false;  // hitInfo + at least one packed GUID mask byte
 
-    data.hitInfo        = packet.readUInt32();
-    data.attackerGuid   = packet.readUInt64();   // full GUID in TBC
-    data.targetGuid     = packet.readUInt64();   // full GUID in TBC
+    data.hitInfo = packet.readUInt32();
+    if (!packet.hasFullPackedGuid()) {
+        packet.setReadPos(startPos);
+        return false;
+    }
+    data.attackerGuid = packet.readPackedGuid();
+    if (!packet.hasFullPackedGuid()) {
+        packet.setReadPos(startPos);
+        return false;
+    }
+    data.targetGuid = packet.readPackedGuid();
+
+    if (rem() < 5) {
+        packet.setReadPos(startPos);
+        return false;
+    }
     data.totalDamage    = static_cast<int32_t>(packet.readUInt32());
     data.subDamageCount = packet.readUInt8();
 
@@ -1493,17 +1531,17 @@ bool TbcPacketParsers::parseAttackerStateUpdate(network::Packet& packet, Attacke
 
     data.subDamageCount = static_cast<uint8_t>(data.subDamages.size());
 
-    // victimState + overkill are part of the expected payload.
-    if (rem() < 8) {
+    // TBC sends victim state, an unknown field, a spell id field used by some
+    // melee specials, then blocked amount.  There is no overkill field here.
+    if (rem() < 16) {
         packet.setReadPos(startPos);
         return false;
     }
     data.victimState = packet.readUInt32();
-    data.overkill    = static_cast<int32_t>(packet.readUInt32());
-
-    if (rem() >= 4) {
-        data.blocked = packet.readUInt32();
-    }
+    (void)packet.readUInt32(); // unknown, commonly 0
+    (void)packet.readUInt32(); // spell id for some melee specials
+    data.blocked = packet.readUInt32();
+    data.overkill = -1;
 
     LOG_DEBUG("[TBC] Melee hit: ", data.totalDamage, " damage",
               data.isCrit() ? " (CRIT)" : "",
@@ -1514,21 +1552,19 @@ bool TbcPacketParsers::parseAttackerStateUpdate(network::Packet& packet, Attacke
 // ============================================================================
 // TbcPacketParsers::parseSpellDamageLog — TBC 2.4.3 SMSG_SPELLNONMELEEDAMAGELOG
 //
-// TBC uses full uint64 GUIDs; WotLK uses packed GUIDs.
+// CMaNGOS TBC writes target and attacker as packed GUIDs.
 // ============================================================================
 bool TbcPacketParsers::parseSpellDamageLog(network::Packet& packet, SpellDamageLogData& data) {
-    // Fixed TBC payload size:
-    // targetGuid(8) + attackerGuid(8) + spellId(4) + damage(4) + schoolMask(1)
-    // + absorbed(4) + resisted(4) + periodicLog(1) + unused(1) + blocked(4) + flags(4)
-    // = 43 bytes
-    // Some servers append additional trailing fields; consume the canonical minimum
-    // and leave any extension bytes unread.
-    if (!packet.hasRemaining(43)) return false;
-
     data = SpellDamageLogData{};
+    auto rem = [&]() { return packet.getRemainingSize(); };
 
-    data.targetGuid   = packet.readUInt64();  // full GUID in TBC
-    data.attackerGuid = packet.readUInt64();  // full GUID in TBC
+    if (rem() < 2 || !packet.hasFullPackedGuid()) return false;
+    data.targetGuid = packet.readPackedGuid();
+    if (rem() < 1 || !packet.hasFullPackedGuid()) return false;
+    data.attackerGuid = packet.readPackedGuid();
+
+    // spellId + damage + schoolMask + absorbed + resisted + periodicLog + unused + blocked + flags
+    if (rem() < 21) return false;
     data.spellId      = packet.readUInt32();
     data.damage       = packet.readUInt32();
     data.schoolMask   = packet.readUInt8();
@@ -1553,17 +1589,18 @@ bool TbcPacketParsers::parseSpellDamageLog(network::Packet& packet, SpellDamageL
 // ============================================================================
 // TbcPacketParsers::parseSpellHealLog — TBC 2.4.3 SMSG_SPELLHEALLOG
 //
-// TBC uses full uint64 GUIDs; WotLK uses packed GUIDs.
+// CMaNGOS TBC writes target and caster as packed GUIDs.
 // ============================================================================
 bool TbcPacketParsers::parseSpellHealLog(network::Packet& packet, SpellHealLogData& data) {
-    // Fixed payload is 28 bytes; many cores append crit flag (1 byte).
-    // targetGuid(8) + casterGuid(8) + spellId(4) + heal(4) + overheal(4)
-    if (!packet.hasRemaining(28)) return false;
-
     data = SpellHealLogData{};
+    auto rem = [&]() { return packet.getRemainingSize(); };
 
-    data.targetGuid = packet.readUInt64();  // full GUID in TBC
-    data.casterGuid = packet.readUInt64();  // full GUID in TBC
+    if (rem() < 2 || !packet.hasFullPackedGuid()) return false;
+    data.targetGuid = packet.readPackedGuid();
+    if (rem() < 1 || !packet.hasFullPackedGuid()) return false;
+    data.casterGuid = packet.readPackedGuid();
+
+    if (rem() < 12) return false;
     data.spellId    = packet.readUInt32();
     data.heal       = packet.readUInt32();
     data.overheal   = packet.readUInt32();

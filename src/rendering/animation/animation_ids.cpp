@@ -540,12 +540,23 @@ void validateAgainstDBC(const std::shared_ptr<wowee::pipeline::DBCFile>& dbc) {
 
     // Check: constants we define that are missing from DBC
     uint32_t missingInDbc = 0;
+    uint32_t firstMissingInDbc = ANIM_COUNT;
+    uint32_t lastMissingInDbc = 0;
     for (uint32_t id = 0; id < ANIM_COUNT; ++id) {
         if (dbcIds.find(id) == dbcIds.end()) {
-            LOG_WARNING("Animation ID ", id, " (", nameFromId(id),
-                        ") defined in constants but missing from AnimationData.dbc");
+            if (missingInDbc == 0) firstMissingInDbc = id;
+            lastMissingInDbc = id;
             ++missingInDbc;
         }
+    }
+    if (missingInDbc > 0) {
+        LOG_WARNING("AnimationData.dbc validation: ", missingInDbc,
+                    " animation constants are absent from this client DBC",
+                    " (first=", firstMissingInDbc,
+                    " ", nameFromId(firstMissingInDbc),
+                    ", last=", lastMissingInDbc,
+                    " ", nameFromId(lastMissingInDbc),
+                    "); suppressing per-ID warnings");
     }
 
     // Check: DBC IDs beyond our constant range
