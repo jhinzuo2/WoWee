@@ -921,8 +921,8 @@ void GameHandler::registerOpcodeHandlers() {
 
     // ---- SMSG_INIT_WORLD_STATES ----
     dispatchTable_[Opcode::SMSG_INIT_WORLD_STATES] = [this](network::Packet& packet) {
-        // WotLK format: uint32 mapId, uint32 zoneId, uint32 areaId, uint16 count, N*(uint32 key, uint32 val)
-        // Classic/TBC format: uint32 mapId, uint32 zoneId, uint16 count, N*(uint32 key, uint32 val)
+        // WotLK/TBC format: uint32 mapId, uint32 zoneId, uint32 areaId, uint16 count, N*(uint32 key, uint32 val)
+        // Classic format: uint32 mapId, uint32 zoneId, uint16 count, N*(uint32 key, uint32 val)
         if (!packet.hasRemaining(10)) {
             LOG_WARNING("SMSG_INIT_WORLD_STATES too short: ", packet.getSize(), " bytes");
             return;
@@ -938,11 +938,11 @@ void GameHandler::registerOpcodeHandlers() {
                 worldStateZoneId_ = newZoneId;
             }
         }
-        // WotLK adds areaId (uint32) before count; Classic/TBC/Turtle use the shorter format
+        // TBC added areaId in 2.1.0; WotLK kept it. Classic/Turtle use the shorter format.
         size_t remaining = packet.getRemainingSize();
-        bool isWotLKFormat = isActiveExpansion("wotlk");
-        if (isWotLKFormat && remaining >= 6) {
-            packet.readUInt32(); // areaId (WotLK only)
+        bool hasAreaId = isActiveExpansion("tbc") || isActiveExpansion("wotlk");
+        if (hasAreaId && remaining >= 6) {
+            packet.readUInt32(); // areaId
         }
         uint16_t count = packet.readUInt16();
         size_t needed = static_cast<size_t>(count) * 8;

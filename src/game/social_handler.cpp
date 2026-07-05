@@ -1238,10 +1238,11 @@ void SocialHandler::handleGroupDecline(network::Packet& packet) {
 
 void SocialHandler::handleGroupList(network::Packet& packet) {
     const bool hasRoles = isActiveExpansion("wotlk");
+    const bool hasBattleGroupFlag = isActiveExpansion("tbc");
     const uint8_t prevLootMethod = partyData.lootMethod;
     const bool wasInGroup = !partyData.isEmpty();
     partyData = GroupListData{};
-    if (!GroupListParser::parse(packet, partyData, hasRoles)) return;
+    if (!GroupListParser::parse(packet, partyData, hasRoles, hasBattleGroupFlag)) return;
 
     const bool nowInGroup = !partyData.isEmpty();
     if (!nowInGroup && wasInGroup) {

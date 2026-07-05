@@ -357,13 +357,17 @@ network::Packet GroupDeclinePacket::build() {
     return packet;
 }
 
-bool GroupListParser::parse(network::Packet& packet, GroupListData& data, bool hasRoles) {
+bool GroupListParser::parse(network::Packet& packet, GroupListData& data,
+                            bool hasRoles, bool hasBattleGroupFlag) {
     auto rem = [&]() { return packet.getRemainingSize(); };
 
-    if (rem() < 3) return false;
+    if (rem() < (hasBattleGroupFlag ? 4u : 3u)) return false;
     data.groupType = packet.readUInt8();
-    data.subGroup  = packet.readUInt8();
-    data.flags     = packet.readUInt8();
+    if (hasBattleGroupFlag) {
+        packet.readUInt8(); // isBattleGroup, sent by CMaNGOS TBC before subgroup.
+    }
+    data.subGroup = packet.readUInt8();
+    data.flags    = packet.readUInt8();
 
     // WotLK 3.3.5a added a roles byte (tank/healer/dps) for the dungeon finder.
     // Classic 1.12 and TBC 2.4.3 do not have this byte.
@@ -385,9 +389,12 @@ bool GroupListParser::parse(network::Packet& packet, GroupListData& data, bool h
         }
     }
 
-    if (rem() < 12) return false;
+    if (rem() < 8) return false;
     packet.readUInt64(); // group GUID
-    packet.readUInt32(); // update counter
+    if (hasRoles) {
+        if (rem() < 4) return false;
+        packet.readUInt32(); // update counter (WotLK)
+    }
 
     if (rem() < 4) return false;
     data.memberCount = packet.readUInt32();
