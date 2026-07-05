@@ -26,6 +26,15 @@ public:
     // Callback type for resolving spell icons (spellId, assetMgr) → VkDescriptorSet
     using SpellIconFn = std::function<VkDescriptorSet(uint32_t, pipeline::AssetManager*)>;
 
+    static constexpr int kFrameXmlActionBarPages = 6;
+    static constexpr int kBottomLeftActionPage = 6;
+    static constexpr int kRightActionPage = 3;
+    static constexpr int kLeftActionPage = 4;
+
+    static int actionSlotForPage(int page, int buttonIndex) {
+        return (page - 1) * 12 + buttonIndex;
+    }
+
     // ---- Action bar render methods ----
     void renderActionBar(game::GameHandler& gameHandler,
                          SettingsPanel& settingsPanel,
@@ -46,6 +55,8 @@ public:
     void renderRepBar(game::GameHandler& gameHandler,
                       SettingsPanel& settingsPanel);
 
+    int getMainActionBarPage() const { return mainActionBarPage_; }
+
     // ---- State owned by this panel ----
 
     // Action bar error-flash: spellId → wall-clock time (seconds) when the flash ends
@@ -55,6 +66,7 @@ public:
     // Action bar drag state (-1 = not dragging)
     int actionBarDragSlot_ = -1;
     VkDescriptorSet actionBarDragIcon_ = VK_NULL_HANDLE;
+    int mainActionBarPage_ = 1;  // FrameXML main pages are 1..6.
 
     // Bag bar state
     VkDescriptorSet backpackIconTexture_ = VK_NULL_HANDLE;

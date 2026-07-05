@@ -1065,7 +1065,9 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
 
             for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
                 if (!ctrlDown && input.isKeyJustPressed(actionBarKeys[i])) {
-                    int slotIdx = shiftDown ? (game::GameHandler::SLOTS_PER_BAR + i) : i;
+                    int slotIdx = shiftDown
+                        ? ActionBarPanel::actionSlotForPage(ActionBarPanel::kBottomLeftActionPage, i)
+                        : ActionBarPanel::actionSlotForPage(actionBarPanel_.getMainActionBarPage(), i);
                     if (bar[slotIdx].type == game::ActionBarSlot::SPELL && bar[slotIdx].isReady()) {
                         uint64_t target = gameHandler.hasTarget() ? gameHandler.getTargetGuid() : 0;
                         gameHandler.castSpell(bar[slotIdx].id, target);

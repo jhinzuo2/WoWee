@@ -364,11 +364,14 @@ bool Application::initialize() {
                             uint32_t iconField = 133; // WotLK default
                             uint32_t idField = 0;
                             if (spellL) {
-                                uint32_t layoutIcon = (*spellL)["IconID"];
-                                if (layoutIcon < fieldCount && fieldCount <= layoutIcon + 20) {
-                                    iconField = layoutIcon;
-                                    idField = (*spellL)["ID"];
-                                }
+                                try {
+                                    uint32_t layoutId = (*spellL)["ID"];
+                                    uint32_t layoutIcon = (*spellL)["IconID"];
+                                    if (layoutId < fieldCount && layoutIcon < fieldCount) {
+                                        iconField = layoutIcon;
+                                        idField = layoutId;
+                                    }
+                                } catch (...) {}
                             }
                             for (uint32_t i = 0; i < spellDbc->getRecordCount(); i++) {
                                 uint32_t id = spellDbc->getUInt32(i, idField);

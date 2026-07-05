@@ -182,7 +182,7 @@ private:
     std::unordered_map<uint32_t, VkDescriptorSet> spellIconCache_;
     // SpellIconID -> icon path (from SpellIcon.dbc)
     std::unordered_map<uint32_t, std::string> spellIconPaths_;
-    // SpellID -> SpellIconID (from Spell.dbc field 133)
+    // SpellID -> SpellIconID (from the active expansion's Spell.dbc layout)
     std::unordered_map<uint32_t, uint32_t> spellIconIds_;
     bool spellIconDbLoaded_ = false;
     VkDescriptorSet getSpellIcon(uint32_t spellId, pipeline::AssetManager* am);

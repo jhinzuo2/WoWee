@@ -54,15 +54,15 @@ if (ImGui::SliderFloat("Action Bar Scale", &pendingActionBarScale, 0.5f, 1.5f, "
 }
 ImGui::Spacing();
 
-if (ImGui::Checkbox("Show Second Action Bar", &pendingShowActionBar2)) {
+if (ImGui::Checkbox("Show Bottom Left Bar", &pendingShowActionBar2)) {
     saveCallback();
 }
 ImGui::SameLine();
-ImGui::TextDisabled("(Shift+1 through Shift+=)");
+ImGui::TextDisabled("(client action page 6)");
 
 if (pendingShowActionBar2) {
     ImGui::Spacing();
-    ImGui::TextUnformatted("Second Bar Position Offset");
+    ImGui::TextUnformatted("Bottom Left Bar Position Offset");
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderFloat("Horizontal##bar2x", &pendingActionBar2OffsetX, -600.0f, 600.0f, "%.0f px")) {
         saveCallback();
@@ -83,7 +83,7 @@ if (ImGui::Checkbox("Show Right Side Bar", &pendingShowRightBar)) {
     saveCallback();
 }
 ImGui::SameLine();
-ImGui::TextDisabled("(Slots 25-36)");
+ImGui::TextDisabled("(client action page 3)");
 if (pendingShowRightBar) {
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderFloat("Vertical Offset##rbar", &pendingRightBarOffsetY, -400.0f, 400.0f, "%.0f px")) {
@@ -96,7 +96,7 @@ if (ImGui::Checkbox("Show Left Side Bar", &pendingShowLeftBar)) {
     saveCallback();
 }
 ImGui::SameLine();
-ImGui::TextDisabled("(Slots 37-48)");
+ImGui::TextDisabled("(client action page 4)");
 if (pendingShowLeftBar) {
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderFloat("Vertical Offset##lbar", &pendingLeftBarOffsetY, -400.0f, 400.0f, "%.0f px")) {

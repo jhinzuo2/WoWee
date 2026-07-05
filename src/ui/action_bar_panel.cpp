@@ -183,12 +183,9 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
     float barX = (screenW - barW) / 2.0f;
     float barY = screenH - barH;
 
-    ImGui::SetNextWindowPos(ImVec2(barX, barY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(barW, barH), ImGuiCond_Always);
-
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                              ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar |
-                             ImGuiWindowFlags_NoScrollbar;
+                             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padding, padding));
@@ -199,12 +196,11 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
     // Per-slot rendering lambda — shared by both action bars
     const auto& bar = gameHandler.getActionBar();
     static constexpr const char* keyLabels1[] = {"1","2","3","4","5","6","7","8","9","0","-","="};
-    // "⇧N" labels for bar 2 (UTF-8: E2 87 A7 = U+21E7 UPWARDS WHITE ARROW)
-    static constexpr const char* keyLabels2[] = {
-        "\xe2\x87\xa7" "1", "\xe2\x87\xa7" "2", "\xe2\x87\xa7" "3",
-        "\xe2\x87\xa7" "4", "\xe2\x87\xa7" "5", "\xe2\x87\xa7" "6",
-        "\xe2\x87\xa7" "7", "\xe2\x87\xa7" "8", "\xe2\x87\xa7" "9",
-        "\xe2\x87\xa7" "0", "\xe2\x87\xa7" "-", "\xe2\x87\xa7" "="
+
+    auto changeMainPage = [&](int delta) {
+        mainActionBarPage_ += delta;
+        if (mainActionBarPage_ < 1) mainActionBarPage_ = kFrameXmlActionBarPages;
+        if (mainActionBarPage_ > kFrameXmlActionBarPages) mainActionBarPage_ = 1;
     };
 
     auto renderBarSlot = [&](int absSlot, const char* keyLabel) {
@@ -872,11 +868,15 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         ImGui::EndGroup();
     };
 
-    // Bar 2 (slots 12-23) — only show if at least one slot is populated
-    if (settingsPanel.pendingShowActionBar2) {
-        bool bar2HasContent = false;
-        for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i)
-            if (!bar[game::GameHandler::SLOTS_PER_BAR + i].isEmpty()) { bar2HasContent = true; break; }
+    // Bottom-left extra bar (FrameXML page 6, slots 60-71)
+    bool bottomLeftBarHasContent = false;
+    for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
+        if (!bar[actionSlotForPage(kBottomLeftActionPage, i)].isEmpty()) {
+            bottomLeftBarHasContent = true;
+            break;
+        }
+    }
+    if (settingsPanel.pendingShowActionBar2 && bottomLeftBarHasContent) {
 
         float bar2X = barX + settingsPanel.pendingActionBar2OffsetX;
         float bar2Y = barY - barH - 2.0f + settingsPanel.pendingActionBar2OffsetY;
@@ -886,12 +886,11 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padding, padding));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg,
-            bar2HasContent ? ImVec4(0.05f, 0.05f, 0.05f, 0.85f) : ImVec4(0.05f, 0.05f, 0.05f, 0.4f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.05f, 0.05f, 0.85f));
         if (ImGui::Begin("##ActionBar2", nullptr, flags)) {
             for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
                 if (i > 0) ImGui::SameLine(0, spacing);
-                renderBarSlot(game::GameHandler::SLOTS_PER_BAR + i, keyLabels2[i]);
+                renderBarSlot(actionSlotForPage(kBottomLeftActionPage, i), "");
             }
         }
         ImGui::End();
@@ -899,11 +898,15 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         ImGui::PopStyleVar(4);
     }
 
-    // Bar 1 (slots 0-11)
+    // Main action bar (FrameXML pages 1-6)
+    bool mainBarHovered = false;
+    ImGui::SetNextWindowPos(ImVec2(barX, barY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(barW, barH), ImGuiCond_Always);
     if (ImGui::Begin("##ActionBar", nullptr, flags)) {
+        mainBarHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
         for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
             if (i > 0) ImGui::SameLine(0, spacing);
-            renderBarSlot(i, keyLabels1[i]);
+            renderBarSlot(actionSlotForPage(mainActionBarPage_, i), keyLabels1[i]);
         }
 
         // Macro editor modal — opened by "Edit" in action bar context menus
@@ -931,14 +934,39 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
     }
     ImGui::End();
 
+    if (mainBarHovered) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel > 0.0f) changeMainPage(-1);
+        else if (wheel < 0.0f) changeMainPage(1);
+    }
+
+    const float pagerW = 34.0f;
+    ImGui::SetNextWindowPos(ImVec2(barX + barW + 4.0f, barY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(pagerW, barH), ImGuiCond_Always);
+    if (ImGui::Begin("##ActionBarPager", nullptr, flags)) {
+        const float buttonH = std::max(16.0f, (barH - padding * 2.0f - 18.0f) * 0.5f);
+        if (ImGui::Button("^", ImVec2(pagerW - padding * 2.0f, buttonH))) {
+            changeMainPage(-1);
+        }
+        char pageText[8];
+        snprintf(pageText, sizeof(pageText), "%d/%d", mainActionBarPage_, kFrameXmlActionBarPages);
+        ImVec2 textSize = ImGui::CalcTextSize(pageText);
+        ImGui::SetCursorPosX((pagerW - textSize.x) * 0.5f);
+        ImGui::TextUnformatted(pageText);
+        if (ImGui::Button("v", ImVec2(pagerW - padding * 2.0f, buttonH))) {
+            changeMainPage(1);
+        }
+    }
+    ImGui::End();
+
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(4);
 
-    // Right side vertical bar (bar 3, slots 24-35)
+    // Right side vertical bar (FrameXML page 3, slots 24-35)
     if (settingsPanel.pendingShowRightBar) {
         bool bar3HasContent = false;
         for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i)
-            if (!bar[game::GameHandler::SLOTS_PER_BAR * 2 + i].isEmpty()) { bar3HasContent = true; break; }
+            if (!bar[actionSlotForPage(kRightActionPage, i)].isEmpty()) { bar3HasContent = true; break; }
 
         float sideBarW = slotSize + padding * 2;
         float sideBarH = game::GameHandler::SLOTS_PER_BAR * slotSize + (game::GameHandler::SLOTS_PER_BAR - 1) * spacing + padding * 2;
@@ -955,7 +983,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             bar3HasContent ? ImVec4(0.05f, 0.05f, 0.05f, 0.85f) : ImVec4(0.05f, 0.05f, 0.05f, 0.4f));
         if (ImGui::Begin("##ActionBarRight", nullptr, flags)) {
             for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
-                renderBarSlot(game::GameHandler::SLOTS_PER_BAR * 2 + i, "");
+                renderBarSlot(actionSlotForPage(kRightActionPage, i), "");
             }
         }
         ImGui::End();
@@ -963,11 +991,11 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         ImGui::PopStyleVar(4);
     }
 
-    // Left side vertical bar (bar 4, slots 36-47)
+    // Left side vertical bar (FrameXML page 4, slots 36-47)
     if (settingsPanel.pendingShowLeftBar) {
         bool bar4HasContent = false;
         for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i)
-            if (!bar[game::GameHandler::SLOTS_PER_BAR * 3 + i].isEmpty()) { bar4HasContent = true; break; }
+            if (!bar[actionSlotForPage(kLeftActionPage, i)].isEmpty()) { bar4HasContent = true; break; }
 
         float sideBarW = slotSize + padding * 2;
         float sideBarH = game::GameHandler::SLOTS_PER_BAR * slotSize + (game::GameHandler::SLOTS_PER_BAR - 1) * spacing + padding * 2;
@@ -984,7 +1012,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             bar4HasContent ? ImVec4(0.05f, 0.05f, 0.05f, 0.85f) : ImVec4(0.05f, 0.05f, 0.05f, 0.4f));
         if (ImGui::Begin("##ActionBarLeft", nullptr, flags)) {
             for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
-                renderBarSlot(game::GameHandler::SLOTS_PER_BAR * 3 + i, "");
+                renderBarSlot(actionSlotForPage(kLeftActionPage, i), "");
             }
         }
         ImGui::End();
@@ -1497,7 +1525,17 @@ void ActionBarPanel::renderXpBar(game::GameHandler& gameHandler,
     // bar2 top edge (when visible): bar1 top - barH - 2 + bar2 vertical offset
     float bar1TopY = screenH - barH;
     float xpBarY;
+    bool bottomLeftBarVisible = false;
     if (settingsPanel.pendingShowActionBar2) {
+        const auto& bar = gameHandler.getActionBar();
+        for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
+            if (!bar[actionSlotForPage(kBottomLeftActionPage, i)].isEmpty()) {
+                bottomLeftBarVisible = true;
+                break;
+            }
+        }
+    }
+    if (bottomLeftBarVisible) {
         float bar2TopY = bar1TopY - barH - 2.0f + settingsPanel.pendingActionBar2OffsetY;
         xpBarY = bar2TopY - xpBarH - 2.0f;
     } else {
@@ -1682,7 +1720,17 @@ void ActionBarPanel::renderRepBar(game::GameHandler& gameHandler,
 
     float bar1TopY = screenH - barH_ab;
     float xpBarY;
+    bool bottomLeftBarVisible = false;
     if (settingsPanel.pendingShowActionBar2) {
+        const auto& bar = gameHandler.getActionBar();
+        for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
+            if (!bar[actionSlotForPage(kBottomLeftActionPage, i)].isEmpty()) {
+                bottomLeftBarVisible = true;
+                break;
+            }
+        }
+    }
+    if (bottomLeftBarVisible) {
         float bar2TopY = bar1TopY - barH_ab - 2.0f + settingsPanel.pendingActionBar2OffsetY;
         xpBarY = bar2TopY - xpBarH - 2.0f;
     } else {

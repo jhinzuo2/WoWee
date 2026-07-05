@@ -76,12 +76,12 @@ public:
     bool pendingUseOriginalSoundtrack = true;
 
     // ---- Pending action bar layout ----
-    bool pendingShowActionBar2 = true;   // Show second action bar above main bar
+    bool pendingShowActionBar2 = true;   // Show bottom-left extra action bar above main bar
     float pendingActionBarScale = 1.0f;  // Multiplier for action bar slot size (0.5–1.5)
     float pendingActionBar2OffsetX = 0.0f;  // Horizontal offset from default center position
     float pendingActionBar2OffsetY = 0.0f;  // Vertical offset from default (above bar 1)
-    bool pendingShowRightBar = false;   // Right-edge vertical action bar (bar 3, slots 24-35)
-    bool pendingShowLeftBar  = false;   // Left-edge vertical action bar (bar 4, slots 36-47)
+    bool pendingShowRightBar = false;   // Right-edge vertical action bar (FrameXML page 3)
+    bool pendingShowLeftBar  = false;   // Left-edge vertical action bar (FrameXML page 4)
     float pendingRightBarOffsetY = 0.0f;  // Vertical offset from screen center
     float pendingLeftBarOffsetY  = 0.0f;  // Vertical offset from screen center
 
