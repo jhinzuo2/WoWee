@@ -869,14 +869,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
     };
 
     // Bottom-left extra bar (FrameXML page 6, slots 60-71)
-    bool bottomLeftBarHasContent = false;
-    for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
-        if (!bar[actionSlotForPage(kBottomLeftActionPage, i)].isEmpty()) {
-            bottomLeftBarHasContent = true;
-            break;
-        }
-    }
-    if (settingsPanel.pendingShowActionBar2 && bottomLeftBarHasContent) {
+    if (settingsPanel.pendingShowActionBar2) {
 
         float bar2X = barX + settingsPanel.pendingActionBar2OffsetX;
         float bar2Y = barY - barH - 2.0f + settingsPanel.pendingActionBar2OffsetY;
@@ -1525,16 +1518,7 @@ void ActionBarPanel::renderXpBar(game::GameHandler& gameHandler,
     // bar2 top edge (when visible): bar1 top - barH - 2 + bar2 vertical offset
     float bar1TopY = screenH - barH;
     float xpBarY;
-    bool bottomLeftBarVisible = false;
-    if (settingsPanel.pendingShowActionBar2) {
-        const auto& bar = gameHandler.getActionBar();
-        for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
-            if (!bar[actionSlotForPage(kBottomLeftActionPage, i)].isEmpty()) {
-                bottomLeftBarVisible = true;
-                break;
-            }
-        }
-    }
+    bool bottomLeftBarVisible = settingsPanel.pendingShowActionBar2;
     if (bottomLeftBarVisible) {
         float bar2TopY = bar1TopY - barH - 2.0f + settingsPanel.pendingActionBar2OffsetY;
         xpBarY = bar2TopY - xpBarH - 2.0f;
@@ -1720,16 +1704,7 @@ void ActionBarPanel::renderRepBar(game::GameHandler& gameHandler,
 
     float bar1TopY = screenH - barH_ab;
     float xpBarY;
-    bool bottomLeftBarVisible = false;
-    if (settingsPanel.pendingShowActionBar2) {
-        const auto& bar = gameHandler.getActionBar();
-        for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
-            if (!bar[actionSlotForPage(kBottomLeftActionPage, i)].isEmpty()) {
-                bottomLeftBarVisible = true;
-                break;
-            }
-        }
-    }
+    bool bottomLeftBarVisible = settingsPanel.pendingShowActionBar2;
     if (bottomLeftBarVisible) {
         float bar2TopY = bar1TopY - barH_ab - 2.0f + settingsPanel.pendingActionBar2OffsetY;
         xpBarY = bar2TopY - xpBarH - 2.0f;

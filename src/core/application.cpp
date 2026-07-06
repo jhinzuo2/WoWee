@@ -773,6 +773,10 @@ void Application::run() {
                 }
             }
 
+            if (window->shouldClose()) {
+                break;
+            }
+
             // Update input
             Input::getInstance().update();
 
@@ -788,6 +792,9 @@ void Application::run() {
                 LOG_ERROR("Exception during Application::update (state=", static_cast<int>(state),
                           ", dt=", deltaTime, "): ", e.what());
                 throw;
+            }
+            if (window->shouldClose()) {
+                break;
             }
             // Render
             try {

@@ -40,7 +40,7 @@ namespace {
 namespace wowee {
 namespace game {
 
-std::string normalizeWowTextTokens(std::string text) {
+std::string normalizeWowTextTokens(std::string text, const std::string& playerName) {
     if (text.empty()) return text;
 
     size_t pos = 0;
@@ -50,6 +50,9 @@ std::string normalizeWowTextTokens(std::string text) {
         if (code == 'b' || code == 'B') {
             text.replace(pos, 2, "\n");
             ++pos;
+        } else if ((code == 'n' || code == 'N') && !playerName.empty()) {
+            text.replace(pos, 2, playerName);
+            pos += playerName.size();
         } else {
             ++pos;
         }

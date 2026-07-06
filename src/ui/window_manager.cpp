@@ -1695,7 +1695,12 @@ void WindowManager::renderEscapeMenu(SettingsPanel& settingsPanel) {
                     music->stopMusic(0.0f);
                 }
             }
-            core::Application::getInstance().shutdown();
+            if (auto* window = services_.window) {
+                window->setShouldClose(true);
+            } else if (auto* window = core::Application::getInstance().getWindow()) {
+                window->setShouldClose(true);
+            }
+            showEscapeMenu = false;
         }
         if (ImGui::Button("Settings", ImVec2(-1, 0))) {
             settingsPanel.showEscapeSettingsNotice = false;

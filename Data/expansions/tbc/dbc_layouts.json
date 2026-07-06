@@ -208,6 +208,8 @@
   "Spell": {
     "Attributes": 5,
     "AttributesEx": 6,
+    "RecoveryTime": 23,
+    "CategoryRecoveryTime": 24,
     "CastingTimeIndex": 22,
     "DispelType": 3,
     "DurationIndex": 34,
@@ -270,11 +272,11 @@
     "TabID": 1
   },
   "TalentTab": {
-    "BackgroundFile": 15,
-    "ClassMask": 12,
+    "BackgroundFile": 22,
+    "ClassMask": 20,
     "ID": 0,
     "Name": 1,
-    "OrderIndex": 14
+    "OrderIndex": 21
   },
   "TaxiNodes": {
     "ID": 0,

@@ -180,10 +180,10 @@ void CombatUI::renderCooldownTracker(game::GameHandler& gameHandler,
 
     constexpr float TRACKER_W = 200.0f;
     constexpr int MAX_SHOWN = 12;
-    float posX = screenW - TRACKER_W - 10.0f;
-    float posY = screenH - 220.0f;  // above the action bar area
+    float posX = screenW * 0.5f + 260.0f;
+    float posY = screenH - 290.0f;  // above the action bar area, clear of minimap/quest tracker
 
-    ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always, ImVec2(1.0f, 1.0f));
+    ImGui::SetNextWindowPos(ImVec2(posX, posY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(TRACKER_W, 0.0f), ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.75f);
 

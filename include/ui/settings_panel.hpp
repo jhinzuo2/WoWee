@@ -66,11 +66,13 @@ public:
     bool pendingShowLatencyMeter = true;
     bool pendingSeparateBags = true;
     bool pendingShowKeyring = true;
+    bool pendingShowMicroMenu = false;
 
     // ---- Pending gameplay ----
     bool pendingAutoLoot = false;
     bool pendingAutoSellGrey = false;
     bool pendingAutoRepair = false;
+    bool pendingIdleCameraOrbit = true;
 
     // ---- Pending soundtrack ----
     bool pendingUseOriginalSoundtrack = true;

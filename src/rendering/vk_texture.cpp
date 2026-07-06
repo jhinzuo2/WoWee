@@ -234,7 +234,7 @@ bool VkTexture::createSampler(VkDevice device,
         ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.mipLodBias = 0.0f;
     samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = static_cast<float>(mipLevels_);
+    samplerInfo.maxLod = static_cast<float>(mipLevels_ > 0 ? mipLevels_ - 1 : 0);
     return finalizeSampler(device, samplerInfo);
 }
 
@@ -260,7 +260,7 @@ bool VkTexture::createSampler(VkDevice device,
         ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.mipLodBias = 0.0f;
     samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = static_cast<float>(mipLevels_);
+    samplerInfo.maxLod = static_cast<float>(mipLevels_ > 0 ? mipLevels_ - 1 : 0);
     return finalizeSampler(device, samplerInfo);
 }
 
@@ -277,7 +277,7 @@ bool VkTexture::createShadowSampler(VkDevice device) {
     samplerInfo.compareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
     samplerInfo.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
     samplerInfo.minLod = 0.0f;
-    samplerInfo.maxLod = 1.0f;
+    samplerInfo.maxLod = 0.0f;
     return finalizeSampler(device, samplerInfo);
 }
 

@@ -105,6 +105,13 @@ if (pendingShowLeftBar) {
 }
 
 ImGui::Spacing();
+if (ImGui::Checkbox("Show Micro Menu Buttons", &pendingShowMicroMenu)) {
+    saveCallback();
+}
+ImGui::SameLine();
+ImGui::TextDisabled("(bottom-left window shortcuts)");
+
+ImGui::Spacing();
 ImGui::SeparatorText("Nameplates");
 ImGui::Spacing();
 ImGui::SetNextItemWidth(200.0f);
@@ -203,6 +210,15 @@ if (ImGui::SliderFloat("Camera Pivot Height", &pendingPivotHeight, 0.0f, 3.0f, "
 ImGui::SetItemTooltip("Height of camera orbit point above feet. Lower = less detached feel. Default: 1.8");
 if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Allow the camera to zoom out further than normal");
+
+if (ImGui::Checkbox("Idle Camera Orbit", &pendingIdleCameraOrbit)) {
+    if (renderer) {
+        if (auto* cameraController = renderer->getCameraController()) {
+            cameraController->setIdleOrbitEnabled(pendingIdleCameraOrbit);
+        }
+    }
+    saveCallback();
+}
 
 if (ImGui::SliderFloat("Field of View", &pendingFov, 45.0f, 110.0f, "%.0f°")) {
     if (renderer) {
@@ -316,6 +332,7 @@ if (ImGui::Button("Restore Gameplay Defaults", ImVec2(-1, 0))) {
     inventoryScreen.setSeparateBags(true);
     pendingShowKeyring = true;
     inventoryScreen.setShowKeyring(true);
+    pendingShowMicroMenu = false;
     uiOpacity_ = 0.65f;
     minimapRotate_ = false;
     minimapSquare_ = false;
@@ -641,6 +658,7 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
                 cameraController->setExtendedZoom(pendingExtendedZoom);
                 cameraController->setCameraSmoothSpeed(pendingCameraStiffness);
                 cameraController->setPivotHeight(pendingPivotHeight);
+                cameraController->setIdleOrbitEnabled(pendingIdleCameraOrbit);
             }
         }
         pendingResIndex = 0;

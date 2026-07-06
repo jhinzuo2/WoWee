@@ -744,20 +744,25 @@ network::Packet TbcPacketParsers::buildCastSpell(uint32_t spellId, uint64_t targ
 
 // ============================================================================
 // TBC 2.4.3 CMSG_USE_ITEM
-// Format: bag(u8) + slot(u8) + castCount(u8) + spellId(u32) + itemGuid(u64) +
-//         castFlags(u8) + SpellCastTargets
-// WotLK 3.3.5a adds glyphIndex(u32) between itemGuid and castFlags — TBC does NOT.
+// Format: bag(u8) + slot(u8) + spellIndex(u8) + castCount(u8) + itemGuid(u64)
+//         + SpellCastTargets
+// WotLK sends spellId/glyph/castFlags fields here; TBC does not.
 // ============================================================================
-network::Packet TbcPacketParsers::buildUseItem(uint8_t bagIndex, uint8_t slotIndex, uint64_t itemGuid, uint32_t spellId) {
+network::Packet TbcPacketParsers::buildUseItem(uint8_t bagIndex, uint8_t slotIndex,
+                                               uint64_t itemGuid, uint32_t /*spellId*/,
+                                               uint64_t targetGuid) {
     network::Packet packet(wireOpcode(LogicalOpcode::CMSG_USE_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
+    packet.writeUInt8(0);          // item spell index
     packet.writeUInt8(0);          // cast count
-    packet.writeUInt32(spellId);   // on-use spell id
     packet.writeUInt64(itemGuid);  // full 8-byte GUID
-    // No glyph index field in TBC 2.4.3
-    packet.writeUInt8(0);          // cast flags
-    packet.writeUInt32(0x00);      // SpellCastTargets: TARGET_FLAG_SELF
+    if (targetGuid != 0) {
+        packet.writeUInt32(0x02);  // TARGET_FLAG_UNIT
+        packet.writePackedGuid(targetGuid);
+    } else {
+        packet.writeUInt32(0x00);  // TARGET_FLAG_SELF
+    }
     return packet;
 }
 
@@ -952,12 +957,12 @@ bool TbcPacketParsers::parseNameQueryResponse(network::Packet& packet, NameQuery
 // Differences from WotLK (handled by base class ItemQueryResponseParser::parse):
 //   - No Flags2 field (WotLK added a second flags uint32 after Flags)
 //   - No BuyCount field (WotLK added this between Flags2 and BuyPrice)
-//   - Stats: sends exactly statsCount pairs (WotLK always sends 10)
+//   - Stats: sends 10 fixed stat pairs with no statsCount prefix
 //   - No ScalingStatDistribution / ScalingStatValue (WotLK-only heirloom scaling)
 //
 // Differences from Classic (ClassicPacketParsers::parseItemQueryResponse):
 //   - Has SoundOverrideSubclass (int32) after subClass (Classic lacks it)
-//   - Has statsCount prefix (Classic reads 10 pairs with no prefix)
+//   - Otherwise keeps the fixed 10-stat-pair item metadata layout
 // ============================================================================
 bool TbcPacketParsers::parseItemQueryResponse(network::Packet& packet, ItemQueryResponseData& data) {
     // Validate minimum packet size: entry(4)
@@ -1007,9 +1012,9 @@ bool TbcPacketParsers::parseItemQueryResponse(network::Packet& packet, ItemQuery
 
     data.inventoryType = packet.readUInt32();
 
-    // Validate minimum size for remaining fixed fields: 13×4 = 52 bytes
-    if (!packet.hasRemaining(52)) {
-        LOG_ERROR("TBC SMSG_ITEM_QUERY_SINGLE_RESPONSE: truncated before statsCount (entry=", data.entry, ")");
+    // Validate minimum size for remaining fixed fields: 14×4 = 56 bytes
+    if (!packet.hasRemaining(56)) {
+        LOG_ERROR("TBC SMSG_ITEM_QUERY_SINGLE_RESPONSE: truncated before stats (entry=", data.entry, ")");
         return false;
     }
 
@@ -1028,25 +1033,20 @@ bool TbcPacketParsers::parseItemQueryResponse(network::Packet& packet, ItemQuery
     data.maxStack = static_cast<int32_t>(packet.readUInt32()); // Stackable
     data.containerSlots = packet.readUInt32();
 
-    // TBC: statsCount prefix + exactly statsCount pairs (WotLK always sends 10)
-    if (!packet.hasRemaining(4)) {
-        LOG_WARNING("TBC SMSG_ITEM_QUERY_SINGLE_RESPONSE: truncated at statsCount (entry=", data.entry, ")");
-        return true;  // Have core fields; stats are optional
+    // TBC/CMaNGOS sends the same fixed 10 stat pairs as vanilla. There is no
+    // statsCount prefix here; reading one shifts every later field and makes
+    // StartQuest look non-zero for ordinary items.
+    if (!packet.hasRemaining(80)) {
+        LOG_WARNING("TBC SMSG_ITEM_QUERY_SINGLE_RESPONSE: truncated in stats section (entry=", data.entry, ")");
     }
-    uint32_t statsCount = packet.readUInt32();
-    if (statsCount > 10) {
-        LOG_WARNING("TBC SMSG_ITEM_QUERY_SINGLE_RESPONSE: statsCount=", statsCount, " exceeds max 10 (entry=",
-                    data.entry, "), capping");
-        statsCount = 10;
-    }
-    for (uint32_t i = 0; i < statsCount; i++) {
-        // Each stat is 2 uint32s = 8 bytes
+    for (uint32_t i = 0; i < 10; i++) {
         if (!packet.hasRemaining(8)) {
             LOG_WARNING("TBC SMSG_ITEM_QUERY_SINGLE_RESPONSE: stat ", i, " truncated (entry=", data.entry, ")");
             break;
         }
         uint32_t statType  = packet.readUInt32();
         int32_t  statValue = static_cast<int32_t>(packet.readUInt32());
+        if (statType == 0) continue;
         switch (statType) {
             case 3: data.agility  = statValue; break;
             case 4: data.strength = statValue; break;
@@ -1125,7 +1125,7 @@ bool TbcPacketParsers::parseItemQueryResponse(network::Packet& packet, ItemQuery
 
     // Post-description: PageText, LanguageID, PageMaterial, StartQuest
     if (packet.hasRemaining(16)) {
-        packet.readUInt32(); // PageText
+        data.pageTextId = packet.readUInt32(); // PageText
         packet.readUInt32(); // LanguageID
         packet.readUInt32(); // PageMaterial
         data.startQuestId = packet.readUInt32(); // StartQuest
@@ -1453,36 +1453,46 @@ bool TbcPacketParsers::parseSpellGo(network::Packet& packet, SpellGoData& data) 
     return true;
 }
 
+static uint8_t translateTbcCastFailure(uint8_t tbcResult) {
+    // TBC has no SUCCESS entry, while WoWee's shared string table is WotLK-based.
+    // Most early values line up with +1.  Later enum sections diverge; map observed
+    // high-value TBC failures explicitly so user-facing errors stay sane.
+    if (tbcResult == 63) return 67; // SPELL_FAILED_NOT_READY
+    return static_cast<uint8_t>(tbcResult + 1);
+}
+
 // ============================================================================
 // TbcPacketParsers::parseCastResult — TBC 2.4.3 SMSG_CAST_RESULT
 //
-// TBC format: spellId(u32) + result(u8) = 5 bytes
-// WotLK adds a castCount(u8) prefix making it 6 bytes.
-// Without this override, WotLK parser reads spellId[0] as castCount,
-// then the remaining 4 bytes as spellId (off by one), producing wrong result.
+// TBC format: spellId(u32) + result(u8) + castCount(u8).
 // ============================================================================
 bool TbcPacketParsers::parseCastResult(network::Packet& packet, uint32_t& spellId, uint8_t& result) {
     if (!packet.hasRemaining(5)) return false;
-    spellId = packet.readUInt32();   // No castCount prefix in TBC
-    result  = packet.readUInt8();
+    spellId = packet.readUInt32();
+    uint8_t tbcResult = packet.readUInt8();
+    result = translateTbcCastFailure(tbcResult);
+    if (packet.hasRemaining(1)) packet.readUInt8(); // castCount
+    LOG_DEBUG("[TBC] Cast result: spell=", spellId,
+              " tbcResult=", static_cast<int>(tbcResult),
+              " mappedResult=", static_cast<int>(result));
     return true;
 }
 
 // ============================================================================
 // TbcPacketParsers::parseCastFailed — TBC 2.4.3 SMSG_CAST_FAILED
 //
-// TBC format: spellId(u32) + result(u8)
-// WotLK added castCount(u8) before spellId; reading it on TBC would shift
-// the spellId by one byte and corrupt all subsequent fields.
-// Classic has the same layout, but the result enum starts differently (offset +1);
-// TBC uses the same result values as WotLK so no offset is needed.
+// TBC format: spellId(u32) + result(u8) + castCount(u8).
 // ============================================================================
 bool TbcPacketParsers::parseCastFailed(network::Packet& packet, CastFailedData& data) {
     if (!packet.hasRemaining(5)) return false;
-    data.castCount = 0;                      // not present in TBC
+    data.castCount = 0;
     data.spellId   = packet.readUInt32();
-    data.result    = packet.readUInt8();     // same enum as WotLK
-    LOG_DEBUG("[TBC] Cast failed: spell=", data.spellId, " result=", static_cast<int>(data.result));
+    uint8_t tbcResult = packet.readUInt8();
+    data.result = translateTbcCastFailure(tbcResult);
+    if (packet.hasRemaining(1)) data.castCount = packet.readUInt8();
+    LOG_DEBUG("[TBC] Cast failed: spell=", data.spellId,
+              " tbcResult=", static_cast<int>(tbcResult),
+              " mappedResult=", static_cast<int>(data.result));
     return true;
 }
 

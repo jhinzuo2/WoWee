@@ -142,6 +142,7 @@ public:
     const std::unordered_map<uint32_t, TalentEntry>& getAllTalents() const { return talentCache_; }
     const std::unordered_map<uint32_t, TalentTabEntry>& getAllTalentTabs() const { return talentTabCache_; }
     void loadTalentDbc();
+    void syncPreWotlkTalentsFromKnownSpells();
 
     // Auras
     const std::vector<AuraSlot>& getPlayerAuras() const { return playerAuras_; }
@@ -311,6 +312,7 @@ private:
     // Find the on-use spell for an item (trigger=0 Use or trigger=5 NoDelay).
     // CMSG_USE_ITEM requires a valid spellId or the server silently ignores it.
     uint32_t findOnUseSpellId(uint32_t itemId) const;
+    void seedCooldownFromSpellInfo(uint32_t spellId);
     void handleSupercededSpell(network::Packet& packet);
     void handleRemovedSpell(network::Packet& packet);
     void handleUnlearnSpells(network::Packet& packet);

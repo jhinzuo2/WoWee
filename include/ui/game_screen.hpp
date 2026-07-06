@@ -161,6 +161,7 @@ private:
     void renderUIErrors(game::GameHandler& gameHandler, float deltaTime);
     void renderQuestMarkers(game::GameHandler& gameHandler);
     void renderMinimapMarkers(game::GameHandler& gameHandler);
+    void renderMicroMenu(game::GameHandler& gameHandler);
     void renderQuestObjectiveTracker(game::GameHandler& gameHandler);
     void renderNameplates(game::GameHandler& gameHandler);
     void renderDurabilityWarning(game::GameHandler& gameHandler);

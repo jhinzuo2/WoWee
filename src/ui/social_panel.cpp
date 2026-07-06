@@ -43,10 +43,29 @@ namespace ui {
 void SocialPanel::renderPartyFrames(game::GameHandler& gameHandler,
                                        ChatPanel& chatPanel,
                                        SpellIconFn getSpellIcon) {
-    if (!gameHandler.isInGroup()) return;
-
     auto* assetMgr = services_.assetManager;
     const auto& partyData = gameHandler.getPartyData();
+
+    if (!gameHandler.isInGroup()) return;
+
+    if (partyData.members.empty()) {
+        ImGui::SetNextWindowPos(ImVec2(10.0f, 120.0f), ImGuiCond_Always);
+        ImGui::SetNextWindowSize(ImVec2(180.0f, 0.0f), ImGuiCond_Always);
+
+        ImGuiWindowFlags emptyFlags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar |
+                                      ImGuiWindowFlags_AlwaysAutoResize;
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.1f, 0.1f, 0.1f, 0.65f));
+
+        if (ImGui::Begin("##PartyFramesEmpty", nullptr, emptyFlags))
+            ImGui::TextDisabled("Party: waiting for roster");
+        ImGui::End();
+        ImGui::PopStyleColor();
+        ImGui::PopStyleVar();
+        return;
+    }
+
     const bool isRaid = (partyData.groupType == 1);
     float frameY = 120.0f;
 

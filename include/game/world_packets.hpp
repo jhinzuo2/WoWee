@@ -18,7 +18,7 @@ namespace wowee {
 namespace game {
 
 // Normalize WoW in-text tokens (e.g. "$B", "|n") into plain text suitable for UI.
-std::string normalizeWowTextTokens(std::string text);
+std::string normalizeWowTextTokens(std::string text, const std::string& playerName = "");
 
 /**
  * SMSG_AUTH_CHALLENGE data (from server)
@@ -1644,6 +1644,7 @@ struct ItemQueryResponseData {
     std::array<ItemSpell, 5> spells{};
     uint32_t bindType = 0;      // 0=none, 1=BoP, 2=BoE, 3=BoU, 4=BoQ
     std::string description;    // Flavor/lore text
+    uint32_t pageTextId = 0;     // Non-zero: item can be read via CMSG_READ_ITEM + page query
     // Generic stat pairs for non-primary stats (hit, crit, haste, AP, SP, etc.)
     struct ExtraStat { uint32_t statType = 0; int32_t statValue = 0; };
     std::vector<ExtraStat> extraStats;
@@ -2052,11 +2053,19 @@ public:
 /** CMSG_USE_ITEM packet builder */
 class UseItemPacket {
 public:
-    static network::Packet build(uint8_t bagIndex, uint8_t slotIndex, uint64_t itemGuid, uint32_t spellId = 0);
+    static network::Packet build(uint8_t bagIndex, uint8_t slotIndex,
+                                 uint64_t itemGuid, uint32_t spellId = 0,
+                                 uint64_t targetGuid = 0);
 };
 
 /** CMSG_OPEN_ITEM packet builder (for locked containers / lockboxes) */
 class OpenItemPacket {
+public:
+    static network::Packet build(uint8_t bagIndex, uint8_t slotIndex);
+};
+
+/** CMSG_READ_ITEM packet builder (for readable books / scrolls / notes) */
+class ReadItemPacket {
 public:
     static network::Packet build(uint8_t bagIndex, uint8_t slotIndex);
 };

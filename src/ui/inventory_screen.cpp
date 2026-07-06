@@ -1040,6 +1040,19 @@ void InventoryScreen::renderSeparateBags(game::Inventory& inventory, uint64_t mo
         snprintf(bpTitle, sizeof(bpTitle), "Backpack (%d/%d)##backpack", bpUsed, bpTotal);
         int bpRows = (bpTotal + columns - 1) / columns;
         float bpH = bpRows * (slotSize + 4.0f) + 80.0f; // header + money + padding
+        if (showKeyring_) {
+            constexpr float keySlotSize = 24.0f;
+            constexpr int keyCols = 8;
+            int lastOccupied = -1;
+            for (int i = inventory.getKeyringSize() - 1; i >= 0; --i) {
+                if (!inventory.getKeyringSlot(i).empty()) { lastOccupied = i; break; }
+            }
+            if (lastOccupied >= 0) {
+                int visibleKeySlots = ((lastOccupied / keyCols) + 1) * keyCols;
+                int keyRows = (visibleKeySlots + keyCols - 1) / keyCols;
+                bpH += 30.0f + keyRows * (keySlotSize + 4.0f);
+            }
+        }
         float defaultY = stackBottom - bpH;
         renderBagWindow(bpTitle, backpackOpen_, inventory, -1, stackX, defaultY, moneyCopper);
         stackBottom = defaultY - stackGap;
@@ -1138,6 +1151,20 @@ void InventoryScreen::renderBagWindow(const char* title, bool& isOpen,
     if (winPos.x > scrW || winPos.y > scrH ||
         winPos.x + winSize.x < 0 || winPos.y + winSize.y < 0) {
         ImGui::SetWindowPos(ImVec2(defaultX, defaultY));
+        winPos = ImGui::GetWindowPos();
+        winSize = ImGui::GetWindowSize();
+    }
+
+    if (bagIndex < 0) {
+        constexpr float bagBarSlotSize = 42.0f;
+        constexpr float bagBarPadding = 6.0f;
+        constexpr float bagBarBottomMargin = 10.0f;
+        constexpr float stackGap = 8.0f;
+        const float bagBarTop = scrH - (bagBarSlotSize + bagBarPadding * 2.0f) - bagBarBottomMargin;
+        const float maxY = bagBarTop - stackGap - winSize.y;
+        if (winPos.y > maxY) {
+            ImGui::SetWindowPos(ImVec2(winPos.x, std::max(0.0f, maxY)));
+        }
     }
 
     // Render item slots in 4-column grid
@@ -2529,7 +2556,9 @@ void InventoryScreen::renderItemSlot(game::Inventory& inventory, const game::Ite
                     // itemClass==1 (Container) with inventoryType==0 means a lockbox;
                     // use CMSG_OPEN_ITEM so the server checks keyring automatically.
                     auto* info = gameHandler_->getItemInfo(item.itemId);
-                    if (info && info->valid && info->itemClass == 1) {
+                    if (info && info->valid && info->pageTextId != 0) {
+                        gameHandler_->readItemBySlot(backpackIndex);
+                    } else if (info && info->valid && info->itemClass == 1) {
                         gameHandler_->openItemBySlot(backpackIndex);
                     } else {
                         gameHandler_->useItemBySlot(backpackIndex);
@@ -2547,7 +2576,9 @@ void InventoryScreen::renderItemSlot(game::Inventory& inventory, const game::Ite
                     gameHandler_->autoEquipItemInBag(bagIndex, bagSlotIndex);
                 } else {
                     auto* info = gameHandler_->getItemInfo(item.itemId);
-                    if (info && info->valid && info->itemClass == 1) {
+                    if (info && info->valid && info->pageTextId != 0) {
+                        gameHandler_->readItemInBag(bagIndex, bagSlotIndex);
+                    } else if (info && info->valid && info->itemClass == 1) {
                         gameHandler_->openItemInBag(bagIndex, bagSlotIndex);
                     } else {
                         gameHandler_->useItemInBag(bagIndex, bagSlotIndex);

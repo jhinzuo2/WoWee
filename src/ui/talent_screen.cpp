@@ -140,6 +140,20 @@ void TalentScreen::renderTalentTrees(game::GameHandler& gameHandler) {
         ImGui::TextColored(ui::colors::kDarkGray, "No points available");
     }
 
+    if (!classTabs.empty()) {
+        uint32_t totalSpent = 0;
+        for (size_t ti = 0; ti < classTabs.size() && ti < 3; ti++) {
+            totalSpent += treeTotals[ti];
+        }
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("Spent: %u", totalSpent);
+        for (size_t ti = 0; ti < classTabs.size() && ti < 3; ti++) {
+            ImGui::SameLine(0, 16);
+            ImGui::Text("%s: %u", classTabs[ti]->name.c_str(), treeTotals[ti]);
+        }
+    }
+
     ImGui::Separator();
 
     // Render tabs with point counts in tab labels

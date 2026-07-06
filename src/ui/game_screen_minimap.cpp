@@ -842,37 +842,6 @@ void GameScreen::renderMinimapMarkers(game::GameHandler& gameHandler) {
         drawList->AddText(font, fontSize, ImVec2(tx, ty), IM_COL32(230, 220, 140, 255), coordBuf);
     }
 
-    // Local time clock — displayed just below the coordinate label
-    {
-        auto now = std::chrono::system_clock::now();
-        std::time_t tt = std::chrono::system_clock::to_time_t(now);
-        std::tm tmLocal{};
-#if defined(_WIN32)
-        localtime_s(&tmLocal, &tt);
-#else
-        localtime_r(&tt, &tmLocal);
-#endif
-        char clockBuf[16];
-        std::snprintf(clockBuf, sizeof(clockBuf), "%02d:%02d",
-                      tmLocal.tm_hour, tmLocal.tm_min);
-
-        ImFont* font = ImGui::GetFont();
-        float fontSize = ImGui::GetFontSize() * 0.9f;  // slightly smaller than coords
-        ImVec2 clockSz = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, clockBuf);
-
-        float tx = centerX - clockSz.x * 0.5f;
-        // Position below the coordinate line (+fontSize of coord + 2px gap)
-        float coordLineH = ImGui::GetFontSize();
-        float ty = centerY + mapRadius + 3.0f + coordLineH + 2.0f;
-
-        float pad = 2.0f;
-        drawList->AddRectFilled(
-            ImVec2(tx - pad, ty - pad),
-            ImVec2(tx + clockSz.x + pad, ty + clockSz.y + pad),
-            IM_COL32(0, 0, 0, 120), 3.0f);
-        drawList->AddText(font, fontSize, ImVec2(tx, ty), IM_COL32(200, 200, 220, 220), clockBuf);
-    }
-
     // Zone name display — drawn inside the top edge of the minimap circle
     {
         auto* zmRenderer = renderer ? renderer->getZoneManager() : nullptr;
@@ -1432,33 +1401,6 @@ void GameScreen::renderMinimapMarkers(game::GameHandler& gameHandler) {
         }
     }
 
-    // Local time clock — always visible below minimap indicators
-    {
-        auto now = std::chrono::system_clock::now();
-        std::time_t tt = std::chrono::system_clock::to_time_t(now);
-        struct tm tmBuf;
-#ifdef _WIN32
-        localtime_s(&tmBuf, &tt);
-#else
-        localtime_r(&tt, &tmBuf);
-#endif
-        char clockStr[16];
-        snprintf(clockStr, sizeof(clockStr), "%02d:%02d", tmBuf.tm_hour, tmBuf.tm_min);
-
-        ImGui::SetNextWindowPos(ImVec2(indicatorX, nextIndicatorY), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(indicatorW, kIndicatorH), ImGuiCond_Always);
-        ImGuiWindowFlags clockFlags = indicatorFlags & ~ImGuiWindowFlags_NoInputs;
-        if (ImGui::Begin("##ClockIndicator", nullptr, clockFlags)) {
-            ImGui::TextColored(ImVec4(0.85f, 0.85f, 0.85f, 0.75f), "%s", clockStr);
-            if (ImGui::IsItemHovered()) {
-                char fullTime[32];
-                snprintf(fullTime, sizeof(fullTime), "%02d:%02d:%02d (local)",
-                         tmBuf.tm_hour, tmBuf.tm_min, tmBuf.tm_sec);
-                ImGui::SetTooltip("%s", fullTime);
-            }
-        }
-        ImGui::End();
-    }
 }
 
 void GameScreen::saveSettings() {
@@ -1483,6 +1425,8 @@ void GameScreen::saveSettings() {
     out << "show_cooldown_tracker=" << (settingsPanel_.showCooldownTracker_ ? 1 : 0) << "\n";
     out << "separate_bags=" << (settingsPanel_.pendingSeparateBags ? 1 : 0) << "\n";
     out << "show_keyring=" << (settingsPanel_.pendingShowKeyring ? 1 : 0) << "\n";
+    out << "show_micro_menu=" << (settingsPanel_.pendingShowMicroMenu ? 1 : 0) << "\n";
+    out << "idle_camera_orbit=" << (settingsPanel_.pendingIdleCameraOrbit ? 1 : 0) << "\n";
     out << "action_bar_scale=" << settingsPanel_.pendingActionBarScale << "\n";
     out << "nameplate_scale=" << settingsPanel_.nameplateScale_ << "\n";
     out << "show_friendly_nameplates=" << (settingsPanel_.showFriendlyNameplates_ ? 1 : 0) << "\n";
@@ -1613,6 +1557,10 @@ void GameScreen::loadSettings() {
             } else if (key == "show_keyring") {
                 settingsPanel_.pendingShowKeyring = (std::stoi(val) != 0);
                 inventoryScreen.setShowKeyring(settingsPanel_.pendingShowKeyring);
+            } else if (key == "show_micro_menu") {
+                settingsPanel_.pendingShowMicroMenu = (std::stoi(val) != 0);
+            } else if (key == "idle_camera_orbit") {
+                settingsPanel_.pendingIdleCameraOrbit = (std::stoi(val) != 0);
             } else if (key == "action_bar_scale") {
                 settingsPanel_.pendingActionBarScale = std::clamp(std::stof(val), 0.5f, 1.5f);
             } else if (key == "nameplate_scale") {
@@ -1752,6 +1700,7 @@ void GameScreen::loadSettings() {
             cam->setExtendedZoom(settingsPanel_.pendingExtendedZoom);
             cam->setCameraSmoothSpeed(settingsPanel_.pendingCameraStiffness);
             cam->setPivotHeight(settingsPanel_.pendingPivotHeight);
+            cam->setIdleOrbitEnabled(settingsPanel_.pendingIdleCameraOrbit);
         }
     }
 

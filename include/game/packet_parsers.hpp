@@ -55,8 +55,10 @@ public:
     }
 
     /** Build CMSG_USE_ITEM (WotLK default: bag + slot + castCount + spellId + itemGuid + glyphIndex + castFlags + targets) */
-    virtual network::Packet buildUseItem(uint8_t bagIndex, uint8_t slotIndex, uint64_t itemGuid, uint32_t spellId = 0) {
-        return UseItemPacket::build(bagIndex, slotIndex, itemGuid, spellId);
+    virtual network::Packet buildUseItem(uint8_t bagIndex, uint8_t slotIndex,
+                                         uint64_t itemGuid, uint32_t spellId = 0,
+                                         uint64_t targetGuid = 0) {
+        return UseItemPacket::build(bagIndex, slotIndex, itemGuid, spellId, targetGuid);
     }
 
     // --- Character Enumeration ---
@@ -126,7 +128,8 @@ public:
 
     /** Parse SMSG_CAST_RESULT header (spellId + result), expansion-aware.
      *  WotLK: castCount(u8) + spellId(u32) + result(u8)
-     *  TBC/Classic: spellId(u32) + result(u8)  (no castCount prefix)
+     *  TBC/Classic: spellId(u32) + result(u8)  (no castCount prefix).
+     *  Classic/TBC result enums have no SUCCESS entry, so parsers shift +1.
      */
     virtual bool parseCastResult(network::Packet& packet, uint32_t& spellId, uint8_t& result) {
         // WotLK default: skip castCount, read spellId + result
@@ -333,15 +336,17 @@ public:
     network::Packet buildAcceptQuestPacket(uint64_t npcGuid, uint32_t questId) override;
     // TBC 2.4.3 CMSG_CAST_SPELL has no castFlags byte (WotLK added it)
     network::Packet buildCastSpell(uint32_t spellId, uint64_t targetGuid, uint8_t castCount) override;
-    // TBC 2.4.3 CMSG_USE_ITEM has no glyphIndex field (WotLK added it)
-    network::Packet buildUseItem(uint8_t bagIndex, uint8_t slotIndex, uint64_t itemGuid, uint32_t spellId = 0) override;
+    // TBC 2.4.3 CMSG_USE_ITEM uses spellIndex + castCount + itemGuid + targets.
+    network::Packet buildUseItem(uint8_t bagIndex, uint8_t slotIndex,
+                                 uint64_t itemGuid, uint32_t spellId = 0,
+                                 uint64_t targetGuid = 0) override;
     // TBC 2.4.3 SMSG_MONSTER_MOVE has no unk byte after packed GUID (WotLK added it)
     bool parseMonsterMove(network::Packet& packet, MonsterMoveData& data) override;
     // TBC 2.4.3 SMSG_GOSSIP_MESSAGE quests lack questFlags(u32)+isRepeatable(u8) (WotLK added them)
     bool parseGossipMessage(network::Packet& packet, GossipMessageData& data) override;
-    // TBC 2.4.3 SMSG_CAST_RESULT: spellId(u32) + result(u8) — WotLK added castCount(u8) prefix
+    // TBC 2.4.3 SMSG_CAST_RESULT: spellId(u32) + result(u8) + castCount(u8)
     bool parseCastResult(network::Packet& packet, uint32_t& spellId, uint8_t& result) override;
-    // TBC 2.4.3 SMSG_CAST_FAILED: spellId(u32) + result(u8) — WotLK added castCount(u8) prefix
+    // TBC 2.4.3 SMSG_CAST_FAILED: spellId(u32) + result(u8) + castCount(u8)
     bool parseCastFailed(network::Packet& packet, CastFailedData& data) override;
     // TBC 2.4.3 SMSG_INITIAL_SPELLS: uint16 spellId + uint16 unk per entry.
     bool parseInitialSpells(network::Packet& packet, InitialSpellsData& data) override {
@@ -410,7 +415,9 @@ public:
                                          const MovementInfo& info,
                                          uint64_t playerGuid = 0) override;
     network::Packet buildCastSpell(uint32_t spellId, uint64_t targetGuid, uint8_t castCount) override;
-    network::Packet buildUseItem(uint8_t bagIndex, uint8_t slotIndex, uint64_t itemGuid, uint32_t spellId = 0) override;
+    network::Packet buildUseItem(uint8_t bagIndex, uint8_t slotIndex,
+                                 uint64_t itemGuid, uint32_t spellId = 0,
+                                 uint64_t targetGuid = 0) override;
     bool parseCastFailed(network::Packet& packet, CastFailedData& data) override;
     bool parseCastResult(network::Packet& packet, uint32_t& spellId, uint8_t& result) override;
     bool parseMessageChat(network::Packet& packet, MessageChatData& data) override;

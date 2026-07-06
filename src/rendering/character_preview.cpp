@@ -11,12 +11,14 @@
 #include "pipeline/m2_loader.hpp"
 #include "pipeline/dbc_loader.hpp"
 #include "pipeline/dbc_layout.hpp"
+#include "core/appearance_composer.hpp"
 #include "core/logger.hpp"
 #include "core/application.hpp"
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <unordered_map>
 #include <unordered_set>
 #include <cstring>
 
@@ -27,6 +29,106 @@ CharacterPreview::CharacterPreview() = default;
 
 CharacterPreview::~CharacterPreview() {
     shutdown();
+}
+
+void CharacterPreview::ensureAppearanceGeosetsLoaded() {
+    if (appearanceGeosetsLoaded_ || !assetManager_) {
+        return;
+    }
+
+    appearanceGeosetsLoaded_ = true;
+    hairGeosetMap_.clear();
+    facialHairGeosetMap_.clear();
+
+    // CharHairGeosets.dbc maps (race, sex, hairStyleId) to the group-0
+    // scalp/hair submesh. Activating every group-0 submesh draws all hair
+    // variants at once, which shows up as flickering magenta patches.
+    if (auto chg = assetManager_->loadDBC("CharHairGeosets.dbc"); chg && chg->isLoaded()) {
+        const auto* chgL = pipeline::getActiveDBCLayout()
+            ? pipeline::getActiveDBCLayout()->getLayout("CharHairGeosets") : nullptr;
+        for (uint32_t i = 0; i < chg->getRecordCount(); i++) {
+            uint32_t raceId = chg->getUInt32(i, chgL ? (*chgL)["RaceID"] : 1);
+            uint32_t sexId = chg->getUInt32(i, chgL ? (*chgL)["SexID"] : 2);
+            uint32_t variation = chg->getUInt32(i, chgL ? (*chgL)["Variation"] : 3);
+            uint32_t geosetId = chg->getUInt32(i, chgL ? (*chgL)["GeosetID"] : 4);
+            uint32_t key = (raceId << 16) | (sexId << 8) | variation;
+            hairGeosetMap_[key] = static_cast<uint16_t>(geosetId);
+        }
+        LOG_INFO("CharacterPreview: loaded ", hairGeosetMap_.size(), " hair geoset mappings");
+    }
+
+    if (auto cfh = assetManager_->loadDBC("CharacterFacialHairStyles.dbc"); cfh && cfh->isLoaded()) {
+        const auto* cfhL = pipeline::getActiveDBCLayout()
+            ? pipeline::getActiveDBCLayout()->getLayout("CharacterFacialHairStyles") : nullptr;
+        for (uint32_t i = 0; i < cfh->getRecordCount(); i++) {
+            uint32_t raceId = cfh->getUInt32(i, cfhL ? (*cfhL)["RaceID"] : 0);
+            uint32_t sexId = cfh->getUInt32(i, cfhL ? (*cfhL)["SexID"] : 1);
+            uint32_t variation = cfh->getUInt32(i, cfhL ? (*cfhL)["Variation"] : 2);
+            uint32_t key = (raceId << 16) | (sexId << 8) | variation;
+
+            FacialHairGeosets geosets;
+            geosets.geoset100 = static_cast<uint16_t>(cfh->getUInt32(i, cfhL ? (*cfhL)["Geoset100"] : 3));
+            geosets.geoset300 = static_cast<uint16_t>(cfh->getUInt32(i, cfhL ? (*cfhL)["Geoset300"] : 4));
+            geosets.geoset200 = static_cast<uint16_t>(cfh->getUInt32(i, cfhL ? (*cfhL)["Geoset200"] : 5));
+            facialHairGeosetMap_[key] = geosets;
+        }
+        LOG_INFO("CharacterPreview: loaded ", facialHairGeosetMap_.size(), " facial hair geoset mappings");
+    }
+}
+
+uint16_t CharacterPreview::selectedHairScalpGeoset() const {
+    const uint8_t raceId = static_cast<uint8_t>(race_);
+    const uint8_t sexId = (gender_ == game::Gender::FEMALE) ? 1u : 0u;
+    const uint32_t key = (static_cast<uint32_t>(raceId) << 16) |
+                         (static_cast<uint32_t>(sexId) << 8) |
+                         static_cast<uint32_t>(hairStyle_);
+
+    auto it = hairGeosetMap_.find(key);
+    if (it != hairGeosetMap_.end() && it->second > 0) {
+        return it->second;
+    }
+
+    // Last-resort heuristic for incomplete data sets. The DBC path above is
+    // expected for real clients and is much more reliable than this fallback.
+    return static_cast<uint16_t>(std::max<uint8_t>(hairStyle_ + 1, 1));
+}
+
+std::unordered_set<uint16_t> CharacterPreview::buildBaseGeosets() {
+    ensureAppearanceGeosetsLoaded();
+
+    const uint8_t raceId = static_cast<uint8_t>(race_);
+    const uint8_t sexId = (gender_ == game::Gender::FEMALE) ? 1u : 0u;
+    const uint16_t selectedHairScalp = selectedHairScalpGeoset();
+
+    std::unordered_set<uint16_t> activeGeosets;
+    activeGeosets.insert(0); // body base
+    activeGeosets.insert(selectedHairScalp);
+
+    // Draw one scalp/hair variant. Enabling every low-numbered group-0 submesh
+    // draws multiple hair/scalp variants at once and can cause z-fighting.
+    activeGeosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(selectedHairScalp, 1)));
+
+    const uint32_t facialKey = (static_cast<uint32_t>(raceId) << 16) |
+                               (static_cast<uint32_t>(sexId) << 8) |
+                               static_cast<uint32_t>(facialHair_);
+    auto itFacial = facialHairGeosetMap_.find(facialKey);
+    if (itFacial != facialHairGeosetMap_.end()) {
+        activeGeosets.insert(static_cast<uint16_t>(200 + std::max<uint16_t>(itFacial->second.geoset200, 1)));
+        activeGeosets.insert(static_cast<uint16_t>(300 + std::max<uint16_t>(itFacial->second.geoset300, 1)));
+    } else {
+        activeGeosets.insert(201);
+        activeGeosets.insert(301);
+    }
+
+    activeGeosets.insert(core::kGeosetBareForearms);
+    activeGeosets.insert(core::kGeosetBareShins);
+    activeGeosets.insert(core::kGeosetDefaultEars);
+    activeGeosets.insert(core::kGeosetBareSleeves);
+    activeGeosets.insert(core::kGeosetDefaultKneepads);
+    activeGeosets.insert(core::kGeosetBarePants);
+    activeGeosets.insert(core::kGeosetNoCape);
+    activeGeosets.insert(core::kGeosetBareFeet);
+    return activeGeosets;
 }
 
 bool CharacterPreview::initialize(pipeline::AssetManager* am) {
@@ -564,35 +666,18 @@ bool CharacterPreview::loadCharacter(game::Race race, game::Gender gender,
         return false;
     }
 
-    // Set default geosets (naked character)
-    std::unordered_set<uint16_t> activeGeosets;
-    // Body parts (group 0: IDs 0-99, vanilla models use up to 27)
-    for (uint16_t i = 0; i <= 99; i++) {
-        activeGeosets.insert(i);
-    }
-    // Hair style geoset: group 1 = 100 + variation + 1
-    activeGeosets.insert(static_cast<uint16_t>(100 + hairStyle + 1));
-    // Facial hair geoset: group 2 = 200 + variation + 1
-    activeGeosets.insert(static_cast<uint16_t>(200 + facialHair + 1));
-    activeGeosets.insert(401);   // Bare forearms (no gloves) — group 4
-    activeGeosets.insert(502);   // Bare shins (no boots) — group 5
-    activeGeosets.insert(702);   // Ears: default
-    activeGeosets.insert(801);   // Bare wrists (no sleeves) — group 8
-    activeGeosets.insert(902);   // Kneepads: default — group 9
-    activeGeosets.insert(1301);  // Bare legs (no pants) — group 13
-    activeGeosets.insert(1502);  // No cloak — group 15
-    activeGeosets.insert(2002);  // Bare feet mesh — group 20
-    charRenderer_->setActiveGeosets(instanceId_, activeGeosets);
-
-    // Play idle animation (Stand = animation ID 0)
-    charRenderer_->playAnimation(instanceId_, rendering::anim::STAND, true);
-
-    // Cache core appearance for later equipment geosets.
+    // Cache core appearance before geoset selection; the DBC resolver uses it.
     race_ = race;
     gender_ = gender;
     useFemaleModel_ = useFemaleModel;
     hairStyle_ = hairStyle;
     facialHair_ = facialHair;
+
+    std::unordered_set<uint16_t> activeGeosets = buildBaseGeosets();
+    charRenderer_->setActiveGeosets(instanceId_, activeGeosets);
+
+    // Play idle animation (Stand = animation ID 0)
+    charRenderer_->playAnimation(instanceId_, rendering::anim::STAND, true);
 
     // Cache the type-1 texture slot index so applyEquipment can update it.
     skinTextureSlotIndex_ = 0;
@@ -615,6 +700,9 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
     if (!modelLoaded_ || instanceId_ == 0 || !charRenderer_ || !assetManager_ || !assetManager_->isInitialized()) {
         return false;
     }
+
+    charRenderer_->clearTextureSlotOverride(instanceId_, static_cast<uint16_t>(skinTextureSlotIndex_));
+    charRenderer_->setGroupTextureOverride(instanceId_, 15, nullptr);
 
     auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
     if (!displayInfoDbc || !displayInfoDbc->isLoaded()) {
@@ -642,89 +730,119 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
         return 0;
     };
 
-    auto getGeosetGroup = [&](uint32_t displayInfoId, int groupField) -> uint32_t {
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    const uint32_t geosetGroup1Field = idiL ? (*idiL)["GeosetGroup1"] : 7u;
+    const uint32_t geosetGroup3Field = idiL ? (*idiL)["GeosetGroup3"] : 9u;
+
+    auto getGeosetGroup = [&](uint32_t displayInfoId, uint32_t fieldIdx) -> uint32_t {
         if (displayInfoId == 0) return 0;
         int32_t recIdx = displayInfoDbc->findRecordById(displayInfoId);
         if (recIdx < 0) return 0;
-        uint32_t val = displayInfoDbc->getUInt32(static_cast<uint32_t>(recIdx), 7 + groupField);
-        return val;
+        return displayInfoDbc->getUInt32(static_cast<uint32_t>(recIdx), fieldIdx);
     };
 
     // --- Geosets ---
     // M2 geoset IDs encode body part group × 100 + variant (e.g., 801 = group 8
     // (sleeves) variant 1, 1301 = group 13 (pants) variant 1). ItemDisplayInfo.dbc
     // provides the variant offset per equipped item; base IDs are per-group constants.
-    std::unordered_set<uint16_t> geosets;
-    for (uint16_t i = 0; i <= 99; i++) geosets.insert(i);
-    geosets.insert(static_cast<uint16_t>(100 + hairStyle_ + 1));    // Hair style
-    geosets.insert(static_cast<uint16_t>(200 + facialHair_ + 1));  // Facial hair
-    geosets.insert(701);   // Ears
-    geosets.insert(902);   // Kneepads: default (group 9)
-    geosets.insert(2002);  // Bare feet mesh (group 20 = CG_FEET)
+    std::unordered_set<uint16_t> geosets = buildBaseGeosets();
+
+    auto eraseGroup = [&](uint16_t group) {
+        for (auto it = geosets.begin(); it != geosets.end();) {
+            if ((*it / 100) == group) {
+                it = geosets.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
 
     // CharGeosets: group 4=gloves(forearm), 5=boots(shin), 8=sleeves, 13=pants
-    uint16_t geosetGloves = 401;   // Bare forearms (group 4)
-    uint16_t geosetBoots = 502;    // Bare shins (group 5)
-    uint16_t geosetSleeves = 801;  // Bare wrists (group 8)
-    uint16_t geosetPants = 1301;   // Bare legs (group 13)
+    std::unordered_set<uint16_t> modelGeosets;
+    if (const auto* modelData = charRenderer_->getModelData(PREVIEW_MODEL_ID)) {
+        for (const auto& batch : modelData->batches) {
+            modelGeosets.insert(batch.submeshId);
+        }
+    }
+
+    auto pickGeoset = [&](uint16_t preferred, uint16_t fallback) -> uint16_t {
+        if (preferred != 0 && modelGeosets.count(preferred) > 0) return preferred;
+        if (fallback != 0 && modelGeosets.count(fallback) > 0) return fallback;
+        return 0;
+    };
+
+    uint16_t geosetGloves = pickGeoset(core::kGeosetBareForearms, core::kGeosetBareForearms);
+    uint16_t geosetBoots = pickGeoset(core::kGeosetBareShins, core::kGeosetBareShins);
+    uint16_t geosetSleeves = pickGeoset(core::kGeosetBareSleeves, core::kGeosetBareSleeves);
+    uint16_t geosetPants = pickGeoset(core::kGeosetBarePants, core::kGeosetBarePants);
 
     // Chest/Shirt/Robe → group 8 (sleeves)
     {
         uint32_t did = findDisplayId({4, 5, 20});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetSleeves = static_cast<uint16_t>(801 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetSleeves = pickGeoset(static_cast<uint16_t>(core::kGeosetBareSleeves + gg), core::kGeosetBareSleeves);
         // Robe kilt legs
-        uint32_t gg3 = getGeosetGroup(did, 2);
-        if (gg3 > 0) geosetPants = static_cast<uint16_t>(1301 + gg3);
+        uint32_t gg3 = getGeosetGroup(did, geosetGroup3Field);
+        if (gg3 > 0) geosetPants = pickGeoset(static_cast<uint16_t>(core::kGeosetBarePants + gg3), core::kGeosetBarePants);
     }
     // Legs → group 13 (trousers)
     {
         uint32_t did = findDisplayId({7});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetPants = static_cast<uint16_t>(1301 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetPants = pickGeoset(static_cast<uint16_t>(core::kGeosetBarePants + gg), core::kGeosetBarePants);
     }
     // Boots → group 5 (shins)
     {
         uint32_t did = findDisplayId({8});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetBoots = static_cast<uint16_t>(501 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetBoots = pickGeoset(static_cast<uint16_t>(501 + gg), core::kGeosetBareShins);
     }
     // Gloves → group 4 (forearms)
     {
         uint32_t did = findDisplayId({10});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetGloves = static_cast<uint16_t>(401 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetGloves = pickGeoset(static_cast<uint16_t>(core::kGeosetBareForearms + gg), core::kGeosetBareForearms);
     }
     // Wrists/Bracers → group 8 (sleeves, only if chest/shirt didn't set it)
     {
         uint32_t did = findDisplayId({9});
-        if (did != 0 && geosetSleeves == 801) {
-            uint32_t gg = getGeosetGroup(did, 0);
-            if (gg > 0) geosetSleeves = static_cast<uint16_t>(801 + gg);
+        if (did != 0 && geosetSleeves == pickGeoset(core::kGeosetBareSleeves, core::kGeosetBareSleeves)) {
+            uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+            if (gg > 0) geosetSleeves = pickGeoset(static_cast<uint16_t>(core::kGeosetBareSleeves + gg), core::kGeosetBareSleeves);
         }
     }
     // Belt → group 18 (buckle)
     uint16_t geosetBelt = 0;
     {
         uint32_t did = findDisplayId({6});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetBelt = static_cast<uint16_t>(1801 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetBelt = pickGeoset(static_cast<uint16_t>(1801 + gg), 0);
     }
 
-    geosets.insert(geosetGloves);
-    geosets.insert(geosetBoots);
-    geosets.insert(geosetSleeves);
-    geosets.insert(geosetPants);
+    eraseGroup(4);
+    eraseGroup(5);
+    eraseGroup(8);
+    eraseGroup(13);
+    eraseGroup(15);
+    eraseGroup(18);
+    if (geosetGloves != 0) geosets.insert(geosetGloves);
+    if (geosetBoots != 0) geosets.insert(geosetBoots);
+    if (geosetSleeves != 0) geosets.insert(geosetSleeves);
+    if (geosetPants != 0) geosets.insert(geosetPants);
     if (geosetBelt != 0) geosets.insert(geosetBelt);
-    geosets.insert(hasInvType({16}) ? 1502 : 1501); // Cloak mesh toggle (visual may still be limited)
-    if (hasInvType({19})) geosets.insert(1201);     // Tabard mesh toggle
-
-    // Hide hair under helmets (helmets are separate models; this still avoids hair clipping)
-    if (hasInvType({1})) {
-        geosets.erase(static_cast<uint16_t>(100 + hairStyle_ + 1));
-        geosets.insert(1);   // Bald scalp cap
-        geosets.insert(101); // Default group-1 connector
+    uint16_t geosetCape = pickGeoset(
+        hasInvType({16}) ? core::kGeosetWithCape : core::kGeosetNoCape,
+        core::kGeosetNoCape);
+    if (geosetCape != 0) geosets.insert(geosetCape); // Cloak mesh toggle (visual may still be limited)
+    if (hasInvType({19})) {
+        uint16_t geosetTabard = pickGeoset(core::kGeosetDefaultTabard, 0);
+        if (geosetTabard != 0) geosets.insert(geosetTabard);
     }
+
+    // Keep hair visible in the preview. The in-world renderer can hide hair
+    // because it attaches helmet models, but this preview path does not yet
+    // render head-slot attachments; hiding hair here leaves bald characters.
 
     charRenderer_->setActiveGeosets(instanceId_, geosets);
 
@@ -738,8 +856,6 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
     };
 
     // Texture component region fields — use DBC layout when available, fall back to binary offsets.
-    const auto* idiL = pipeline::getActiveDBCLayout()
-        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
     uint32_t texRegionFields[8];
     pipeline::getItemDisplayInfoTextureFields(*displayInfoDbc, idiL, texRegionFields);
 
@@ -779,7 +895,7 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
     if (!regionLayers.empty()) {
         VkTexture* newTex = charRenderer_->compositeWithRegions(bodySkinPath_, baseLayers_, regionLayers);
         if (newTex != nullptr) {
-            charRenderer_->setModelTexture(PREVIEW_MODEL_ID, skinTextureSlotIndex_, newTex);
+            charRenderer_->setTextureSlotOverride(instanceId_, static_cast<uint16_t>(skinTextureSlotIndex_), newTex);
         }
     }
 
@@ -906,8 +1022,10 @@ void CharacterPreview::compositePass(VkCommandBuffer cmd, uint32_t frameIndex) {
     // No fog in preview
     ubo.fogColor = glm::vec4(0.05f, 0.05f, 0.1f, 0.0f);
     ubo.fogParams = glm::vec4(9999.0f, 10000.0f, 0.0f, 0.0f);
-    // Enable shadows for visual depth in preview (strength=0.5 for subtle effect)
-    ubo.shadowParams = glm::vec4(1.0f, 0.5f, 0.0f, 0.0f);
+    // Off-screen preview has no real shadow pass/light-space setup. Sampling
+    // the global shadow binding here can produce unstable fragments on some
+    // drivers, so keep the portrait on studio lighting only.
+    ubo.shadowParams = glm::vec4(0.0f);
 
     std::memcpy(previewUBOMapped_[fi], &ubo, sizeof(GPUPerFrameData));
 

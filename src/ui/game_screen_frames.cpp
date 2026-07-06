@@ -1424,7 +1424,7 @@ void GameScreen::renderTargetFrame(game::GameHandler& gameHandler) {
                 if (itHi != tFields.end())
                     totGuid |= (static_cast<uint64_t>(itHi->second) << 32);
             }
-            if (totGuid != 0) {
+            if (totGuid != 0 && totGuid != targetGuid) {
                 auto totEnt = gameHandler.getEntityManager().getEntity(totGuid);
                 std::string totName;
                 ImVec4 totColor(0.7f, 0.7f, 0.7f, 1.0f);
@@ -1689,7 +1689,7 @@ void GameScreen::renderTargetFrame(game::GameHandler& gameHandler) {
                 totGuid |= (static_cast<uint64_t>(hiIt->second) << 32);
         }
 
-        if (totGuid != 0) {
+        if (totGuid != 0 && totGuid != targetGuid) {
             auto totEntity = gameHandler.getEntityManager().getEntity(totGuid);
             if (totEntity) {
                 // Position ToT frame just below and right-aligned with the target frame

@@ -60,6 +60,15 @@ public:
     void startIntroPan(float durationSec = 2.8f, float orbitDegrees = 140.0f);
     bool isIntroActive() const { return introActive; }
     bool isIdleOrbit() const { return idleOrbit_; }
+    void setIdleOrbitEnabled(bool enabled) {
+        idleOrbitEnabled_ = enabled;
+        if (!enabled && idleOrbit_) {
+            introActive = false;
+            idleOrbit_ = false;
+            idleTimer_ = 0.0f;
+        }
+    }
+    bool isIdleOrbitEnabled() const { return idleOrbitEnabled_; }
 
     float getMovementSpeed() const { return movementSpeed; }
     const glm::vec3& getDefaultPosition() const { return defaultPosition; }
@@ -383,6 +392,7 @@ private:
     // Idle camera: triggers intro pan after IDLE_TIMEOUT seconds of no input
     float idleTimer_ = 0.0f;
     bool idleOrbit_ = false;  // true when current intro pan is an idle orbit (loops)
+    bool idleOrbitEnabled_ = true;
     static constexpr float IDLE_TIMEOUT = 120.0f; // 2 minutes
 
     // Last known safe position (saved periodically when grounded on real geometry)

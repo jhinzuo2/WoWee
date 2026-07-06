@@ -240,13 +240,15 @@ void CameraController::update(float deltaTime) {
     bool anyInput = leftMouseDown || rightMouseDown || keyW || keyS || keyA || keyD || keyQ || keyE || nowJump;
     if (anyInput) {
         idleTimer_ = 0.0f;
-    } else if (!introActive) {
+    } else if (!introActive && idleOrbitEnabled_) {
         idleTimer_ += deltaTime;
         if (idleTimer_ >= IDLE_TIMEOUT) {
             idleTimer_ = 0.0f;
             startIntroPan(30.0f, 360.0f); // Slow casual orbit over 30 seconds
             idleOrbit_ = true;
         }
+    } else if (!idleOrbitEnabled_) {
+        idleTimer_ = 0.0f;
     }
 
     if (introActive) {

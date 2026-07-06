@@ -386,6 +386,7 @@ void GameScreen::render(game::GameHandler& gameHandler) {
     actionBarPanel_.renderStanceBar(gameHandler, settingsPanel_, spellbookScreen,
         [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); });
     actionBarPanel_.renderBagBar(gameHandler, settingsPanel_, inventoryScreen);
+    renderMicroMenu(gameHandler);
     actionBarPanel_.renderXpBar(gameHandler, settingsPanel_);
     actionBarPanel_.renderRepBar(gameHandler, settingsPanel_);
     auto spellIconFn = [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); };
@@ -739,6 +740,89 @@ void GameScreen::render(game::GameHandler& gameHandler) {
 
     // Restore previous alpha
     ImGui::GetStyle().Alpha = prevAlpha;
+}
+
+void GameScreen::renderMicroMenu(game::GameHandler& gameHandler) {
+    if (!settingsPanel_.pendingShowMicroMenu) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    constexpr float buttonSize = 28.0f;
+    constexpr float margin = 10.0f;
+    const float y = std::max(8.0f, io.DisplaySize.y - buttonSize - 18.0f);
+
+    ImGui::SetNextWindowPos(ImVec2(margin, y), ImGuiCond_Always);
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_AlwaysAutoResize;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f, 4.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(8, 8, 12, 145));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(120, 130, 165, 90));
+
+    if (ImGui::Begin("##MicroMenu", nullptr, flags)) {
+        auto button = [&](const char* label, const char* tooltip, bool active) {
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(64, 82, 132, 210));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(82, 102, 160, 230));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(98, 120, 180, 245));
+            }
+            const bool clicked = ImGui::Button(label, ImVec2(buttonSize, buttonSize));
+            if (active) ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+            return clicked;
+        };
+
+        if (button("C##MicroCharacter", "Character", inventoryScreen.isCharacterOpen())) {
+            const bool wasOpen = inventoryScreen.isCharacterOpen();
+            inventoryScreen.toggleCharacter();
+            if (!wasOpen && gameHandler.isConnected()) gameHandler.requestPlayedTime();
+        }
+        ImGui::SameLine();
+        if (button("B##MicroBags", "Backpack", inventoryScreen.isBackpackOpen())) {
+            inventoryScreen.toggleBackpack();
+        }
+        ImGui::SameLine();
+        if (button("P##MicroSpellbook", "Spellbook", spellbookScreen.isOpen())) {
+            spellbookScreen.toggle();
+        }
+        ImGui::SameLine();
+        if (button("N##MicroTalents", "Talents", talentScreen.isOpen())) {
+            talentScreen.toggle();
+        }
+        ImGui::SameLine();
+        if (button("L##MicroQuests", "Quest Log", questLogScreen.isOpen())) {
+            questLogScreen.toggle();
+        }
+        ImGui::SameLine();
+        if (button("K##MicroSkills", "Skills", windowManager_.showSkillsWindow_)) {
+            windowManager_.showSkillsWindow_ = !windowManager_.showSkillsWindow_;
+        }
+        ImGui::SameLine();
+        if (button("O##MicroSocial", "Social", socialPanel_.showSocialFrame_)) {
+            socialPanel_.showSocialFrame_ = !socialPanel_.showSocialFrame_;
+        }
+        ImGui::SameLine();
+        if (button("G##MicroGroup", "Party/Raid Frames", socialPanel_.showRaidFrames_)) {
+            socialPanel_.showRaidFrames_ = !socialPanel_.showRaidFrames_;
+        }
+        ImGui::SameLine();
+        if (button("M##MicroMap", "World Map", showWorldMap_)) {
+            showWorldMap_ = !showWorldMap_;
+        }
+        ImGui::SameLine();
+        if (button("*##MicroSettings", "Settings", settingsPanel_.showSettingsWindow)) {
+            settingsPanel_.showSettingsWindow = !settingsPanel_.showSettingsWindow;
+        }
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
 }
 
 void GameScreen::renderPlayerInfo(game::GameHandler& gameHandler) {

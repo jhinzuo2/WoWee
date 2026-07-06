@@ -6,6 +6,8 @@
 #include <memory>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wowee {
@@ -56,8 +58,17 @@ public:
     bool isModelLoaded() const { return modelLoaded_; }
 
 private:
+    struct FacialHairGeosets {
+        uint16_t geoset100 = 0;
+        uint16_t geoset300 = 0;
+        uint16_t geoset200 = 0;
+    };
+
     void createFBO();
     void destroyFBO();
+    void ensureAppearanceGeosetsLoaded();
+    std::unordered_set<uint16_t> buildBaseGeosets();
+    uint16_t selectedHairScalpGeoset() const;
 
     pipeline::AssetManager* assetManager_ = nullptr;
     VkContext* vkCtx_ = nullptr;
@@ -105,6 +116,10 @@ private:
     std::string bodySkinPath_;
     std::vector<std::string> baseLayers_; // face + underwear, etc.
     uint32_t skinTextureSlotIndex_ = 0;
+
+    bool appearanceGeosetsLoaded_ = false;
+    std::unordered_map<uint32_t, uint16_t> hairGeosetMap_;
+    std::unordered_map<uint32_t, FacialHairGeosets> facialHairGeosetMap_;
 };
 
 } // namespace rendering

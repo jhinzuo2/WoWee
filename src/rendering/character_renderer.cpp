@@ -54,6 +54,114 @@ size_t approxTextureBytesWithMips(int w, int h) {
     size_t base = static_cast<size_t>(w) * static_cast<size_t>(h) * 4ull;
     return base + (base / 3);  // ~4/3 for mip chain
 }
+
+std::string normalizeTexturePathKey(std::string key) {
+    std::replace(key.begin(), key.end(), '/', '\\');
+    std::transform(key.begin(), key.end(), key.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return key;
+}
+
+bool isMagentaKeyCandidate(const uint8_t* rgba) {
+    const int r = rgba[0];
+    const int g = rgba[1];
+    const int b = rgba[2];
+    const int rbDelta = (r > b) ? (r - b) : (b - r);
+    return r >= 170 && b >= 170 && g <= 120 &&
+           r >= g + 70 && b >= g + 70 && rbDelta <= 96;
+}
+
+bool shouldApplyMagentaKey(const std::string& normalizedPath) {
+    return normalizedPath.find("character\\") == 0 ||
+           normalizedPath.find("item\\texturecomponents\\") == 0 ||
+           normalizedPath.find("item\\objectcomponents\\") == 0 ||
+           normalizedPath.find("\\hair") != std::string::npos ||
+           normalizedPath.find("hair") == 0 ||
+           normalizedPath.find("\\cape\\") != std::string::npos ||
+           normalizedPath.find("cape\\") == 0;
+}
+
+size_t bleedAndStripMagentaKey(std::vector<uint8_t>& rgba, int width, int height) {
+    if (width <= 0 || height <= 0 || rgba.size() < static_cast<size_t>(width) * height * 4) {
+        return 0;
+    }
+
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    std::vector<uint8_t> source = rgba;
+    std::vector<uint8_t> mask(pixelCount, 0);
+    size_t stripped = 0;
+
+    for (size_t p = 0; p < pixelCount; ++p) {
+        size_t i = p * 4;
+        if (!isMagentaKeyCandidate(&source[i])) continue;
+        mask[p] = 1;
+        ++stripped;
+    }
+
+    if (stripped == 0) return 0;
+
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            size_t p = static_cast<size_t>(y) * width + x;
+            if (!mask[p]) continue;
+
+            uint32_t rSum = 0;
+            uint32_t gSum = 0;
+            uint32_t bSum = 0;
+            uint32_t samples = 0;
+
+            for (int radius = 1; radius <= 8 && samples == 0; ++radius) {
+                for (int dy = -radius; dy <= radius; ++dy) {
+                    int ny = y + dy;
+                    if (ny < 0 || ny >= height) continue;
+                    for (int dx = -radius; dx <= radius; ++dx) {
+                        if (std::abs(dx) != radius && std::abs(dy) != radius) continue;
+                        int nx = x + dx;
+                        if (nx < 0 || nx >= width) continue;
+
+                        size_t np = static_cast<size_t>(ny) * width + nx;
+                        if (mask[np]) continue;
+                        size_t ni = np * 4;
+                        if (source[ni + 3] == 0) continue;
+                        rSum += source[ni + 0];
+                        gSum += source[ni + 1];
+                        bSum += source[ni + 2];
+                        ++samples;
+                    }
+                }
+            }
+
+            size_t i = p * 4;
+            if (samples > 0) {
+                rgba[i + 0] = static_cast<uint8_t>(rSum / samples);
+                rgba[i + 1] = static_cast<uint8_t>(gSum / samples);
+                rgba[i + 2] = static_cast<uint8_t>(bSum / samples);
+            } else {
+                rgba[i + 0] = 0;
+                rgba[i + 1] = 0;
+                rgba[i + 2] = 0;
+            }
+            rgba[i + 3] = 0;
+        }
+    }
+    return stripped;
+}
+
+bool hasNonOpaqueAlpha(const std::vector<uint8_t>& rgba) {
+    for (size_t i = 3; i < rgba.size(); i += 4) {
+        if (rgba[i] != 255) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void applyMagentaKeyIfNeeded(pipeline::BLPImage& image, const std::string& path) {
+    if (!image.isValid()) return;
+    std::string key = normalizeTexturePathKey(path);
+    if (!shouldApplyMagentaKey(key)) return;
+    bleedAndStripMagentaKey(image.data, image.width, image.height);
+}
 } // namespace
 
 // Descriptor pool sizing
@@ -63,6 +171,7 @@ static constexpr uint32_t MAX_BONE_SETS = 8192;
 // Texture compositing sizes (NPC skin upscale)
 static constexpr int kBaseTexSize    = 256;  // NPC baked texture default
 static constexpr int kUpscaleTexSize = 512;  // Target size for region compositing
+static constexpr int32_t kPreviewSimpleTextureMode = -31336;
 
 // CharMaterial UBO layout (matches character.frag.glsl set=1 binding=1)
 struct CharMaterialUBO {
@@ -655,13 +764,7 @@ VkTexture* CharacterRenderer::loadTexture(const std::string& path) {
     }
     if (allWhitespace) return whiteTexture_.get();
 
-    auto normalizeKey = [](std::string key) {
-        std::replace(key.begin(), key.end(), '/', '\\');
-        std::transform(key.begin(), key.end(), key.begin(),
-                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-        return key;
-    };
-    std::string key = normalizeKey(path);
+    std::string key = normalizeTexturePathKey(path);
     const uint64_t lookupSerial = ++textureLookupSerial_;
     auto containsToken = [](const std::string& haystack, const char* token) {
         return haystack.find(token) != std::string::npos;
@@ -708,6 +811,8 @@ VkTexture* CharacterRenderer::loadTexture(const std::string& path) {
         }
         return whiteTexture_.get();
     }
+
+    applyMagentaKeyIfNeeded(blpImage, key);
 
     size_t approxBytes = approxTextureBytesWithMips(blpImage.width, blpImage.height);
     if (textureCacheBytes_ + approxBytes > textureCacheBudgetBytes_) {
@@ -977,6 +1082,7 @@ VkTexture* CharacterRenderer::compositeTextures(const std::vector<std::string>& 
         core::Logger::getInstance().warning("Composite: failed to load base layer: ", layerPaths[0]);
         return whiteTexture_.get();
     }
+    applyMagentaKeyIfNeeded(base, layerPaths[0]);
 
     // Copy base pixel data as our working buffer
     std::vector<uint8_t> composite = base.data;
@@ -1030,6 +1136,7 @@ VkTexture* CharacterRenderer::compositeTextures(const std::vector<std::string>& 
             core::Logger::getInstance().warning("Composite: FAILED to load overlay: ", layerPaths[layer]);
             continue;
         }
+        applyMagentaKeyIfNeeded(overlay, layerPaths[layer]);
 
         core::Logger::getInstance().info("Composite: overlay ", layerPaths[layer],
             " (", overlay.width, "x", overlay.height, ")");
@@ -1106,6 +1213,9 @@ VkTexture* CharacterRenderer::compositeTextures(const std::vector<std::string>& 
         }
     }
 
+    bleedAndStripMagentaKey(composite, width, height);
+    const bool hasAlpha = hasNonOpaqueAlpha(composite);
+
     // Upload composite to GPU via VkTexture
     auto tex = std::make_unique<VkTexture>();
     tex->upload(*vkCtx_, composite.data(), width, height, VK_FORMAT_R8G8B8A8_UNORM, true);
@@ -1121,8 +1231,9 @@ VkTexture* CharacterRenderer::compositeTextures(const std::vector<std::string>& 
     e.texture = std::move(tex);
     e.approxBytes = approxTextureBytesWithMips(width, height);
     e.lastUse = ++textureCacheCounter_;
-    e.hasAlpha = false;
+    e.hasAlpha = hasAlpha;
     e.colorKeyBlack = false;
+    texturePropsByPtr_[texPtr] = {hasAlpha, false};
     textureCache.emplace(cacheKey, std::move(e));
 
     core::Logger::getInstance().info("Composite texture created: ", width, "x", height, " from ", layerPaths.size(), " layers");
@@ -1205,6 +1316,7 @@ VkTexture* CharacterRenderer::compositeWithRegions(const std::string& basePath,
     if (!base.isValid()) {
         return whiteTexture_.get();
     }
+    applyMagentaKeyIfNeeded(base, basePath);
 
     std::vector<uint8_t> composite;
     int width = base.width;
@@ -1254,6 +1366,7 @@ VkTexture* CharacterRenderer::compositeWithRegions(const std::string& basePath,
         }
         if (!overlay.isValid()) overlay = assetManager->loadTexture(ul);
         if (!overlay.isValid()) continue;
+        applyMagentaKeyIfNeeded(overlay, ul);
 
         if (overlay.width == width && overlay.height == height) {
             blitOverlay(composite, width, height, overlay, 0, 0);
@@ -1347,6 +1460,7 @@ VkTexture* CharacterRenderer::compositeWithRegions(const std::string& basePath,
             core::Logger::getInstance().warning("compositeWithRegions: failed to load ", rl.second);
             continue;
         }
+        applyMagentaKeyIfNeeded(overlay, rl.second);
 
         int dstX = regionCoords256[regionIdx][0] * scaleX;
         int dstY = regionCoords256[regionIdx][1] * scaleY;
@@ -1381,6 +1495,9 @@ VkTexture* CharacterRenderer::compositeWithRegions(const std::string& basePath,
         }
     }
 
+    bleedAndStripMagentaKey(composite, width, height);
+    const bool hasAlpha = hasNonOpaqueAlpha(composite);
+
     // Upload to GPU via VkTexture
     auto tex = std::make_unique<VkTexture>();
     tex->upload(*vkCtx_, composite.data(), width, height, VK_FORMAT_R8G8B8A8_UNORM, true);
@@ -1396,8 +1513,9 @@ VkTexture* CharacterRenderer::compositeWithRegions(const std::string& basePath,
     entry.texture = std::move(tex);
     entry.approxBytes = approxTextureBytesWithMips(width, height);
     entry.lastUse = ++textureCacheCounter_;
-    entry.hasAlpha = false;
+    entry.hasAlpha = hasAlpha;
     entry.colorKeyBlack = false;
+    texturePropsByPtr_[texPtr] = {hasAlpha, false};
     auto ins = textureCache.emplace(storageKey, std::move(entry));
     if (!ins.second) {
         // Existing texture already owns this key; keep pointer stable.
@@ -2391,25 +2509,8 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 return whiteTexture_.get();
             };
 
-            // One-time batch diagnostic for first character instance
-            static bool batchDiagDone = false;
-            if (!batchDiagDone && !instance.hasOverrideModelMatrix) {
-                batchDiagDone = true;
-                for (const auto& b : gpuModel.data.batches) {
-                    uint16_t bm = 0, mf = 0;
-                    if (b.materialIndex < gpuModel.data.materials.size()) {
-                        bm = gpuModel.data.materials[b.materialIndex].blendMode;
-                        mf = gpuModel.data.materials[b.materialIndex].flags;
-                    }
-                    uint16_t bg = static_cast<uint16_t>(b.submeshId / 100);
-                    bool active = instance.activeGeosets.empty() ||
-                                  instance.activeGeosets.count(b.submeshId);
-                    LOG_DEBUG("BATCH DIAG: submesh=", b.submeshId, " group=", bg,
-                                " blend=", bm, " matFlags=0x", std::hex, mf, std::dec,
-                                " texIdx=", b.textureIndex, " matIdx=", b.materialIndex,
-                                " active=", active);
-                }
-            }
+            const bool previewMainModel = renderPassOverride_ != VK_NULL_HANDLE &&
+                                          !instance.hasOverrideModelMatrix;
 
             // Draw batches in two passes: opaque (blendMode 0) first, then
             // alpha-key/blend after.  This ensures capes and body parts write
@@ -2441,7 +2542,6 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                     uint16_t grp = batch.submeshId / 100;
                     if (grp == 17 || grp == 18) continue;
                 }
-
                 // Resolve texture for this batch (prefer hair textures for hair geosets).
                 VkTexture* texPtr = resolveBatchTexture(instance, gpuModel, batch);
                 const uint16_t batchGroup = static_cast<uint16_t>(batch.submeshId / 100);
@@ -2523,7 +2623,9 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                         colorKeyBlack = pit->second.colorKeyBlack;
                     }
                 }
-                const bool blendNeedsCutout = (blendMode == 1) || (blendMode >= 2 && !alphaCutout);
+                const bool blendNeedsCutout = (blendMode == 1) ||
+                                              (blendMode == 0 && alphaCutout) ||
+                                              (blendMode >= 2 && !alphaCutout);
                 const bool unlit = ((materialFlags & 0x01) != 0) || (blendMode >= 3);
 
                 float emissiveBoost = 1.0f;
@@ -2582,6 +2684,8 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 int pomSamples = 32;
                 if (pomQuality_ == 0) pomSamples = 16;
                 else if (pomQuality_ == 2) pomSamples = 64;
+                const bool useAdvancedMaterials = !previewMainModel;
+                const bool usePreviewSimpleShader = previewMainModel;
 
                 // Create per-batch material UBO
                 CharMaterialUBO matData{};
@@ -2594,12 +2698,17 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 matData.emissiveTintG = emissiveTint.g;
                 matData.emissiveTintB = emissiveTint.b;
                 matData.specularIntensity = 0.5f;
-                matData.enableNormalMap = normalMappingEnabled_ ? 1 : 0;
-                matData.enablePOM = pomEnabled_ ? 1 : 0;
+                matData.enableNormalMap = (useAdvancedMaterials && normalMappingEnabled_) ? 1 : 0;
+                matData.enablePOM = (useAdvancedMaterials && pomEnabled_) ? 1 : 0;
                 matData.pomScale = 0.06f;
                 matData.pomMaxSamples = pomSamples;
-                matData.heightMapVariance = batchHeightVariance;
+                matData.heightMapVariance = useAdvancedMaterials ? batchHeightVariance : 0.0f;
                 matData.normalMapStrength = normalMapStrength_;
+                if (usePreviewSimpleShader) {
+                    matData.enableNormalMap = 0;
+                    matData.enablePOM = kPreviewSimpleTextureMode;
+                    matData.heightMapVariance = 0.0f;
+                }
 
                 // Sub-allocate material UBO from ring buffer
                 uint32_t matOffset = materialRingOffset_[frameSlot];
@@ -2683,12 +2792,20 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
             matData.emissiveTintG = 1.0f;
             matData.emissiveTintB = 1.0f;
             matData.specularIntensity = 0.5f;
-            matData.enableNormalMap = normalMappingEnabled_ ? 1 : 0;
-            matData.enablePOM = pomEnabled_ ? 1 : 0;
+            const bool previewMainModel = renderPassOverride_ != VK_NULL_HANDLE &&
+                                          !instance.hasOverrideModelMatrix;
+            const bool useAdvancedMaterials = !previewMainModel;
+            const bool usePreviewSimpleShader = previewMainModel;
+            matData.enableNormalMap = (useAdvancedMaterials && normalMappingEnabled_) ? 1 : 0;
+            matData.enablePOM = (useAdvancedMaterials && pomEnabled_) ? 1 : 0;
             matData.pomScale = 0.06f;
             matData.pomMaxSamples = pomSamples2;
             matData.heightMapVariance = 0.0f;
             matData.normalMapStrength = normalMapStrength_;
+            if (usePreviewSimpleShader) {
+                matData.enableNormalMap = 0;
+                matData.enablePOM = kPreviewSimpleTextureMode;
+            }
 
             // Sub-allocate material UBO from ring buffer
             uint32_t matOffset2 = materialRingOffset_[frameSlot];
