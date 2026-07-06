@@ -431,12 +431,19 @@ network::Packet ClassicPacketParsers::buildCastSpell(uint32_t spellId, uint64_t 
 // Vanilla 1.12.x: bag(u8) + slot(u8) + spellIndex(u8) + SpellCastTargets(u16)
 // NO spellId, itemGuid, glyphIndex, or castFlags fields (those are WotLK)
 // ============================================================================
-network::Packet ClassicPacketParsers::buildUseItem(uint8_t bagIndex, uint8_t slotIndex, uint64_t /*itemGuid*/, uint32_t /*spellId*/) {
+network::Packet ClassicPacketParsers::buildUseItem(uint8_t bagIndex, uint8_t slotIndex,
+                                                   uint64_t /*itemGuid*/, uint32_t /*spellId*/,
+                                                   uint64_t targetGuid) {
     network::Packet packet(wireOpcode(LogicalOpcode::CMSG_USE_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
     packet.writeUInt8(0);       // spell_index (which item spell to trigger, usually 0)
-    packet.writeUInt16(0x0000); // SpellCastTargets: TARGET_FLAG_SELF
+    if (targetGuid != 0) {
+        packet.writeUInt16(0x0002); // TARGET_FLAG_UNIT
+        packet.writePackedGuid(targetGuid);
+    } else {
+        packet.writeUInt16(0x0000); // TARGET_FLAG_SELF
+    }
     return packet;
 }
 
@@ -1827,7 +1834,7 @@ bool ClassicPacketParsers::parseItemQueryResponse(network::Packet& packet, ItemQ
 
     // Post-description: PageText, LanguageID, PageMaterial, StartQuest
     if (packet.hasRemaining(16)) {
-        packet.readUInt32(); // PageText
+        data.pageTextId = packet.readUInt32(); // PageText
         packet.readUInt32(); // LanguageID
         packet.readUInt32(); // PageMaterial
         data.startQuestId = packet.readUInt32(); // StartQuest

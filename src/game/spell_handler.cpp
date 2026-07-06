@@ -33,6 +33,28 @@ static float mergeCooldownSeconds(float current, float incoming) {
     return incoming;
 }
 
+namespace {
+constexpr uint32_t kItemClassConsumable = 0;
+constexpr uint32_t kConsumableSubclassBandage = 7;
+constexpr uint32_t kConsumableSubclassItemEnhancement = 6;
+constexpr uint8_t kSpellFailedNotReady = 67;
+
+bool isBandageItem(const ItemQueryResponseData* info) {
+    return info && info->valid &&
+           info->itemClass == kItemClassConsumable &&
+           info->subClass == kConsumableSubclassBandage;
+}
+
+uint64_t targetGuidForUseItem(GameHandler& owner, const ItemQueryResponseData* info) {
+    if (!info || !info->valid || info->itemClass != kItemClassConsumable) return 0;
+    if (isBandageItem(info)) {
+        return owner.getPlayerGuid();
+    }
+    if (info->subClass == kConsumableSubclassItemEnhancement) return 0;
+    return owner.getPlayerGuid();
+}
+} // namespace
+
 static CombatTextEntry::Type combatTextTypeFromSpellMissInfo(uint8_t missInfo) {
     switch (missInfo) {
         case SpellMissInfo::MISS:    return CombatTextEntry::MISS;
@@ -220,12 +242,15 @@ void SpellHandler::registerOpcodes(DispatchTable& table) {
     table[Opcode::SMSG_SPELLENERGIZELOG] = [this](network::Packet& p) { handleSpellEnergizeLog(p); };
     table[Opcode::SMSG_INIT_EXTRA_AURA_INFO_OBSOLETE] = [this](network::Packet& p) { handleExtraAuraInfo(p, true); };
     table[Opcode::SMSG_SET_EXTRA_AURA_INFO_OBSOLETE] = [this](network::Packet& p) { handleExtraAuraInfo(p, false); };
+    table[Opcode::SMSG_SET_EXTRA_AURA_INFO_NEED_UPDATE] = [this](network::Packet& p) { handleExtraAuraInfo(p, false); };
+    table[Opcode::SMSG_SET_EXTRA_AURA_INFO_NEED_UPDATE_OBSOLETE] = [this](network::Packet& p) { handleExtraAuraInfo(p, false); };
     table[Opcode::SMSG_SPELLDISPELLOG] = [this](network::Packet& p) { handleSpellDispelLog(p); };
     table[Opcode::SMSG_SPELLSTEALLOG] = [this](network::Packet& p) { handleSpellStealLog(p); };
     table[Opcode::SMSG_SPELL_CHANCE_PROC_LOG] = [this](network::Packet& p) { handleSpellChanceProcLog(p); };
     table[Opcode::SMSG_SPELLINSTAKILLLOG] = [this](network::Packet& p) { handleSpellInstaKillLog(p); };
     table[Opcode::SMSG_SPELLLOGEXECUTE] = [this](network::Packet& p) { handleSpellLogExecute(p); };
     table[Opcode::SMSG_CLEAR_EXTRA_AURA_INFO] = [this](network::Packet& p) { handleClearExtraAuraInfo(p); };
+    table[Opcode::SMSG_CLEAR_EXTRA_AURA_INFO_OBSOLETE] = [this](network::Packet& p) { handleClearExtraAuraInfo(p); };
     table[Opcode::SMSG_ITEM_ENCHANT_TIME_UPDATE] = [this](network::Packet& p) { handleItemEnchantTimeUpdate(p); };
     table[Opcode::SMSG_RESUME_CAST_BAR] = [this](network::Packet& p) { handleResumeCastBar(p); };
     table[Opcode::MSG_CHANNEL_START] = [this](network::Packet& p) { handleChannelStart(p); };
@@ -466,6 +491,33 @@ float SpellHandler::getSpellCooldown(uint32_t spellId) const {
     return (it != spellCooldowns_.end()) ? it->second : 0.0f;
 }
 
+void SpellHandler::seedCooldownFromSpellInfo(uint32_t spellId) {
+    if (spellId == 0) return;
+    auto existing = spellCooldowns_.find(spellId);
+    if (existing != spellCooldowns_.end() && existing->second > 0.5f) return;
+
+    owner_.loadSpellNameCache();
+    auto it = owner_.spellNameCacheRef().find(spellId);
+    if (it == owner_.spellNameCacheRef().end()) return;
+
+    const uint32_t cooldownMs = std::max(it->second.recoveryMs, it->second.categoryRecoveryMs);
+    if (cooldownMs <= 1500) return; // ignore GCD-sized recovery
+
+    const float seconds = cooldownMs / 1000.0f;
+    spellCooldowns_[spellId] = seconds;
+    for (auto& slot : owner_.actionBarRef()) {
+        if (slot.type != ActionBarSlot::SPELL || slot.id != spellId) continue;
+        slot.cooldownRemaining = seconds;
+        slot.cooldownTotal = seconds;
+    }
+
+    LOG_DEBUG("Seeded cooldown from Spell.dbc: spell=", spellId, " ms=", cooldownMs);
+    if (owner_.addonEventCallbackRef()) {
+        owner_.addonEventCallbackRef()("SPELL_UPDATE_COOLDOWN", {});
+        owner_.addonEventCallbackRef()("ACTIONBAR_UPDATE_COOLDOWN", {});
+    }
+}
+
 void SpellHandler::learnTalent(uint32_t talentId, uint32_t requestedRank) {
     if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) {
         LOG_WARNING("learnTalent: Not in world or no socket connection");
@@ -562,9 +614,11 @@ void SpellHandler::useItemBySlot(int backpackIndex) {
 
     if (itemGuid != 0 && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
         uint32_t useSpellId = findOnUseSpellId(slot.item.itemId);
+        const auto* itemInfo = owner_.getItemInfo(slot.item.itemId);
+        const uint64_t targetGuid = targetGuidForUseItem(owner_, itemInfo);
         auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId)
-            : UseItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId);
+            ? owner_.getPacketParsers()->buildUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId, targetGuid)
+            : UseItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId, targetGuid);
         owner_.getSocket()->send(packet);
     } else if (itemGuid == 0) {
         owner_.addSystemChatMessage("Cannot use that item right now.");
@@ -595,9 +649,11 @@ void SpellHandler::useItemInBag(int bagIndex, int slotIndex) {
     if (itemGuid != 0 && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
         uint32_t useSpellId = findOnUseSpellId(slot.item.itemId);
         uint8_t wowBag = static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex);
+        const auto* itemInfo = owner_.getItemInfo(slot.item.itemId);
+        const uint64_t targetGuid = targetGuidForUseItem(owner_, itemInfo);
         auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId)
-            : UseItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId);
+            ? owner_.getPacketParsers()->buildUseItem(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId, targetGuid)
+            : UseItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId, targetGuid);
         LOG_INFO("useItemInBag: sending CMSG_USE_ITEM, bag=", (int)wowBag, " slot=", slotIndex,
                  " packetSize=", packet.getSize());
         owner_.getSocket()->send(packet);
@@ -769,6 +825,57 @@ void SpellHandler::loadTalentDbc() {
     } else {
         LOG_WARNING("Could not load TalentTab.dbc");
     }
+
+    syncPreWotlkTalentsFromKnownSpells();
+}
+
+void SpellHandler::syncPreWotlkTalentsFromKnownSpells() {
+    if (!isPreWotlk() || talentCache_.empty() || knownSpells_.empty()) return;
+
+    std::unordered_map<uint32_t, uint8_t> derived;
+    uint32_t spentPoints = 0;
+    for (const auto& [talentId, talent] : talentCache_) {
+        uint8_t rankKnown = 0;
+        for (int rank = 0; rank < 5; ++rank) {
+            uint32_t rankSpell = talent.rankSpells[rank];
+            if (rankSpell != 0 && knownSpells_.count(rankSpell) > 0) {
+                rankKnown = static_cast<uint8_t>(rank + 1);
+            }
+        }
+        if (rankKnown > 0) {
+            derived[talentId] = rankKnown;
+            spentPoints += rankKnown;
+        }
+    }
+
+    const uint32_t playerLevel = owner_.getPlayerLevel();
+    const uint32_t earnedPoints = (playerLevel > 9)
+        ? std::min<uint32_t>(playerLevel - 9, 61u)
+        : 0u;
+    const uint8_t unspent = static_cast<uint8_t>(
+        earnedPoints > spentPoints ? std::min<uint32_t>(earnedPoints - spentPoints, 255u) : 0u);
+
+    if (learnedTalents_[0] == derived && activeTalentSpec_ == 0 &&
+        unspentTalentPoints_[0] == unspent) {
+        return;
+    }
+
+    activeTalentSpec_ = 0;
+    learnedTalents_[0] = std::move(derived);
+    learnedTalents_[1].clear();
+    learnedGlyphs_[0].fill(0);
+    learnedGlyphs_[1].fill(0);
+    unspentTalentPoints_[0] = unspent;
+    unspentTalentPoints_[1] = 0;
+
+    LOG_INFO("[pre-WotLK] Derived ", learnedTalents_[0].size(),
+             " learned talent(s) from known spells; spent=", spentPoints,
+             " unspent=", static_cast<int>(unspent));
+
+    if (owner_.addonEventCallbackRef()) {
+        owner_.addonEventCallbackRef()("CHARACTER_POINTS_CHANGED", {});
+        owner_.addonEventCallbackRef()("PLAYER_TALENT_UPDATE", {});
+    }
 }
 
 void SpellHandler::updateTimers(float dt) {
@@ -817,6 +924,10 @@ void SpellHandler::handleInitialSpells(network::Packet& packet) {
     // Ensure Attack (6603) and Hearthstone (8690) are always present
     knownSpells_.insert(6603u);
     knownSpells_.insert(8690u);
+    if (isPreWotlk()) {
+        loadTalentDbc();
+        syncPreWotlkTalentsFromKnownSpells();
+    }
 
     // Set initial cooldowns
     for (const auto& cd : data.cooldowns) {
@@ -903,6 +1014,9 @@ void SpellHandler::handleCastFailed(network::Packet& packet) {
     auto playerEntity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid());
     if (auto playerUnit = std::dynamic_pointer_cast<Unit>(playerEntity)) {
         powerType = playerUnit->getPowerType();
+    }
+    if (data.result == kSpellFailedNotReady) {
+        seedCooldownFromSpellInfo(data.spellId);
     }
     const char* reason = getSpellCastResultString(data.result, powerType);
     std::string errMsg = reason ? reason
@@ -1355,6 +1469,7 @@ void SpellHandler::handleLearnedSpell(network::Packet& packet) {
     const bool alreadyKnown = knownSpells_.count(spellId) > 0;
     knownSpells_.insert(spellId);
     LOG_INFO("Learned spell: ", spellId, alreadyKnown ? " (already known, skipping chat)" : "");
+    if (isPreWotlk()) loadTalentDbc();
 
     // Check if this spell corresponds to a talent rank
     bool isTalentSpell = false;
@@ -1399,6 +1514,7 @@ void SpellHandler::handleRemovedSpell(network::Packet& packet) {
     if (packet.getRemainingSize() < minSz) return;
     uint32_t spellId = classicSpellId ? packet.readUInt16() : packet.readUInt32();
     knownSpells_.erase(spellId);
+    syncPreWotlkTalentsFromKnownSpells();
     LOG_INFO("Removed spell: ", spellId);
     if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("SPELLS_CHANGED", {});
 
@@ -1430,6 +1546,7 @@ void SpellHandler::handleSupercededSpell(network::Packet& packet) {
     const bool newSpellAlreadyAnnounced = knownSpells_.count(newSpellId) > 0;
 
     knownSpells_.insert(newSpellId);
+    syncPreWotlkTalentsFromKnownSpells();
 
     LOG_INFO("Spell superceded: ", oldSpellId, " -> ", newSpellId);
 
@@ -1904,6 +2021,8 @@ void SpellHandler::loadSpellNameCache() const {
     const uint32_t ebp2Field = spellL ? spellL->field("EffectBasePoints2") : 0xFFFFFFFF;
     const uint32_t durIdxField = spellL ? spellL->field("DurationIndex") : 0xFFFFFFFF;
     const uint32_t spellVisualIdField = spellL ? spellL->field("SpellVisualID") : 0xFFFFFFFF;
+    const uint32_t recoveryField = spellL ? spellL->field("RecoveryTime") : 0xFFFFFFFF;
+    const uint32_t categoryRecoveryField = spellL ? spellL->field("CategoryRecoveryTime") : 0xFFFFFFFF;
 
     uint32_t count = dbc->getRecordCount();
     for (uint32_t i = 0; i < count; ++i) {
@@ -1912,7 +2031,9 @@ void SpellHandler::loadSpellNameCache() const {
         std::string name = dbc->getString(i, nameField);
         std::string rank = dbc->getString(i, rankField);
         if (!name.empty()) {
-            GameHandler::SpellNameEntry entry{std::move(name), std::move(rank), {}, 0, 0, 0, {0, 0, 0}, 0.0f, 0};
+            GameHandler::SpellNameEntry entry;
+            entry.name = std::move(name);
+            entry.rank = std::move(rank);
             if (tooltipField != 0xFFFFFFFF) {
                 entry.description = dbc->getString(i, tooltipField);
             }
@@ -1939,6 +2060,10 @@ void SpellHandler::loadSpellNameCache() const {
             // SpellVisualID: references SpellVisual.dbc for cast/impact M2 effects
             if (spellVisualIdField != 0xFFFFFFFF && spellVisualIdField < dbc->getFieldCount())
                 entry.spellVisualId = dbc->getUInt32(i, spellVisualIdField);
+            if (recoveryField != 0xFFFFFFFF && recoveryField < dbc->getFieldCount())
+                entry.recoveryMs = dbc->getUInt32(i, recoveryField);
+            if (categoryRecoveryField != 0xFFFFFFFF && categoryRecoveryField < dbc->getFieldCount())
+                entry.categoryRecoveryMs = dbc->getUInt32(i, categoryRecoveryField);
             owner_.spellNameCacheRef()[id] = std::move(entry);
         }
     }
@@ -2261,6 +2386,9 @@ void SpellHandler::handleCastResult(network::Packet& packet) {
                     playerPowerType = static_cast<int>(pu->getPowerType());
             }
             const char* reason = getSpellCastResultString(castResult, playerPowerType);
+            if (castResult == kSpellFailedNotReady) {
+                seedCooldownFromSpellInfo(castResultSpellId);
+            }
             std::string errMsg = reason ? reason
                                         : ("Spell cast failed (error " + std::to_string(castResult) + ")");
             owner_.addUIError(errMsg);
@@ -2825,6 +2953,14 @@ void SpellHandler::handleExtraAuraInfo(network::Packet& packet, bool isInit) {
             a.receivedAtMs = nowMs;
         }
     }
+    if (auraList && owner_.addonEventCallbackRef()) {
+        std::string unitId;
+        if (auraTargetGuid == owner_.getPlayerGuid()) unitId = "player";
+        else if (auraTargetGuid == owner_.getTargetGuid()) unitId = "target";
+        else if (auraTargetGuid == owner_.focusGuidRef()) unitId = "focus";
+        else if (auraTargetGuid == owner_.petGuidRef()) unitId = "pet";
+        if (!unitId.empty()) owner_.addonEventCallbackRef()("UNIT_AURA", {unitId});
+    }
     packet.skipAll();
 }
 
@@ -3275,8 +3411,17 @@ void SpellHandler::handleClearExtraAuraInfo(network::Packet& packet) {
         std::vector<AuraSlot>* auraList = nullptr;
         if (clearGuid == owner_.getPlayerGuid())       auraList = &playerAuras_;
         else if (clearGuid == owner_.getTargetGuid())   auraList = &targetAuras_;
+        else if (clearGuid != 0)                         auraList = &unitAurasCache_[clearGuid];
         if (auraList && slot < auraList->size()) {
             (*auraList)[slot] = AuraSlot{};
+        }
+        if (auraList && owner_.addonEventCallbackRef()) {
+            std::string unitId;
+            if (clearGuid == owner_.getPlayerGuid()) unitId = "player";
+            else if (clearGuid == owner_.getTargetGuid()) unitId = "target";
+            else if (clearGuid == owner_.focusGuidRef()) unitId = "focus";
+            else if (clearGuid == owner_.petGuidRef()) unitId = "pet";
+            if (!unitId.empty()) owner_.addonEventCallbackRef()("UNIT_AURA", {unitId});
         }
     }
     packet.skipAll();

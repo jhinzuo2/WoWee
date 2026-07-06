@@ -1002,7 +1002,7 @@ void GameHandler::registerOpcodeHandlers() {
             if (rem < 4) return;
             uint32_t packed = packet.readUInt32();
             rem -= 4;
-            if (i >= ACTION_BAR_SLOTS) continue;  // only load bars 1 and 2
+            if (i >= ACTION_BAR_SLOTS) continue;
             if (packed == 0) {
                 // Empty slot — only clear if not already set to Attack/Hearthstone defaults
                 // so we don't wipe hardcoded fallbacks when the server sends zeros.

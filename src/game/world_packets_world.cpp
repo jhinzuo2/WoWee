@@ -491,7 +491,9 @@ network::Packet AutostoreLootItemPacket::build(uint8_t slotIndex) {
     return packet;
 }
 
-network::Packet UseItemPacket::build(uint8_t bagIndex, uint8_t slotIndex, uint64_t itemGuid, uint32_t spellId) {
+network::Packet UseItemPacket::build(uint8_t bagIndex, uint8_t slotIndex,
+                                     uint64_t itemGuid, uint32_t spellId,
+                                     uint64_t targetGuid) {
     network::Packet packet(wireOpcode(Opcode::CMSG_USE_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
@@ -500,13 +502,24 @@ network::Packet UseItemPacket::build(uint8_t bagIndex, uint8_t slotIndex, uint64
     packet.writeUInt64(itemGuid); // full 8-byte GUID
     packet.writeUInt32(0); // glyph index
     packet.writeUInt8(0);  // cast flags
-    // SpellCastTargets: self
-    packet.writeUInt32(0x00);
+    if (targetGuid != 0) {
+        packet.writeUInt32(0x02); // TARGET_FLAG_UNIT
+        packet.writePackedGuid(targetGuid);
+    } else {
+        packet.writeUInt32(0x00); // TARGET_FLAG_SELF
+    }
     return packet;
 }
 
 network::Packet OpenItemPacket::build(uint8_t bagIndex, uint8_t slotIndex) {
     network::Packet packet(wireOpcode(Opcode::CMSG_OPEN_ITEM));
+    packet.writeUInt8(bagIndex);
+    packet.writeUInt8(slotIndex);
+    return packet;
+}
+
+network::Packet ReadItemPacket::build(uint8_t bagIndex, uint8_t slotIndex) {
+    network::Packet packet(wireOpcode(Opcode::CMSG_READ_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
     return packet;

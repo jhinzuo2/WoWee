@@ -437,13 +437,13 @@ void EntityController::updateNonPlayerTransportAttachment(const UpdateBlock& blo
     }
 }
 
-//     Rebuild playerAuras from UNIT_FIELD_AURAS (Classic/vanilla only).
+//     Rebuild playerAuras from UNIT_FIELD_AURAS (Classic/TBC-era clients).
 //     blockFields is used to check if any aura field was updated in this packet.
 //     entity->getFields() is used for reading the full accumulated state.
-//     Normalises Classic harmful bit (0x02) to WotLK debuff bit (0x80) so
+//     Normalises pre-WotLK harmful bit (0x02) to WotLK debuff bit (0x80) so
 //     downstream code checking for 0x80 works consistently across expansions.
-void EntityController::syncClassicAurasFromFields(const std::shared_ptr<Entity>& entity) {
-    if (!isClassicLikeExpansion() || !owner_.getSpellHandler()) return;
+void EntityController::syncPreWotlkAurasFromFields(const std::shared_ptr<Entity>& entity) {
+    if (!isPreWotlk() || !owner_.getSpellHandler()) return;
 
     const uint16_t ufAuras     = fieldIndex(UF::UNIT_FIELD_AURAS);
     const uint16_t ufAuraFlags = fieldIndex(UF::UNIT_FIELD_AURAFLAGS);
@@ -472,7 +472,7 @@ void EntityController::syncClassicAurasFromFields(const std::shared_ptr<Entity>&
                 if (fit != allFields.end())
                     aFlag = static_cast<uint8_t>((fit->second >> ((slot % 4) * 8)) & 0xFF);
             }
-            // Normalize Classic harmful bit (0x02) to WotLK debuff bit (0x80)
+            // Normalize pre-WotLK harmful bit (0x02) to WotLK debuff bit (0x80)
             // so downstream code checking for 0x80 works consistently.
             if (aFlag & 0x02)
                 aFlag = (aFlag & ~0x02) | 0x80;
@@ -483,7 +483,7 @@ void EntityController::syncClassicAurasFromFields(const std::shared_ptr<Entity>&
             a.receivedAtMs = nowMs;
         }
     }
-    LOG_DEBUG("[Classic] Rebuilt playerAuras from UNIT_FIELD_AURAS");
+    LOG_DEBUG("[pre-WotLK] Rebuilt playerAuras from UNIT_FIELD_AURAS");
     pendingEvents_.emit("UNIT_AURA", {"player"});
 }
 
@@ -503,7 +503,7 @@ void EntityController::detectPlayerMountChange(uint32_t newMountDisplayId,
                 owner_.mountAuraSpellIdRef() = a.spellId;
             }
         }
-        // Classic/vanilla fallback: scan UNIT_FIELD_AURAS from same update block
+        // Pre-WotLK fallback: scan UNIT_FIELD_AURAS from same update block
         if (owner_.mountAuraSpellIdRef() == 0) {
             const uint16_t ufAuras = fieldIndex(UF::UNIT_FIELD_AURAS);
             if (ufAuras != 0xFFFF) {
@@ -1458,9 +1458,9 @@ void EntityController::onCreatePlayer(const UpdateBlock& block, std::shared_ptr<
             }
         }
     }
-    // Classic aura sync on initial object create
+    // Pre-WotLK aura sync on initial object create
     if (block.guid == owner_.getPlayerGuid()) {
-        syncClassicAurasFromFields(entity);
+        syncPreWotlkAurasFromFields(entity);
     }
 
     // Hostility
@@ -1628,9 +1628,9 @@ void EntityController::onValuesUpdatePlayer(const UpdateBlock& block, std::share
     UnitFieldIndices ufi = UnitFieldIndices::resolve();
     UnitFieldUpdateResult result = applyUnitFieldsOnUpdate(block, entity, unit, ufi);
 
-    // Classic aura sync from UNIT_FIELD_AURAS when those fields are updated
+    // Pre-WotLK aura sync from UNIT_FIELD_AURAS when those fields are updated
     if (block.guid == owner_.getPlayerGuid()) {
-        syncClassicAurasFromFields(entity);
+        syncPreWotlkAurasFromFields(entity);
     }
 
     // Display ID changed — re-spawn/model-change
@@ -2209,6 +2209,13 @@ void EntityController::handlePageTextQueryResponse(network::Packet& packet) {
     if (!PageTextQueryResponseParser::parse(packet, data)) return;
 
     if (!data.isValid()) return;
+
+    std::string playerName;
+    if (auto entity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid())) {
+        if (auto unit = std::dynamic_pointer_cast<Unit>(entity))
+            playerName = unit->getName();
+    }
+    data.text = normalizeWowTextTokens(data.text, playerName);
 
     // Append page if not already collected
     bool alreadyHave = false;

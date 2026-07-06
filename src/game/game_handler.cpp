@@ -1993,6 +1993,15 @@ const std::vector<GameHandler::WhoEntry>& GameHandler::getWhoResults() const {
     return empty;
 }
 
+bool GameHandler::isInGroup() const {
+    return socialHandler_ ? socialHandler_->isInGroup() : !partyData.isEmpty();
+}
+
+const GroupListData& GameHandler::getPartyData() const {
+    if (socialHandler_) return socialHandler_->getPartyData();
+    return partyData;
+}
+
 uint32_t GameHandler::getWhoOnlineCount() const {
     return socialHandler_ ? socialHandler_->getWhoOnlineCount() : 0;
 }

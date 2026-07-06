@@ -508,7 +508,7 @@ bool ItemQueryResponseParser::parse(network::Packet& packet, ItemQueryResponseDa
 
     // Post-description fields: PageText, LanguageID, PageMaterial, StartQuest
     if (packet.hasRemaining(16)) {
-        packet.readUInt32(); // PageText
+        data.pageTextId = packet.readUInt32(); // PageText
         packet.readUInt32(); // LanguageID
         packet.readUInt32(); // PageMaterial
         data.startQuestId = packet.readUInt32(); // StartQuest
@@ -944,12 +944,12 @@ bool InitialSpellsParser::parse(network::Packet& packet, InitialSpellsData& data
     }
 
     LOG_DEBUG("SMSG_INITIAL_SPELLS: spellCount=", spellCount,
-              vanillaFormat ? " (vanilla uint16 format)" : " (TBC/WotLK uint32 format)");
+              vanillaFormat ? " (uint16 spell format)" : " (uint32 spell format)");
 
     data.spellIds.reserve(spellCount);
     for (uint16_t i = 0; i < spellCount; ++i) {
-        // Vanilla spell: spellId(2) + slot(2) = 4 bytes
-        // TBC/WotLK spell: spellId(4) + unknown(2) = 6 bytes
+        // Classic/TBC spell: spellId(2) + slot/unknown(2) = 4 bytes
+        // WotLK spell: spellId(4) + unknown(2) = 6 bytes
         size_t spellEntrySize = vanillaFormat ? 4 : 6;
         if (!packet.hasRemaining(spellEntrySize)) {
             LOG_WARNING("SMSG_INITIAL_SPELLS: spell ", i, " truncated (", spellCount, " expected)");
@@ -990,8 +990,8 @@ bool InitialSpellsParser::parse(network::Packet& packet, InitialSpellsData& data
 
     data.cooldowns.reserve(cooldownCount);
     for (uint16_t i = 0; i < cooldownCount; ++i) {
-        // Vanilla cooldown: spellId(2) + itemId(2) + categoryId(2) + cooldownMs(4) + categoryCooldownMs(4) = 14 bytes
-        // TBC/WotLK cooldown: spellId(4) + itemId(2) + categoryId(2) + cooldownMs(4) + categoryCooldownMs(4) = 16 bytes
+        // Classic/TBC cooldown: spellId(2) + itemId(2) + categoryId(2) + cooldownMs(4) + categoryCooldownMs(4) = 14 bytes
+        // WotLK cooldown: spellId(4) + itemId(2) + categoryId(2) + cooldownMs(4) + categoryCooldownMs(4) = 16 bytes
         size_t cooldownEntrySize = vanillaFormat ? 14 : 16;
         if (!packet.hasRemaining(cooldownEntrySize)) {
             LOG_WARNING("SMSG_INITIAL_SPELLS: cooldown ", i, " truncated (", cooldownCount, " expected)");

@@ -1298,8 +1298,8 @@ public:
     void leaveGroup();
     void convertToRaid();
     void sendSetLootMethod(uint32_t method, uint32_t threshold, uint64_t masterLooterGuid);
-    bool isInGroup() const { return !partyData.isEmpty(); }
-    const GroupListData& getPartyData() const { return partyData; }
+    bool isInGroup() const;
+    const GroupListData& getPartyData() const;
     const std::vector<ContactEntry>& getContacts() const { return contacts_; }
     bool hasPendingGroupInvite() const;
     const std::string& getPendingInviterName() const;
@@ -1976,6 +1976,8 @@ public:
     // CMSG_OPEN_ITEM — for locked containers (lockboxes); server checks keyring automatically
     void openItemBySlot(int backpackIndex);
     void openItemInBag(int bagIndex, int slotIndex);
+    void readItemBySlot(int backpackIndex);
+    void readItemInBag(int bagIndex, int slotIndex);
     void destroyItem(uint8_t bag, uint8_t slot, uint8_t count = 1);
     void splitItem(uint8_t srcBag, uint8_t srcSlot, uint8_t count);
     void swapContainerItems(uint8_t srcBag, uint8_t srcSlot, uint8_t dstBag, uint8_t dstSlot);
@@ -2507,6 +2509,8 @@ public:
         int32_t effectBasePoints[3] = {0, 0, 0};
         float durationSec = 0.0f;
         uint32_t spellVisualId = 0;
+        uint32_t recoveryMs = 0;
+        uint32_t categoryRecoveryMs = 0;
     };
     static constexpr size_t PLAYER_EXPLORED_ZONES_COUNT = 128;
     std::string getAreaName(uint32_t areaId) const;

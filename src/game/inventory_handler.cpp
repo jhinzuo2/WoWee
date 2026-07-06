@@ -26,6 +26,27 @@ std::string formatCopperAmount(uint32_t amount);
 InventoryHandler::InventoryHandler(GameHandler& owner)
     : owner_(owner) {}
 
+namespace {
+constexpr uint32_t kItemClassConsumable = 0;
+constexpr uint32_t kConsumableSubclassBandage = 7;
+constexpr uint32_t kConsumableSubclassItemEnhancement = 6;
+
+bool isBandageItem(const ItemQueryResponseData* info) {
+    return info && info->valid &&
+           info->itemClass == kItemClassConsumable &&
+           info->subClass == kConsumableSubclassBandage;
+}
+
+uint64_t targetGuidForUseItem(GameHandler& owner, const ItemQueryResponseData* info) {
+    if (!info || !info->valid || info->itemClass != kItemClassConsumable) return 0;
+    if (isBandageItem(info)) {
+        return owner.getPlayerGuid();
+    }
+    if (info->subClass == kConsumableSubclassItemEnhancement) return 0;
+    return owner.getPlayerGuid();
+}
+} // namespace
+
 // ============================================================
 // Opcode Registration
 // ============================================================
@@ -88,8 +109,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
     table[Opcode::SMSG_LOOT_CLEAR_MONEY] = [](network::Packet& /*packet*/) {};
 
     // ---- Read item (books) (moved from GameHandler) ----
-    table[Opcode::SMSG_READ_ITEM_OK] = [this](network::Packet& packet) {
-        owner_.bookPagesRef().clear();  // fresh book for this item read
+    table[Opcode::SMSG_READ_ITEM_OK] = [](network::Packet& packet) {
         packet.skipAll();
     };
     table[Opcode::SMSG_READ_ITEM_FAILED] = [this](network::Packet& packet) {
@@ -1139,9 +1159,11 @@ void InventoryHandler::useItemBySlot(int backpackIndex) {
             LOG_DEBUG("useItemBySlot: entry=", slot.item.itemId,
                       " spellId=", useSpellId);
         }
+        const auto* itemInfo = owner_.getItemInfo(slot.item.itemId);
+        const uint64_t targetGuid = targetGuidForUseItem(owner_, itemInfo);
         auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId)
-            : UseItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId);
+            ? owner_.getPacketParsers()->buildUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId, targetGuid)
+            : UseItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId, targetGuid);
         owner_.getSocket()->send(packet);
     } else if (itemGuid == 0) {
         LOG_WARNING("useItemBySlot: itemGuid=0 for item='", slot.item.name,
@@ -1182,9 +1204,11 @@ void InventoryHandler::useItemInBag(int bagIndex, int slotIndex) {
             }
         }
         uint8_t wowBag = static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex);
+        const auto* itemInfo = owner_.getItemInfo(slot.item.itemId);
+        const uint64_t targetGuid = targetGuidForUseItem(owner_, itemInfo);
         auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId)
-            : UseItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId);
+            ? owner_.getPacketParsers()->buildUseItem(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId, targetGuid)
+            : UseItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId, targetGuid);
         LOG_INFO("useItemInBag: sending CMSG_USE_ITEM, bag=", (int)wowBag, " slot=", slotIndex,
                  " packetSize=", packet.getSize());
         owner_.getSocket()->send(packet);
@@ -1212,6 +1236,59 @@ void InventoryHandler::openItemInBag(int bagIndex, int slotIndex) {
     auto packet = OpenItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex));
     LOG_INFO("openItemInBag: CMSG_OPEN_ITEM bag=", (int)wowBag, " slot=", slotIndex);
     owner_.getSocket()->send(packet);
+}
+
+void InventoryHandler::readItemBySlot(int backpackIndex) {
+    if (backpackIndex < 0 || backpackIndex >= owner_.inventoryRef().getBackpackSize()) return;
+    const auto& slot = owner_.inventoryRef().getBackpackSlot(backpackIndex);
+    if (slot.empty()) return;
+    if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+
+    const auto* info = owner_.getItemInfo(slot.item.itemId);
+    uint32_t pageTextId = info ? info->pageTextId : slot.item.pageTextId;
+    if (pageTextId == 0) return;
+
+    uint64_t itemGuid = owner_.backpackSlotGuidsRef()[backpackIndex];
+    if (itemGuid == 0) itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
+
+    owner_.bookPagesRef().clear();
+    auto readPacket = ReadItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex));
+    owner_.getSocket()->send(readPacket);
+    auto pagePacket = PageTextQueryPacket::build(pageTextId, itemGuid != 0 ? itemGuid : owner_.getPlayerGuid());
+    owner_.getSocket()->send(pagePacket);
+    LOG_INFO("readItemBySlot: CMSG_READ_ITEM pageTextId=", pageTextId,
+             " bag=0xFF slot=", (Inventory::NUM_EQUIP_SLOTS + backpackIndex));
+}
+
+void InventoryHandler::readItemInBag(int bagIndex, int slotIndex) {
+    if (bagIndex < 0 || bagIndex >= owner_.inventoryRef().NUM_BAG_SLOTS) return;
+    if (slotIndex < 0 || slotIndex >= owner_.inventoryRef().getBagSize(bagIndex)) return;
+    const auto& slot = owner_.inventoryRef().getBagSlot(bagIndex, slotIndex);
+    if (slot.empty()) return;
+    if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+
+    const auto* info = owner_.getItemInfo(slot.item.itemId);
+    uint32_t pageTextId = info ? info->pageTextId : slot.item.pageTextId;
+    if (pageTextId == 0) return;
+
+    uint64_t itemGuid = 0;
+    uint64_t bagGuid = owner_.equipSlotGuidsRef()[Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex];
+    if (bagGuid != 0) {
+        auto it = owner_.containerContentsRef().find(bagGuid);
+        if (it != owner_.containerContentsRef().end() && slotIndex < static_cast<int>(it->second.numSlots)) {
+            itemGuid = it->second.slotGuids[slotIndex];
+        }
+    }
+    if (itemGuid == 0) itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
+
+    uint8_t wowBag = static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex);
+    owner_.bookPagesRef().clear();
+    auto readPacket = ReadItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex));
+    owner_.getSocket()->send(readPacket);
+    auto pagePacket = PageTextQueryPacket::build(pageTextId, itemGuid != 0 ? itemGuid : owner_.getPlayerGuid());
+    owner_.getSocket()->send(pagePacket);
+    LOG_INFO("readItemInBag: CMSG_READ_ITEM pageTextId=", pageTextId,
+             " bag=", static_cast<int>(wowBag), " slot=", slotIndex);
 }
 
 void InventoryHandler::destroyItem(uint8_t bag, uint8_t slot, uint8_t count) {
@@ -2756,6 +2833,7 @@ ItemDef InventoryHandler::buildItemDef(uint32_t entry, uint32_t stackCount,
         def.requiredLevel = info.requiredLevel;
         def.bindType = info.bindType;
         def.description = info.description;
+        def.pageTextId = info.pageTextId;
         def.startQuestId = info.startQuestId;
         def.extraStats.clear();
         for (const auto& es : info.extraStats)

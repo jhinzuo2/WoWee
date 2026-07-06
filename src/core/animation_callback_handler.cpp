@@ -382,7 +382,43 @@ void AnimationCallbackHandler::setupCallbacks() {
             uint32_t currentSpell = isLocalPlayer ? gameHandler_.getCurrentCastSpellId() : 0;
             bool isFishing = isChannel && isFishingSpell(currentSpell);
 
-            if (isFishing && cr->hasAnimation(instanceId, rendering::anim::FISHING_LOOP)) {
+            // Helper: pick first animation the model supports from a list
+            auto pickFirst = [&](std::initializer_list<uint32_t> ids) -> uint32_t {
+                for (uint32_t id : ids)
+                    if (cr->hasAnimation(instanceId, id)) return id;
+                return 0;
+            };
+
+            bool isBandage = false;
+            if (isLocalPlayer && currentSpell != 0) {
+                gameHandler_.loadSpellNameCache();
+                auto it = gameHandler_.spellNameCacheRef().find(currentSpell);
+                isBandage = (it != gameHandler_.spellNameCacheRef().end() &&
+                             it->second.name.find("Bandage") != std::string::npos);
+            }
+
+            if (isBandage) {
+                uint32_t useStart = isChannel ? 0 : pickFirst({
+                    rendering::anim::USE_STANDING_START,
+                    rendering::anim::EMOTE_USE_STANDING_NO_SHEATHE,
+                    rendering::anim::EMOTE_USE_STANDING
+                });
+                uint32_t useLoop = pickFirst({
+                    rendering::anim::USE_STANDING_LOOP,
+                    rendering::anim::EMOTE_USE_STANDING_NO_SHEATHE,
+                    rendering::anim::EMOTE_USE_STANDING,
+                    rendering::anim::CHANNEL_CAST_OMNI,
+                    rendering::anim::READY_SPELL_OMNI,
+                    rendering::anim::STAND
+                });
+                uint32_t useEnd = isChannel ? 0 : pickFirst({
+                    rendering::anim::USE_STANDING_END,
+                    rendering::anim::STAND
+                });
+                if (auto* ac = renderer_.getAnimationController()) {
+                    ac->startSpellCast(useStart, useLoop ? useLoop : rendering::anim::STAND, true, useEnd);
+                }
+            } else if (isFishing && cr->hasAnimation(instanceId, rendering::anim::FISHING_LOOP)) {
                 // Fishing: use FISHING_LOOP (looping idle) for the channel duration
                 if (isLocalPlayer) {
                     auto* ac = renderer_.getAnimationController();
@@ -391,13 +427,6 @@ void AnimationCallbackHandler::setupCallbacks() {
                     cr->playAnimation(instanceId, rendering::anim::FISHING_LOOP, true);
                 }
             } else {
-            // Helper: pick first animation the model supports from a list
-            auto pickFirst = [&](std::initializer_list<uint32_t> ids) -> uint32_t {
-                for (uint32_t id : ids)
-                    if (cr->hasAnimation(instanceId, id)) return id;
-                return 0;
-            };
-
             // Precast wind-up (one-shot, non-channels only)
             uint32_t precastAnim = 0;
             if (!isChannel) {

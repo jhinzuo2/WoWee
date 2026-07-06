@@ -159,9 +159,9 @@ private:
     void updateNonPlayerTransportAttachment(const UpdateBlock& block,
                                             const std::shared_ptr<Entity>& entity,
                                             ObjectType entityType);
-    // Rebuild playerAuras_ from UNIT_FIELD_AURAS (Classic/vanilla only).
+    // Rebuild playerAuras_ from UNIT_FIELD_AURAS (Classic/TBC-era clients).
     //     Consolidates identical logic from CREATE and VALUES handlers.
-    void syncClassicAurasFromFields(const std::shared_ptr<Entity>& entity);
+    void syncPreWotlkAurasFromFields(const std::shared_ptr<Entity>& entity);
     // Detect mount/dismount from UNIT_FIELD_MOUNTDISPLAYID changes (self-player only).
     //     Consolidates identical logic from CREATE and VALUES handlers.
     void detectPlayerMountChange(uint32_t newMountDisplayId,

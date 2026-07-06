@@ -2313,6 +2313,14 @@ void GameHandler::openItemInBag(int bagIndex, int slotIndex) {
     if (inventoryHandler_) inventoryHandler_->openItemInBag(bagIndex, slotIndex);
 }
 
+void GameHandler::readItemBySlot(int backpackIndex) {
+    if (inventoryHandler_) inventoryHandler_->readItemBySlot(backpackIndex);
+}
+
+void GameHandler::readItemInBag(int bagIndex, int slotIndex) {
+    if (inventoryHandler_) inventoryHandler_->readItemInBag(bagIndex, slotIndex);
+}
+
 void GameHandler::useItemById(uint32_t itemId) {
     if (inventoryHandler_) inventoryHandler_->useItemById(itemId);
 }
