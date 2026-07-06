@@ -22,6 +22,7 @@ public:
     void update(float deltaTime);
     void processMouseMotion(const SDL_MouseMotionEvent& event);
     void processMouseButton(const SDL_MouseButtonEvent& event);
+    void releaseMouseCapture();
 
     void setMovementSpeed(float speed) { movementSpeed = speed; }
     void setMouseSensitivity(float sensitivity) { mouseSensitivity = sensitivity; }

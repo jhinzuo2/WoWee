@@ -119,6 +119,8 @@ public:
 private:
     void update(float deltaTime);
     void render();
+    void performLogoutToLogin();
+    void processDeferredLogoutToLogin();
     void setupUICallbacks();
     void spawnPlayerCharacter();
     void buildFactionHostilityMap(uint8_t playerRace);
@@ -154,6 +156,8 @@ private:
 
     AppState state = AppState::AUTHENTICATION;
     bool running = false;
+    bool renderingFrame_ = false;
+    bool logoutToLoginPending_ = false;
     bool playerCharacterSpawned = false;
     bool npcsSpawned = false;
     bool spawnSnapToGround = true;

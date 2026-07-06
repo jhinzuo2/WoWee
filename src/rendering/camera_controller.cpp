@@ -2038,6 +2038,14 @@ void CameraController::processMouseButton(const SDL_MouseButtonEvent& event) {
     mouseButtonDown = anyDown;
 }
 
+void CameraController::releaseMouseCapture() {
+    leftMouseDown = false;
+    rightMouseDown = false;
+    mouseButtonDown = false;
+    SDL_SetRelativeMouseMode(SDL_FALSE);
+    SDL_ShowCursor(SDL_ENABLE);
+}
+
 void CameraController::resetAngles() {
     if (!camera) return;
     yaw = defaultYaw;

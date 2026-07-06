@@ -679,6 +679,9 @@ void Application::run() {
                 if (window && window->getSDLWindow()) {
                     SDL_SetWindowGrab(window->getSDLWindow(), SDL_FALSE);
                 }
+                if (renderer && renderer->getCameraController()) {
+                    renderer->getCameraController()->releaseMouseCapture();
+                }
                 LOG_WARNING("Watchdog: force-released mouse capture on main thread");
             }
 
@@ -691,6 +694,10 @@ void Application::run() {
             // Cap delta time to prevent large jumps
             if (deltaTime > 0.1f) {
                 deltaTime = 0.1f;
+            }
+
+            if (renderer && renderer->getCameraController() && ImGui::GetIO().WantCaptureMouse) {
+                renderer->getCameraController()->releaseMouseCapture();
             }
 
             // Poll events
@@ -816,6 +823,8 @@ void Application::run() {
                 LOG_ERROR("Exception during swapBuffers: ", e.what());
                 throw;
             }
+
+            processDeferredLogoutToLogin();
 
             // Exit gracefully on GPU device lost (unrecoverable)
             if (renderer && renderer->getVkContext() && renderer->getVkContext()->isDeviceLost()) {
@@ -1085,6 +1094,24 @@ void Application::reloadExpansionData() {
 }
 
 void Application::logoutToLogin() {
+    if (renderingFrame_) {
+        if (!logoutToLoginPending_) {
+            LOG_INFO("Logout requested during render; deferring until frame completes");
+        }
+        logoutToLoginPending_ = true;
+        return;
+    }
+
+    performLogoutToLogin();
+}
+
+void Application::processDeferredLogoutToLogin() {
+    if (!logoutToLoginPending_) return;
+    logoutToLoginPending_ = false;
+    performLogoutToLogin();
+}
+
+void Application::performLogoutToLogin() {
     LOG_INFO("Logout requested");
 
     // Disconnect TransportManager from WMORenderer before tearing down
@@ -1115,6 +1142,11 @@ void Application::logoutToLogin() {
     spawnedPlayerGuid_ = 0;
     spawnedAppearanceBytes_ = 0;
     spawnedFacialFeatures_ = 0;
+
+    if (renderer && renderer->getVkContext() && !renderer->getVkContext()->isDeviceLost()) {
+        LOG_DEBUG("Waiting for GPU idle before logout scene cleanup...");
+        vkDeviceWaitIdle(renderer->getVkContext()->getDevice());
+    }
 
     // --- Reset all EntitySpawner state (mount, creatures, players, GOs, queues, caches) ---
     if (entitySpawner_) entitySpawner_->resetAllState();
@@ -2148,6 +2180,7 @@ void Application::render() {
         return;
     }
 
+    renderingFrame_ = true;
     renderer->beginFrame();
 
     // Only render 3D world when in-game
@@ -2170,6 +2203,8 @@ void Application::render() {
     }
 
     renderer->endFrame();
+    renderingFrame_ = false;
+    processDeferredLogoutToLogin();
 }
 
 void Application::setupUICallbacks() {
