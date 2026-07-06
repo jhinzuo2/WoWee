@@ -1469,7 +1469,10 @@ void SpellHandler::handleLearnedSpell(network::Packet& packet) {
     const bool alreadyKnown = knownSpells_.count(spellId) > 0;
     knownSpells_.insert(spellId);
     LOG_INFO("Learned spell: ", spellId, alreadyKnown ? " (already known, skipping chat)" : "");
-    if (isPreWotlk()) loadTalentDbc();
+    if (isPreWotlk()) {
+        loadTalentDbc();
+        syncPreWotlkTalentsFromKnownSpells();
+    }
 
     // Check if this spell corresponds to a talent rank
     bool isTalentSpell = false;
