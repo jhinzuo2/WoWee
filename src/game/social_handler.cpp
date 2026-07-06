@@ -13,10 +13,30 @@
 #include "core/application.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 
 namespace wowee {
 namespace game {
+
+namespace {
+
+std::filesystem::path guildNameCachePath() {
+#ifdef _WIN32
+    if (const char* appData = std::getenv("APPDATA")) {
+        return std::filesystem::path(appData) / "wowee" / "guild_names.tsv";
+    }
+#else
+    if (const char* home = std::getenv("HOME")) {
+        return std::filesystem::path(home) / ".wowee" / "guild_names.tsv";
+    }
+#endif
+    return std::filesystem::path("guild_names.tsv");
+}
+
+} // namespace
 
 
 
@@ -62,7 +82,59 @@ static const char* lfgTeleportDeniedString(uint8_t reason) {
 static const std::string kEmptyString;
 
 SocialHandler::SocialHandler(GameHandler& owner)
-    : owner_(owner) {}
+    : owner_(owner) {
+    loadGuildNameCache();
+}
+
+void SocialHandler::loadGuildNameCache() {
+    std::ifstream in(guildNameCachePath());
+    if (!in.is_open()) return;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const auto separator = line.find('\t');
+        if (separator == std::string::npos) continue;
+
+        try {
+            const uint32_t guildId = static_cast<uint32_t>(std::stoul(line.substr(0, separator)));
+            std::string guildName = line.substr(separator + 1);
+            if (guildId != 0 && !guildName.empty()) {
+                guildNameCache_[guildId] = std::move(guildName);
+            }
+        } catch (...) {
+            // Ignore stale or hand-edited cache lines.
+        }
+    }
+}
+
+void SocialHandler::saveGuildNameCache() const {
+    const std::filesystem::path path = guildNameCachePath();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        LOG_WARNING("Could not save guild name cache to ", path.string());
+        return;
+    }
+
+    for (const auto& [guildId, guildName] : guildNameCache_) {
+        if (guildId != 0 && !guildName.empty()) {
+            out << guildId << '\t' << guildName << '\n';
+        }
+    }
+}
+
+void SocialHandler::rememberGuildName(uint32_t guildId, const std::string& guildName) {
+    if (guildId == 0 || guildName.empty()) return;
+
+    auto it = guildNameCache_.find(guildId);
+    if (it != guildNameCache_.end() && it->second == guildName) return;
+
+    guildNameCache_[guildId] = guildName;
+    saveGuildNameCache();
+}
 
 // ============================================================
 // registerOpcodes
@@ -526,7 +598,14 @@ const std::string& SocialHandler::lookupGuildName(uint32_t guildId) {
     if (guildId == 0) return kEmptyString;
     auto it = guildNameCache_.find(guildId);
     if (it != guildNameCache_.end()) return it->second;
-    if (pendingGuildNameQueries_.insert(guildId).second) {
+
+    const auto now = std::chrono::steady_clock::now();
+    auto pendingIt = pendingGuildNameQueries_.find(guildId);
+    const bool shouldQuery =
+        pendingIt == pendingGuildNameQueries_.end() ||
+        std::chrono::duration_cast<std::chrono::seconds>(now - pendingIt->second).count() >= 2;
+    if (shouldQuery) {
+        pendingGuildNameQueries_[guildId] = now;
         queryGuildInfo(guildId);
     }
     return kEmptyString;
@@ -1434,6 +1513,12 @@ void SocialHandler::handlePartyMemberStats(network::Packet& packet, bool isFull)
 void SocialHandler::handleGuildInfo(network::Packet& packet) {
     GuildInfoData data;
     if (!GuildInfoParser::parse(packet, data)) return;
+    if (!data.guildName.empty()) {
+        if (const Character* ch = owner_.getActiveCharacter(); ch && ch->hasGuild()) {
+            rememberGuildName(ch->guildId, data.guildName);
+            if (guildName_.empty()) guildName_ = data.guildName;
+        }
+    }
     // SMSG_GUILD_INFO is pushed by the server on every guild roster sync
     // (login, member join/leave, periodic refreshes). Only print when
     // something the user can see has actually changed; otherwise the
@@ -1460,9 +1545,11 @@ void SocialHandler::handleGuildRoster(network::Packet& packet) {
 void SocialHandler::handleGuildQueryResponse(network::Packet& packet) {
     GuildQueryResponseData data;
     if (!owner_.getPacketParsers()->parseGuildQueryResponse(packet, data)) return;
-    if (data.guildId != 0 && !data.guildName.empty()) {
-        guildNameCache_[data.guildId] = data.guildName;
+    if (data.guildId != 0) {
         pendingGuildNameQueries_.erase(data.guildId);
+        if (!data.guildName.empty()) {
+            rememberGuildName(data.guildId, data.guildName);
+        }
     }
     const Character* ch = owner_.getActiveCharacter();
     bool isLocalGuild = (ch && ch->hasGuild() && ch->guildId == data.guildId);

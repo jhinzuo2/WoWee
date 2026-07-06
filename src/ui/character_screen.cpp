@@ -388,7 +388,7 @@ void CharacterScreen::render(game::GameHandler& gameHandler) {
             if (!guildName.empty())
                 ImGui::Text("<%s>", guildName.c_str());
             else
-                ImGui::TextDisabled("<Guild %u>", character.guildId);
+                ImGui::TextDisabled("Guild: resolving...");
         } else {
             ImGui::TextDisabled("No Guild");
         }

@@ -1968,5 +1968,58 @@ bool TbcPacketParsers::parseGuildRoster(network::Packet& packet, GuildRosterData
     return true;
 }
 
+// ============================================================================
+// TBC 2.4.3 guild query response parser
+// Classic/TBC shape: guildId + name + 10 rank names + 5 emblem fields.
+// WotLK adds a trailing rankCount field; do not require it here.
+// ============================================================================
+
+bool TbcPacketParsers::parseGuildQueryResponse(network::Packet& packet, GuildQueryResponseData& data) {
+    if (packet.getSize() < 4) {
+        LOG_ERROR("TBC SMSG_GUILD_QUERY_RESPONSE too small: ", packet.getSize());
+        return false;
+    }
+
+    data.guildId = packet.readUInt32();
+
+    if (!packet.hasData()) {
+        LOG_WARNING("TBC GuildQueryResponse: truncated before guild name");
+        data.guildName.clear();
+        data.rankCount = 10;
+        return true;
+    }
+
+    data.guildName = packet.readString();
+    for (int i = 0; i < 10; ++i) {
+        if (!packet.hasData()) {
+            LOG_WARNING("TBC GuildQueryResponse: truncated at rank name ", i);
+            data.rankNames[i].clear();
+            continue;
+        }
+        data.rankNames[i] = packet.readString();
+    }
+
+    if (!packet.hasRemaining(20)) {
+        LOG_WARNING("TBC GuildQueryResponse: truncated before emblem data");
+        data.emblemStyle = 0;
+        data.emblemColor = 0;
+        data.borderStyle = 0;
+        data.borderColor = 0;
+        data.backgroundColor = 0;
+        data.rankCount = 10;
+        return true;
+    }
+
+    data.emblemStyle = packet.readUInt32();
+    data.emblemColor = packet.readUInt32();
+    data.borderStyle = packet.readUInt32();
+    data.borderColor = packet.readUInt32();
+    data.backgroundColor = packet.readUInt32();
+    data.rankCount = 10;
+
+    LOG_INFO("Parsed TBC SMSG_GUILD_QUERY_RESPONSE: guild=", data.guildName, " id=", data.guildId);
+    return true;
+}
+
 } // namespace game
 } // namespace wowee

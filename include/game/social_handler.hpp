@@ -353,6 +353,9 @@ private:
     void handleSetFactionVisible(network::Packet& packet);
     void handleGroupSetLeader(network::Packet& packet);
     void handleTalentsInfo(network::Packet& packet);
+    void loadGuildNameCache();
+    void saveGuildNameCache() const;
+    void rememberGuildName(uint32_t guildId, const std::string& guildName);
 
     GameHandler& owner_;
 
@@ -389,7 +392,7 @@ private:
     GuildQueryResponseData guildQueryData_;
     bool hasGuildRoster_ = false;
     std::unordered_map<uint32_t, std::string> guildNameCache_;
-    std::unordered_set<uint32_t> pendingGuildNameQueries_;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> pendingGuildNameQueries_;
     bool pendingGuildInvite_ = false;
     std::string pendingGuildInviterName_;
     std::string pendingGuildInviteGuildName_;

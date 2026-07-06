@@ -18,12 +18,51 @@
 #include <backends/imgui_impl_vulkan.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <unordered_map>
 #include <unordered_set>
 #include <cstring>
 
 namespace wowee {
 namespace rendering {
+
+namespace {
+
+bool isFiniteVec3(const glm::vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+void frameCameraForModelBounds(Camera& camera, const glm::vec3& boundMin, const glm::vec3& boundMax) {
+    if (!isFiniteVec3(boundMin) || !isFiniteVec3(boundMax)) {
+        return;
+    }
+
+    const glm::vec3 extent = boundMax - boundMin;
+    if (extent.z <= 0.0f) {
+        return;
+    }
+
+    const float fovY = glm::radians(camera.getFovDegrees());
+    const float tanHalfY = std::tan(fovY * 0.5f);
+    if (!std::isfinite(tanHalfY) || tanHalfY <= 0.0f) {
+        return;
+    }
+
+    const float tanHalfX = tanHalfY * std::max(camera.getAspectRatio(), 0.1f);
+    const float height = std::max(extent.z, 0.1f);
+    const float width = std::max(std::max(extent.x, extent.y), 0.1f);
+    const float margin = 1.50f;
+    const float distanceForHeight = (height * margin) / (2.0f * tanHalfY);
+    const float distanceForWidth = (width * margin) / (2.0f * tanHalfX);
+    const float distance = std::max({4.5f, distanceForHeight, distanceForWidth});
+    const float centerZ = (boundMin.z + boundMax.z) * 0.5f;
+
+    camera.setPosition(glm::vec3(0.0f, distance, centerZ));
+    camera.setRotation(270.0f, 0.0f);
+}
+
+} // namespace
 
 CharacterPreview::CharacterPreview() = default;
 
@@ -479,6 +518,25 @@ bool CharacterPreview::loadCharacter(game::Race race, game::Gender gender,
     if (!model.isValid()) {
         LOG_WARNING("CharacterPreview: invalid model: ", m2Path);
         return false;
+    }
+
+    if (camera_) {
+        glm::vec3 frameMin = model.boundMin;
+        glm::vec3 frameMax = model.boundMax;
+        if (!model.vertices.empty()) {
+            glm::vec3 tightMin(std::numeric_limits<float>::max());
+            glm::vec3 tightMax(-std::numeric_limits<float>::max());
+            for (const auto& v : model.vertices) {
+                if (!isFiniteVec3(v.position)) continue;
+                tightMin = glm::min(tightMin, v.position);
+                tightMax = glm::max(tightMax, v.position);
+            }
+            if (tightMin.x <= tightMax.x && tightMin.y <= tightMax.y && tightMin.z <= tightMax.z) {
+                frameMin = tightMin;
+                frameMax = tightMax;
+            }
+        }
+        frameCameraForModelBounds(*camera_, frameMin, frameMax);
     }
 
     // Look up CharSections.dbc for all appearance textures

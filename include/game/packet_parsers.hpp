@@ -377,6 +377,9 @@ public:
     // TBC 2.4.3 SMSG_GUILD_ROSTER: same rank structure as WotLK (variable rankCount +
     // goldLimit + bank tabs), but NO gender byte per member (WotLK added it)
     bool parseGuildRoster(network::Packet& packet, GuildRosterData& data) override;
+    // TBC 2.4.3 SMSG_GUILD_QUERY_RESPONSE has the Classic-era shape with no
+    // trailing rankCount field.
+    bool parseGuildQueryResponse(network::Packet& packet, GuildQueryResponseData& data) override;
     // TBC 2.4.3 SMSG_QUESTGIVER_STATUS: uint32 status (WotLK uses uint8)
     uint8_t readQuestGiverStatus(network::Packet& packet) override;
     // TBC 2.4.3 SMSG_MESSAGECHAT: no senderGuid/unknown prefix before type-specific data
