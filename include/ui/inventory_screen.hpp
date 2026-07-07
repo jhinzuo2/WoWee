@@ -197,6 +197,12 @@ private:
     int splitCount_ = 1;
     std::string splitItemName_;
 
+    // ImGui starts window movement before item widgets run for the frame, so
+    // keep bag windows title-bar-draggable while bags are open.
+    bool bagMoveConfigActive_ = false;
+    bool previousMoveFromTitleBarOnly_ = false;
+    void setBagMoveConfigActive(bool active);
+
     // Server-side bag sort swap queue (one swap per frame)
     std::deque<game::Inventory::SwapOp> sortSwapQueue_;
 

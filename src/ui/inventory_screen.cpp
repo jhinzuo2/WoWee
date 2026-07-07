@@ -133,8 +133,28 @@ const game::ItemSlot* findComparableEquipped(const game::Inventory& inventory, u
 } // namespace
 
 InventoryScreen::~InventoryScreen() {
+    setBagMoveConfigActive(false);
     // Vulkan textures are owned by VkContext and cleaned up on shutdown
     iconCache_.clear();
+}
+
+void InventoryScreen::setBagMoveConfigActive(bool active) {
+    if (!ImGui::GetCurrentContext()) {
+        bagMoveConfigActive_ = false;
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    if (active) {
+        if (!bagMoveConfigActive_) {
+            previousMoveFromTitleBarOnly_ = io.ConfigWindowsMoveFromTitleBarOnly;
+            bagMoveConfigActive_ = true;
+        }
+        io.ConfigWindowsMoveFromTitleBarOnly = true;
+    } else if (bagMoveConfigActive_) {
+        io.ConfigWindowsMoveFromTitleBarOnly = previousMoveFromTitleBarOnly_;
+        bagMoveConfigActive_ = false;
+    }
 }
 
 ImVec4 InventoryScreen::getQualityColor(game::ItemQuality quality) {
@@ -794,9 +814,12 @@ void InventoryScreen::render(game::Inventory& inventory, uint64_t moneyCopper) {
     }
 
     if (!open) {
+        setBagMoveConfigActive(false);
         if (holdingItem) cancelPickup(inventory);
         return;
     }
+
+    setBagMoveConfigActive(true);
 
     // Escape cancels held item
     if (holdingItem && !wantsTextInput && core::Input::getInstance().isKeyPressed(SDL_SCANCODE_ESCAPE)) {
@@ -972,7 +995,10 @@ void InventoryScreen::renderAggregateBags(game::Inventory& inventory, uint64_t m
     ImGui::SetNextWindowSize(ImVec2(windowW, windowH), ImGuiCond_Always);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
-    if (!ImGui::Begin("Bags", &open, flags)) {
+    if (holdingItem || pickupPending_) flags |= ImGuiWindowFlags_NoMove;
+
+    bool windowVisible = ImGui::Begin("Bags", &open, flags);
+    if (!windowVisible) {
         ImGui::End();
         return;
     }
@@ -1037,7 +1063,7 @@ void InventoryScreen::renderSeparateBags(game::Inventory& inventory, uint64_t mo
         int bpUsed = 0;
         for (int i = 0; i < bpTotal; ++i) if (!inventory.getBackpackSlot(i).empty()) ++bpUsed;
         char bpTitle[64];
-        snprintf(bpTitle, sizeof(bpTitle), "Backpack (%d/%d)##backpack", bpUsed, bpTotal);
+        snprintf(bpTitle, sizeof(bpTitle), "Backpack (%d/%d)###backpack", bpUsed, bpTotal);
         int bpRows = (bpTotal + columns - 1) / columns;
         float bpH = bpRows * (slotSize + 4.0f) + 80.0f; // header + money + padding
         if (showKeyring_) {
@@ -1083,9 +1109,9 @@ void InventoryScreen::renderSeparateBags(game::Inventory& inventory, uint64_t mo
         game::EquipSlot bagSlot = static_cast<game::EquipSlot>(static_cast<int>(game::EquipSlot::BAG1) + bag);
         const auto& bagItem = inventory.getEquipSlot(bagSlot);
         if (!bagItem.empty() && !bagItem.item.name.empty()) {
-            snprintf(title, sizeof(title), "%s (%d/%d)##bag%d", bagItem.item.name.c_str(), bagUsed, bagSize, bag);
+            snprintf(title, sizeof(title), "%s (%d/%d)###bag%d", bagItem.item.name.c_str(), bagUsed, bagSize, bag);
         } else {
-            snprintf(title, sizeof(title), "Bag Slot %d (%d/%d)##bag%d", bag + 1, bagUsed, bagSize, bag);
+            snprintf(title, sizeof(title), "Bag Slot %d (%d/%d)###bag%d", bag + 1, bagUsed, bagSize, bag);
         }
 
         renderBagWindow(title, bagOpen_[bag], inventory, bag, stackX, defaultY, 0);
@@ -1138,7 +1164,10 @@ void InventoryScreen::renderBagWindow(const char* title, bool& isOpen,
     ImGui::SetNextWindowSize(ImVec2(windowW, windowH), ImGuiCond_Always);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
-    if (!ImGui::Begin(title, &isOpen, flags)) {
+    if (holdingItem || pickupPending_) flags |= ImGuiWindowFlags_NoMove;
+
+    bool windowVisible = ImGui::Begin(title, &isOpen, flags);
+    if (!windowVisible) {
         ImGui::End();
         return;
     }

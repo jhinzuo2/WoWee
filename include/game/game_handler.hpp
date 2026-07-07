@@ -862,10 +862,12 @@ public:
 
     // Talent DBC access
     const TalentEntry* getTalentEntry(uint32_t talentId) const {
+        if (spellHandler_) return spellHandler_->getTalentEntry(talentId);
         auto it = talentCache_.find(talentId);
         return (it != talentCache_.end()) ? &it->second : nullptr;
     }
     const TalentTabEntry* getTalentTabEntry(uint32_t tabId) const {
+        if (spellHandler_) return spellHandler_->getTalentTabEntry(tabId);
         auto it = talentTabCache_.find(tabId);
         return (it != talentTabCache_.end()) ? &it->second : nullptr;
     }
