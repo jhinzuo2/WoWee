@@ -430,8 +430,10 @@ public:
 
     using InspectArenaTeam = game::InspectArenaTeam;
     using InspectResult = game::InspectResult;
-    const InspectResult* getInspectResult() const {
-        return inspectResult_.guid ? &inspectResult_ : nullptr;
+    const InspectResult* getInspectResult() const;
+    const std::array<uint32_t, 19>* getOtherPlayerVisibleEquipment(uint64_t guid) const {
+        auto it = otherPlayerVisibleItemEntries_.find(guid);
+        return (it != otherPlayerVisibleItemEntries_.end()) ? &it->second : nullptr;
     }
 
     // Server info commands
@@ -2472,6 +2474,7 @@ public:
     void rebuildOnlineInventory();
     void maybeDetectVisibleItemLayout();
     void updateOtherPlayerVisibleItems(uint64_t guid, const FlatFieldMap& fields);
+    void cacheInspectedPlayerEquipment(uint64_t guid, const std::array<uint32_t, 19>& itemEntries);
     void detectInventorySlotBases(const FlatFieldMap& fields);
     bool applyInventoryFields(const FlatFieldMap& fields);
     void extractContainerFields(uint64_t containerGuid, const FlatFieldMap& fields);

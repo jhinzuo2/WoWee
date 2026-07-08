@@ -241,6 +241,7 @@ public:
     void rebuildOnlineInventory();
     void maybeDetectVisibleItemLayout();
     void updateOtherPlayerVisibleItems(uint64_t guid, const FlatFieldMap& fields);
+    void cacheInspectedPlayerEquipment(uint64_t guid, const std::array<uint32_t, 19>& itemEntries);
     void emitOtherPlayerEquipment(uint64_t guid);
     void emitAllOtherPlayerEquipment();
     void handleItemQueryResponse(network::Packet& packet);

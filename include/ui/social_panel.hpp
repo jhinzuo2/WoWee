@@ -78,6 +78,7 @@ public:
 
 private:
     UIServices services_;
+    uint64_t inspectWindowAutoRequestGuid_ = 0;
 };
 
 } // namespace ui

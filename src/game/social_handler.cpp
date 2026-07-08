@@ -17,6 +17,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <vector>
 
 namespace wowee {
 namespace game {
@@ -77,6 +78,294 @@ static const char* lfgTeleportDeniedString(uint8_t reason) {
         case 5:  return "You do not meet the requirements.";
         default: return "Teleport to dungeon denied.";
     }
+}
+
+static bool parseInspectEquipmentPayload(network::Packet& packet,
+                                         uint64_t& outGuid,
+                                         std::array<uint32_t, 19>& outItems,
+                                         std::array<uint16_t, 19>& outEnchants) {
+    const size_t start = packet.getReadPos();
+    constexpr size_t kGearBytes = 19 * sizeof(uint32_t);
+    constexpr uint32_t kEquipmentSlotMask = (1u << 19) - 1u;
+
+    auto reset = [&]() {
+        packet.setReadPos(start);
+        outGuid = 0;
+        outItems.fill(0);
+        outEnchants.fill(0);
+    };
+
+    auto countSlots = [](uint32_t mask) {
+        int count = 0;
+        for (int slot = 0; slot < 19; ++slot) {
+            if (mask & (1u << slot)) ++count;
+        }
+        return count;
+    };
+
+    auto parseMaskedItems = [&](const char* guidEncoding) -> bool {
+        if (!packet.hasRemaining(sizeof(uint32_t))) return false;
+        const uint32_t slotMask = packet.readUInt32();
+        if ((slotMask & ~kEquipmentSlotMask) != 0) return false;
+
+        const int slotCount = countSlots(slotMask);
+        if (slotCount <= 0) return false;
+
+        const size_t remaining = packet.getRemainingSize();
+        const size_t candidateRecordSizes[] = {24, 20, 16, 12, 8, 4};
+        size_t recordSize = 0;
+        for (size_t candidate : candidateRecordSizes) {
+            if (remaining == static_cast<size_t>(slotCount) * candidate) {
+                recordSize = candidate;
+                break;
+            }
+        }
+        if (recordSize == 0) {
+            // Some cores append a tiny trailer. Prefer the largest plausible
+            // record that fits cleanly, but do not consume packets that are
+            // clearly not the masked inspect format.
+            for (size_t candidate : candidateRecordSizes) {
+                const size_t needed = static_cast<size_t>(slotCount) * candidate;
+                if (remaining >= needed && remaining - needed <= 8) {
+                    recordSize = candidate;
+                    break;
+                }
+            }
+        }
+        if (recordSize < sizeof(uint32_t)) return false;
+
+        int nonZero = 0;
+        for (int slot = 0; slot < 19; ++slot) {
+            if ((slotMask & (1u << slot)) == 0) continue;
+            if (!packet.hasRemaining(recordSize)) return false;
+
+            const size_t recordStart = packet.getReadPos();
+            const uint32_t itemEntry = packet.readUInt32();
+            uint16_t enchantId = 0;
+            if (recordSize >= sizeof(uint32_t) + sizeof(uint16_t) &&
+                packet.hasRemaining(sizeof(uint16_t))) {
+                enchantId = packet.readUInt16();
+            }
+            packet.setReadPos(recordStart + recordSize);
+
+            outItems[slot] = itemEntry;
+            outEnchants[slot] = enchantId;
+            if (itemEntry != 0) ++nonZero;
+        }
+
+        if (nonZero == 0) return false;
+        LOG_INFO("SMSG_INSPECT_RESULTS_UPDATE masked gear: guidEncoding=", guidEncoding,
+                 " mask=0x", std::hex, slotMask, std::dec,
+                 " slots=", slotCount, " recordSize=", recordSize,
+                 " nonZero=", nonZero);
+        return true;
+    };
+
+    auto readItems = [&]() -> bool {
+        for (uint32_t& item : outItems) {
+            if (!packet.hasRemaining(sizeof(uint32_t))) return false;
+            item = packet.readUInt32();
+        }
+        return true;
+    };
+
+    reset();
+    if (packet.hasRemaining(sizeof(uint64_t))) {
+        outGuid = packet.readUInt64();
+        if (outGuid != 0 && parseMaskedItems("uint64")) {
+            return true;
+        }
+    }
+
+    reset();
+    if (packet.hasFullPackedGuid()) {
+        outGuid = packet.readPackedGuid();
+        if (outGuid != 0 && parseMaskedItems("packed")) {
+            return true;
+        }
+    }
+
+    reset();
+    if (packet.getRemainingSize() >= sizeof(uint64_t) + kGearBytes) {
+        outGuid = packet.readUInt64();
+        if (outGuid != 0 && readItems()) {
+            LOG_INFO("SMSG_INSPECT_RESULTS_UPDATE flat gear: guidEncoding=uint64 slots=19");
+            return true;
+        }
+    }
+
+    reset();
+    if (packet.hasFullPackedGuid()) {
+        outGuid = packet.readPackedGuid();
+        if (outGuid != 0 && packet.getRemainingSize() >= kGearBytes && readItems()) {
+            LOG_INFO("SMSG_INSPECT_RESULTS_UPDATE flat gear: guidEncoding=packed slots=19");
+            return true;
+        }
+    }
+
+    reset();
+    return false;
+}
+
+static bool isTbcInspectTalentBitSet(const std::vector<uint8_t>& bitfield, uint32_t bitIndex) {
+    const uint32_t slot = bitIndex / 7u;
+    const uint32_t offset = bitIndex % 7u;
+    return slot < bitfield.size() && (bitfield[slot] & (1u << offset)) != 0;
+}
+
+static bool decodeTbcInspectTalentBitfield(GameHandler& owner,
+                                           uint8_t classId,
+                                           const std::vector<uint8_t>& bitfield,
+                                           std::array<uint32_t, 3>& outTreePoints,
+                                           uint32_t& outSpentTalents) {
+    outTreePoints.fill(0);
+    outSpentTalents = 0;
+    if (classId == 0 || bitfield.empty()) return false;
+
+    owner.loadTalentDbc();
+
+    const uint32_t classMask = 1u << (classId - 1u);
+    std::vector<const TalentTabEntry*> classTabs;
+    for (const auto& [tabId, tab] : owner.getAllTalentTabs()) {
+        if (tab.classMask & classMask) {
+            classTabs.push_back(&tab);
+        }
+    }
+    std::sort(classTabs.begin(), classTabs.end(),
+              [](const auto* a, const auto* b) { return a->orderIndex < b->orderIndex; });
+    if (classTabs.empty()) return false;
+
+    uint32_t tabBitStart = 0;
+    for (size_t tabIndex = 0; tabIndex < classTabs.size() && tabIndex < outTreePoints.size(); ++tabIndex) {
+        std::vector<const TalentEntry*> talents;
+        for (const auto& [talentId, talent] : owner.getAllTalents()) {
+            if (talent.tabId == classTabs[tabIndex]->tabId && talent.maxRank > 0) {
+                talents.push_back(&talent);
+            }
+        }
+        std::sort(talents.begin(), talents.end(), [](const auto* a, const auto* b) {
+            if (a->row != b->row) return a->row < b->row;
+            if (a->column != b->column) return a->column < b->column;
+            return a->talentId < b->talentId;
+        });
+
+        uint32_t tabBits = 0;
+        for (const auto* talent : talents) {
+            uint8_t rank = 0;
+            for (uint8_t r = 1; r <= talent->maxRank; ++r) {
+                if (isTbcInspectTalentBitSet(bitfield, tabBitStart + tabBits + (r - 1u))) {
+                    rank = r;
+                }
+            }
+            outTreePoints[tabIndex] += rank;
+            outSpentTalents += rank;
+            tabBits += talent->maxRank;
+        }
+        tabBitStart += tabBits;
+    }
+
+    return true;
+}
+
+static bool parseTbcInspectTalentPayload(network::Packet& packet,
+                                         GameHandler& owner,
+                                         uint8_t classId,
+                                         uint32_t& outUnspentTalents,
+                                         uint32_t& outSpentTalents,
+                                         std::array<uint32_t, 3>& outTreePoints,
+                                         bool& outHasTreePoints) {
+    const size_t start = packet.getReadPos();
+    outUnspentTalents = 0;
+    outSpentTalents = 0;
+    outTreePoints.fill(0);
+    outHasTreePoints = false;
+
+    const size_t payloadSize = packet.getRemainingSize();
+    if (payloadSize < sizeof(uint32_t)) {
+        packet.setReadPos(start);
+        return false;
+    }
+
+    auto parseTalentRecords = [](network::Packet& p, size_t count) {
+        uint32_t spent = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t talentId = p.readUInt32();
+            const uint8_t rank = p.readUInt8();
+            if (talentId == 0) continue;
+            spent += static_cast<uint32_t>(rank) + 1u;
+        }
+        return spent;
+    };
+
+    const uint32_t firstValue = packet.readUInt32();
+
+    // TBC/CMaNGOS sends SMSG_INSPECT_TALENT as:
+    //   uint32 byteCount, byte[byteCount] compact talent bitfield.
+    // Older attempts treated byteCount (0x3d) as talent points; keep the
+    // fallback list-style parser below for other 2.x cores, but prefer this
+    // server-authored bitfield when the size lines up exactly.
+    if (firstValue > 0 && firstValue <= 256 && packet.getRemainingSize() == firstValue) {
+        std::vector<uint8_t> bitfield;
+        bitfield.reserve(firstValue);
+        for (uint32_t i = 0; i < firstValue; ++i) {
+            bitfield.push_back(packet.readUInt8());
+        }
+
+        outHasTreePoints = decodeTbcInspectTalentBitfield(owner, classId, bitfield, outTreePoints, outSpentTalents);
+        if (!outHasTreePoints) {
+            outSpentTalents = 0;
+        }
+        LOG_INFO("SMSG_INSPECT_TALENT (TBC): parsed cmangos bitfield bytes=", firstValue,
+                 " spent=", outSpentTalents,
+                 " trees=", outTreePoints[0], "/", outTreePoints[1], "/", outTreePoints[2],
+                 " class=", static_cast<int>(classId),
+                 " decoded=", (outHasTreePoints ? "yes" : "no"),
+                 " trailingBytes=", packet.getRemainingSize());
+        return true;
+    }
+
+    // The regular talents-info packet uses uint32 unspent + uint8 count.
+    // Accept that shape too so different 2.x cores still render something useful.
+    if (packet.hasRemaining(1)) {
+        const uint8_t nextByte = packet.readUInt8();
+        const size_t afterHeaderBytes = packet.getRemainingSize();
+
+        if (afterHeaderBytes > 0 && (afterHeaderBytes % 5u) == 0u) {
+            const size_t recordCount = afterHeaderBytes / 5u;
+            const uint32_t rankSpent = parseTalentRecords(packet, recordCount);
+            outUnspentTalents = 0;
+            outSpentTalents = firstValue != 0 ? firstValue : rankSpent;
+            LOG_INFO("SMSG_INSPECT_TALENT (TBC): parsed cmangos talents records=", recordCount,
+                     " spent=", outSpentTalents, " rankSpent=", rankSpent,
+                     " unk=", static_cast<int>(nextByte),
+                     " trailingBytes=", packet.getRemainingSize());
+            return true;
+        }
+
+        const uint8_t talentCount = nextByte;
+        if (packet.hasRemaining(static_cast<size_t>(talentCount) * 5u)) {
+            const uint32_t spentTalents = parseTalentRecords(packet, talentCount);
+            outUnspentTalents = firstValue;
+            outSpentTalents = spentTalents;
+            LOG_INFO("SMSG_INSPECT_TALENT (TBC): parsed talents count=", static_cast<int>(talentCount),
+                     " spent=", spentTalents, " unspent=", firstValue,
+                     " trailingBytes=", packet.getRemainingSize());
+            return true;
+        }
+    }
+
+    if ((payloadSize % 5u) == 0u) {
+        packet.setReadPos(start);
+        const size_t recordCount = payloadSize / 5u;
+        outSpentTalents = parseTalentRecords(packet, recordCount);
+        LOG_INFO("SMSG_INSPECT_TALENT (TBC): parsed bare talents records=", recordCount,
+                 " spent=", outSpentTalents,
+                 " trailingBytes=", packet.getRemainingSize());
+        return true;
+    }
+
+    packet.setReadPos(start);
+    return false;
 }
 
 static const std::string kEmptyString;
@@ -642,6 +931,101 @@ void SocialHandler::inspectTarget() {
 }
 
 void SocialHandler::handleInspectResults(network::Packet& packet) {
+    if (isActiveExpansion("tbc") && packet.getOpcode() == wireOpcode(Opcode::SMSG_INSPECT_RESULTS_UPDATE)) {
+        uint64_t guid = 0;
+        std::array<uint32_t, 19> items{};
+        std::array<uint16_t, 19> enchantIds{};
+        if (parseInspectEquipmentPayload(packet, guid, items, enchantIds)) {
+            owner_.cacheInspectedPlayerEquipment(guid, items);
+
+            auto entity = owner_.getEntityManager().getEntity(guid);
+            std::string playerName = "Target";
+            if (entity) {
+                auto player = std::dynamic_pointer_cast<Player>(entity);
+                if (player && !player->getName().empty()) playerName = player->getName();
+            }
+
+            // TBC servers send inspected gear separately from talent data. Make the
+            // gear-only response visible to the Inspect window immediately while
+            // preserving talents if a matching talent response already arrived.
+            if (inspectResult_.guid != guid) {
+                inspectResult_ = InspectResult{};
+                inspectResult_.guid = guid;
+            }
+            inspectResult_.playerName = playerName;
+            inspectResult_.itemEntries = items;
+            inspectResult_.enchantIds = enchantIds;
+
+            LOG_INFO("SMSG_INSPECT_RESULTS_UPDATE (TBC gear): ", playerName, " has gear in ",
+                     std::count_if(items.begin(), items.end(),
+                                   [](uint32_t e) { return e != 0; }), "/19 slots");
+            if (owner_.addonEventCallbackRef()) {
+                char guidBuf[32];
+                snprintf(guidBuf, sizeof(guidBuf), "0x%016llX", (unsigned long long)guid);
+                owner_.addonEventCallbackRef()("INSPECT_READY", {guidBuf});
+            }
+            return;
+        }
+        LOG_DEBUG("SMSG_INSPECT_RESULTS_UPDATE (TBC gear): unrecognized payload size=",
+                  packet.getSize());
+    }
+
+    if (isActiveExpansion("tbc") &&
+        packet.getOpcode() == wireOpcode(Opcode::SMSG_INSPECT_TALENT)) {
+        if (!packet.hasFullPackedGuid()) return;
+        uint64_t guid = packet.readPackedGuid();
+        if (guid == 0) return;
+
+        auto entity = owner_.getEntityManager().getEntity(guid);
+        std::string playerName = "Target";
+        if (entity) {
+            auto player = std::dynamic_pointer_cast<Player>(entity);
+            if (player && !player->getName().empty()) playerName = player->getName();
+        }
+
+        if (inspectResult_.guid != guid) {
+            inspectResult_ = InspectResult{};
+            inspectResult_.guid = guid;
+        }
+        inspectResult_.playerName = playerName;
+
+        uint32_t unspentTalents = 0;
+        uint32_t spentTalents = 0;
+        std::array<uint32_t, 3> treePoints{};
+        bool hasTreePoints = false;
+        const uint8_t classId = owner_.lookupPlayerClass(guid);
+        const size_t talentPayloadStart = packet.getReadPos();
+        if (parseTbcInspectTalentPayload(packet, owner_, classId, unspentTalents, spentTalents,
+                                         treePoints, hasTreePoints)) {
+            inspectResult_.totalTalents = spentTalents;
+            inspectResult_.unspentTalents = unspentTalents;
+            inspectResult_.hasTalentData = true;
+            inspectResult_.hasTalentTreePoints = hasTreePoints;
+            inspectResult_.talentTreePoints = treePoints;
+            inspectResult_.talentGroups = 1;
+            inspectResult_.activeTalentGroup = 0;
+        } else {
+            packet.setReadPos(talentPayloadStart);
+            LOG_INFO("SMSG_INSPECT_TALENT (TBC): ", playerName,
+                     " unparsed payload bytes=", packet.getRemainingSize());
+        }
+
+        auto gearIt = owner_.inspectedPlayerItemEntriesRef().find(guid);
+        if (gearIt != owner_.inspectedPlayerItemEntriesRef().end()) {
+            inspectResult_.itemEntries = gearIt->second;
+        }
+
+        LOG_INFO("SMSG_INSPECT_TALENT (TBC): ", playerName,
+                 " gearCached=", (gearIt != owner_.inspectedPlayerItemEntriesRef().end() ? "yes" : "no"),
+                 " payload bytes remaining=", packet.getRemainingSize());
+        if (owner_.addonEventCallbackRef()) {
+            char guidBuf[32];
+            snprintf(guidBuf, sizeof(guidBuf), "0x%016llX", (unsigned long long)guid);
+            owner_.addonEventCallbackRef()("INSPECT_READY", {guidBuf});
+        }
+        return;
+    }
+
     if (!packet.hasRemaining(1)) return;
     uint8_t talentType = packet.readUInt8();
 
@@ -760,6 +1144,9 @@ void SocialHandler::handleInspectResults(network::Packet& packet) {
     inspectResult_.playerName        = playerName;
     inspectResult_.totalTalents      = totalTalents;
     inspectResult_.unspentTalents    = unspentTalents;
+    inspectResult_.hasTalentData     = true;
+    inspectResult_.hasTalentTreePoints = false;
+    inspectResult_.talentTreePoints  = {};
     inspectResult_.talentGroups      = talentGroupCount;
     inspectResult_.activeTalentGroup = activeTalentGroup;
     inspectResult_.enchantIds        = enchantIds;

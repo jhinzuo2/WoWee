@@ -14,6 +14,7 @@
 #include "core/logger.hpp"
 #include "rendering/renderer.hpp"
 #include "game/game_handler.hpp"
+#include "game/game_utils.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/dbc_layout.hpp"
 #include "ui/keybinding_manager.hpp"
@@ -21,6 +22,7 @@
 #include <imgui.h>
 #include <imgui_internal.h>
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -2396,7 +2398,10 @@ void SocialPanel::renderWhoWindow(game::GameHandler& gameHandler,
 
 void SocialPanel::renderInspectWindow(game::GameHandler& gameHandler,
                                          InventoryScreen& inventoryScreen) {
-    if (!showInspectWindow_) return;
+    if (!showInspectWindow_) {
+        inspectWindowAutoRequestGuid_ = 0;
+        return;
+    }
 
     // Lazy-load SpellItemEnchantment.dbc for enchant name lookup
     static std::unordered_map<uint32_t, std::string> s_enchantNames;
@@ -2432,6 +2437,17 @@ void SocialPanel::renderInspectWindow(game::GameHandler& gameHandler,
     ImGui::SetNextWindowPos(ImVec2(350, 120), ImGuiCond_FirstUseEver);
 
     const game::GameHandler::InspectResult* result = gameHandler.getInspectResult();
+    const uint64_t targetGuid = gameHandler.getTargetGuid();
+    auto target = gameHandler.getTarget();
+    const bool targetIsPlayer =
+        target && target->getType() == game::ObjectType::PLAYER && targetGuid != 0;
+    if (targetIsPlayer &&
+        inspectWindowAutoRequestGuid_ != targetGuid &&
+        (!result || result->guid != targetGuid)) {
+        inspectWindowAutoRequestGuid_ = targetGuid;
+        gameHandler.inspectTarget();
+        result = gameHandler.getInspectResult();
+    }
 
     std::string title = result ? ("Inspect: " + result->playerName + "###InspectWin")
                                 : "Inspect###InspectWin";
@@ -2459,16 +2475,6 @@ void SocialPanel::renderInspectWindow(game::GameHandler& gameHandler,
             ImGui::TextColored(classColorVec4(cid), "(%s)", classNameStr(cid));
         }
     }
-    ImGui::SameLine();
-    ImGui::TextDisabled("  %u talent pts", result->totalTalents);
-    if (result->unspentTalents > 0) {
-        ImGui::SameLine();
-        ImGui::TextColored(colors::kSoftRed, "(%u unspent)", result->unspentTalents);
-    }
-    if (result->talentGroups > 1) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("  Dual spec (active %u)", static_cast<unsigned>(result->activeTalentGroup) + 1);
-    }
 
     ImGui::Separator();
 
@@ -2477,8 +2483,198 @@ void SocialPanel::renderInspectWindow(game::GameHandler& gameHandler,
     for (int s = 0; s < 19; ++s) {
         if (result->itemEntries[s] != 0) { hasAnyGear = true; break; }
     }
+    const auto* visibleEquipment = game::isActiveExpansion("tbc")
+        ? gameHandler.getOtherPlayerVisibleEquipment(result->guid)
+        : nullptr;
+    bool hasVisibleEquipment = false;
+    if (visibleEquipment) {
+        for (uint32_t displayId : *visibleEquipment) {
+            if (displayId != 0) {
+                hasVisibleEquipment = true;
+                break;
+            }
+        }
+    }
 
-    if (!hasAnyGear) {
+    struct InspectGearSlot {
+        uint32_t entry = 0;
+        uint32_t displayId = 0;
+        uint16_t enchantId = 0;
+        const game::ItemQueryResponseData* info = nullptr;
+        bool loading = false;
+    };
+
+    const bool usingVisibleFallback = !hasAnyGear && hasVisibleEquipment;
+    std::array<InspectGearSlot, 19> gearSlots{};
+
+    for (int s = 0; s < 19; ++s) {
+        if (hasAnyGear) {
+            const uint32_t entry = result->itemEntries[s];
+            if (entry == 0) continue;
+            gearSlots[s].entry = entry;
+            gearSlots[s].enchantId = result->enchantIds[s];
+            gearSlots[s].info = gameHandler.getItemInfo(entry);
+            if (gearSlots[s].info) {
+                gearSlots[s].displayId = gearSlots[s].info->displayInfoId;
+            } else {
+                gearSlots[s].loading = true;
+                gameHandler.ensureItemInfo(entry);
+            }
+        } else if (usingVisibleFallback) {
+            const uint32_t entry = (*visibleEquipment)[s];
+            if (entry == 0) continue;
+            gearSlots[s].entry = entry;
+            gearSlots[s].info = gameHandler.getItemInfo(entry);
+            if (gearSlots[s].info) {
+                gearSlots[s].displayId = gearSlots[s].info->displayInfoId;
+            } else {
+                gearSlots[s].loading = true;
+                gameHandler.ensureItemInfo(entry);
+            }
+        }
+    }
+
+    auto renderInspectSlot = [&](int slotIndex, float size) {
+        const auto& slot = gearSlots[slotIndex];
+        const bool empty = slot.entry == 0 && slot.displayId == 0;
+        const char* label = kSlotNames[slotIndex];
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+
+        ImVec4 qColor = slot.info
+            ? InventoryScreen::getQualityColor(static_cast<game::ItemQuality>(slot.info->quality))
+            : ImVec4(0.45f, 0.48f, 0.56f, 1.0f);
+        ImU32 borderCol = empty
+            ? IM_COL32(70, 70, 80, 190)
+            : ImGui::ColorConvertFloat4ToU32(qColor);
+        ImU32 bgCol = empty ? IM_COL32(25, 25, 32, 190) : IM_COL32(40, 35, 30, 220);
+
+        VkDescriptorSet iconTex = (!empty && slot.displayId != 0)
+            ? inventoryScreen.getItemIcon(slot.displayId)
+            : VK_NULL_HANDLE;
+        if (iconTex) {
+            drawList->AddImage((ImTextureID)(uintptr_t)iconTex, pos,
+                               ImVec2(pos.x + size, pos.y + size));
+            drawList->AddRect(pos, ImVec2(pos.x + size, pos.y + size),
+                              borderCol, 0.0f, 0, 2.0f);
+        } else {
+            drawList->AddRectFilled(pos, ImVec2(pos.x + size, pos.y + size), bgCol);
+            drawList->AddRect(pos, ImVec2(pos.x + size, pos.y + size),
+                              borderCol, 0.0f, 0, empty ? 1.0f : 2.0f);
+
+            char abbr[4] = {};
+            if (slot.loading) {
+                abbr[0] = '.';
+                abbr[1] = '.';
+            } else if (slot.info && !slot.info->name.empty()) {
+                abbr[0] = slot.info->name[0];
+                if (slot.info->name.size() > 1) abbr[1] = slot.info->name[1];
+            } else {
+                abbr[0] = label[0];
+                if (label[1]) abbr[1] = label[1];
+            }
+            float textW = ImGui::CalcTextSize(abbr).x;
+            drawList->AddText(ImVec2(pos.x + (size - textW) * 0.5f, pos.y + size * 0.3f),
+                              empty ? IM_COL32(85, 85, 95, 180) : borderCol, abbr);
+        }
+
+        if (slot.enchantId != 0) {
+            drawList->AddText(ImVec2(pos.x + size - 10.0f, pos.y + 1.0f),
+                              IM_COL32(150, 220, 255, 240), "*");
+        }
+
+        ImGui::InvisibleButton("slot", ImVec2(size, size));
+        if (ImGui::IsItemHovered()) {
+            if (slot.info && slot.info->valid) {
+                inventoryScreen.renderItemTooltip(*slot.info);
+            } else {
+                ImGui::BeginTooltip();
+                ImGui::TextDisabled("%s", label);
+                if (slot.entry != 0) {
+                    ImGui::Text("Item #%u", static_cast<unsigned>(slot.entry));
+                    ImGui::TextDisabled("Loading item details...");
+                } else if (slot.displayId != 0) {
+                    ImGui::Text("Display ID %u", static_cast<unsigned>(slot.displayId));
+                } else {
+                    ImGui::TextDisabled("Empty");
+                }
+                ImGui::EndTooltip();
+            }
+        }
+    };
+
+    auto renderInspectPaperDoll = [&]() {
+        static constexpr int leftSlots[] = {0, 1, 2, 14, 4, 3, 18, 8};
+        static constexpr int rightSlots[] = {9, 5, 6, 7, 10, 11, 12, 13};
+        static constexpr int weaponSlots[] = {15, 16, 17};
+        constexpr float slotSize = 36.0f;
+        constexpr float previewW = 140.0f;
+
+        ImGui::TextColored(ui::colors::kWarmGold, "Equipment");
+        if (usingVisibleFallback) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("(visible)");
+            if (ImGui::IsItemHovered()) {
+                ImGui::BeginTooltip();
+                ImGui::TextDisabled("Showing public visible equipment fields.");
+                ImGui::EndTooltip();
+            }
+        }
+        ImGui::Separator();
+
+        float contentStartX = ImGui::GetCursorPosX();
+        float rightColX = contentStartX + slotSize + 8.0f + previewW + 8.0f;
+        float previewStartY = ImGui::GetCursorScreenPos().y;
+
+        for (int r = 0; r < 8; ++r) {
+            ImGui::PushID(leftSlots[r]);
+            renderInspectSlot(leftSlots[r], slotSize);
+            ImGui::PopID();
+
+            ImGui::SameLine(rightColX);
+            ImGui::PushID(rightSlots[r]);
+            renderInspectSlot(rightSlots[r], slotSize);
+            ImGui::PopID();
+        }
+
+        float previewEndY = ImGui::GetCursorScreenPos().y;
+        float previewX = ImGui::GetWindowPos().x + contentStartX + slotSize + 8.0f;
+        float previewH = previewEndY - previewStartY;
+        ImVec2 pMin(previewX, previewStartY);
+        ImVec2 pMax(previewX + previewW, previewStartY + previewH);
+        ImDrawList* drawList = ImGui::GetWindowDrawList();
+        drawList->AddRectFilled(pMin, pMax, IM_COL32(13, 13, 25, 210));
+        drawList->AddRect(pMin, pMax, IM_COL32(60, 60, 80, 200));
+
+        std::string centerName = result->playerName;
+        ImVec2 nameSize = ImGui::CalcTextSize(centerName.c_str());
+        drawList->AddText(ImVec2(pMin.x + (previewW - nameSize.x) * 0.5f, pMin.y + 14.0f),
+                          IM_COL32(220, 220, 235, 230), centerName.c_str());
+        auto ent = gameHandler.getEntityManager().getEntity(result->guid);
+        uint8_t cid = entityClassId(ent.get());
+        if (cid != 0) {
+            const char* cls = classNameStr(cid);
+            ImVec2 classSize = ImGui::CalcTextSize(cls);
+            drawList->AddText(ImVec2(pMin.x + (previewW - classSize.x) * 0.5f, pMin.y + 34.0f),
+                              ImGui::ColorConvertFloat4ToU32(classColorVec4(cid)), cls);
+        }
+        const char* sourceText = usingVisibleFallback ? "Visible gear" : "Inspect gear";
+        ImVec2 srcSize = ImGui::CalcTextSize(sourceText);
+        drawList->AddText(ImVec2(pMin.x + (previewW - srcSize.x) * 0.5f, pMax.y - 24.0f),
+                          IM_COL32(150, 150, 165, 210), sourceText);
+
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::SetCursorPosX(contentStartX + slotSize + 8.0f);
+        for (int i = 0; i < 3; ++i) {
+            if (i > 0) ImGui::SameLine();
+            ImGui::PushID(weaponSlots[i]);
+            renderInspectSlot(weaponSlots[i], slotSize);
+            ImGui::PopID();
+        }
+    };
+
+    if (!hasAnyGear && !hasVisibleEquipment) {
         ImGui::TextDisabled("Equipment data not yet available.");
         ImGui::TextDisabled("(Gear loads after the player is inspected in-range)");
     } else {
@@ -2503,76 +2699,7 @@ void SocialPanel::renderInspectWindow(game::GameHandler& gameHandler,
             ImGui::TextDisabled("(%d/%d slots loaded)", iLevelCount,
                 [&]{ int c=0; for(int s=0;s<19;++s){if(s==3||s==18)continue;if(result->itemEntries[s])++c;} return c; }());
         }
-        if (ImGui::BeginChild("##inspect_gear", ImVec2(0, 0), false)) {
-            constexpr float kIconSz = 28.0f;
-            for (int s = 0; s < 19; ++s) {
-                uint32_t entry = result->itemEntries[s];
-                if (entry == 0) continue;
-
-                const game::ItemQueryResponseData* info = gameHandler.getItemInfo(entry);
-                if (!info) {
-                    gameHandler.ensureItemInfo(entry);
-                    ImGui::PushID(s);
-                    ImGui::TextDisabled("[%s]  (loading…)", kSlotNames[s]);
-                    ImGui::PopID();
-                    continue;
-                }
-
-                ImGui::PushID(s);
-                auto qColor = InventoryScreen::getQualityColor(
-                    static_cast<game::ItemQuality>(info->quality));
-                uint16_t enchantId = result->enchantIds[s];
-
-                // Item icon
-                VkDescriptorSet iconTex = inventoryScreen.getItemIcon(info->displayInfoId);
-                if (iconTex) {
-                    ImGui::Image((ImTextureID)(uintptr_t)iconTex, ImVec2(kIconSz, kIconSz),
-                                 ImVec2(0,0), ImVec2(1,1),
-                                 colors::kWhite, qColor);
-                } else {
-                    ImGui::GetWindowDrawList()->AddRectFilled(
-                        ImGui::GetCursorScreenPos(),
-                        ImVec2(ImGui::GetCursorScreenPos().x + kIconSz,
-                               ImGui::GetCursorScreenPos().y + kIconSz),
-                        IM_COL32(40, 40, 50, 200));
-                    ImGui::Dummy(ImVec2(kIconSz, kIconSz));
-                }
-                bool hovered = ImGui::IsItemHovered();
-
-                ImGui::SameLine();
-                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + (kIconSz - ImGui::GetTextLineHeight()) * 0.5f);
-                ImGui::BeginGroup();
-                ImGui::TextDisabled("%s", kSlotNames[s]);
-                ImGui::TextColored(qColor, "%s", info->name.c_str());
-                // Enchant indicator on the same row as the name
-                if (enchantId != 0) {
-                    auto enchIt = s_enchantNames.find(enchantId);
-                    const std::string& enchName = (enchIt != s_enchantNames.end())
-                                                  ? enchIt->second : std::string{};
-                    ImGui::SameLine();
-                    if (!enchName.empty()) {
-                        ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f),
-                            "\xe2\x9c\xa6 %s", enchName.c_str());  // UTF-8 ✦
-                    } else {
-                        ImGui::TextColored(ImVec4(0.6f, 0.85f, 1.0f, 1.0f), "\xe2\x9c\xa6");
-                        if (ImGui::IsItemHovered())
-                            ImGui::SetTooltip("Enchanted (ID %u)", static_cast<unsigned>(enchantId));
-                    }
-                }
-                ImGui::EndGroup();
-                hovered = hovered || ImGui::IsItemHovered();
-
-                if (hovered && info->valid) {
-                    inventoryScreen.renderItemTooltip(*info);
-                } else if (hovered) {
-                    ImGui::SetTooltip("%s", info->name.c_str());
-                }
-
-                ImGui::PopID();
-                ImGui::Spacing();
-            }
-        }
-        ImGui::EndChild();
+        renderInspectPaperDoll();
     }
 
     // Arena teams (WotLK — from MSG_INSPECT_ARENA_TEAMS)

@@ -304,7 +304,7 @@ void EntitySpawner::spawnOnlinePlayer(uint64_t guid,
     activeGeosets.insert(kGeosetBareSleeves);
     activeGeosets.insert(kGeosetDefaultKneepads);
     activeGeosets.insert(kGeosetBarePants);
-    activeGeosets.insert(kGeosetWithCape);
+    activeGeosets.insert(kGeosetNoCape);
     activeGeosets.insert(kGeosetBareFeet);
     charRenderer->setActiveGeosets(instanceId, activeGeosets);
 
@@ -416,41 +416,64 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
     const uint32_t geosetGroup1Field = idiL ? (*idiL)["GeosetGroup1"] : 7;
     const uint32_t geosetGroup3Field = idiL ? (*idiL)["GeosetGroup3"] : 9;
 
+    std::unordered_set<uint16_t> modelGeosets;
+    if (const auto* modelData = charRenderer->getModelData(st.modelId)) {
+        for (const auto& batch : modelData->batches) {
+            modelGeosets.insert(batch.submeshId);
+        }
+    }
+
+    auto eraseGroup = [&](uint16_t group) {
+        for (auto it = geosets.begin(); it != geosets.end();) {
+            if ((*it / 100) == group) {
+                it = geosets.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+
+    auto pickGeoset = [&](uint16_t preferred, uint16_t fallback) -> uint16_t {
+        if (preferred != 0 && modelGeosets.count(preferred) > 0) return preferred;
+        if (fallback != 0 && modelGeosets.count(fallback) > 0) return fallback;
+        return 0;
+    };
+
     // Per-group defaults — overridden below when equipment provides a geoset value.
-    uint16_t geosetGloves  = kGeosetBareForearms;
-    uint16_t geosetBoots   = kGeosetBareShins;
-    uint16_t geosetSleeves = kGeosetBareSleeves;
-    uint16_t geosetPants   = kGeosetBarePants;
+    uint16_t geosetGloves  = pickGeoset(kGeosetBareForearms, kGeosetBareForearms);
+    uint16_t geosetBoots   = pickGeoset(kGeosetBareShins, kGeosetBareShins);
+    uint16_t geosetSleeves = pickGeoset(kGeosetBareSleeves, kGeosetBareSleeves);
+    uint16_t geosetPants   = pickGeoset(kGeosetBarePants, kGeosetBarePants);
 
     // Chest/Shirt/Robe (invType 4,5,20) → wrist/sleeve group 8
     {
         uint32_t did = findDisplayIdByInvType({4, 5, 20});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetSleeves = static_cast<uint16_t>(kGeosetBareSleeves + gg1);
+        if (gg1 > 0) geosetSleeves = pickGeoset(static_cast<uint16_t>(kGeosetBareSleeves + gg1), kGeosetBareSleeves);
         // Robe kilt → leg group 13
         uint32_t gg3 = getGeosetGroup(did, geosetGroup3Field);
-        if (gg3 > 0) geosetPants = static_cast<uint16_t>(kGeosetBarePants + gg3);
+        if (gg3 > 0) geosetPants = pickGeoset(static_cast<uint16_t>(kGeosetBarePants + gg3), kGeosetBarePants);
     }
 
     // Legs (invType 7) → leg group 13
     {
         uint32_t did = findDisplayIdByInvType({7});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetPants = static_cast<uint16_t>(kGeosetBarePants + gg1);
+        if (gg1 > 0) geosetPants = pickGeoset(static_cast<uint16_t>(kGeosetBarePants + gg1), kGeosetBarePants);
     }
 
     // Feet/Boots (invType 8) → shin group 5
     {
         uint32_t did = findDisplayIdByInvType({8});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetBoots = static_cast<uint16_t>(501 + gg1);
+        if (gg1 > 0) geosetBoots = pickGeoset(static_cast<uint16_t>(501 + gg1), kGeosetBareShins);
     }
 
     // Hands/Gloves (invType 10) → forearm group 4
     {
         uint32_t did = findDisplayIdByInvType({10});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetGloves = static_cast<uint16_t>(kGeosetBareForearms + gg1);
+        if (gg1 > 0) geosetGloves = pickGeoset(static_cast<uint16_t>(kGeosetBareForearms + gg1), kGeosetBareForearms);
     }
 
     // Wrists/Bracers (invType 9) → sleeve group 8 (only if chest/shirt didn't set it)
@@ -458,7 +481,7 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
         uint32_t did = findDisplayIdByInvType({9});
         if (did != 0 && geosetSleeves == kGeosetBareSleeves) {
             uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-            if (gg1 > 0) geosetSleeves = static_cast<uint16_t>(kGeosetBareSleeves + gg1);
+            if (gg1 > 0) geosetSleeves = pickGeoset(static_cast<uint16_t>(kGeosetBareSleeves + gg1), kGeosetBareSleeves);
         }
     }
 
@@ -467,16 +490,25 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
     {
         uint32_t did = findDisplayIdByInvType({6});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetBelt = static_cast<uint16_t>(1801 + gg1);
+        if (gg1 > 0) geosetBelt = pickGeoset(static_cast<uint16_t>(1801 + gg1), 0);
     }
 
-    geosets.insert(geosetGloves);
-    geosets.insert(geosetBoots);
-    geosets.insert(geosetSleeves);
-    geosets.insert(geosetPants);
+    eraseGroup(4);
+    eraseGroup(5);
+    eraseGroup(8);
+    eraseGroup(13);
+    eraseGroup(15);
+    eraseGroup(18);
+    if (geosetGloves != 0) geosets.insert(geosetGloves);
+    if (geosetBoots != 0) geosets.insert(geosetBoots);
+    if (geosetSleeves != 0) geosets.insert(geosetSleeves);
+    if (geosetPants != 0) geosets.insert(geosetPants);
     if (geosetBelt != 0) geosets.insert(geosetBelt);
     // Back/Cloak (invType 16)
-    geosets.insert(hasInvType({16}) ? kGeosetWithCape : kGeosetNoCape);
+    uint16_t geosetCape = pickGeoset(
+        hasInvType({16}) ? kGeosetWithCape : kGeosetNoCape,
+        kGeosetNoCape);
+    if (geosetCape != 0) geosets.insert(geosetCape);
     // Tabard (invType 19)
     if (hasInvType({19})) geosets.insert(kGeosetDefaultTabard);
 

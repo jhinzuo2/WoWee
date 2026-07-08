@@ -1940,13 +1940,7 @@ void GameHandler::registerOpcodeHandlers() {
             ir.enchantIds     = {};
         }
 
-        // Also cache for future talent-inspect cross-reference
-        inspectedPlayerItemEntries_[guid] = items;
-
-        // Trigger item queries for non-empty slots
-        for (int s = 0; s < kGearSlots; ++s) {
-            if (items[s] != 0) queryItemInfo(items[s], 0);
-        }
+        cacheInspectedPlayerEquipment(guid, items);
 
         LOG_INFO("SMSG_INSPECT (Classic): ", playerName, " has gear in ",
                  std::count_if(items.begin(), items.end(),

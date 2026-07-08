@@ -83,6 +83,7 @@ imgui.ini
 # Config files
 config.ini
 config.json
+.env
 
 # Runtime cache (floor heights, etc.)
 cache/

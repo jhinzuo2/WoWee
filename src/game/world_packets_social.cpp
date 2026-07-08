@@ -2,6 +2,7 @@
 #include "game/packet_parsers.hpp"
 #include "game/opcodes.hpp"
 #include "game/character.hpp"
+#include "game/game_utils.hpp"
 #include "auth/crypto.hpp"
 #include "core/logger.hpp"
 #include <algorithm>
@@ -404,7 +405,11 @@ network::Packet SetActiveMoverPacket::build(uint64_t guid) {
 
 network::Packet InspectPacket::build(uint64_t targetGuid) {
     network::Packet packet(wireOpcode(Opcode::CMSG_INSPECT));
-    packet.writePackedGuid(targetGuid);
+    if (isActiveExpansion("classic") || isActiveExpansion("tbc") || isActiveExpansion("turtle")) {
+        packet.writeUInt64(targetGuid);
+    } else {
+        packet.writePackedGuid(targetGuid);
+    }
     LOG_DEBUG("Built CMSG_INSPECT: target=0x", std::hex, targetGuid, std::dec);
     return packet;
 }

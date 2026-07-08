@@ -88,6 +88,9 @@ struct InspectResult {
     std::string playerName;
     uint32_t    totalTalents   = 0;
     uint32_t    unspentTalents = 0;
+    bool        hasTalentData  = false;
+    bool        hasTalentTreePoints = false;
+    std::array<uint32_t, 3> talentTreePoints{};
     uint8_t     talentGroups   = 0;
     uint8_t     activeTalentGroup = 0;
     std::array<uint32_t, 19> itemEntries{};

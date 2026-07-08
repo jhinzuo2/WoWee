@@ -1298,6 +1298,10 @@ void GameHandler::inspectTarget() {
     if (socialHandler_) socialHandler_->inspectTarget();
 }
 
+const GameHandler::InspectResult* GameHandler::getInspectResult() const {
+    return socialHandler_ ? socialHandler_->getInspectResult() : nullptr;
+}
+
 void GameHandler::queryServerTime() {
     if (socialHandler_) socialHandler_->queryServerTime();
 }
@@ -1604,6 +1608,10 @@ void GameHandler::maybeDetectVisibleItemLayout() {
 
 void GameHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFieldMap& fields) {
     if (inventoryHandler_) inventoryHandler_->updateOtherPlayerVisibleItems(guid, fields);
+}
+
+void GameHandler::cacheInspectedPlayerEquipment(uint64_t guid, const std::array<uint32_t, 19>& itemEntries) {
+    if (inventoryHandler_) inventoryHandler_->cacheInspectedPlayerEquipment(guid, itemEntries);
 }
 
 void GameHandler::emitOtherPlayerEquipment(uint64_t guid) {

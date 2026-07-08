@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <sstream>
 
 namespace wowee {
@@ -35,6 +36,58 @@ bool isBandageItem(const ItemQueryResponseData* info) {
     return info && info->valid &&
            info->itemClass == kItemClassConsumable &&
            info->subClass == kConsumableSubclassBandage;
+}
+
+bool usesVisibleItemDisplayIds() {
+    return false;
+}
+
+constexpr int kTbcVisibleItemStride = 16;
+
+int tbcVisibleItemBaseFallback() {
+    const uint16_t invSlotHead = fieldIndex(UF::PLAYER_FIELD_INV_SLOT_HEAD);
+    constexpr int kVisibleSlots = 19;
+    const int visibleBytes = kVisibleSlots * kTbcVisibleItemStride;
+    if (invSlotHead != 0xFFFF && invSlotHead >= visibleBytes) {
+        return static_cast<int>(invSlotHead) - visibleBytes;
+    }
+    return 346;
+}
+
+bool visibleEquipmentFieldDiagEnabled() {
+    static const bool enabled = [] {
+        const char* raw = std::getenv("WOWEE_VISIBLE_EQUIP_FIELD_DIAG");
+        if (!raw || raw[0] == '\0') return false;
+        std::string value(raw);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value != "0" && value != "false" && value != "off";
+    }();
+    return enabled;
+}
+
+std::array<uint8_t, 19> inferredVisibleInventoryTypes() {
+    return {
+        InvType::HEAD,
+        InvType::NECK,
+        InvType::SHOULDERS,
+        InvType::SHIRT,
+        InvType::CHEST,
+        InvType::WAIST,
+        InvType::LEGS,
+        InvType::FEET,
+        InvType::WRISTS,
+        InvType::HANDS,
+        InvType::FINGER,
+        InvType::FINGER,
+        InvType::TRINKET,
+        InvType::TRINKET,
+        InvType::BACK,
+        InvType::MAIN_HAND,
+        InvType::SHIELD,
+        InvType::RANGED_BOW,
+        InvType::TABARD,
+    };
 }
 
 uint64_t targetGuidForUseItem(GameHandler& owner, const ItemQueryResponseData* info) {
@@ -3103,7 +3156,113 @@ void InventoryHandler::rebuildOnlineInventory() {
 
 void InventoryHandler::maybeDetectVisibleItemLayout() {
     if (owner_.visibleItemLayoutVerifiedRef()) return;
+    if (usesVisibleItemDisplayIds()) {
+        std::array<uint32_t, 19> equipDisplayIds = owner_.lastEquipDisplayIdsRef();
+        int nonZero = 0;
+        for (int i = 0; i < 19; ++i) {
+            if (equipDisplayIds[i] == 0) {
+                const auto& slot = owner_.inventoryRef().getEquipSlot(static_cast<EquipSlot>(i));
+                if (!slot.empty()) equipDisplayIds[i] = slot.item.displayInfoId;
+            }
+            if (equipDisplayIds[i] != 0) nonZero++;
+        }
+
+        int bestBase = -1;
+        int bestStride = 0;
+        int bestMatches = 0;
+        int bestMismatches = 9999;
+        int bestScore = -999999;
+
+        if (nonZero >= 2 && !owner_.lastPlayerFieldsRef().empty()) {
+            const uint16_t maxKey = owner_.lastPlayerFieldsRef().back().first;
+            const int strides[] = {16, 12, 8, 4, 2, 3, 1};
+            for (int stride : strides) {
+                for (const auto& [baseIdxU16, _v] : owner_.lastPlayerFieldsRef()) {
+                    const int base = static_cast<int>(baseIdxU16);
+                    if (base + 18 * stride > static_cast<int>(maxKey)) continue;
+
+                    int matches = 0;
+                    int mismatches = 0;
+                    for (int s = 0; s < 19; ++s) {
+                        uint32_t want = equipDisplayIds[s];
+                        if (want == 0) continue;
+                        const uint16_t idx = static_cast<uint16_t>(base + s * stride);
+                        auto it = owner_.lastPlayerFieldsRef().find(idx);
+                        if (it == owner_.lastPlayerFieldsRef().end()) continue;
+                        if (it->second == want) {
+                            matches++;
+                        } else if (it->second != 0) {
+                            mismatches++;
+                        }
+                    }
+
+                    int score = matches * 3 - mismatches * 2;
+                    if (score > bestScore ||
+                        (score == bestScore && matches > bestMatches) ||
+                        (score == bestScore && matches == bestMatches && mismatches < bestMismatches) ||
+                        (score == bestScore && matches == bestMatches && mismatches == bestMismatches &&
+                         (bestBase < 0 || base < bestBase))) {
+                        bestScore = score;
+                        bestMatches = matches;
+                        bestMismatches = mismatches;
+                        bestBase = base;
+                        bestStride = stride;
+                    }
+                }
+            }
+        }
+
+        bool changed = false;
+        if (bestMatches >= 2 && bestBase >= 0 && bestStride > 0 && bestMismatches <= 2) {
+            changed = owner_.visibleItemEntryBaseRef() != bestBase ||
+                      owner_.visibleItemStrideRef() != bestStride;
+            owner_.visibleItemEntryBaseRef() = bestBase;
+            owner_.visibleItemStrideRef() = bestStride;
+            owner_.visibleItemLayoutVerifiedRef() = true;
+            LOG_INFO("Detected TBC PLAYER_VISIBLE_ITEM display layout: base=", bestBase,
+                     " stride=", bestStride, " (matches=", bestMatches,
+                     " mismatches=", bestMismatches, " score=", bestScore, ")");
+        } else {
+            // TBC exposes display IDs rather than item entries, but private cores
+            // are not perfectly consistent about the base offset. Keep the known
+            // 2.4.x fallback active without marking it verified, so later local
+            // equipment updates can still detect a better layout.
+            const int kTbcFallbackBase = tbcVisibleItemBaseFallback();
+            constexpr int kTbcFallbackStride = kTbcVisibleItemStride;
+            changed = owner_.visibleItemEntryBaseRef() != kTbcFallbackBase ||
+                      owner_.visibleItemStrideRef() != kTbcFallbackStride;
+            owner_.visibleItemEntryBaseRef() = kTbcFallbackBase;
+            owner_.visibleItemStrideRef() = kTbcFallbackStride;
+            static bool loggedProvisionalLayout = false;
+            if (!loggedProvisionalLayout) {
+                loggedProvisionalLayout = true;
+                LOG_INFO("Using provisional TBC PLAYER_VISIBLE_ITEM display layout: base=",
+                         kTbcFallbackBase, " stride=", kTbcFallbackStride,
+                         " (waiting for local display-ID confirmation)");
+            }
+            if (visibleEquipmentFieldDiagEnabled()) {
+                LOG_INFO("TBC visible layout detection pending: localDisplayIds=", nonZero,
+                         " bestBase=", bestBase, " bestStride=", bestStride,
+                         " matches=", bestMatches, " mismatches=", bestMismatches,
+                         " score=", bestScore);
+            }
+        }
+
+        if (changed || owner_.visibleItemLayoutVerifiedRef()) {
+            for (const auto& [guid, ent] : owner_.getEntityManager().getEntities()) {
+                if (!ent || ent->getType() != ObjectType::PLAYER) continue;
+                if (guid == owner_.getPlayerGuid()) continue;
+                updateOtherPlayerVisibleItems(guid, ent->getFields());
+            }
+        }
+        return;
+    }
     if (owner_.lastPlayerFieldsRef().empty()) return;
+
+    if (isActiveExpansion("tbc")) {
+        owner_.visibleItemEntryBaseRef() = tbcVisibleItemBaseFallback();
+        owner_.visibleItemStrideRef() = kTbcVisibleItemStride;
+    }
 
     std::array<uint32_t, 19> equipEntries{};
     int nonZero = 0;
@@ -3132,7 +3291,9 @@ void InventoryHandler::maybeDetectVisibleItemLayout() {
     int bestMismatches = 9999;
     int bestScore = -999999;
 
-    const int strides[] = {2, 3, 4, 1};
+    const std::array<int, 5> strides = isActiveExpansion("tbc")
+        ? std::array<int, 5>{16, 2, 3, 4, 1}
+        : std::array<int, 5>{2, 3, 4, 1, 16};
     for (int stride : strides) {
         for (const auto& [baseIdxU16, _v] : owner_.lastPlayerFieldsRef()) {
             const int base = static_cast<int>(baseIdxU16);
@@ -3191,8 +3352,19 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
     // Use the current base/stride (defaults are correct for WotLK 3.3.5a: base=284, stride=2).
     // The heuristic may refine these later, but we proceed immediately with whatever values
     // are set rather than waiting for verification.
-    const int base = owner_.visibleItemEntryBaseRef();
-    const int stride = owner_.visibleItemStrideRef();
+    const bool valuesAreDisplayIds = usesVisibleItemDisplayIds();
+    int base = owner_.visibleItemEntryBaseRef();
+    int stride = owner_.visibleItemStrideRef();
+    if (isActiveExpansion("tbc") && !owner_.visibleItemLayoutVerifiedRef()) {
+        const int kTbcFallbackBase = tbcVisibleItemBaseFallback();
+        constexpr int kTbcFallbackStride = kTbcVisibleItemStride;
+        if (base != kTbcFallbackBase || stride != kTbcFallbackStride) {
+            base = kTbcFallbackBase;
+            stride = kTbcFallbackStride;
+            owner_.visibleItemEntryBaseRef() = base;
+            owner_.visibleItemStrideRef() = stride;
+        }
+    }
     if (base < 0 || stride <= 0) return; // Defensive: should never happen with defaults.
 
     std::array<uint32_t, 19> newEntries{};
@@ -3204,6 +3376,19 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
 
     int nonZero = 0;
     for (uint32_t e : newEntries) { if (e != 0) nonZero++; }
+    const bool hasVisibleBodySlot =
+        newEntries[2] != 0 ||  // shoulders
+        newEntries[4] != 0 ||  // chest
+        newEntries[6] != 0 ||  // legs
+        newEntries[7] != 0 ||  // feet
+        newEntries[9] != 0 ||  // hands
+        newEntries[15] != 0 || // main hand
+        newEntries[16] != 0;   // off hand
+    const bool sparseTbcVisible =
+        valuesAreDisplayIds &&
+        (nonZero == 0 || nonZero < 4 || (!hasVisibleBodySlot && nonZero < 8));
+    const bool hasInspectedEntries =
+        owner_.inspectedPlayerItemEntriesRef().find(guid) != owner_.inspectedPlayerItemEntriesRef().end();
 
     // Dump raw fields around visible item range to find the correct offset
     static int dumpCount = 0;
@@ -3219,13 +3404,48 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
         }
         LOG_DEBUG("RAW FIELDS 270-340:", dump);
     }
+    static int diagDumpCount = 0;
+    if (visibleEquipmentFieldDiagEnabled() && diagDumpCount < 8 && fields.size() > 20) {
+        diagDumpCount++;
+        std::ostringstream dump;
+        int emitted = 0;
+        uint16_t maxField = 0;
+        for (const auto& [idx, val] : fields) {
+            if (idx > maxField) maxField = idx;
+            if (idx < 220 || idx > 760 || val == 0) continue;
+            dump << " [" << idx << "]=" << val;
+            if (++emitted >= 180) {
+                dump << " ...";
+                break;
+            }
+        }
+        LOG_INFO("VISIBLE EQUIP FIELD DIAG guid=0x", std::hex, guid, std::dec,
+                 " fieldCount=", fields.size(), " maxField=", maxField,
+                 " base=", base, " stride=", stride,
+                 " verified=", owner_.visibleItemLayoutVerifiedRef(),
+                 " nonZero[220-760]=", dump.str());
+    }
 
     if (nonZero > 0) {
         LOG_DEBUG("updateOtherPlayerVisibleItems: guid=0x", std::hex, guid, std::dec,
                  " nonZero=", nonZero, " base=", base, " stride=", stride,
+                 " values=", (valuesAreDisplayIds ? "displayIds" : "itemEntries"),
                  " head=", newEntries[0], " shoulders=", newEntries[2],
                  " chest=", newEntries[4], " legs=", newEntries[6],
                  " mainhand=", newEntries[15], " offhand=", newEntries[16]);
+    }
+
+    if (sparseTbcVisible) {
+        if (!hasInspectedEntries && owner_.getSocket() && owner_.getState() == WorldState::IN_WORLD) {
+            owner_.pendingAutoInspectRef().insert(guid);
+            LOG_DEBUG("updateOtherPlayerVisibleItems: guid=0x", std::hex, guid, std::dec,
+                      " sparse TBC visible fields (nonZero=", nonZero,
+                      ", base=", base, ", stride=", stride,
+                      ") - queuing auto-inspect");
+        } else if (hasInspectedEntries) {
+            LOG_DEBUG("updateOtherPlayerVisibleItems: guid=0x", std::hex, guid, std::dec,
+                      " sparse TBC visible fields ignored; inspect gear already cached");
+        }
     }
 
     bool changed = false;
@@ -3233,6 +3453,17 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
     if (old != newEntries) {
         old = newEntries;
         changed = true;
+    }
+
+    if (valuesAreDisplayIds) {
+        if (sparseTbcVisible && hasInspectedEntries) {
+            return;
+        }
+        if (changed) {
+            owner_.otherPlayerVisibleDirtyRef().insert(guid);
+            emitOtherPlayerEquipment(guid);
+        }
+        return;
     }
 
     // Request item templates for any new visible entries.
@@ -3261,6 +3492,43 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
     }
 }
 
+void InventoryHandler::cacheInspectedPlayerEquipment(uint64_t guid, const std::array<uint32_t, 19>& itemEntries) {
+    if (guid == 0) return;
+
+    owner_.inspectedPlayerItemEntriesRef()[guid] = itemEntries;
+
+    std::array<uint32_t, 19> displayIds{};
+    std::array<uint8_t, 19> invTypes{};
+    int entries = 0;
+    int resolved = 0;
+
+    for (int s = 0; s < 19; ++s) {
+        const uint32_t entry = itemEntries[s];
+        if (entry == 0) continue;
+        entries++;
+
+        auto infoIt = owner_.itemInfoCacheRef().find(entry);
+        if (infoIt != owner_.itemInfoCacheRef().end()) {
+            displayIds[s] = infoIt->second.displayInfoId;
+            invTypes[s] = static_cast<uint8_t>(infoIt->second.inventoryType);
+            resolved++;
+            continue;
+        }
+
+        queryItemInfo(entry, 0);
+    }
+
+    LOG_DEBUG("cacheInspectedPlayerEquipment: guid=0x", std::hex, guid, std::dec,
+              " entries=", entries, " resolved=", resolved,
+              " head=", displayIds[0], " shoulders=", displayIds[2],
+              " chest=", displayIds[4], " legs=", displayIds[6],
+              " mainhand=", displayIds[15], " offhand=", displayIds[16]);
+
+    if (resolved > 0 && owner_.playerEquipmentCallbackRef()) {
+        owner_.playerEquipmentCallbackRef()(guid, displayIds, invTypes);
+    }
+}
+
 void InventoryHandler::emitOtherPlayerEquipment(uint64_t guid) {
     if (!owner_.playerEquipmentCallbackRef()) return;
     auto it = owner_.otherPlayerVisibleItemEntriesRef().find(guid);
@@ -3268,6 +3536,26 @@ void InventoryHandler::emitOtherPlayerEquipment(uint64_t guid) {
 
     std::array<uint32_t, 19> displayIds{};
     std::array<uint8_t, 19> invTypes{};
+    if (usesVisibleItemDisplayIds()) {
+        displayIds = it->second;
+        invTypes = inferredVisibleInventoryTypes();
+        int nonZeroDisplay = 0;
+        for (uint32_t displayId : displayIds) {
+            if (displayId != 0) nonZeroDisplay++;
+        }
+
+        LOG_DEBUG("emitOtherPlayerEquipment: guid=0x", std::hex, guid, std::dec,
+                 " TBC displayIds=", nonZeroDisplay,
+                 " head=", displayIds[0], " shoulders=", displayIds[2],
+                 " chest=", displayIds[4], " legs=", displayIds[6],
+                 " mainhand=", displayIds[15], " offhand=", displayIds[16]);
+
+        if (nonZeroDisplay == 0) return;
+        owner_.playerEquipmentCallbackRef()(guid, displayIds, invTypes);
+        owner_.otherPlayerVisibleDirtyRef().erase(guid);
+        return;
+    }
+
     bool anyEntry = false;
     int resolved = 0, unresolved = 0;
 
