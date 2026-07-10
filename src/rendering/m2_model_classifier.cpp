@@ -122,21 +122,26 @@ M2ClassificationResult classifyM2Model(
     // Foliage token table (sorted alphabetically)
     // ---------------------------------------------------------------
     static constexpr auto kFoliageTokens = std::to_array<std::string_view>({
-        "algae",      "bamboo",     "banana",     "barley",     "bracken",
-        "branch",     "briars",     "brush",      "bush",
-        "cactus",     "canopy",     "cattail",    "clover",     "coconut",
-        "coral",      "corn",       "crop",
+        "algae",      "bamboo",     "banana",     "barley",     "bean",
+        "bracken",    "bramble",    "branch",     "briar",      "brush",
+        "bush",
+        "cactus",     "canopy",     "carrot",     "cattail",    "clover",
+        "clump",      "coconut",    "coral",      "corn",       "crop",
         "dead-grass", "dead_grass", "deadgrass",
         "dry-grass",  "dry_grass",  "drygrass",
         "fern",       "fernleaf",   "fireflies",  "firefly",    "fireflys",
         "flower",     "frond",      "fungus",     "gourd",      "grapes",
         "grass",
-        "hay",        "hedge",      "hops",       "ivy",
-        "kelp",       "leaf",       "leaves",     "lichen",     "lily",
+        "hay",        "hedge",      "herb",       "hops",       "ivy",
+        "kelp",       "leaf",       "leaves",     "lettuce",    "lichen",
+        "lily",
         "melon",      "moss",       "mushroom",   "nettle",
-        "palm",       "pinecone",   "pumpkin",    "reed",       "root",
-        "sapling",    "seaweed",    "seedling",   "shrub",      "squash",
-        "stalk",      "thorn",      "thistle",    "toadstool",
+        "okra",       "onion",
+        "palm",       "pepper",     "pinecone",   "potato",     "pumpkin",
+        "reed",       "root",
+        "sapling",    "seaweed",    "seedling",   "shrub",      "sprout",
+        "squash",     "stalk",      "thorn",      "thistle",    "toadstool",
+        "tomato",     "turnip",
         "underbrush", "vine",       "watermelon", "weed",       "wheat",
     });
 
@@ -175,6 +180,16 @@ M2ClassificationResult classifyM2Model(
     r.collisionNoBlock        = (foliageName || softTree || carpetOrRug) && !forceSolidCurb;
     // Ground-clutter detail cards are always non-blocking.
     if (r.isGroundDetail) r.collisionNoBlock = true;
+    // Small doodads that aren't explicitly solid should not block movement.
+    // In WoW, only named solid objects (crates, barrels, anvils, etc.) and
+    // large structural doodads have collision — small decorative models are
+    // always walkthrough regardless of their name.
+    if (!r.collisionNoBlock && !smallSolid && !forceSolidCurb
+        && !r.collisionSteppedFountain && !r.collisionTreeTrunk
+        && !r.collisionNarrowVerticalProp && !r.collisionStatue
+        && horiz < 2.0f && vert < 2.0f) {
+        r.collisionNoBlock = true;
+    }
 
     // ---------------------------------------------------------------
     // Ambient creatures: fireflies, dragonflies, moths, butterflies
