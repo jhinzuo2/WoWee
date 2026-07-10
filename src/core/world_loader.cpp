@@ -748,24 +748,8 @@ void WorldLoader::loadOnlineWorldTerrain(uint32_t mapId, float x, float y, float
                                 glm::vec3 worldPos = glm::vec3(worldMatrix[3]);
 
                                 uint32_t doodadModelId = static_cast<uint32_t>(std::hash<std::string>{}(m2Path));
-                                std::string lowerDoodadPath = m2Path;
-                                std::transform(lowerDoodadPath.begin(), lowerDoodadPath.end(), lowerDoodadPath.begin(),
-                                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-                                const bool isPortalDoodad = lowerDoodadPath.find("instanceportal") != std::string::npos;
-                                if (isPortalDoodad) {
-                                    LOG_WARNING("Portal doodad reached: path=", m2Path,
-                                                " localPos=(", doodad.position.x, ",", doodad.position.y, ",", doodad.position.z, ")",
-                                                " scale=", doodad.scale,
-                                                " worldPos=(", worldPos.x, ",", worldPos.y, ",", worldPos.z, ")");
-                                }
-                                if (!m2Renderer->loadModel(m2Model, doodadModelId)) {
-                                    if (isPortalDoodad) LOG_WARNING("Portal doodad: loadModel FAILED");
-                                    continue;
-                                }
+                                if (!m2Renderer->loadModel(m2Model, doodadModelId)) continue;
                                 uint32_t doodadInstId = m2Renderer->createInstanceWithMatrix(doodadModelId, worldMatrix, worldPos);
-                                if (isPortalDoodad) {
-                                    LOG_WARNING("Portal doodad: createInstanceWithMatrix returned instId=", doodadInstId);
-                                }
                                 if (doodadInstId) m2Renderer->setSkipCollision(doodadInstId, true);
                                 loadedDoodads++;
                             }

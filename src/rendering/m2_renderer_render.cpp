@@ -241,11 +241,6 @@ uint32_t M2Renderer::createInstanceWithMatrix(uint32_t modelId, const glm::mat4&
             glm::vec3(modelMatrix[1]) / (sy > 0.0001f ? sy : 1.0f),
             glm::vec3(modelMatrix[2]) / (sz > 0.0001f ? sz : 1.0f));
         instance.rotation = glm::eulerAngles(glm::quat_cast(rotMat));
-        LOG_WARNING("Portal instance decomposed: modelId=", modelId,
-                    " pos=(", instance.position.x, ",", instance.position.y, ",", instance.position.z, ")",
-                    " rot=(", instance.rotation.x, ",", instance.rotation.y, ",", instance.rotation.z, ")",
-                    " scale=", instance.scale,
-                    " cachedIsValid=", instance.cachedIsValid);
     }
 
     // Initialize animation
