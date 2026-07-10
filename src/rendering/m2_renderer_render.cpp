@@ -212,9 +212,36 @@ uint32_t M2Renderer::createInstanceWithMatrix(uint32_t modelId, const glm::mat4&
     instance.cachedBoundRadius = mdl2.boundRadius;
     instance.cachedIsGroundDetail = mdl2.isGroundDetail;
     instance.cachedIsInvisibleTrap = mdl2.isInvisibleTrap;
+    instance.cachedIsInstancePortal = mdl2.isInstancePortal;
     instance.cachedIsValid = mdl2.isValid();
     instance.cachedModel = &mdl2;
     instance.recomputeCachedCullFactors();
+
+    // Portal spin animation (see update()'s "Spin instance portals" block) rebuilds
+    // modelMatrix from position/rotation/scale every frame - it has no way to spin a
+    // raw matrix. WMO-embedded portal doodads (e.g. Subway.wmo bakes a real
+    // InstancePortal_White doodad at each tunnel end) come through this matrix-based
+    // path and were silently getting no spin and no portal classification at all,
+    // since createInstance() (used for everything else) sets these fields but this
+    // function never did. Decompose the incoming world matrix into position/rotation/
+    // scale so the spin update can drive it exactly like a createInstance()-made
+    // portal. Z rotation gets overwritten by the spin angle within one frame
+    // regardless of what's extracted here, so only position, any static X/Y tilt, and
+    // uniform scale actually need to survive the round-trip - scoped to
+    // isInstancePortal models only, so every other WMO doodad's matrix-based
+    // placement (position/rotation/scale fields otherwise unused) is untouched.
+    if (mdl2.isInstancePortal) {
+        instance.position = glm::vec3(modelMatrix[3]);
+        float sx = glm::length(glm::vec3(modelMatrix[0]));
+        float sy = glm::length(glm::vec3(modelMatrix[1]));
+        float sz = glm::length(glm::vec3(modelMatrix[2]));
+        instance.scale = (sx + sy + sz) / 3.0f;
+        glm::mat3 rotMat(
+            glm::vec3(modelMatrix[0]) / (sx > 0.0001f ? sx : 1.0f),
+            glm::vec3(modelMatrix[1]) / (sy > 0.0001f ? sy : 1.0f),
+            glm::vec3(modelMatrix[2]) / (sz > 0.0001f ? sz : 1.0f));
+        instance.rotation = glm::eulerAngles(glm::quat_cast(rotMat));
+    }
 
     // Initialize animation
     if (mdl2.hasAnimation && !mdl2.disableAnimation) {
@@ -254,6 +281,9 @@ uint32_t M2Renderer::createInstanceWithMatrix(uint32_t modelId, const glm::mat4&
     size_t idx = instances.size() - 1;
     if (mdl2.isSmoke) {
         smokeInstanceIndices_.push_back(idx);
+    }
+    if (mdl2.isInstancePortal) {
+        portalInstanceIndices_.push_back(idx);
     }
     if (!mdl2.particleEmitters.empty()) {
         particleInstanceIndices_.push_back(idx);

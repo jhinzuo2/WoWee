@@ -91,21 +91,25 @@ void spawnDeeprunPortalVisuals(uint32_t mapId,
         m2Renderer->markModelAsSpellEffect(kPortalModelId);
     }
 
+    // Only the map-0 (city-side) entries remain here. The map-369 (tunnel-side) fake
+    // glow was removed: Subway.wmo already bakes a real InstancePortal_White doodad at
+    // each tunnel end (confirmed by dumping the WMO's own doodad set - local positions
+    // (-72.80,-10.41,-8.31) and (-72.92,-2490.64,-8.11), matching the Ironforge and
+    // Stormwind ends respectively). It just never rendered correctly: WMO doodads load
+    // through M2Renderer::createInstanceWithMatrix(), which - unlike createInstance()
+    // used everywhere else - never set cachedIsInstancePortal or registered the
+    // instance for the portal-spin update, so it got neither the spin animation nor
+    // portal classification (see the fix in m2_renderer_render.cpp). No investigation
+    // yet into whether an equivalent real doodad exists on the map-0 city side, so
+    // those entries stay as a fallback for now.
     static const DeeprunPortalVisual kPortals[] = {
         // Ironforge station -> Deeprun Tram
         {0,   glm::vec3(-1330.46f, -4840.26f, 503.85f), 3.10f},
-        // Deeprun Tram -> Ironforge station
-        {369, glm::vec3(10.50f, 76.03f, -2.30f),       3.12f},
         // Stormwind station -> Deeprun Tram. Coordinates from a live playthrough's
-        // actual AreaTrigger 2173 fire: entrance trigger position on map 0, and the
-        // canonical position the player actually landed at on map 369 after transfer
-        // (Z lifted by the same ~+2.0 offset the Ironforge map-369 entry uses relative
-        // to its own arrival point, since both tunnel ends have similar floor height).
-        // Yaw reuses the Ironforge value as a starting point - Stormwind's entrance
-        // faces a different direction, so this likely needs live tuning.
+        // actual AreaTrigger 2173 fire (entrance trigger position on map 0). Yaw
+        // reuses the Ironforge value as a starting point - Stormwind's entrance faces
+        // a different direction, so this likely needs live tuning.
         {0,   glm::vec3(514.03f, -8346.46f, 97.60f),   3.12f},
-        // Deeprun Tram -> Stormwind station
-        {369, glm::vec3(2490.91f, 68.30f, -2.30f),     3.12f},
     };
 
     for (const auto& portal : kPortals) {
