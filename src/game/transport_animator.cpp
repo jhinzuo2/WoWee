@@ -41,26 +41,22 @@ void TransportAnimator::evaluateAndApply(
         // orientationFromTangent orients along the full 3D tangent, pitching/banking to
         // match vertical slope - correct for something like a boat cresting swells, but
         // a subway car shouldn't nose-dive on a downhill grade the way this made it look
-        // ("angling downwards instead of staying flat" reported live). Fully flattening
-        // tangent.z to 0 fixed that but overcorrected: the car's position still follows
-        // the real track elevation (unchanged below), so a level, unpitched model on a
-        // real grade visually clips into the sloped tunnel floor ("cars clipping into
-        // the ground when going up and/or down the hills" reported live). Clamp the
-        // pitch instead of removing it, so the car banks gently with real grade changes
-        // without the exaggerated nose-dive the raw Catmull-Rom tangent produced near
-        // control points; other transports keep full tangent-based orientation.
+        // ("angling downwards instead of staying flat" reported live). Flattening
+        // tangent.z to 0 fixed that, but a subsequent live test reported the level car
+        // visually clipping into the sloped tunnel floor on grade changes, so that was
+        // changed to a clamped partial pitch instead of a full flatten. Confirmed via a
+        // later live comparison against the real game client that this was the wrong
+        // trade-off: in the real client, tram cars stay level (parallel to the ground)
+        // through elevation changes - any clamped tilt is visibly wrong regardless of
+        // whether it also reduces clipping. Reverted to a full flatten to match the
+        // real client's confirmed behavior; other transports keep full tangent-based
+        // orientation.
         const bool isDeeprunTram =
             transport.displayId == 3831u ||
             (transport.entry >= 176080u && transport.entry <= 176085u) ||
             (transport.pathId >= 176080u && transport.pathId <= 176085u);
         if (isDeeprunTram) {
-            const float horizLen = std::sqrt(tangent.x * tangent.x + tangent.y * tangent.y);
-            if (horizLen > 1e-4f) {
-                // ~0.3 rad (~17 degrees) max pitch either way.
-                constexpr float kMaxSlope = 0.3f;
-                const float maxAbsZ = horizLen * kMaxSlope;
-                tangent.z = std::clamp(tangent.z, -maxAbsZ, maxAbsZ);
-            }
+            tangent.z = 0.0f;
         }
         transport.rotation = math::CatmullRomSpline::orientationFromTangent(tangent);
     }

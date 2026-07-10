@@ -1652,6 +1652,9 @@ void Application::update(float deltaTime) {
                     } else {
                         hasM2RideLock_ = false;
                     }
+                    if (auto* ac = renderer->getAnimationController()) {
+                        ac->setM2TransportRiding(hasM2RideLock_);
+                    }
 
                     glm::vec3 canonical = core::coords::renderToCanonical(renderPos);
                     gameHandler->setPosition(canonical.x, canonical.y, canonical.z);

@@ -1074,7 +1074,10 @@ void AnimationController::updateCharacterAnimation() {
     fi.autoRunning = cameraController->isAutoRunning();
     fi.strafeLeft = cameraController->isStrafingLeft();
     fi.strafeRight = cameraController->isStrafingRight();
-    fi.grounded = cameraController->isGrounded();
+    // See setM2TransportRiding() comment: real physics correctly reports "not grounded"
+    // over open track under a moving platform, but the animation FSM needs "grounded"
+    // to avoid playing a falling animation for the whole ride.
+    fi.grounded = m2TransportRiding_ ? true : cameraController->isGrounded();
     fi.jumping = cameraController->isJumping();
     fi.swimming = cameraController->isSwimming();
     fi.sitting = cameraController->isSitting();

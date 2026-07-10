@@ -156,6 +156,18 @@ public:
     void setMounted(uint32_t mountInstId, uint32_t mountDisplayId,
                     float heightOffset, const std::string& modelPath = "");
     void setTaxiFlight(bool onTaxi) { taxiFlight_ = onTaxi; }
+    // M2 transport riding (Deeprun Tram, Thunder Bluff lifts): the ride-lock code in
+    // Application overwrites the character's render position directly every frame, so
+    // the camera controller's own gravity/collision never finds real ground beneath a
+    // moving platform over open track and reports not-grounded - correctly for physics
+    // purposes (there genuinely isn't a static floor there), but that fed straight into
+    // the animation FSM as "falling", so riders saw a falling animation play the entire
+    // ride even though position tracking was correct - "kept like playing the falling
+    // animation the whole time... it sure looked like it was going to [fall off]"
+    // reported live. Override just the animation-facing grounded signal while actively
+    // riding; leave the camera controller's real physics/collision untouched (needed
+    // for walk-while-riding to keep working).
+    void setM2TransportRiding(bool riding) { m2TransportRiding_ = riding; }
     void setMountPitchRoll(float pitch, float roll) { mountPitch_ = pitch; mountRoll_ = roll; }
     void clearMount();
     bool isMounted() const { return mountInstanceId_ != 0; }
@@ -213,6 +225,7 @@ private:
     glm::vec3 smoothedMountSeatPos_ = glm::vec3(0.0f);
     bool mountSeatSmoothingInit_ = false;
     bool taxiFlight_ = false;
+    bool m2TransportRiding_ = false;
     bool sprintAuraActive_ = false;
 
     // ── Private helpers ──────────────────────────────────────────────────

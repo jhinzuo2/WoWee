@@ -1523,6 +1523,30 @@ void GameHandler::updateM2TransportBoarding(const glm::vec3& playerCanonical) {
     if (!tr) return;
     glm::vec3 diff = playerCanonical - tr->position;
     float horizDistSq = diff.x * diff.x + diff.y * diff.y;
+
+    // Sanity guard against a transient bad position sample rather than a real disembark.
+    // Live data caught one: player=(-44.9,2309.03,..) vs tram=(2309.83,-45.4,..) - the
+    // player's X and Y are each within ~1 unit of the tram's Y and X respectively (an
+    // axis swap, not a real position), giving horizDist~3330 in a single frame despite
+    // riding smoothly for the prior ~70 seconds. Nothing can legitimately move that far
+    // between frames; whatever produced that sample (suspected: a raw server-coordinate
+    // movement update landing without the usual serverToCanonical swap, since that
+    // conversion has the exact same X/Y-swap shape as the corruption seen - possibly
+    // tied to a packet glitch, a "MSG_MOVE_TELEPORT_ACK: not enough data for movement
+    // info" was logged moments later in the same session) shouldn't be trusted enough to
+    // eject the player over open track - "kicked me off when I almost got to the other
+    // station" reported live. Skip disembark entirely this frame on an implausible jump;
+    // it'll re-evaluate next frame against (presumably) good data instead.
+    constexpr float kImplausibleDisembarkDistSq = 200.0f * 200.0f;
+    if (horizDistSq > kImplausibleDisembarkDistSq) {
+        LOG_WARNING("Deeprun tram disembark check skipped - implausible jump: guid=0x",
+                    std::hex, getPlayerTransportGuid(), std::dec,
+                    " horizDist=", std::sqrt(horizDistSq),
+                    " player=(", playerCanonical.x, ",", playerCanonical.y, ",", playerCanonical.z, ")",
+                    " tram=(", tr->position.x, ",", tr->position.y, ",", tr->position.z, ")");
+        return;
+    }
+
     const bool isThunderBluffLift =
         (tr->entry >= 20649u && tr->entry <= 20657u);
     const bool isDeeprunTram =
