@@ -332,18 +332,21 @@ network::Packet GroupInvitePacket::build(const std::string& playerName) {
     return packet;
 }
 
-bool GroupInviteResponseParser::parse(network::Packet& packet, GroupInviteResponseData& data) {
-    // Validate minimum packet size: canAccept(1)
+bool GroupInviteResponseParser::parse(network::Packet& packet, GroupInviteResponseData& data,
+                                      bool hasCanAccept) {
     if (!packet.hasRemaining(1)) {
         LOG_WARNING("SMSG_GROUP_INVITE: packet too small (", packet.getSize(), " bytes)");
         return false;
     }
 
-    data.canAccept = packet.readUInt8();
-    // Note: inviterName is a string, which is always safe to read even if empty
+    // WotLK has a canAccept byte before the inviter name; Classic/TBC do not.
+    if (hasCanAccept)
+        data.canAccept = packet.readUInt8();
+    else
+        data.canAccept = 1;
     data.inviterName = packet.readString();
     LOG_INFO("Group invite from: ", data.inviterName, " (canAccept=", static_cast<int>(data.canAccept), ")");
-    return true;
+    return !data.inviterName.empty();
 }
 
 network::Packet GroupAcceptPacket::build() {

@@ -1685,13 +1685,14 @@ void SocialHandler::requestRaidInfo() {
 
 void SocialHandler::handleGroupInvite(network::Packet& packet) {
     GroupInviteResponseData data;
-    if (!GroupInviteResponseParser::parse(packet, data)) return;
+    const bool hasCanAccept = !isPreWotlk();
+    if (!GroupInviteResponseParser::parse(packet, data, hasCanAccept)) return;
     pendingGroupInvite = true;
     pendingInviterName = data.inviterName;
-    if (!data.inviterName.empty())
-        owner_.addSystemChatMessage(data.inviterName + " has invited you to a group.");
+    owner_.addSystemChatMessage(data.inviterName + " has invited you to a group.");
+    owner_.addUIError(data.inviterName + " has invited you to join a group.");
     if (auto* ac = owner_.services().audioCoordinator)
-        if (auto* sfx = ac->getUiSoundManager()) sfx->playTargetSelect();
+        if (auto* sfx = ac->getUiSoundManager()) sfx->playQuestActivate();
     if (owner_.addonEventCallbackRef())
         owner_.addonEventCallbackRef()("PARTY_INVITE_REQUEST", {data.inviterName});
 }

@@ -1960,7 +1960,8 @@ struct GroupInviteResponseData {
 
 class GroupInviteResponseParser {
 public:
-    static bool parse(network::Packet& packet, GroupInviteResponseData& data);
+    static bool parse(network::Packet& packet, GroupInviteResponseData& data,
+                      bool hasCanAccept = true);
 };
 
 /** CMSG_GROUP_ACCEPT packet builder */
