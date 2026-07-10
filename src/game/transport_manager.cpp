@@ -8,12 +8,30 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/constants.hpp>
 #include <glm/gtx/quaternion.hpp>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
 namespace wowee::game {
 
 namespace {
+
+// Absolute wall-clock ms, used (only) to seed a freshly-registered client-animated
+// transport's starting phase. elapsedTime_ is time-since-this-process-started, so
+// seeding from it makes localClockMs depend on when each client happened to log in
+// or first see a given transport GUID - unrelated clients (or the same client
+// restarted) compute unrelated phases for the same entry, and there's nothing tying
+// two GUIDs that are meant to move in lockstep (e.g. Deeprun Tram's two cars, which
+// should always be roughly opposite each other) into any particular relationship.
+// Once seeded, localClockMs only ever advances by real per-frame deltaTime (see
+// TransportClockSync::computePathTime), so anchoring the seed to absolute time is
+// enough to make it deterministic and consistent across clients/restarts - matching
+// how tools/bot_fleet_manager/deeprun_tram.py already predicts these positions using
+// time.time()*1000 rather than time-since-launch.
+uint64_t nowEpochMs() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+}
 
 bool isDeeprunTramTransport(const ActiveTransport& transport) {
     return transport.displayId == 3831u ||
@@ -171,8 +189,10 @@ void TransportManager::registerTransport(uint64_t guid,
     transport.hasServerVelocity = false;
 
     if (transport.useClientAnimation && spline.durationMs() > 0) {
-        // Seed to a stable phase based on our local clock so elevators don't all start at t=0.
-        transport.localClockMs = static_cast<uint32_t>(elapsedTime_ * 1000.0) % spline.durationMs();
+        // Seed to a stable phase derived from absolute time (see nowEpochMs comment)
+        // so elevators don't all start at t=0, and so paired/opposing transports like
+        // the Deeprun Tram's two cars land at the same relative phase for every client.
+        transport.localClockMs = static_cast<uint32_t>(nowEpochMs() % spline.durationMs());
         LOG_INFO("TransportManager: Enabled client animation for transport 0x",
                  std::hex, guid, std::dec, " path=", pathId,
                  " durationMs=", spline.durationMs(), " seedMs=", transport.localClockMs,
@@ -543,9 +563,9 @@ bool TransportManager::assignTaxiPathToTransport(uint32_t entry, uint32_t taxiPa
         }
         transport.useClientAnimation = true;  // Server won't send position updates
 
-        // Seed local clock to a deterministic phase
+        // Seed local clock to a deterministic phase (see nowEpochMs comment above)
         if (storedEntry && storedEntry->spline.durationMs() > 0) {
-            transport.localClockMs = static_cast<uint32_t>(elapsedTime_ * 1000.0) % storedEntry->spline.durationMs();
+            transport.localClockMs = static_cast<uint32_t>(nowEpochMs() % storedEntry->spline.durationMs());
         }
 
         updateTransformMatrices(transport);
