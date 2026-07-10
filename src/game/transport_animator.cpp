@@ -21,6 +21,25 @@ void TransportAnimator::evaluateAndApply(
     // Evaluate position from time via CatmullRomSpline (path is local offsets, add base position)
     glm::vec3 pathOffset = spline.evaluatePosition(pathTimeMs);
 
+    // Entry 176085's TransportAnimation.dbc path data is mirrored relative to its real
+    // train siblings (176080, 176081): diagnostic dump of all six entries' raw key
+    // extents showed 176080/176081 spanning local X=[0,+2482] (real-world X correctly
+    // increasing toward Stormwind, matching their spawn near Ironforge), while 176085
+    // spans local X=[-2482,0] - the same negative-direction convention as the genuinely
+    // Stormwind-side cars (176082-176084, correct for THEM since their real-world X
+    // needs to decrease toward Ironforge). 176085 spawns at real-world X=-11 (Ironforge
+    // side) but its path pulls it further NEGATIVE instead of toward Stormwind's
+    // positive coordinates, driving it off the edge of the modeled tunnel entirely -
+    // "took me outside of map bounds and back" reported live, on the one car
+    // consistently observed going the wrong way. Y is negligible for all six paths
+    // (confirmed ~0 in the same dump), so a straight X negation is enough to mirror
+    // this one entry's local path back into the same real-world direction as its
+    // siblings, without needing a general per-transport reverse/mirror flag for what's
+    // so far a single-entry data quirk.
+    if (transport.entry == 176085u) {
+        pathOffset.x = -pathOffset.x;
+    }
+
     pathOffset.z = clampZOffset(
         pathOffset.z,
         pathEntry.worldCoords,
@@ -38,6 +57,11 @@ void TransportAnimator::evaluateAndApply(
     } else {
         auto result = spline.evaluate(pathTimeMs);
         glm::vec3 tangent = result.tangent;
+        // Mirror the tangent's X to match the position mirror above, so facing
+        // direction stays consistent with this entry's (corrected) direction of travel.
+        if (transport.entry == 176085u) {
+            tangent.x = -tangent.x;
+        }
         // orientationFromTangent orients along the full 3D tangent, pitching/banking to
         // match vertical slope - correct for something like a boat cresting swells, but
         // a subway car shouldn't nose-dive on a downhill grade the way this made it look
