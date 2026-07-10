@@ -373,6 +373,7 @@ jobs:
           mingw-w64-clang-aarch64-vulkan-loader
           mingw-w64-clang-aarch64-vulkan-headers
           mingw-w64-clang-aarch64-shaderc
+          mingw-w64-clang-aarch64-libtommath
           git
 
     - name: Build StormLib from source
@@ -469,6 +470,7 @@ jobs:
           mingw-w64-x86_64-vulkan-headers
           mingw-w64-x86_64-shaderc
           mingw-w64-x86_64-nsis
+          mingw-w64-x86_64-libtommath
           git
 
     - name: Build StormLib from source

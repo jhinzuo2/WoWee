@@ -331,7 +331,7 @@ jobs:
         # breaking setup after MSYS2 rotates signing keys.
         cache: false
         install: >-
-          ${{ matrix.prefix }}-cmake ${{ matrix.arch == 'x86-64' && format('{0}-gcc', matrix.prefix) || format('{0}-clang', matrix.prefix) }} ${{ matrix.prefix }}-ninja ${{ matrix.prefix }}-pkgconf ${{ matrix.prefix }}-SDL2 ${{ matrix.prefix }}-glm ${{ matrix.prefix }}-openssl ${{ matrix.prefix }}-zlib ${{ matrix.prefix }}-ffmpeg ${{ matrix.prefix }}-unicorn ${{ matrix.prefix }}-vulkan-loader ${{ matrix.prefix }}-vulkan-headers ${{ matrix.prefix }}-shaderc git
+          ${{ matrix.prefix }}-cmake ${{ matrix.arch == 'x86-64' && format('{0}-gcc', matrix.prefix) || format('{0}-clang', matrix.prefix) }} ${{ matrix.prefix }}-ninja ${{ matrix.prefix }}-pkgconf ${{ matrix.prefix }}-SDL2 ${{ matrix.prefix }}-glm ${{ matrix.prefix }}-openssl ${{ matrix.prefix }}-zlib ${{ matrix.prefix }}-ffmpeg ${{ matrix.prefix }}-unicorn ${{ matrix.prefix }}-vulkan-loader ${{ matrix.prefix }}-vulkan-headers ${{ matrix.prefix }}-shaderc ${{ matrix.prefix }}-libtommath git
 
     - name: Install optional packages
       shell: msys2 {0}
