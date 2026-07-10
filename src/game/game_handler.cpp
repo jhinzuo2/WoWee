@@ -1469,10 +1469,22 @@ void GameHandler::updateM2TransportBoarding(const glm::vec3& playerCanonical) {
             }
         }
         if (bestGuid == 0 && nearestDeeprunGuid != 0) {
-            LOG_DEBUG("Deeprun tram boarding: no candidate in range, nearest car guid=0x",
-                      std::hex, nearestDeeprunGuid, std::dec,
-                      " horizDist=", std::sqrt(nearestDeeprunHorizDistSq),
-                      " vertDist=", nearestDeeprunVertDist);
+            // WARNING (not DEBUG) so this shows up in a plain run without needing
+            // WOWEE_LOG_LEVEL=debug set - the boarding radius has already been re-tuned
+            // blind three times (18/18, 7/6, 9.5/8) purely from "it didn't work" reports,
+            // and the last two rounds of live logs came back at the default WARN level
+            // with none of this diagnostic in them. Throttled to ~1/sec since this runs
+            // every frame while not boarded.
+            static double lastLogTime = -1000.0;
+            const double now = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()) / 1000.0;
+            if (now - lastLogTime >= 1.0) {
+                lastLogTime = now;
+                LOG_WARNING("Deeprun tram boarding: no candidate in range, nearest car guid=0x",
+                            std::hex, nearestDeeprunGuid, std::dec,
+                            " horizDist=", std::sqrt(nearestDeeprunHorizDistSq),
+                            " vertDist=", nearestDeeprunVertDist);
+            }
         }
         if (bestGuid != 0) {
             auto* tr = tm->getTransport(bestGuid);
