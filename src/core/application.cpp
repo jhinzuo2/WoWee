@@ -1650,108 +1650,12 @@ void Application::update(float deltaTime) {
                         }
                     }
 
-                    // Client-side transport boarding detection (for M2 transports like trams
-                    // and lifts where the server doesn't send transport attachment data).
-                    // Thunder Bluff elevators use model origins that can be far from the deck
-                    // the player stands on, so they need wider attachment bounds.
-                    if (gameHandler->getTransportManager() && !gameHandler->isOnTransport()) {
-                        auto* tm = gameHandler->getTransportManager();
+                    // Client-side M2 transport (trams, lifts) board/disembark check - shared
+                    // with any other driver that knows the player's canonical position (see
+                    // GameHandler::updateM2TransportBoarding).
+                    if (gameHandler->getTransportManager()) {
                         glm::vec3 playerCanonical = core::coords::renderToCanonical(renderPos);
-                        constexpr float kM2BoardHorizDistSq = 12.0f * 12.0f;
-                        constexpr float kM2BoardVertDist = 15.0f;
-                        constexpr float kTbLiftBoardHorizDistSq = 22.0f * 22.0f;
-                        constexpr float kTbLiftBoardVertDist = 14.0f;
-                        constexpr float kDeeprunTramBoardHorizDistSq = 18.0f * 18.0f;
-                        constexpr float kDeeprunTramBoardVertDist = 18.0f;
-
-                        uint64_t bestGuid = 0;
-                        float bestScore = 1e30f;
-                        for (auto& [guid, transport] : tm->getTransports()) {
-                            if (!transport.isM2) continue;
-                            const bool isThunderBluffLift =
-                                (transport.entry >= 20649u && transport.entry <= 20657u);
-                            const bool isDeeprunTram =
-                                transport.displayId == 3831u ||
-                                (transport.entry >= 176080u && transport.entry <= 176085u) ||
-                                (transport.pathId >= 176080u && transport.pathId <= 176085u);
-                            const float maxHorizDistSq = isThunderBluffLift
-                                ? kTbLiftBoardHorizDistSq
-                                : (isDeeprunTram ? kDeeprunTramBoardHorizDistSq
-                                                 : kM2BoardHorizDistSq);
-                            const float maxVertDist = isThunderBluffLift
-                                ? kTbLiftBoardVertDist
-                                : (isDeeprunTram ? kDeeprunTramBoardVertDist
-                                                 : kM2BoardVertDist);
-                            glm::vec3 diff = playerCanonical - transport.position;
-                            float horizDistSq = diff.x * diff.x + diff.y * diff.y;
-                            float vertDist = std::abs(diff.z);
-                            if (horizDistSq < maxHorizDistSq && vertDist < maxVertDist) {
-                                float score = horizDistSq + vertDist * vertDist;
-                                if (score < bestScore) {
-                                    bestScore = score;
-                                    bestGuid = guid;
-                                }
-                            }
-                        }
-                        if (bestGuid != 0) {
-                            auto* tr = tm->getTransport(bestGuid);
-                            if (tr) {
-                                const bool isDeeprunTram =
-                                    tr->displayId == 3831u ||
-                                    (tr->entry >= 176080u && tr->entry <= 176085u) ||
-                                    (tr->pathId >= 176080u && tr->pathId <= 176085u);
-                                if (isDeeprunTram) {
-                                    const glm::vec3 offset = playerCanonical - tr->position;
-                                    gameHandler->setPlayerOnTransport(bestGuid, offset);
-                                    const bool attached = gameHandler->getPlayerTransportGuid() == bestGuid;
-                                    LOG_WARNING("Deeprun tram boarding candidate ", (attached ? "accepted" : "rejected"),
-                                                ": guid=0x", std::hex, bestGuid, std::dec,
-                                                " entry=", tr->entry,
-                                                " pathId=", tr->pathId,
-                                                " player=(", playerCanonical.x, ",", playerCanonical.y, ",", playerCanonical.z, ")",
-                                                " tram=(", tr->position.x, ",", tr->position.y, ",", tr->position.z, ")",
-                                                " offset=(", offset.x, ",", offset.y, ",", offset.z, ")");
-                                } else {
-                                    gameHandler->setPlayerOnTransport(bestGuid, playerCanonical - tr->position);
-                                    LOG_DEBUG("M2 transport boarding: guid=0x", std::hex, bestGuid, std::dec);
-                                }
-                            }
-                        }
-                    }
-
-                    // M2 transport disembark: player walked far enough from transport center
-                    if (isM2Transport && gameHandler->getTransportManager()) {
-                        auto* tm = gameHandler->getTransportManager();
-                        auto* tr = tm->getTransport(gameHandler->getPlayerTransportGuid());
-                        if (tr) {
-                            glm::vec3 playerCanonical = core::coords::renderToCanonical(renderPos);
-                            glm::vec3 diff = playerCanonical - tr->position;
-                            float horizDistSq = diff.x * diff.x + diff.y * diff.y;
-                            const bool isThunderBluffLift =
-                                (tr->entry >= 20649u && tr->entry <= 20657u);
-                            const bool isDeeprunTram =
-                                tr->displayId == 3831u ||
-                                (tr->entry >= 176080u && tr->entry <= 176085u) ||
-                                (tr->pathId >= 176080u && tr->pathId <= 176085u);
-                            constexpr float kM2DisembarkHorizDistSq = 15.0f * 15.0f;
-                            constexpr float kTbLiftDisembarkHorizDistSq = 28.0f * 28.0f;
-                            constexpr float kM2DisembarkVertDist = 18.0f;
-                            constexpr float kTbLiftDisembarkVertDist = 16.0f;
-                            constexpr float kDeeprunTramDisembarkHorizDistSq = 24.0f * 24.0f;
-                            constexpr float kDeeprunTramDisembarkVertDist = 22.0f;
-                            const float disembarkHorizDistSq = isThunderBluffLift
-                                ? kTbLiftDisembarkHorizDistSq
-                                : (isDeeprunTram ? kDeeprunTramDisembarkHorizDistSq
-                                                 : kM2DisembarkHorizDistSq);
-                            const float disembarkVertDist = isThunderBluffLift
-                                ? kTbLiftDisembarkVertDist
-                                : (isDeeprunTram ? kDeeprunTramDisembarkVertDist
-                                                 : kM2DisembarkVertDist);
-                            if (horizDistSq > disembarkHorizDistSq || std::abs(diff.z) > disembarkVertDist) {
-                                gameHandler->clearPlayerTransport();
-                                LOG_DEBUG("M2 transport disembark");
-                            }
-                        }
+                        gameHandler->updateM2TransportBoarding(playerCanonical);
                     }
                 }
                 }

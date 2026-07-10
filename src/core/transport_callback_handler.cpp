@@ -173,81 +173,12 @@ void TransportCallbackHandler::setupCallbacks() {
                 auto it = goInstances3.find(guid);
                 if (it != goInstances3.end()) {
                     uint32_t wmoInstanceId = it->second.instanceId;
-
-                    // TransportAnimation.dbc is indexed by GameObject entry
-                    uint32_t pathId = entry;
                     const bool preferServerData = gameHandler_.hasServerTransportUpdate(guid);
-
                     // Coordinates are already canonical (converted in game_handler.cpp)
                     glm::vec3 canonicalSpawnPos(x, y, z);
-
-                    // Check if we have a real usable path, otherwise remap/infer/fall back to stationary.
-                    const bool shipOrZeppelinDisplay =
-                        (displayId == 3015 || displayId == 3031 || displayId == 7546 ||
-                         displayId == 7446 || displayId == 1587 || displayId == 2454 ||
-                         displayId == 807 || displayId == 808);
-                    bool hasUsablePath = transportManager->hasPathForEntry(entry);
-                    if (shipOrZeppelinDisplay) {
-                        hasUsablePath = transportManager->hasUsableMovingPathForEntry(entry, 25.0f);
-                    }
-
-                    if (preferServerData) {
-                        // Strict server-authoritative mode: no inferred/remapped fallback routes.
-                        if (!hasUsablePath) {
-                            std::vector<glm::vec3> path = { canonicalSpawnPos };
-                            transportManager->loadPathFromNodes(pathId, path, false, 0.0f);
-                            LOG_INFO("Auto-spawned transport in strict server-first mode (stationary fallback): entry=", entry,
-                                     " displayId=", displayId, " wmoInstance=", wmoInstanceId);
-                        } else {
-                            LOG_INFO("Auto-spawned transport in server-first mode with entry DBC path: entry=", entry,
-                                     " displayId=", displayId, " wmoInstance=", wmoInstanceId);
-                        }
-                    } else if (!hasUsablePath) {
-                        bool allowZOnly = (displayId == 455 || displayId == 462);
-                        uint32_t inferredPath = transportManager->inferDbcPathForSpawn(
-                            canonicalSpawnPos, 1200.0f, allowZOnly);
-                        if (inferredPath != 0) {
-                            pathId = inferredPath;
-                            LOG_INFO("Auto-spawned transport with inferred path: entry=", entry,
-                                     " inferredPath=", pathId, " displayId=", displayId,
-                                     " wmoInstance=", wmoInstanceId);
-                        } else {
-                            uint32_t remappedPath = transportManager->pickFallbackMovingPath(entry, displayId);
-                            if (remappedPath != 0) {
-                                pathId = remappedPath;
-                                LOG_INFO("Auto-spawned transport with remapped fallback path: entry=", entry,
-                                         " remappedPath=", pathId, " displayId=", displayId,
-                                         " wmoInstance=", wmoInstanceId);
-                            } else {
-                                std::vector<glm::vec3> path = { canonicalSpawnPos };
-                                transportManager->loadPathFromNodes(pathId, path, false, 0.0f);
-                                LOG_INFO("Auto-spawned transport with stationary path: entry=", entry,
-                                         " displayId=", displayId, " wmoInstance=", wmoInstanceId);
-                            }
-                        }
-                    } else {
-                        LOG_INFO("Auto-spawned transport with real path: entry=", entry,
-                                 " displayId=", displayId, " wmoInstance=", wmoInstanceId);
-                    }
-
                     const bool isM2Transport = !it->second.isWmo;
-                    transportManager->registerTransport(guid,
-                                                        wmoInstanceId,
-                                                        pathId,
-                                                        canonicalSpawnPos,
-                                                        entry,
-                                                        displayId,
-                                                        isM2Transport);
-                    if (displayId == 3831u) {
-                        if (auto* tr = transportManager->getTransport(guid)) {
-                            LOG_WARNING("Auto-spawned Deeprun tram transport: guid=0x",
-                                        std::hex, guid, std::dec,
-                                        " entry=", entry,
-                                        " pathId=", tr->pathId,
-                                        " isM2=", tr->isM2,
-                                        " mode=", (tr->useClientAnimation ? "client" : "server"));
-                        }
-                    }
+                    transportManager->resolveAndRegisterSpawn(guid, entry, displayId, canonicalSpawnPos,
+                                                              wmoInstanceId, isM2Transport, preferServerData);
                 } else {
                     entitySpawner_.setTransportPendingMove(guid, x, y, z, orientation);
                     LOG_DEBUG("Cannot auto-spawn transport 0x", std::hex, guid, std::dec,

@@ -215,6 +215,78 @@ void TransportManager::unregisterTransport(uint64_t guid) {
     LOG_INFO("TransportManager: Unregistered transport ", guid);
 }
 
+void TransportManager::resolveAndRegisterSpawn(uint64_t guid,
+                                               uint32_t entry,
+                                               uint32_t displayId,
+                                               const glm::vec3& canonicalSpawnPos,
+                                               uint32_t wmoInstanceId,
+                                               bool isM2,
+                                               bool preferServerData) {
+    // TransportAnimation.dbc is indexed by GameObject entry.
+    uint32_t pathId = entry;
+
+    // Check if we have a real usable path, otherwise remap/infer/fall back to stationary.
+    const bool shipOrZeppelinDisplay =
+        (displayId == 3015 || displayId == 3031 || displayId == 7546 ||
+         displayId == 7446 || displayId == 1587 || displayId == 2454 ||
+         displayId == 807 || displayId == 808);
+    bool hasUsablePath = hasPathForEntry(entry);
+    if (shipOrZeppelinDisplay) {
+        hasUsablePath = hasUsableMovingPathForEntry(entry, 25.0f);
+    }
+
+    if (preferServerData) {
+        // Strict server-authoritative mode: no inferred/remapped fallback routes.
+        if (!hasUsablePath) {
+            std::vector<glm::vec3> path = { canonicalSpawnPos };
+            loadPathFromNodes(pathId, path, false, 0.0f);
+            LOG_INFO("Auto-spawned transport in strict server-first mode (stationary fallback): entry=", entry,
+                     " displayId=", displayId, " wmoInstance=", wmoInstanceId);
+        } else {
+            LOG_INFO("Auto-spawned transport in server-first mode with entry DBC path: entry=", entry,
+                     " displayId=", displayId, " wmoInstance=", wmoInstanceId);
+        }
+    } else if (!hasUsablePath) {
+        bool allowZOnly = (displayId == 455 || displayId == 462);
+        uint32_t inferredPath = inferDbcPathForSpawn(canonicalSpawnPos, 1200.0f, allowZOnly);
+        if (inferredPath != 0) {
+            pathId = inferredPath;
+            LOG_INFO("Auto-spawned transport with inferred path: entry=", entry,
+                     " inferredPath=", pathId, " displayId=", displayId,
+                     " wmoInstance=", wmoInstanceId);
+        } else {
+            uint32_t remappedPath = pickFallbackMovingPath(entry, displayId);
+            if (remappedPath != 0) {
+                pathId = remappedPath;
+                LOG_INFO("Auto-spawned transport with remapped fallback path: entry=", entry,
+                         " remappedPath=", pathId, " displayId=", displayId,
+                         " wmoInstance=", wmoInstanceId);
+            } else {
+                std::vector<glm::vec3> path = { canonicalSpawnPos };
+                loadPathFromNodes(pathId, path, false, 0.0f);
+                LOG_INFO("Auto-spawned transport with stationary path: entry=", entry,
+                         " displayId=", displayId, " wmoInstance=", wmoInstanceId);
+            }
+        }
+    } else {
+        LOG_INFO("Auto-spawned transport with real path: entry=", entry,
+                 " displayId=", displayId, " wmoInstance=", wmoInstanceId);
+    }
+
+    registerTransport(guid, wmoInstanceId, pathId, canonicalSpawnPos, entry, displayId, isM2);
+
+    if (displayId == 3831u) {
+        if (auto* tr = getTransport(guid)) {
+            LOG_WARNING("Auto-spawned Deeprun tram transport: guid=0x",
+                        std::hex, guid, std::dec,
+                        " entry=", entry,
+                        " pathId=", tr->pathId,
+                        " isM2=", tr->isM2,
+                        " mode=", (tr->useClientAnimation ? "client" : "server"));
+        }
+    }
+}
+
 ActiveTransport* TransportManager::getTransport(uint64_t guid) {
     auto it = transports_.find(guid);
     if (it != transports_.end()) {

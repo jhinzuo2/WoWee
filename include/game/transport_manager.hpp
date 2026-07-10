@@ -7,6 +7,7 @@
 #include <vector>
 #include <unordered_map>
 #include <string>
+#include <mutex>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
@@ -83,7 +84,20 @@ public:
     void unregisterTransport(uint64_t guid);
 
     ActiveTransport* getTransport(uint64_t guid);
+    // MAIN-THREAD-ONLY: this reference is not lock-protected, matching EntityManager's
+    // getEntities(). Callers on another thread (e.g. a headless HTTP API thread) must
+    // use snapshotTransports() instead.
     const std::unordered_map<uint64_t, ActiveTransport>& getTransports() const { return transports_; }
+    // Thread-safe copy of all registered transports, safe to call from any thread.
+    std::vector<ActiveTransport> snapshotTransports() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<ActiveTransport> snapshot;
+        snapshot.reserve(transports_.size());
+        for (const auto& [guid, transport] : transports_) {
+            snapshot.push_back(transport);
+        }
+        return snapshot;
+    }
     glm::vec3 getPlayerWorldPosition(uint64_t transportGuid, const glm::vec3& localOffset);
     glm::mat4 getTransportInvTransform(uint64_t transportGuid);
 
@@ -126,6 +140,22 @@ public:
     // Update server-controlled transport position/rotation directly (bypasses path movement)
     void updateServerTransport(uint64_t guid, const glm::vec3& position, float orientation);
 
+    // Resolve a usable path (real entry match, inferred by spawn position, remapped fallback,
+    // or a stationary single-point path as last resort) and register a transport that hasn't
+    // been seen before. This is the path-selection cascade every caller needs regardless of
+    // whether it has a real WMO/M2 render instance for the transport (wmoInstanceId=0 is a
+    // valid "no visual instance" sentinel, e.g. for a headless client that doesn't render).
+    // Callers own deciding wmoInstanceId/isM2 (which requires knowing whether the transport's
+    // model resolved to a WMO or M2 asset) and whether to call this at all (i.e. only when
+    // getTransport(guid) is null) and whether to follow up with updateServerTransport().
+    void resolveAndRegisterSpawn(uint64_t guid,
+                                 uint32_t entry,
+                                 uint32_t displayId,
+                                 const glm::vec3& canonicalSpawnPos,
+                                 uint32_t wmoInstanceId,
+                                 bool isM2,
+                                 bool preferServerData);
+
     // Reconnect an existing transport to a newly spawned render instance. Servers can
     // despawn/respawn transports around visibility boundaries while the logical route
     // remains the same.
@@ -143,6 +173,7 @@ private:
     TransportPathRepository pathRepo_;
     TransportClockSync clockSync_;
     TransportAnimator animator_;
+    mutable std::mutex mutex_;  // Guards transports_ map insert/erase for cross-thread snapshotTransports().
     std::unordered_map<uint64_t, ActiveTransport> transports_;
     rendering::WMORenderer* wmoRenderer_ = nullptr;
     rendering::M2Renderer* m2Renderer_ = nullptr;

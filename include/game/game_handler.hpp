@@ -1178,6 +1178,10 @@ public:
     bool hasServerTransportUpdate(uint64_t guid) const { return entityController_->hasServerTransportUpdate(guid); }
     glm::vec3 getComposedWorldPosition();  // Compose transport transform * local offset
     TransportManager* getTransportManager() { return transportManager_.get(); }
+    // Client-side M2 transport (trams, lifts) board/disembark check by proximity to the
+    // transport's live position. Call once per tick with the player's current canonical
+    // world position; safe to call whether or not any M2 transports are registered.
+    void updateM2TransportBoarding(const glm::vec3& playerCanonical);
     void setPlayerOnTransport(uint64_t transportGuid, const glm::vec3& localOffset) {
         // Validate transport is registered before attaching player
         // (defer if transport not yet registered to prevent desyncs)
