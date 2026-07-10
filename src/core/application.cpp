@@ -1916,10 +1916,12 @@ void Application::update(float deltaTime) {
                         if (deadOrCorpse || largeCorrection) {
                             charRenderer->setInstancePosition(instanceId, renderPos);
                         } else if (planarDistSq > kMoveThreshSq || dz > 0.08f) {
-                            // Position changed in entity coords → drive renderer toward it.
-                            float planarDist = std::sqrt(planarDistSq);
-                            float duration = std::clamp(planarDist / 5.5f, 0.05f, 0.22f);
-                            charRenderer->moveInstanceTo(instanceId, renderPos, duration);
+                            // Entity::updateMovement already evaluates the server spline for
+                            // this frame. Starting another renderer interpolation here resets
+                            // that interpolation every frame and leaves the model trailing its
+                            // authoritative entity position. Copy the evaluated position
+                            // directly; animation transitions remain driven below.
+                            charRenderer->setInstancePosition(instanceId, renderPos);
                         }
                         // When entity is moving but getX/Y/Z is stale (distance-culled),
                         // don't call moveInstanceTo — creatureMoveCallback_ already drove

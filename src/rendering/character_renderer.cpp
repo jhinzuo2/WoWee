@@ -3202,6 +3202,11 @@ void CharacterRenderer::setInstancePosition(uint32_t instanceId, const glm::vec3
     auto it = instances.find(instanceId);
     if (it != instances.end()) {
         it->second.position = position;
+        it->second.moveStart = position;
+        it->second.moveEnd = position;
+        it->second.moveElapsed = 0.0f;
+        it->second.moveDuration = 0.0f;
+        it->second.isMoving = false;
     }
 }
 
