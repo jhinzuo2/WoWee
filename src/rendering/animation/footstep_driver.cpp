@@ -13,11 +13,25 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <initializer_list>
 
 namespace wowee {
 namespace rendering {
 
 // ── Footstep event detection (moved from AnimationController) ────────────────
+
+namespace {
+
+bool containsAnyToken(const std::string& text, std::initializer_list<const char*> tokens) {
+    for (const char* token : tokens) {
+        if (text.find(token) != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace
 
 bool FootstepDriver::shouldTriggerFootstepEvent(uint32_t animationId, float animationTimeMs, float animationDurationMs) {
     if (animationDurationMs <= 1.0f) {
@@ -105,12 +119,12 @@ audio::FootstepSurface FootstepDriver::resolveFootstepSurface(Renderer* renderer
         if (texture) {
             std::string t = *texture;
             for (char& c : t) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-            if (t.find("snow") != std::string::npos || t.find("ice") != std::string::npos) surface = audio::FootstepSurface::SNOW;
-            else if (t.find("grass") != std::string::npos || t.find("moss") != std::string::npos || t.find("leaf") != std::string::npos) surface = audio::FootstepSurface::GRASS;
-            else if (t.find("sand") != std::string::npos || t.find("dirt") != std::string::npos || t.find("mud") != std::string::npos) surface = audio::FootstepSurface::DIRT;
-            else if (t.find("wood") != std::string::npos || t.find("timber") != std::string::npos) surface = audio::FootstepSurface::WOOD;
-            else if (t.find("metal") != std::string::npos || t.find("iron") != std::string::npos) surface = audio::FootstepSurface::METAL;
-            else if (t.find("stone") != std::string::npos || t.find("rock") != std::string::npos || t.find("cobble") != std::string::npos || t.find("brick") != std::string::npos) surface = audio::FootstepSurface::STONE;
+            if (containsAnyToken(t, {"snow", "ice"})) surface = audio::FootstepSurface::SNOW;
+            else if (containsAnyToken(t, {"farm", "field", "soil", "plow", "crop", "wheat", "dirt", "mud", "sand"})) surface = audio::FootstepSurface::DIRT;
+            else if (containsAnyToken(t, {"grass", "moss", "leaf"})) surface = audio::FootstepSurface::GRASS;
+            else if (containsAnyToken(t, {"wood", "timber"})) surface = audio::FootstepSurface::WOOD;
+            else if (containsAnyToken(t, {"metal", "iron"})) surface = audio::FootstepSurface::METAL;
+            else if (containsAnyToken(t, {"stone", "rock", "cobble", "brick"})) surface = audio::FootstepSurface::STONE;
         }
     }
 

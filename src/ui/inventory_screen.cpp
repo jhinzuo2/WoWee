@@ -78,6 +78,38 @@ void renderRaceRestriction(uint32_t allowableMask, uint8_t playerRace) {
     ImGui::TextColored(ok ? ImVec4(1,1,1,0.75f) : colors::kPaleRed, "%s", buf);
 }
 
+bool canUseItemType(const game::GameHandler& gameHandler,
+                    uint32_t itemClass,
+                    uint32_t subClass) {
+    if (itemClass == 2) { // Weapon
+        if (gameHandler.getWeaponProficiency() == 0)
+            return true;
+        return gameHandler.canUseWeaponSubclass(subClass);
+    }
+
+    if (itemClass == 4 && subClass > 0) {
+        // Normal armor subclass proficiency is not a reliable tooltip-level
+        // rejection across Classic/TBC/WotLK and private cores. For example,
+        // cloaks and some belts can be reported as cloth/leather subclass
+        // while still being legally equippable. Keep the hard type warning for
+        // shields, where the armor proficiency bit is a distinct equip rule.
+        if (subClass == 6 && gameHandler.getArmorProficiency() != 0)
+            return gameHandler.canUseArmorSubclass(subClass);
+    }
+
+    return true;
+}
+
+void renderItemTypeWarningIfNeeded(const game::GameHandler* gameHandler,
+                                   uint32_t itemClass,
+                                   uint32_t subClass) {
+    if (!gameHandler)
+        return;
+
+    if (!canUseItemType(*gameHandler, itemClass, subClass))
+        ImGui::TextColored(ui::colors::kBrightRed, "You can't use this type of item.");
+}
+
 // Socket types from shared ui_colors.hpp (ui::kSocketTypes)
 
 const game::ItemSlot* findComparableEquipped(const game::Inventory& inventory, uint8_t inventoryType) {
@@ -2737,18 +2769,10 @@ void InventoryScreen::renderItemTooltip(const game::ItemDef& item, const game::I
             }
         }
 
-        // Show red warning if player lacks proficiency for this weapon/armor type
         if (gameHandler_) {
             const auto* qi = gameHandler_->getItemInfo(item.itemId);
-            if (qi && qi->valid) {
-                bool canUse = true;
-                if (qi->itemClass == 2) // Weapon
-                    canUse = gameHandler_->canUseWeaponSubclass(qi->subClass);
-                else if (qi->itemClass == 4 && qi->subClass > 0) // Armor (skip subclass 0 = misc)
-                    canUse = gameHandler_->canUseArmorSubclass(qi->subClass);
-                if (!canUse)
-                    ImGui::TextColored(ui::colors::kBrightRed, "You can't use this type of item.");
-            }
+            if (qi && qi->valid)
+                renderItemTypeWarningIfNeeded(gameHandler_, qi->itemClass, qi->subClass);
         }
     }
 
@@ -3288,16 +3312,7 @@ void InventoryScreen::renderItemTooltip(const game::ItemQueryResponseData& info,
                 ImGui::TextColored(ui::colors::kLightGray, "%s", slotName);
         }
 
-        // Proficiency check for vendor/loot tooltips (ItemQueryResponseData has itemClass/subClass)
-        if (gameHandler_) {
-            bool canUse = true;
-            if (info.itemClass == 2) // Weapon
-                canUse = gameHandler_->canUseWeaponSubclass(info.subClass);
-            else if (info.itemClass == 4 && info.subClass > 0) // Armor (skip subclass 0 = misc)
-                canUse = gameHandler_->canUseArmorSubclass(info.subClass);
-            if (!canUse)
-                ImGui::TextColored(ui::colors::kBrightRed, "You can't use this type of item.");
-        }
+        renderItemTypeWarningIfNeeded(gameHandler_, info.itemClass, info.subClass);
     }
 
     // Weapon stats

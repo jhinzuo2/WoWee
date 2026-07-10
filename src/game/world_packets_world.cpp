@@ -1,6 +1,7 @@
 #include "game/world_packets.hpp"
 #include "game/packet_parsers.hpp"
 #include "game/opcodes.hpp"
+#include "game/game_utils.hpp"
 #include "game/character.hpp"
 #include "auth/crypto.hpp"
 #include "core/logger.hpp"
@@ -955,6 +956,8 @@ bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData
         return true;
     }
 
+    const bool preferFixedRewardArrays = !isPreWotlk();
+
     // After the two strings the packet contains a variable prefix (autoFinish + optional fields)
     // before the emoteCount.  Different expansions and server emulator versions differ:
     //   Classic 1.12   : uint8 autoFinish + uint32 suggestedPlayers  = 5 bytes
@@ -1040,8 +1043,10 @@ bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData
         // Prefer the standard WotLK/TBC 8-byte prefix (uint32 autoFinish + uint32 suggestedPlayers)
         if (prefixSkip == 8) out.score += 3;
         else if (prefixSkip == 5) out.score += 1;  // Classic uint8 autoFinish + uint32 suggestedPlayers
-        // Prefer fixed arrays (WotLK/TBC servers always send 6+4 slots)
-        if (fixedArrays) out.score += 2;
+        // WotLK/AzerothCore uses fixed 6 choice + 4 fixed reward arrays; older
+        // Classic/TBC-style packets use compact variable arrays.  Keep the
+        // reward choice slot aligned with the active protocol.
+        if (fixedArrays == preferFixedRewardArrays) out.score += 4;
         // Valid counts
         if (choiceCount <= 6) out.score += 3;
         if (rewardCount <= 4) out.score += 3;

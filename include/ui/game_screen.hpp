@@ -59,6 +59,8 @@ public:
     void setServices(const UIServices& services);
 
 private:
+    void applyCameraControlSettings();
+
     // Injected UI services (Section 3.5 Phase B - replaces getInstance() calls)
     UIServices services_;
     // Legacy pointer for Phase A compatibility (will be removed when all callsites migrate)

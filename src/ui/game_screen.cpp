@@ -145,6 +145,21 @@ void GameScreen::setServices(const UIServices& services) {
     socialPanel_.setServices(services);
     actionBarPanel_.setServices(services);
     windowManager_.setServices(services);
+    applyCameraControlSettings();
+}
+
+void GameScreen::applyCameraControlSettings() {
+    auto* renderer = services_.renderer;
+    if (!renderer) return;
+
+    if (auto* cam = renderer->getCameraController()) {
+        cam->setMouseSensitivity(settingsPanel_.pendingMouseSensitivity);
+        cam->setInvertMouse(settingsPanel_.pendingInvertMouse);
+        cam->setExtendedZoom(settingsPanel_.pendingExtendedZoom);
+        cam->setCameraSmoothSpeed(settingsPanel_.pendingCameraStiffness);
+        cam->setPivotHeight(settingsPanel_.pendingPivotHeight);
+        cam->setIdleOrbitEnabled(settingsPanel_.pendingIdleCameraOrbit);
+    }
 }
 
 void GameScreen::render(game::GameHandler& gameHandler) {
