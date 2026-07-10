@@ -1032,24 +1032,6 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                 gameHandler.closeQuestRequestItems();
             } else if (gameHandler.isTradeOpen()) {
                 gameHandler.cancelTrade();
-            } else if (socialPanel_.showWhoWindow_) {
-                socialPanel_.showWhoWindow_ = false;
-            } else if (combatUI_.showCombatLog_) {
-                combatUI_.showCombatLog_ = false;
-            } else if (socialPanel_.showSocialFrame_) {
-                socialPanel_.showSocialFrame_ = false;
-            } else if (talentScreen.isOpen()) {
-                talentScreen.setOpen(false);
-            } else if (spellbookScreen.isOpen()) {
-                spellbookScreen.setOpen(false);
-            } else if (questLogScreen.isOpen()) {
-                questLogScreen.setOpen(false);
-            } else if (inventoryScreen.isCharacterOpen()) {
-                inventoryScreen.toggleCharacter();
-            } else if (inventoryScreen.isOpen()) {
-                inventoryScreen.setOpen(false);
-            } else if (showWorldMap_) {
-                showWorldMap_ = false;
             } else {
                 windowManager_.showEscapeMenu = true;
             }
