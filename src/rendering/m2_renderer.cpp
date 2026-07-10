@@ -1699,17 +1699,7 @@ bool M2Renderer::loadModel(const pipeline::M2Model& model, uint32_t modelId) {
             mat.alphaTest = (bgpu.blendMode == 1 || (bgpu.blendMode >= 2 && !bgpu.hasAlpha)) ? 1 : 0;
             mat.colorKeyBlack = bgpu.colorKeyBlack ? 1 : 0;
             mat.colorKeyThreshold = 0.08f;
-            // Instance portal doodads are meant to glow regardless of ambient light -
-            // that's their entire visual purpose. The generic InstancePortal.m2 (used
-            // by the hand-placed city-side visual) has its material's unlit bit set,
-            // but Subway.wmo's own baked InstancePortal_White.m2 doesn't (materialFlags
-            // has neither unlit nor unfogged set) - rendered as ordinary lit geometry,
-            // it was essentially invisible in the dim tunnel ("not seeing the portal...
-            // nothing at all" reported live, even standing right on top of it per the
-            // decomposed instance position in the diagnostic log). Force unlit for any
-            // model the classifier already identified as an instance portal by name,
-            // instead of trusting each individual file's own authored material flags.
-            mat.unlit = (gpuModel.isInstancePortal || (bgpu.materialFlags & 0x01)) ? 1 : 0;
+            mat.unlit = (bgpu.materialFlags & 0x01) ? 1 : 0;
             mat.blendMode = bgpu.blendMode;
             mat.fadeAlpha = 1.0f;
             mat.interiorDarken = 0.0f;
