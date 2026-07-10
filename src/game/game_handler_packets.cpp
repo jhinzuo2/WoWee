@@ -2800,8 +2800,7 @@ void GameHandler::handlePacket(network::Packet& packet) {
     LOG_DEBUG("Received world packet: opcode=0x", std::hex, opcode, std::dec,
               " size=", packet.getSize(), " bytes");
 
-    // Translate wire opcode to logical opcode via expansion table
-    auto logicalOp = opcodeTable_.fromWire(opcode);
+    auto logicalOp = preLogicalOp;
 
     if (!logicalOp) {
         // Login-critical opcodes share the same wire values across all expansions.
