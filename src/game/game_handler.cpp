@@ -1417,15 +1417,21 @@ void GameHandler::updateM2TransportBoarding(const glm::vec3& playerCanonical) {
         constexpr float kM2BoardVertDist = 15.0f;
         constexpr float kTbLiftBoardHorizDistSq = 22.0f * 22.0f;
         constexpr float kTbLiftBoardVertDist = 14.0f;
-        // Deeprun's capture radius has swung twice already: 18/18 (way too wide - let
-        // boarding trigger far enough away that the rider ended up floating off to the
-        // side of the car) down to 7/6 (too tight - stopped attaching at all, "not
-        // sticking to the train/tram cars at all again" reported live). Settle on a
-        // middle value between that and the plain M2 default (12/15, which was itself
-        // too wide - it reached into the corridor below/beside the platform and grabbed
-        // players just walking past).
+        // Deeprun's capture radius has swung twice on the horizontal axis already:
+        // 18/18 (too wide - boarding triggered far enough away that the rider ended up
+        // floating off to the side) down to 7/6 (too tight - stopped attaching at all).
+        // 9.5 horizontal turned out fine - live diagnostic data (logged every second
+        // while no candidate is in range) showed horizDist getting down to ~1-2 units
+        // repeatedly, well inside the box. But boarding *still* never fired, because the
+        // vertical threshold was the real problem all along: vertDist sat consistently
+        // around 10.4-11.9 units at every one of those close-horizontal-approach samples,
+        // across all three different cars tested, far outside the old 8.0 vertical
+        // window. That's not noise - it's SubwayCar.m2's model origin sitting well below
+        // the deck the player actually stands on (same root cause already called out for
+        // Thunder Bluff lifts above: kTbLiftBoardVertDist=14 exists for exactly this
+        // reason). Widen vertical to comfortably clear the observed ~11.9 max.
         constexpr float kDeeprunTramBoardHorizDistSq = 9.5f * 9.5f;
-        constexpr float kDeeprunTramBoardVertDist = 8.0f;
+        constexpr float kDeeprunTramBoardVertDist = 13.0f;
 
         uint64_t bestGuid = 0;
         float bestScore = 1e30f;
