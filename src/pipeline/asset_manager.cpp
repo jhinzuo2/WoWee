@@ -146,7 +146,20 @@ std::string AssetManager::resolveFile(const std::string& normalizedPath) const {
     // If a base-path fallback is configured (expansion-specific primary that only
     // holds DBC overrides), retry against the base extraction.
     if (!baseFallbackDataPath_.empty()) {
-        return baseFallbackManifest_.resolveFilesystemPath(normalizedPath);
+        std::string baseFallbackPath = baseFallbackManifest_.resolveFilesystemPath(normalizedPath);
+        if (!baseFallbackPath.empty()) return baseFallbackPath;
+    }
+
+    // Last resort: some files (e.g. DBFilesClient\TransportAnimation.dbc) can end up
+    // present on disk under dataPath without ever having been captured by whatever
+    // extraction produced manifest.json. Try the loose file directly at its expected
+    // location before giving up, so a missing manifest entry doesn't silently mean
+    // "file doesn't exist" when it plainly does.
+    std::string looseCandidate = normalizedPath;
+    std::replace(looseCandidate.begin(), looseCandidate.end(), '\\', '/');
+    looseCandidate = dataPath + "/" + looseCandidate;
+    if (LooseFileReader::fileExists(looseCandidate)) {
+        return looseCandidate;
     }
     return {};
 }
