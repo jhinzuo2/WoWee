@@ -79,17 +79,23 @@ bool seedDeeprunTramStationPhase(ActiveTransport& transport,
         }
     }
 
+    // CMaNGOS's "presence echo" for these objects is always the same static DB spawn
+    // row, not a live position - it tells us this spawn coordinate corresponds to
+    // local path point stationIdx (a geometric fact about how this entry's path is
+    // anchored in world space), not that the tram is *currently* there. Correct
+    // basePosition so the path curve sits in the right place; leave localClockMs
+    // alone so it keeps reflecting the absolute-time-derived phase set at
+    // registration (see nowEpochMs comment above) instead of snapping back to
+    // "docked at this waypoint" every time an echo arrives.
     const glm::vec3 stationOffset = keys[stationIdx].position;
     transport.basePosition = serverPosition - stationOffset;
-    transport.position = serverPosition;
-    transport.localClockMs = keys[stationIdx].timeMs % spline.durationMs();
+    transport.position = transport.basePosition + spline.evaluatePosition(transport.localClockMs % spline.durationMs());
     transport.hasServerYaw = false;
-    transport.rotation = glm::angleAxis(orientation, glm::vec3(0.0f, 0.0f, 1.0f));
 
-    LOG_WARNING("Deeprun tram station phase seeded: guid=0x", std::hex, transport.guid, std::dec,
+    LOG_WARNING("Deeprun tram station anchor corrected: guid=0x", std::hex, transport.guid, std::dec,
                 " entry=", transport.entry,
                 " pathId=", transport.pathId,
-                " phaseMs=", transport.localClockMs,
+                " localClockMs=", transport.localClockMs,
                 " stationOffset=(", stationOffset.x, ",", stationOffset.y, ",", stationOffset.z, ")",
                 " base=(", transport.basePosition.x, ",", transport.basePosition.y, ",", transport.basePosition.z, ")",
                 " serverPos=(", serverPosition.x, ",", serverPosition.y, ",", serverPosition.z, ")");
