@@ -33,6 +33,7 @@ layout(set = 1, binding = 1) uniform CharMaterial {
     int pomMaxSamples;
     float heightMapVariance;
     float normalMapStrength;
+    int hairMaterial;
 };
 
 layout(set = 1, binding = 2) uniform sampler2D uNormalHeightMap;
@@ -178,6 +179,9 @@ void main() {
         if (alphaTest != 0 && texColor.a < 0.5) {
             discard;
         }
+        if (alphaTest != 0 && hairMaterial != 0) {
+            texColor.a = 1.0;
+        }
         if (colorKeyBlack != 0) {
             float lum = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
             float ck = smoothstep(0.12, 0.30, lum);
@@ -220,6 +224,16 @@ void main() {
     }
 
     vec4 texColor = texture(uTexture, finalUV);
+    // Repair dark DXT fringes on alpha-cut character textures such as hair.
+    // Transparent edge texels can carry black/garbage RGB even when alpha is
+    // valid; pull color from a coarser mip and trust the source more as alpha
+    // approaches opaque. This matches the generic M2 path.
+    if (alphaTest != 0 && texColor.a > 0.01 && texColor.a < 1.0) {
+        vec3 mipColor = textureLod(uTexture, finalUV, 4.0).rgb;
+        float trust = smoothstep(0.0, 0.9, texColor.a);
+        texColor.rgb = mix(mipColor, texColor.rgb, trust);
+    }
+
     // Some classic/TBC character textures use bright magenta as a color key.
     // Apply this before any material-specific alpha path because a few preview
     // batches report as opaque/blended even when their texture still carries
@@ -228,7 +242,12 @@ void main() {
         discard;
     }
 
-    if (alphaTest != 0) {
+    if (alphaTest != 0 && hairMaterial != 0) {
+        if (texColor.a < 0.5) {
+            discard;
+        }
+        texColor.a = 1.0;
+    } else if (alphaTest != 0) {
         // Screen-space sharpened alpha for alpha-to-coverage anti-aliasing.
         // Rescales alpha so the 0.5 cutoff maps to exactly the texel boundary,
         // giving smooth edges when MSAA + alpha-to-coverage is active.

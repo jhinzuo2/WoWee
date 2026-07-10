@@ -157,27 +157,40 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
         return false;
     };
 
-    // Base geosets always present (group 0: IDs 0-99, some models use up to 27)
     std::unordered_set<uint16_t> geosets;
-    for (uint16_t i = 0; i <= 99; i++) {
-        geosets.insert(i);
-    }
-    // Hair/facial geosets must match the active character's appearance, otherwise
-    // we end up forcing a default hair mesh (often perceived as "wrong hair").
-    {
-        uint8_t hairStyleId = 0;
-        uint8_t facialId = 0;
+    if (appearanceComposer_) {
         if (auto* gh = app.getGameHandler()) {
             if (const auto* ch = gh->getActiveCharacter()) {
-                hairStyleId = static_cast<uint8_t>((ch->appearanceBytes >> 16) & 0xFF);
-                facialId = ch->facialFeatures;
+                const uint8_t raceId = static_cast<uint8_t>(ch->race);
+                const uint8_t sexId = static_cast<uint8_t>(ch->gender);
+                const uint8_t hairStyleId = static_cast<uint8_t>((ch->appearanceBytes >> 16) & 0xFF);
+                const uint8_t facialId = ch->facialFeatures;
+                geosets = appearanceComposer_->buildDefaultPlayerGeosets(raceId, sexId, hairStyleId, facialId);
             }
         }
-        geosets.insert(static_cast<uint16_t>(100 + hairStyleId + 1)); // Group 1 hair
-        geosets.insert(static_cast<uint16_t>(200 + facialId + 1));    // Group 2 facial
     }
-    geosets.insert(702);  // Ears: visible (default)
-    geosets.insert(2002); // Bare feet mesh (group 20 = CG_FEET, always on)
+    if (geosets.empty()) {
+        geosets.insert(0);
+        geosets.insert(101);
+        geosets.insert(201);
+        geosets.insert(301);
+        geosets.insert(702);
+        geosets.insert(2002);
+    }
+
+    auto eraseGroup = [&](uint16_t group) {
+        for (auto it = geosets.begin(); it != geosets.end();) {
+            if ((*it / 100) == group) it = geosets.erase(it);
+            else ++it;
+        }
+    };
+
+    eraseGroup(4);
+    eraseGroup(5);
+    eraseGroup(8);
+    eraseGroup(13);
+    eraseGroup(15);
+    eraseGroup(12);
 
     // CharGeosets mapping (verified via vertex bounding boxes):
     //   Group 4 (401+) = GLOVES (forearm area, Z~1.1-1.4)

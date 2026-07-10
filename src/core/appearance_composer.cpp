@@ -246,7 +246,6 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
 
     // Look up the correct hair scalp geoset from CharHairGeosets.dbc
     uint16_t selectedHairScalp = 1; // default
-    std::unordered_set<uint16_t> allHairScalpGeosets;
     if (entitySpawner_) {
         const auto& hairMap = entitySpawner_->getHairGeosetMap();
         uint32_t hairKey = (static_cast<uint32_t>(raceId) << 16) |
@@ -255,25 +254,13 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
         auto it = hairMap.find(hairKey);
         if (it != hairMap.end() && it->second > 0)
             selectedHairScalp = it->second;
-
-        // Collect all hair scalp geosets for this race/sex to exclude the others
-        for (const auto& [k, v] : hairMap) {
-            if (static_cast<uint8_t>((k >> 16) & 0xFF) == raceId &&
-                static_cast<uint8_t>((k >> 8) & 0xFF) == sexId &&
-                v > 0 && v < 100)
-                allHairScalpGeosets.insert(v);
-        }
     }
 
-    // Group 0: add body base submeshes (0) but exclude other hair scalp variants
+    // Group 0: body base plus exactly one selected hair scalp. Do not enable
+    // every non-mapped group-0 submesh as a fallback; if the hair DBC map is
+    // unavailable or incomplete, that path activates multiple hair variants.
     activeGeosets.insert(0);  // body base
     activeGeosets.insert(selectedHairScalp);
-    // Some models have additional non-hair body submeshes (e.g. earrings, jaw);
-    // these are typically < 100 and NOT in the hair geoset set
-    for (uint16_t i = 1; i < 100; i++) {
-        if (allHairScalpGeosets.count(i) == 0)
-            activeGeosets.insert(i);  // not a hair geoset, safe to include
-    }
 
     // Hair connector: group 1 = 100 + geoset
     activeGeosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(selectedHairScalp, 1)));
