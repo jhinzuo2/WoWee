@@ -3142,7 +3142,7 @@ void WindowManager::renderAuctionHouseWindow(game::GameHandler& gameHandler,
             gameHandler.auctionSearch(auctionSearchName_,
                 static_cast<uint8_t>(auctionLevelMin_),
                 static_cast<uint8_t>(auctionLevelMax_),
-                q, getSearchClassId(), getSearchSubClassId(), 0,
+                q, getSearchClassId(), getSearchSubClassId(), 0xFFFFFFFFu,
                 auctionUsableOnly_ ? 1 : 0, offset);
         };
 

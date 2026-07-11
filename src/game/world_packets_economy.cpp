@@ -481,8 +481,9 @@ network::Packet AuctionListItemsPacket::build(
     p.writeUInt32(quality);
     p.writeUInt8(usableOnly);
     p.writeUInt8(0);  // getAll (0 = normal search)
-    p.writeUInt8(exactMatch);
-    // Sort columns (0 = none)
+    // WotLK has no exact-match field here; the next byte is the sort count.
+    // Keep the API argument for callers shared with older server profiles.
+    (void)exactMatch;
     p.writeUInt8(0);
     return p;
 }
