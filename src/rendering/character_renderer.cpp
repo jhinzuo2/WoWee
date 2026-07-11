@@ -3294,6 +3294,12 @@ const pipeline::M2Model* CharacterRenderer::getModelData(uint32_t modelId) const
     return &it->second.data;
 }
 
+const pipeline::M2Model* CharacterRenderer::getInstanceModelData(uint32_t instanceId) const {
+    auto instIt = instances.find(instanceId);
+    if (instIt == instances.end()) return nullptr;
+    return getModelData(instIt->second.modelId);
+}
+
 void CharacterRenderer::startFadeIn(uint32_t instanceId, float durationSeconds) {
     auto it = instances.find(instanceId);
     if (it == instances.end()) return;

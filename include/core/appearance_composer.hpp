@@ -20,7 +20,7 @@ class EntitySpawner;
 // Each group's base is groupNumber * 100; variant 01 is typically bare/default.
 constexpr uint16_t kGeosetDefaultConnector = 101;   // Group  1: default hair connector
 constexpr uint16_t kGeosetBareForearms     = 401;   // Group  4: no gloves
-constexpr uint16_t kGeosetBareShins        = 503;   // Group  5: no boots
+constexpr uint16_t kGeosetBareShins        = 501;   // Group  5: no boots
 constexpr uint16_t kGeosetDefaultEars      = 702;   // Group  7: ears
 constexpr uint16_t kGeosetBareSleeves      = 801;   // Group  8: no chest armor sleeves
 constexpr uint16_t kGeosetDefaultKneepads  = 902;   // Group  9: kneepads

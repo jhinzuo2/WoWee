@@ -101,7 +101,8 @@ std::set<uint32_t> detectStringColumns(const DBCFile& dbc,
     // integer fields whose small values accidentally land inside longer strings.
     auto boundaries = computeStringBoundaries(stringBlock);
 
-    for (uint32_t col = 0; col < fieldCount; ++col) {
+    // Field 0 is always the numeric record ID — skip it.
+    for (uint32_t col = 1; col < fieldCount; ++col) {
         bool allZeroOrValid = true;
         bool hasNonZero = false;
         std::set<std::string> distinctStrings;

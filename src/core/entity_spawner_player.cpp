@@ -34,7 +34,7 @@ namespace {
 // Each group's base is groupNumber * 100; variant 01 is typically bare/default.
 constexpr uint16_t kGeosetDefaultConnector = 101;   // Group  1: default hair connector
 constexpr uint16_t kGeosetBareForearms     = 401;   // Group  4: no gloves
-constexpr uint16_t kGeosetBareShins        = 503;   // Group  5: no boots
+constexpr uint16_t kGeosetBareShins        = 501;   // Group  5: no boots
 constexpr uint16_t kGeosetDefaultEars      = 702;   // Group  7: ears
 constexpr uint16_t kGeosetBareSleeves      = 801;   // Group  8: no chest armor sleeves
 constexpr uint16_t kGeosetDefaultKneepads  = 902;   // Group  9: kneepads
@@ -461,9 +461,19 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
         return 0;
     };
 
+    // Find the lowest submesh ID in a group (e.g., group 5 → lowest 5xx).
+    // Races like Gnome (no 501) and Tauren (only 505) need this fallback.
+    auto lowestInGroup = [&](uint16_t group) -> uint16_t {
+        uint16_t best = 0;
+        for (uint16_t g : modelGeosets) {
+            if (g / 100 == group && (best == 0 || g < best)) best = g;
+        }
+        return best;
+    };
+
     // Per-group defaults — overridden below when equipment provides a geoset value.
     uint16_t geosetGloves  = pickGeoset(kGeosetBareForearms, kGeosetBareForearms);
-    uint16_t geosetBoots   = pickGeoset(kGeosetBareShins, kGeosetBareShins);
+    uint16_t geosetBoots   = pickGeoset(kGeosetBareShins, lowestInGroup(5));
     uint16_t geosetSleeves = pickGeoset(kGeosetBareSleeves, kGeosetBareSleeves);
     uint16_t geosetPants   = pickGeoset(kGeosetBarePants, kGeosetBarePants);
 
@@ -488,7 +498,7 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
     {
         uint32_t did = findDisplayIdByInvType({8});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetBoots = pickGeoset(static_cast<uint16_t>(501 + gg1), kGeosetBareShins);
+        if (gg1 > 0) geosetBoots = pickGeoset(static_cast<uint16_t>(501 + gg1), lowestInGroup(5));
     }
 
     // Hands/Gloves (invType 10) → forearm group 4

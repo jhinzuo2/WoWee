@@ -122,7 +122,8 @@ static std::set<uint32_t> detectStringColumns(const DBCFile& dbc,
 
     auto boundaries = computeStringBoundaries(stringBlock);
 
-    for (uint32_t col = 0; col < fieldCount; ++col) {
+    // Field 0 is always the numeric record ID — skip it.
+    for (uint32_t col = 1; col < fieldCount; ++col) {
         bool allZeroOrValid = true;
         bool hasNonZero = false;
         std::set<std::string> distinctStrings;
@@ -135,17 +136,12 @@ static std::set<uint32_t> detectStringColumns(const DBCFile& dbc,
                 allZeroOrValid = false;
                 break;
             }
-            // Collect distinct non-empty strings for diversity check.
             const char* s = reinterpret_cast<const char*>(stringBlock.data() + val);
             if (*s != '\0') {
                 distinctStrings.insert(std::string(s, strnlen(s, 256)));
             }
         }
 
-        // Require at least 2 distinct non-empty string values.  Columns that
-        // only ever point to a single string (e.g. SexID=1 always resolves to
-        // the same path fragment at offset 1 in the block) are almost certainly
-        // integer fields whose small values accidentally land at a string boundary.
         if (allZeroOrValid && hasNonZero && distinctStrings.size() >= 2) {
             cols.insert(col);
         }

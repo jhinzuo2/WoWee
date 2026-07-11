@@ -337,21 +337,49 @@ std::shared_ptr<DBCFile> AssetManager::loadDBC(const std::string& name) {
 
     // Try Data/db/ directory (pre-extracted binary DBCs shared across expansions)
     if (dbcData.empty()) {
-        // dataPath is expansion-specific (e.g. Data/expansions/wotlk/); go up to Data/
-        for (const std::string& base : {dataPath + "/db/" + name,
-                                         dataPath + "/../../db/" + name,
-                                         "Data/db/" + name}) {
-            if (std::filesystem::exists(base)) {
-                std::ifstream f(base, std::ios::binary | std::ios::ate);
-                if (f) {
-                    auto size = f.tellg();
-                    if (size > 0) {
-                        f.seekg(0);
-                        dbcData.resize(static_cast<size_t>(size));
-                        f.read(reinterpret_cast<char*>(dbcData.data()), size);
-                        LOG_INFO("Loaded binary DBC from: ", base, " (", size, " bytes)");
+        // Expansion overlay first (e.g. Data/expansions/tbc/overlay/db/), then
+        // expansion db/, then shared Data/db/.
+        std::vector<std::string> dbDirs;
+        if (!expansionDataPath_.empty())
+            dbDirs.push_back(expansionDataPath_ + "/overlay/db");
+        dbDirs.push_back(dataPath + "/db");
+        dbDirs.push_back(dataPath + "/../../db");
+        dbDirs.push_back("Data/db");
+        // Try exact-case first, then case-insensitive scan (Linux is case-sensitive
+        // but DBC filenames in Data/db/ are often all-lowercase).
+        std::string nameLower = name;
+        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        for (const auto& dir : dbDirs) {
+            if (!std::filesystem::is_directory(dir)) continue;
+            std::string exact = dir + "/" + name;
+            std::string resolved;
+            if (std::filesystem::exists(exact)) {
+                resolved = exact;
+            } else {
+                for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+                    if (!entry.is_regular_file()) continue;
+                    std::string fn = entry.path().filename().string();
+                    std::string fnLower = fn;
+                    std::transform(fnLower.begin(), fnLower.end(), fnLower.begin(),
+                                   [](unsigned char c) { return std::tolower(c); });
+                    if (fnLower == nameLower) {
+                        resolved = entry.path().string();
                         break;
                     }
+                }
+            }
+            if (resolved.empty()) continue;
+            std::ifstream f(resolved, std::ios::binary | std::ios::ate);
+            if (f) {
+                auto size = f.tellg();
+                if (size > 0) {
+                    f.seekg(0);
+                    dbcData.resize(static_cast<size_t>(size));
+                    f.read(reinterpret_cast<char*>(dbcData.data()), size);
+                    LOG_INFO("Loaded binary DBC from: ", resolved, " (", size, " bytes)");
+                    break;
                 }
             }
         }

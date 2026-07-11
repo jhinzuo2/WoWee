@@ -120,14 +120,16 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
     if (assetManager) {
         displayInfoDbc = assetManager->loadDBC("ItemDisplayInfo.dbc");
     }
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    const uint32_t geosetGroup1Field = idiL ? (*idiL)["GeosetGroup1"] : 7;
+    const uint32_t geosetGroup3Field = idiL ? (*idiL)["GeosetGroup3"] : 9;
 
-    // Helper: get geosetGroup field for an equipped item's displayInfoId
-    // DBC binary fields: 7=geosetGroup_1, 8=geosetGroup_2, 9=geosetGroup_3
-    auto getGeosetGroup = [&](uint32_t displayInfoId, int groupField) -> uint32_t {
+    auto getGeosetGroup = [&](uint32_t displayInfoId, uint32_t fieldIdx) -> uint32_t {
         if (!displayInfoDbc || displayInfoId == 0) return 0;
         int32_t recIdx = displayInfoDbc->findRecordById(displayInfoId);
         if (recIdx < 0) return 0;
-        return displayInfoDbc->getUInt32(static_cast<uint32_t>(recIdx), 7 + groupField);
+        return displayInfoDbc->getUInt32(static_cast<uint32_t>(recIdx), fieldIdx);
     };
 
     // Helper: find first equipped item matching inventoryType, return its displayInfoId
@@ -185,6 +187,30 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
         }
     };
 
+    // Build set of geoset IDs present in the model for validation.
+    // Races like Gnome (no 501) and Tauren (only 505) need fallback.
+    std::unordered_set<uint16_t> modelGeosets;
+    if (const auto* modelData = charRenderer->getInstanceModelData(instanceId)) {
+        for (const auto& batch : modelData->batches) {
+            modelGeosets.insert(batch.submeshId);
+        }
+    }
+
+    auto pickGeoset = [&](uint16_t preferred, uint16_t fallback) -> uint16_t {
+        if (modelGeosets.empty()) return preferred;
+        if (preferred != 0 && modelGeosets.count(preferred) > 0) return preferred;
+        if (fallback != 0 && modelGeosets.count(fallback) > 0) return fallback;
+        return preferred;
+    };
+
+    auto lowestInGroup = [&](uint16_t group) -> uint16_t {
+        uint16_t best = 0;
+        for (uint16_t g : modelGeosets) {
+            if (g / 100 == group && (best == 0 || g < best)) best = g;
+        }
+        return best;
+    };
+
     eraseGroup(4);
     eraseGroup(5);
     eraseGroup(8);
@@ -202,20 +228,18 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
     //   Group 20 (2002) = FEET
 
     // Gloves: inventoryType 10 → group 4 (forearms)
-    // 401=bare forearms, 402+=glove styles covering forearm
     {
         uint32_t did = findEquippedDisplayId({10});
-        uint32_t gg = getGeosetGroup(did, 0);
-        geosets.insert(static_cast<uint16_t>(gg > 0 ? 401 + gg : 401));
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        geosets.insert(pickGeoset(static_cast<uint16_t>(gg > 0 ? 401 + gg : 401), lowestInGroup(4)));
     }
 
     // Boots: inventoryType 8 → group 5 (shins/lower legs)
-    // 501=narrow bare shin, 502=wider (matches thigh width better). Use 502 as bare default.
-    // When boots equipped, gg selects boot style: 501+gg (gg=1→502, gg=2→503, etc.)
     {
         uint32_t did = findEquippedDisplayId({8});
-        uint32_t gg = getGeosetGroup(did, 0);
-        geosets.insert(static_cast<uint16_t>(gg > 0 ? 501 + gg : 502));
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        uint16_t selectedShin = pickGeoset(static_cast<uint16_t>(gg > 0 ? 501 + gg : core::kGeosetBareShins), lowestInGroup(5));
+        geosets.insert(selectedShin);
     }
 
     // Chest/Shirt: inventoryType 4 (shirt), 5 (chest), 20 (robe)
@@ -223,10 +247,9 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
     // Also controls group 13 (trousers) via GeosetGroup[2] for robes
     {
         uint32_t did = findEquippedDisplayId({4, 5, 20});
-        uint32_t gg = getGeosetGroup(did, 0);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
         geosets.insert(static_cast<uint16_t>(gg > 0 ? 801 + gg : 801));
-        // Robe kilt: GeosetGroup[2] > 0 → show kilt legs (1302+)
-        uint32_t gg3 = getGeosetGroup(did, 2);
+        uint32_t gg3 = getGeosetGroup(did, geosetGroup3Field);
         if (gg3 > 0) {
             geosets.insert(static_cast<uint16_t>(1301 + gg3));
         }
@@ -239,7 +262,7 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
     // 1301=bare legs, 1302+=pant/kilt styles
     {
         uint32_t did = findEquippedDisplayId({7});
-        uint32_t gg = getGeosetGroup(did, 0);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
         // Only add if robe hasn't already set a kilt geoset
         if (geosets.count(1302) == 0 && geosets.count(1303) == 0) {
             geosets.insert(static_cast<uint16_t>(gg > 0 ? 1301 + gg : 1301));
