@@ -201,6 +201,18 @@ M2ClassificationResult classifyM2Model(
     const bool ambientCreature = hasAny(n, kAmbientTokens);
 
     // ---------------------------------------------------------------
+    // Sky birds / bats: animated flying doodads that look frozen beyond bone range
+    // ---------------------------------------------------------------
+    static constexpr auto kSkyBirdTokens = std::to_array<std::string_view>({
+        "albatross", "carrionbird", "crane", "crow",
+        "eagle",     "gull",        "hawk",  "osprey",
+        "owl",       "parrot",      "pelican",
+        "raven",     "seagull",     "vulture",
+    });
+    r.isSkyBird = hasAny(n, kSkyBirdTokens) || has(n, "\\bird")
+                || has(n, "\\bat\\") || has(n, "\\bat.");
+
+    // ---------------------------------------------------------------
     // Animation / foliage rendering flags
     // ---------------------------------------------------------------
     const bool foliageOrTree = foliageName || treeLike;

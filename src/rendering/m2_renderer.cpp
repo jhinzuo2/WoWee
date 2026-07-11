@@ -1245,6 +1245,7 @@ bool M2Renderer::loadModel(const pipeline::M2Model& model, uint32_t modelId) {
     gpuModel.isWaterfall                 = cls.isWaterfall;
     gpuModel.isBrazierOrFire             = cls.isBrazierOrFire;
     gpuModel.isTorch                     = cls.isTorch;
+    gpuModel.isSkyBird                   = cls.isSkyBird;
     gpuModel.ambientEmitterType          = cls.ambientEmitterType;
     gpuModel.boundMin = tightMin;
     gpuModel.boundMax = tightMax;

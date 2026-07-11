@@ -130,6 +130,7 @@ struct M2ModelGPU {
     bool isLanternLike = false;     // Model name matches lantern/lamp/light (precomputed)
     bool isKoboldFlame = false;     // Model name matches kobold+(candle/torch/mine) (precomputed)
     bool isLavaModel = false;       // Model name contains lava/molten/magma (UV scroll fallback)
+    bool isSkyBird = false;         // Flying bird/bat doodad — hide until animation range
     bool hasTextureAnimation = false; // True if any batch has UV animation
     bool hasTransparentBatches = false; // True if any batch uses alpha-blend or additive (blendMode >= 2)
     uint8_t availableLODs = 0;  // Bitmask: bit N set if any batch has submeshLevel==N
@@ -215,6 +216,7 @@ struct M2Instance {
     bool cachedIsGroundDetail = false;
     bool cachedIsInvisibleTrap = false;
     bool cachedIsInstancePortal = false;
+    bool cachedIsSkyBird = false;
     bool cachedIsValid = false;
     bool skipCollision = false;    // WMO interior doodads — skip player wall collision
     float cachedBoundRadius = 0.0f;

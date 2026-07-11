@@ -90,6 +90,7 @@ uint32_t M2Renderer::createInstance(uint32_t modelId, const glm::vec3& position,
     instance.cachedIsGroundDetail = mdlRef.isGroundDetail;
     instance.cachedIsInvisibleTrap = mdlRef.isInvisibleTrap;
     instance.cachedIsInstancePortal = mdlRef.isInstancePortal;
+    instance.cachedIsSkyBird = mdlRef.isSkyBird;
     instance.cachedIsValid = mdlRef.isValid();
     instance.cachedModel = &mdlRef;
     instance.recomputeCachedCullFactors();
@@ -212,6 +213,7 @@ uint32_t M2Renderer::createInstanceWithMatrix(uint32_t modelId, const glm::mat4&
     instance.cachedBoundRadius = mdl2.boundRadius;
     instance.cachedIsGroundDetail = mdl2.isGroundDetail;
     instance.cachedIsInvisibleTrap = mdl2.isInvisibleTrap;
+    instance.cachedIsSkyBird = mdl2.isSkyBird;
     instance.cachedIsValid = mdl2.isValid();
     instance.cachedModel = &mdl2;
     instance.recomputeCachedCullFactors();
@@ -868,6 +870,16 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
 
             float paddedRadius = instance.cachedPaddedRadius;
             if (paddedRadius > 0.0f && !frustum.intersectsSphere(instance.position, paddedRadius)) continue;
+        }
+
+        // Animated sky birds: cap render distance to bone-update range so they
+        // fade in only when close enough for animation, hiding frozen poses.
+        if (instance.cachedIsSkyBird && instance.cachedHasAnimation && !instance.cachedDisableAnimation) {
+            constexpr float kBirdMaxDistSq = rendering::M2_LOD3_DISTANCE * rendering::M2_LOD3_DISTANCE;
+            if (effectiveMaxDistSq > kBirdMaxDistSq) {
+                effectiveMaxDistSq = kBirdMaxDistSq;
+                if (distSq > effectiveMaxDistSq) continue;
+            }
         }
 
         sortedVisible_.push_back({i, instance.modelId, distSq, effectiveMaxDistSq});

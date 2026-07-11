@@ -51,6 +51,7 @@ struct M2ClassificationResult {
     bool isWaterfall        = false; ///< Waterfall model (ambient sound + splash particles)
     bool isBrazierOrFire    = false; ///< Brazier / campfire / bonfire model
     bool isTorch            = false; ///< Wall-mounted or standing torch
+    bool isSkyBird          = false; ///< Flying bird/bat doodad (hide until animation range)
 
     // --- Ambient emitter type (for sound system) ---
     AmbientEmitterType ambientEmitterType = AmbientEmitterType::None;
