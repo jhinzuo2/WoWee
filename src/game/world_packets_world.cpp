@@ -1040,12 +1040,14 @@ bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData
 
         out.ok = true;
         out.score = 0;
-        // Prefer the standard WotLK/TBC 8-byte prefix (uint32 autoFinish + uint32 suggestedPlayers)
-        if (prefixSkip == 8) out.score += 3;
-        else if (prefixSkip == 5) out.score += 1;  // Classic uint8 autoFinish + uint32 suggestedPlayers
+        // WotLK prefix: autoFinish(4) + flags(4) + suggestedPlayers(4) = 12 bytes
+        // (AzerothCore/TrinityCore include the flags field)
+        // TBC prefix: autoFinish(4) + suggestedPlayers(4) = 8 bytes
+        // Classic prefix: autoFinish(1) + suggestedPlayers(4) = 5 bytes
+        if (prefixSkip == 8 || prefixSkip == 12) out.score += 3;
+        else if (prefixSkip == 5) out.score += 1;
         // WotLK/AzerothCore uses fixed 6 choice + 4 fixed reward arrays; older
-        // Classic/TBC-style packets use compact variable arrays.  Keep the
-        // reward choice slot aligned with the active protocol.
+        // Classic/TBC-style packets use compact variable arrays.
         if (fixedArrays == preferFixedRewardArrays) out.score += 4;
         // Valid counts
         if (choiceCount <= 6) out.score += 3;
@@ -1053,6 +1055,13 @@ bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData
         // All non-zero items are within declared counts
         if (nonZeroChoice <= choiceCount) out.score += 2;
         if (nonZeroFixed <= rewardCount) out.score += 2;
+        // Item plausibility: valid items have reasonable count and non-zero displayInfoId
+        for (const auto& ri : out.choiceRewards) {
+            if (ri.count > 0 && ri.count < 1000 && ri.displayInfoId > 0) out.score += 1;
+        }
+        for (const auto& ri : out.fixedRewards) {
+            if (ri.count > 0 && ri.count < 1000 && ri.displayInfoId > 0) out.score += 1;
+        }
         // No bytes left over (or only a few)
         size_t remaining = packet.getRemainingSize();
         if (remaining == 0) out.score += 5;
