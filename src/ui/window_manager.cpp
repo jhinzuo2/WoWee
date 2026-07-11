@@ -262,26 +262,28 @@ void WindowManager::renderGossipWindow(game::GameHandler& gameHandler,
     ImGui::SetNextWindowPos(ImVec2(screenW / 2 - 200, 150), ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(400, 0), ImGuiCond_Always);
 
+    const auto& gossip = gameHandler.getCurrentGossip();
+    auto npcEntity = gameHandler.getEntityManager().getEntity(gossip.npcGuid);
+    std::string npcName;
+    if (npcEntity && npcEntity->getType() == game::ObjectType::UNIT) {
+        auto unit = std::static_pointer_cast<game::Unit>(npcEntity);
+        npcName = unit->getName();
+    }
+
+    // Keep a stable ImGui ID while presenting the NPC name as the title.
+    std::string windowTitle = (npcName.empty() ? "NPC Dialog" : npcName) +
+                              std::string("###NPCDialog");
     bool open = true;
-    if (ImGui::Begin("NPC Dialog", &open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
-        const auto& gossip = gameHandler.getCurrentGossip();
-
-        // NPC name (from creature cache)
-        auto npcEntity = gameHandler.getEntityManager().getEntity(gossip.npcGuid);
-        if (npcEntity && npcEntity->getType() == game::ObjectType::UNIT) {
-            auto unit = std::static_pointer_cast<game::Unit>(npcEntity);
-            if (!unit->getName().empty()) {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.0f, 1.0f), "%s", unit->getName().c_str());
-                ImGui::Separator();
-            }
-        }
-
+    if (ImGui::Begin(windowTitle.c_str(), &open,
+                     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_AlwaysAutoResize)) {
         // NPC body text (from NPC_TEXT referenced by titleTextId)
         if (gossip.titleTextId > 0) {
             const std::string& bodyText = gameHandler.getNpcText(gossip.titleTextId);
             if (!bodyText.empty()) {
+                std::string processedBodyText =
+                    chat_utils::replaceGenderPlaceholders(bodyText, gameHandler);
                 ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 380.0f);
-                ImGui::TextWrapped("%s", bodyText.c_str());
+                ImGui::TextWrapped("%s", processedBodyText.c_str());
                 ImGui::PopTextWrapPos();
                 ImGui::Separator();
             }
