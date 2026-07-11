@@ -204,7 +204,7 @@ private:
         bool hasOverrideModelMatrix = false;
         glm::mat4 overrideModelMatrix{1.0f};
 
-        // Bone update throttling (skip frames for distant characters)
+        // Bone update throttling for characters outside normal gameplay range.
         uint32_t boneUpdateCounter = 0;
         const M2ModelGPU* cachedModel = nullptr;  // Avoid per-frame hash lookups
 

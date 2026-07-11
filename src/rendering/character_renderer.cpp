@@ -1908,11 +1908,14 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
             }
         }
 
-        // Distance-tiered bone throttling: near=every frame, mid=every 4th, far=every 8th
+        // Keep combat-range creatures at the render frame rate. Aggressive
+        // throttling used to begin at 10 yards and reached every eighth frame
+        // at 40 yards, making ordinary monster locomotion look like a slideshow.
+        // Reserve frame skipping for models far enough away that bone detail is
+        // much less noticeable, consistent with the generic M2 renderer.
         uint32_t boneInterval = 1;
-        if (distSq > 40.0f * 40.0f) boneInterval = 8;
-        else if (distSq > 20.0f * 20.0f) boneInterval = 4;
-        else if (distSq > 10.0f * 10.0f) boneInterval = 2;
+        if (distSq > 90.0f * 90.0f) boneInterval = 4;
+        else if (distSq > 45.0f * 45.0f) boneInterval = 2;
 
         inst.boneUpdateCounter++;
         bool needsBones = (inst.boneUpdateCounter >= boneInterval) || inst.boneMatrices.empty();
