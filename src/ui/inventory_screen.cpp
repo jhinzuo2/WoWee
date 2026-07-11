@@ -3159,30 +3159,30 @@ void InventoryScreen::renderItemTooltip(const game::ItemDef& item, const game::I
                 char ilvlBuf[64];
                 float diff = static_cast<float>(item.itemLevel) - static_cast<float>(eq->item.itemLevel);
                 if (diff > 0.0f)
-                    std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (▲%.0f)", item.itemLevel, diff);
+                    std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (▲%.0f)", eq->item.itemLevel, diff);
                 else if (diff < 0.0f)
-                    std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (▼%.0f)", item.itemLevel, -diff);
+                    std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (▼%.0f)", eq->item.itemLevel, -diff);
                 else
-                    std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (=)", item.itemLevel);
+                    std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (=)", eq->item.itemLevel);
                 ImVec4 ilvlColor = (diff > 0.0f) ? ImVec4(0.0f, 1.0f, 0.0f, 1.0f)
                                  : (diff < 0.0f) ? ui::colors::kRed
                                  : ui::colors::kLightGray;
                 ImGui::TextColored(ilvlColor, "%s", ilvlBuf);
             }
 
-            // Helper: render a numeric stat diff line
+            // Helper: render a stat diff line showing the equipped item's value
             auto showDiff = [](const char* label, float newVal, float eqVal) {
                 if (newVal == 0.0f && eqVal == 0.0f) return;
                 float diff = newVal - eqVal;
                 char buf[128];
                 if (diff > 0.0f) {
-                    std::snprintf(buf, sizeof(buf), "%s: %.0f (▲%.0f)", label, newVal, diff);
+                    std::snprintf(buf, sizeof(buf), "%s: %.0f (▲%.0f)", label, eqVal, diff);
                     ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "%s", buf);
                 } else if (diff < 0.0f) {
-                    std::snprintf(buf, sizeof(buf), "%s: %.0f (▼%.0f)", label, newVal, -diff);
+                    std::snprintf(buf, sizeof(buf), "%s: %.0f (▼%.0f)", label, eqVal, -diff);
                     ImGui::TextColored(ui::colors::kRed, "%s", buf);
                 } else {
-                    std::snprintf(buf, sizeof(buf), "%s: %.0f (=)", label, newVal);
+                    std::snprintf(buf, sizeof(buf), "%s: %.0f (=)", label, eqVal);
                     ImGui::TextColored(ui::colors::kLightGray, "%s", buf);
                 }
             };
@@ -3651,17 +3651,17 @@ void InventoryScreen::renderItemTooltip(const game::ItemQueryResponseData& info,
                 if (nv == 0.0f && ev == 0.0f) return;
                 float diff = nv - ev;
                 char buf[96];
-                if (diff > 0.0f) { std::snprintf(buf, sizeof(buf), "%s: %.0f (▲%.0f)", label, nv, diff);  ImGui::TextColored(ImVec4(0.0f,1.0f,0.0f,1.0f), "%s", buf); }
-                else if (diff < 0.0f) { std::snprintf(buf, sizeof(buf), "%s: %.0f (▼%.0f)", label, nv, -diff); ImGui::TextColored(ui::colors::kRed, "%s", buf); }
-                else { std::snprintf(buf, sizeof(buf), "%s: %.0f (=)", label, nv); ImGui::TextColored(ui::colors::kLightGray, "%s", buf); }
+                if (diff > 0.0f) { std::snprintf(buf, sizeof(buf), "%s: %.0f (▲%.0f)", label, ev, diff);  ImGui::TextColored(ImVec4(0.0f,1.0f,0.0f,1.0f), "%s", buf); }
+                else if (diff < 0.0f) { std::snprintf(buf, sizeof(buf), "%s: %.0f (▼%.0f)", label, ev, -diff); ImGui::TextColored(ui::colors::kRed, "%s", buf); }
+                else { std::snprintf(buf, sizeof(buf), "%s: %.0f (=)", label, ev); ImGui::TextColored(ui::colors::kLightGray, "%s", buf); }
             };
 
             float ilvlDiff = static_cast<float>(info.itemLevel) - static_cast<float>(eq->item.itemLevel);
             if (info.itemLevel > 0 || eq->item.itemLevel > 0) {
                 char ilvlBuf[64];
-                if (ilvlDiff > 0)      std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (▲%.0f)", info.itemLevel, ilvlDiff);
-                else if (ilvlDiff < 0) std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (▼%.0f)", info.itemLevel, -ilvlDiff);
-                else                   std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (=)", info.itemLevel);
+                if (ilvlDiff > 0)      std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (▲%.0f)", eq->item.itemLevel, ilvlDiff);
+                else if (ilvlDiff < 0) std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (▼%.0f)", eq->item.itemLevel, -ilvlDiff);
+                else                   std::snprintf(ilvlBuf, sizeof(ilvlBuf), "Item Level: %u (=)", eq->item.itemLevel);
                 ImVec4 ic = ilvlDiff > 0 ? ImVec4(0,1,0,1) : ilvlDiff < 0 ? ImVec4(1,0.3f,0.3f,1) : ImVec4(0.7f,0.7f,0.7f,1);
                 ImGui::TextColored(ic, "%s", ilvlBuf);
             }
