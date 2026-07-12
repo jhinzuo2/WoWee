@@ -1,5 +1,17 @@
 # Changelog
 
+## [v2.0.7-preview] — 2026-07-12
+
+### Camera
+- **Hills no longer clip through the third-person camera.** Terrain was only ever a floor clamp at the camera's final position, so a rise *between* the character and the camera sliced straight through the view and the clamp just popped the camera upward after the fact. The camera ray now marches the terrain heightfield (coarse ~1.25-unit steps, then bisection for a tight limit) and the resulting distance feeds the same asymmetric pull-in/recover smoothing as the WMO wall raycast. Worst case is ~28 bilinear height lookups a frame — negligible. Pull-in snaps 1:1 while the mouse or turn keys are actively rotating, since the 60 ms ease was exactly the window where a fast swing into a hillside still dipped underground
+- The terrain march is skipped inside interior WMOs (terrain above a tunnel is not a real occluder) and when the pivot itself sits below the heightfield (caves, WMO basements, ADT holes), so it cannot pin the camera to first-person where the heightfield is irrelevant
+- X now dives while swimming instead of toggling sit, water-exit assists are suppressed while diving, and the swim-depth gate only applies on water entry — deliberate dives can go arbitrarily deep
+
+### UI
+- Crafting panel reagent lines show live have/need counts, recounted every frame so consumption is visible mid-craft; Create/Create All disable when any reagent is short
+
+---
+
 ## [v2.0.6-preview] — 2026-07-12
 
 ### Networking
