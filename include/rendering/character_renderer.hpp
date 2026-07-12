@@ -26,6 +26,14 @@ class Camera;
 class VkContext;
 class VkTexture;
 
+// Enchant visual (glint, glow) attached to a weapon at one of the weapon model's
+// own item-visual attachment points.
+struct WeaponEffectAttachment {
+    uint32_t effectModelId;
+    uint32_t effectInstanceId;
+    glm::vec3 offset;          // attachment position on the weapon model
+};
+
 // Weapon attached to a character instance at a bone attachment point
 struct WeaponAttachment {
     uint32_t weaponModelId;
@@ -33,6 +41,7 @@ struct WeaponAttachment {
     uint32_t attachmentId;     // 1=RightHand, 2=LeftHand
     uint16_t boneIndex;
     glm::vec3 offset;
+    std::vector<WeaponEffectAttachment> effects;
 };
 
 /**
@@ -105,8 +114,19 @@ public:
                       const pipeline::M2Model& weaponModel, uint32_t weaponModelId,
                       const std::string& texturePath);
 
-    /** Detach a weapon from the given attachment point. */
+    /** Detach a weapon from the given attachment point (drops its enchant effects too). */
     void detachWeapon(uint32_t charInstanceId, uint32_t attachmentId);
+
+    /**
+     * Attach an enchant visual to the weapon at the given attachment point.
+     * visualSlot is the ItemVisuals.dbc slot (0-4), which selects the attachment
+     * point on the weapon model the effect hangs from.
+     */
+    bool attachWeaponEffect(uint32_t charInstanceId, uint32_t attachmentId, uint32_t visualSlot,
+                            const pipeline::M2Model& effectModel, uint32_t effectModelId);
+
+    /** Remove all enchant visuals from the weapon at the given attachment point. */
+    void detachWeaponEffects(uint32_t charInstanceId, uint32_t attachmentId);
 
     /** Get the world-space transform of an attachment point on an instance. */
     bool getAttachmentTransform(uint32_t instanceId, uint32_t attachmentId, glm::mat4& outTransform);
@@ -204,6 +224,11 @@ private:
         bool hasOverrideModelMatrix = false;
         glm::mat4 overrideModelMatrix{1.0f};
 
+        // Enchant visual attached to a weapon. Such a model is nothing but the
+        // additive FX batches that attached weapons otherwise drop, and it still
+        // needs its animation advanced even though its transform comes from the parent.
+        bool isEffectModel = false;
+
         // Bone update throttling for characters outside normal gameplay range.
         uint32_t boneUpdateCounter = 0;
         const M2ModelGPU* cachedModel = nullptr;  // Avoid per-frame hash lookups
@@ -288,6 +313,24 @@ private:
 
     // Descriptor pool
     VkDescriptorPool materialDescPools_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    struct MaterialDescriptorKey {
+        VkImageView diffuse = VK_NULL_HANDLE;
+        VkImageView normal = VK_NULL_HANDLE;
+        VkSampler diffuseSampler = VK_NULL_HANDLE;
+        VkSampler normalSampler = VK_NULL_HANDLE;
+        bool operator==(const MaterialDescriptorKey&) const = default;
+    };
+    struct MaterialDescriptorKeyHash {
+        size_t operator()(const MaterialDescriptorKey& key) const {
+            const size_t a = std::hash<VkImageView>{}(key.diffuse);
+            const size_t b = std::hash<VkImageView>{}(key.normal);
+            const size_t c = std::hash<VkSampler>{}(key.diffuseSampler);
+            const size_t d = std::hash<VkSampler>{}(key.normalSampler);
+            return a ^ (b << 1) ^ (c << 2) ^ (d << 3);
+        }
+    };
+    std::unordered_map<MaterialDescriptorKey, VkDescriptorSet, MaterialDescriptorKeyHash>
+        materialDescriptorCache_[2];
     VkDescriptorPool boneDescPool_ = VK_NULL_HANDLE;
     std::shared_ptr<std::atomic<uint64_t>> boneDescPoolGeneration_ =
         std::make_shared<std::atomic<uint64_t>>(0);

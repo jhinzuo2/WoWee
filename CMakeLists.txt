@@ -1072,10 +1072,31 @@ if(GLSLC)
     compile_shaders(wowee)
 endif()
 
+# Version header generated from `git describe`. Regenerated on every build (the
+# script rewrites the header only when the version changed), so tagging a release
+# is enough to update the version shown in the client.
+set(WOWEE_VERSION_HEADER ${CMAKE_BINARY_DIR}/generated/core/version.hpp)
+set(WOWEE_VERSION_SCRIPT_ARGS
+    -DSRC_DIR=${CMAKE_SOURCE_DIR}
+    -DIN_FILE=${CMAKE_SOURCE_DIR}/include/core/version.hpp.in
+    -DOUT_FILE=${WOWEE_VERSION_HEADER}
+    -P ${CMAKE_SOURCE_DIR}/cmake/GitVersion.cmake
+)
+# Once now, so the header exists before the first compile.
+execute_process(COMMAND ${CMAKE_COMMAND} ${WOWEE_VERSION_SCRIPT_ARGS})
+add_custom_target(wowee_version ALL
+    COMMAND ${CMAKE_COMMAND} ${WOWEE_VERSION_SCRIPT_ARGS}
+    BYPRODUCTS ${WOWEE_VERSION_HEADER}
+    COMMENT "Resolving version from git"
+    VERBATIM
+)
+add_dependencies(wowee wowee_version)
+
 # Include directories
 target_include_directories(wowee PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
 )
 # Vendored headers as SYSTEM to suppress third-party warnings
 target_include_directories(wowee SYSTEM PRIVATE

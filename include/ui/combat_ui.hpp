@@ -15,6 +15,7 @@ namespace ui {
 
 class SettingsPanel;
 class SpellbookScreen;
+class InventoryScreen;
 
 /**
  * Combat UI overlay manager (extracted from GameScreen)
@@ -63,8 +64,10 @@ public:
     void renderCombatText(game::GameHandler& gameHandler);
     void renderDPSMeter(game::GameHandler& gameHandler,
                         const SettingsPanel& settings);
+    // inventoryScreen supplies the weapon item icons shown for temporary weapon enchants.
     void renderBuffBar(game::GameHandler& gameHandler,
                        SpellbookScreen& spellbookScreen,
+                       InventoryScreen& inventoryScreen,
                        SpellIconFn getSpellIcon);
     void renderBattlegroundScore(game::GameHandler& gameHandler);
     void renderCombatLog(game::GameHandler& gameHandler,

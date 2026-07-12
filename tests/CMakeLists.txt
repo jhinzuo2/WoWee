@@ -106,6 +106,37 @@ target_link_libraries(test_opcode_table PRIVATE catch2_main)
 add_test(NAME opcode_table COMMAND test_opcode_table)
 register_test_target(test_opcode_table)
 
+# ── test_use_item_packet ─────────────────────────────────────
+add_executable(test_use_item_packet
+    test_use_item_packet.cpp
+    ${TEST_COMMON_SOURCES}
+    ${CMAKE_SOURCE_DIR}/src/network/packet.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/opcode_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/expansion_profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/character.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/spline_packet.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets_world.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets_entity.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets_social.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets_economy.cpp
+    ${CMAKE_SOURCE_DIR}/src/auth/crypto.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/packet_parsers_classic.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/packet_parsers_tbc.cpp
+)
+target_include_directories(test_use_item_packet PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_use_item_packet SYSTEM PRIVATE ${TEST_SYSTEM_INCLUDE_DIRS})
+target_link_libraries(test_use_item_packet PRIVATE catch2_main SDL2::SDL2 ZLIB::ZLIB
+                                                   OpenSSL::SSL OpenSSL::Crypto)
+if(TARGET glm::glm)
+    target_link_libraries(test_use_item_packet PRIVATE glm::glm)
+endif()
+if(TARGET Vulkan::Vulkan)
+    target_link_libraries(test_use_item_packet PRIVATE Vulkan::Vulkan)
+endif()
+add_test(NAME use_item_packet COMMAND test_use_item_packet)
+register_test_target(test_use_item_packet)
+
 # ── test_entity ──────────────────────────────────────────────
 add_executable(test_entity
     test_entity.cpp
@@ -127,6 +158,7 @@ add_executable(test_dbc_loader
     test_dbc_loader.cpp
     ${TEST_COMMON_SOURCES}
     ${CMAKE_SOURCE_DIR}/src/pipeline/dbc_loader.cpp
+    ${CMAKE_SOURCE_DIR}/src/pipeline/dbc_layout.cpp
 )
 target_include_directories(test_dbc_loader PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_dbc_loader SYSTEM PRIVATE ${TEST_SYSTEM_INCLUDE_DIRS})

@@ -13,6 +13,8 @@ cmake_install.cmake
 Makefile
 *.cmake
 !CMakeLists.txt
+# Hand-written CMake modules live in cmake/ and are source, not build output.
+!cmake/*.cmake
 
 # Compiled Object files
 *.o

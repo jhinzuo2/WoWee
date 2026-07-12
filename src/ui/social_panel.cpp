@@ -2415,7 +2415,7 @@ void SocialPanel::renderInspectWindow(game::GameHandler& gameHandler,
                                  ? pipeline::getActiveDBCLayout()->getLayout("SpellItemEnchantment")
                                  : nullptr;
             uint32_t idField   = layout ? (*layout)["ID"]   : 0;
-            uint32_t nameField = layout ? (*layout)["Name"] : 8;
+            uint32_t nameField = pipeline::detectEnchantmentNameField(dbc.get(), layout);
             for (uint32_t i = 0; i < dbc->getRecordCount(); ++i) {
                 uint32_t id = dbc->getUInt32(i, idField);
                 if (id == 0) continue;

@@ -166,9 +166,14 @@
     "SkillLineID": 1,
     "SpellID": 2
   },
+  "SpellItemEnchantment": {
+    "ID": 0,
+    "Name": 10
+  },
   "Spell": {
     "Attributes": 5,
     "AttributesEx": 6,
+    "Targets": 13,
     "CastingTimeIndex": 15,
     "DispelType": 4,
     "DurationIndex": 40,

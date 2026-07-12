@@ -512,6 +512,7 @@ void ChatHandler::handleMessageChat(network::Packet& packet) {
     }
 
     // Add to chat history
+    data.uid = ++chatUidCounter_;
     chatHistory_.push_back(data);
     if (chatHistory_.size() > maxChatHistory_) {
         chatHistory_.erase(chatHistory_.begin());
@@ -840,6 +841,7 @@ void ChatHandler::autoJoinDefaultChannels() {
 
 void ChatHandler::addLocalChatMessage(const MessageChatData& msg) {
     chatHistory_.push_back(msg);
+    chatHistory_.back().uid = ++chatUidCounter_;
     if (chatHistory_.size() > maxChatHistory_) {
         chatHistory_.pop_front();
     }

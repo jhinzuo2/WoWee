@@ -11,7 +11,7 @@
 #include <vector>
 
 namespace wowee {
-namespace pipeline { class AssetManager; }
+namespace pipeline { class AssetManager; struct M2Model; }
 namespace rendering {
 
 class CharacterRenderer;
@@ -70,6 +70,13 @@ private:
     std::unordered_set<uint16_t> buildBaseGeosets();
     uint16_t selectedHairScalpGeoset() const;
 
+    // Read an M2 (plus its .skin for WotLK-era models) through the asset manager.
+    bool loadPreviewM2(const std::string& m2Path, pipeline::M2Model& outModel);
+    // Hang the character's weapons off the preview model's hand attachments.
+    void attachWeapons(const std::vector<game::EquipmentItem>& equipment);
+    // Load the race's glue scene (Stormwind for humans, Orgrimmar for orcs, ...) as a backdrop.
+    void loadRacialBackdrop(game::Race race);
+
     pipeline::AssetManager* assetManager_ = nullptr;
     VkContext* vkCtx_ = nullptr;
     std::unique_ptr<CharacterRenderer> charRenderer_;
@@ -96,11 +103,17 @@ private:
     VkDescriptorSet imguiTextureId_ = VK_NULL_HANDLE;
 
     // 4:5 portrait aspect ratio — taller than wide to show full character body
-    // from head to feet in the character creation/selection screen
-    static constexpr int fboWidth_ = 400;
-    static constexpr int fboHeight_ = 500;
+    // from head to feet in the character creation/selection screen. Rendered at
+    // roughly the size it is displayed at, so the larger panel is not upscaled mush.
+    static constexpr int fboWidth_ = 640;
+    static constexpr int fboHeight_ = 800;
 
     static constexpr uint32_t PREVIEW_MODEL_ID = 9999;
+    static constexpr uint32_t PREVIEW_MAINHAND_MODEL_ID = 9998;
+    static constexpr uint32_t PREVIEW_OFFHAND_MODEL_ID  = 9997;
+    static constexpr uint32_t PREVIEW_BACKDROP_MODEL_ID = 9996;
+    uint32_t backdropInstanceId_ = 0;
+    int backdropRace_ = -1;   // race whose glue scene is currently loaded (-1 = none)
     uint32_t instanceId_ = 0;
     bool modelLoaded_ = false;
     bool compositeRequested_ = false;

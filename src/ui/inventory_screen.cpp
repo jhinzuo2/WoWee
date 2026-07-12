@@ -701,6 +701,51 @@ void InventoryScreen::cancelPickup(game::Inventory& inv) {
     inventoryDirty = true;
 }
 
+void InventoryScreen::renderItemTargetCursor() {
+    if (!gameHandler_ || !gameHandler_->isAwaitingItemTarget()) {
+        itemTargetArmedFrame_ = -1;
+        return;
+    }
+    if (itemTargetArmedFrame_ < 0) itemTargetArmedFrame_ = ImGui::GetFrameCount();
+
+    // Escape or right-click abandons the pending use. Skipped on the arming frame,
+    // where the right-click that used the item is still being handled.
+    if (itemTargetArmedFrame_ != ImGui::GetFrameCount() && !ImGui::GetIO().WantTextInput) {
+        if (ImGui::IsMouseClicked(ImGuiMouseButton_Right) ||
+            core::Input::getInstance().isKeyPressed(SDL_SCANCODE_ESCAPE)) {
+            gameHandler_->cancelItemTargeting();
+            itemTargetArmedFrame_ = -1;
+            return;
+        }
+    }
+
+    ImVec2 mousePos = ImGui::GetIO().MousePos;
+    constexpr float size = 36.0f;
+    ImVec2 pos(mousePos.x - size * 0.5f, mousePos.y - size * 0.5f);
+    ImDrawList* drawList = ImGui::GetForegroundDrawList();
+
+    uint32_t displayInfoId = 0;
+    const auto* info = gameHandler_->getItemInfo(gameHandler_->getPendingItemTargetSourceItemId());
+    if (info && info->valid) displayInfoId = info->displayInfoId;
+
+    VkDescriptorSet iconTex = displayInfoId ? getItemIcon(displayInfoId) : VK_NULL_HANDLE;
+    if (iconTex) {
+        drawList->AddImage((ImTextureID)(uintptr_t)iconTex, pos, ImVec2(pos.x + size, pos.y + size));
+    } else {
+        drawList->AddRectFilled(pos, ImVec2(pos.x + size, pos.y + size), IM_COL32(40, 35, 30, 200));
+    }
+    // Green frame marks the cursor as armed for an item target.
+    drawList->AddRect(pos, ImVec2(pos.x + size, pos.y + size), IM_COL32(0, 220, 0, 230), 0.0f, 0, 2.0f);
+
+    const char* hint = "Select an item";
+    ImVec2 hintSize = ImGui::CalcTextSize(hint);
+    ImVec2 hintPos(mousePos.x - hintSize.x * 0.5f, pos.y + size + 4.0f);
+    drawList->AddRectFilled(ImVec2(hintPos.x - 3.0f, hintPos.y - 2.0f),
+                            ImVec2(hintPos.x + hintSize.x + 3.0f, hintPos.y + hintSize.y + 2.0f),
+                            IM_COL32(0, 0, 0, 180));
+    drawList->AddText(hintPos, IM_COL32(0, 255, 0, 255), hint);
+}
+
 void InventoryScreen::renderHeldItem() {
     if (!holdingItem) return;
 
@@ -813,6 +858,20 @@ void InventoryScreen::openAllBags() {
 void InventoryScreen::closeAllBags() {
     backpackOpen_ = false;
     for (auto& b : bagOpen_) b = false;
+}
+
+void InventoryScreen::toggleCombinedBags() {
+    if (separateBags_) {
+        // Consolidating is an explicit request to see the inventory, even when
+        // all of the individual windows happened to be closed.
+        separateBags_ = false;
+        open = true;
+    } else {
+        // Restore every physical bag as a visible, independently movable window.
+        separateBags_ = true;
+        openAllBags();
+        open = true;
+    }
 }
 
 bool InventoryScreen::bagHasAnyItems(const game::Inventory& inventory, int bagIndex) const {
@@ -1006,15 +1065,33 @@ void InventoryScreen::renderAggregateBags(game::Inventory& inventory, uint64_t m
 
     constexpr float slotSize = 40.0f;
     constexpr int columns = 6;
-    int rows = (inventory.getBackpackSize() + columns - 1) / columns;
-    float bagContentH = rows * (slotSize + 4.0f) + 40.0f;
-
+    int totalSlots = inventory.getBackpackSize();
+    int usedSlots = 0;
+    for (int slot = 0; slot < inventory.getBackpackSize(); ++slot)
+        usedSlots += !inventory.getBackpackSlot(slot).empty();
     for (int bag = 0; bag < game::Inventory::NUM_BAG_SLOTS; bag++) {
         int bagSize = inventory.getBagSize(bag);
         if (bagSize <= 0) continue;
-        if (compactBags_ && !bagHasAnyItems(inventory, bag)) continue;
-        int bagRows = (bagSize + columns - 1) / columns;
-        bagContentH += bagRows * (slotSize + 4.0f) + 30.0f;
+        totalSlots += bagSize;
+        for (int slot = 0; slot < bagSize; ++slot)
+            usedSlots += !inventory.getBagSlot(bag, slot).empty();
+    }
+
+    int rows = (totalSlots + columns - 1) / columns;
+    float bagContentH = rows * (slotSize + 4.0f) + 40.0f;
+    int visibleKeySlots = 0;
+    if (showKeyring_) {
+        constexpr int keyColumns = 8;
+        int lastOccupied = -1;
+        for (int slot = inventory.getKeyringSize() - 1; slot >= 0; --slot) {
+            if (!inventory.getKeyringSlot(slot).empty()) { lastOccupied = slot; break; }
+        }
+        visibleKeySlots = lastOccupied < 0 ? 0 : ((lastOccupied / keyColumns) + 1) * keyColumns;
+        if (visibleKeySlots > 0) {
+            constexpr float keySlotSize = 24.0f;
+            const int keyRows = (visibleKeySlots + keyColumns - 1) / keyColumns;
+            bagContentH += 30.0f + keyRows * (keySlotSize + 4.0f);
+        }
     }
 
     float windowW = columns * (slotSize + 4.0f) + 30.0f;
@@ -1029,7 +1106,9 @@ void InventoryScreen::renderAggregateBags(game::Inventory& inventory, uint64_t m
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
     if (holdingItem || pickupPending_) flags |= ImGuiWindowFlags_NoMove;
 
-    bool windowVisible = ImGui::Begin("Bags", &open, flags);
+    char windowTitle[64];
+    snprintf(windowTitle, sizeof(windowTitle), "All Bags (%d/%d)###Bags", usedSlots, totalSlots);
+    bool windowVisible = ImGui::Begin(windowTitle, &open, flags);
     if (!windowVisible) {
         ImGui::End();
         return;
@@ -1043,7 +1122,43 @@ void InventoryScreen::renderAggregateBags(game::Inventory& inventory, uint64_t m
         ImGui::SetWindowPos(ImVec2(posX, posY));
     }
 
-    renderBackpackPanel(inventory, compactBags_);
+    // Draw one uninterrupted grid while retaining each slot's real container
+    // and index for pickup, use, split, destroy, and server swap operations.
+    int gridIndex = 0;
+    auto renderCombinedSlot = [&](const game::ItemSlot& slot, int backpackIndex,
+                                  int bagIndex, int bagSlotIndex) {
+        if (gridIndex % columns != 0) ImGui::SameLine();
+        ImGui::PushID(gridIndex);
+        renderItemSlot(inventory, slot, slotSize, nullptr,
+                       SlotKind::BACKPACK, backpackIndex, game::EquipSlot::NUM_SLOTS,
+                       bagIndex, bagSlotIndex);
+        ImGui::PopID();
+        ++gridIndex;
+    };
+
+    for (int slot = 0; slot < inventory.getBackpackSize(); ++slot)
+        renderCombinedSlot(inventory.getBackpackSlot(slot), slot, -1, -1);
+    for (int bag = 0; bag < game::Inventory::NUM_BAG_SLOTS; ++bag) {
+        const int bagSize = inventory.getBagSize(bag);
+        if (bagSize <= 0) continue;
+        for (int slot = 0; slot < bagSize; ++slot)
+            renderCombinedSlot(inventory.getBagSlot(bag, slot), -1, bag, slot);
+    }
+
+    if (visibleKeySlots > 0) {
+        constexpr float keySlotSize = 24.0f;
+        constexpr int keyColumns = 8;
+        ImGui::Spacing();
+        ImGui::Separator();
+        ImGui::TextColored(ui::colors::kDarkYellow, "Keyring");
+        for (int slot = 0; slot < visibleKeySlots; ++slot) {
+            if (slot % keyColumns != 0) ImGui::SameLine();
+            ImGui::PushID(10000 + slot);
+            renderItemSlot(inventory, inventory.getKeyringSlot(slot), keySlotSize, nullptr,
+                           SlotKind::BACKPACK, -1, game::EquipSlot::NUM_SLOTS);
+            ImGui::PopID();
+        }
+    }
 
     ImGui::Spacing();
     uint64_t gold = moneyCopper / 10000;
@@ -1053,18 +1168,6 @@ void InventoryScreen::renderAggregateBags(game::Inventory& inventory, uint64_t m
                        static_cast<unsigned long long>(gold),
                        static_cast<unsigned long long>(silver),
                        static_cast<unsigned long long>(copper));
-    ImGui::SameLine();
-    const char* collapseLabel = compactBags_ ? "Expand Empty" : "Collapse Empty";
-    const float btnW = 92.0f;
-    const float rightMargin = 8.0f;
-    float rightX = ImGui::GetWindowContentRegionMax().x - btnW - rightMargin;
-    if (rightX > ImGui::GetCursorPosX()) ImGui::SetCursorPosX(rightX);
-    if (ImGui::SmallButton(collapseLabel)) {
-        compactBags_ = !compactBags_;
-    }
-    if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("Toggle empty bag section visibility");
-    }
     ImGui::End();
 }
 
@@ -2495,8 +2598,26 @@ void InventoryScreen::renderItemSlot(game::Inventory& inventory, const game::Ite
 
         ImGui::InvisibleButton("slot", ImVec2(size, size));
 
+        // A used sharpening stone / weightstone / oil arms an item-target cursor:
+        // this slot becomes the item it is applied to, and normal slot clicks are
+        // suppressed until a target is chosen or the cursor is cancelled.
+        const bool targetingItem = gameHandler_ && gameHandler_->isAwaitingItemTarget();
+
         // Left mouse: hold to pick up, release to drop/swap
-        if (!holdingItem) {
+        if (targetingItem && !holdingItem) {
+            if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                uint64_t targetGuid = 0;
+                if (kind == SlotKind::BACKPACK && backpackIndex >= 0) {
+                    targetGuid = gameHandler_->getBackpackItemGuid(backpackIndex);
+                } else if (kind == SlotKind::BACKPACK && isBagSlot) {
+                    targetGuid = gameHandler_->getBagItemGuid(bagIndex, bagSlotIndex);
+                } else if (kind == SlotKind::EQUIPMENT) {
+                    targetGuid = gameHandler_->getEquipSlotGuid(static_cast<int>(equipSlot));
+                }
+                // Empty slots are not targets — leave the cursor armed.
+                if (targetGuid != 0) gameHandler_->completeItemUseOnItem(targetGuid);
+            }
+        } else if (!holdingItem) {
             // Start pickup tracking on mouse press
             if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                 pickupPending_ = true;
@@ -2545,7 +2666,7 @@ void InventoryScreen::renderItemSlot(game::Inventory& inventory, const game::Ite
 
         // Shift+right-click: split stack (if stackable >1) or destroy confirmation
         if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right) &&
-            !holdingItem && ImGui::GetIO().KeyShift && item.itemId != 0) {
+            !holdingItem && !targetingItem && ImGui::GetIO().KeyShift && item.itemId != 0) {
             if (item.stackCount > 1 && item.maxStack > 1) {
                 // Open split popup for stackable items
                 splitConfirmOpen_ = true;
@@ -2581,7 +2702,7 @@ void InventoryScreen::renderItemSlot(game::Inventory& inventory, const game::Ite
 
         // Right-click: bank deposit (if bank open), vendor sell (if vendor mode), or auto-equip/use
         // Note: InvisibleButton only tracks left-click by default, so use IsItemHovered+IsMouseClicked
-        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !holdingItem && !ImGui::GetIO().KeyShift && gameHandler_) {
+        if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right) && !holdingItem && !targetingItem && !ImGui::GetIO().KeyShift && gameHandler_) {
             LOG_DEBUG("Right-click slot: kind=", static_cast<int>(kind),
                      " backpackIndex=", backpackIndex,
                      " bagIndex=", bagIndex, " bagSlotIndex=", bagSlotIndex,
@@ -2649,7 +2770,7 @@ void InventoryScreen::renderItemSlot(game::Inventory& inventory, const game::Ite
         }
 
         // Shift+left-click: insert item link into chat input
-        if (ImGui::IsItemHovered() && !holdingItem &&
+        if (ImGui::IsItemHovered() && !holdingItem && !targetingItem &&
             ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
             ImGui::GetIO().KeyShift &&
             item.itemId != 0 && !item.name.empty()) {
@@ -2692,8 +2813,7 @@ const std::unordered_map<uint32_t, std::string>& InventoryScreen::getEnchantment
         if (dbc && dbc->isLoaded()) {
             const auto* lay = pipeline::getActiveDBCLayout()
                 ? pipeline::getActiveDBCLayout()->getLayout("SpellItemEnchantment") : nullptr;
-            uint32_t nf = lay ? lay->field("Name") : 8u;
-            if (nf == 0xFFFFFFFF) nf = 8;
+            uint32_t nf = pipeline::detectEnchantmentNameField(dbc.get(), lay);
             uint32_t fc = dbc->getFieldCount();
             for (uint32_t r = 0; r < dbc->getRecordCount(); ++r) {
                 uint32_t eid = dbc->getUInt32(r, 0);

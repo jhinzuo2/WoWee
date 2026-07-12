@@ -748,6 +748,7 @@ bool CharacterPreview::loadCharacter(game::Race race, game::Gender gender,
     }
 
     modelLoaded_ = true;
+    loadRacialBackdrop(race);
     LOG_INFO("CharacterPreview: loaded ", m2Path,
              " skin=", static_cast<int>(skin), " face=", static_cast<int>(face),
              " hair=", static_cast<int>(hairStyle), " hairColor=", static_cast<int>(hairColor),
@@ -1052,7 +1053,145 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
         }
     }
 
+    attachWeapons(equipment);
     return true;
+}
+
+bool CharacterPreview::loadPreviewM2(const std::string& m2Path, pipeline::M2Model& outModel) {
+    if (!assetManager_) return false;
+
+    auto m2Data = assetManager_->readFile(m2Path);
+    if (m2Data.empty()) return false;
+
+    outModel = pipeline::M2Loader::load(m2Data);
+    if (outModel.name.empty()) outModel.name = m2Path;
+
+    // WotLK-era models (version 264+) keep submesh data in an external .skin.
+    std::string skinPath = m2Path;
+    size_t dot = skinPath.rfind('.');
+    if (dot != std::string::npos) skinPath = skinPath.substr(0, dot);
+    skinPath += "00.skin";
+    auto skinData = assetManager_->readFile(skinPath);
+    if (!skinData.empty() && outModel.version >= 264) {
+        pipeline::M2Loader::loadSkin(skinData, outModel);
+    }
+    return outModel.isValid();
+}
+
+void CharacterPreview::attachWeapons(const std::vector<game::EquipmentItem>& equipment) {
+    if (!charRenderer_ || !assetManager_ || instanceId_ == 0) return;
+
+    // Attachment 1 = right hand, 2 = left hand.
+    charRenderer_->detachWeapon(instanceId_, 1);
+    charRenderer_->detachWeapon(instanceId_, 2);
+
+    auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
+    if (!displayInfoDbc || !displayInfoDbc->isLoaded()) return;
+
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    const uint32_t modelField   = idiL ? (*idiL)["LeftModel"]        : 1u;
+    const uint32_t textureField = idiL ? (*idiL)["LeftModelTexture"] : 3u;
+
+    struct WeaponSlot {
+        std::initializer_list<uint8_t> invTypes;
+        uint32_t attachmentId;
+        uint32_t modelId;
+    };
+    // Main hand also covers two-handers and ranged; off hand covers shields and held items.
+    const WeaponSlot slots[] = {
+        { {13, 17, 21, 15, 25, 26}, 1, PREVIEW_MAINHAND_MODEL_ID },
+        { {14, 22, 23},             2, PREVIEW_OFFHAND_MODEL_ID  },
+    };
+
+    for (const auto& ws : slots) {
+        uint32_t displayId = 0;
+        for (const auto& item : equipment) {
+            if (item.displayModel == 0) continue;
+            for (uint8_t t : ws.invTypes) {
+                if (item.inventoryType == t) { displayId = item.displayModel; break; }
+            }
+            if (displayId != 0) break;
+        }
+        if (displayId == 0) continue;
+
+        int32_t recIdx = displayInfoDbc->findRecordById(displayId);
+        if (recIdx < 0) continue;
+
+        std::string modelName = displayInfoDbc->getString(static_cast<uint32_t>(recIdx), modelField);
+        std::string textureName = displayInfoDbc->getString(static_cast<uint32_t>(recIdx), textureField);
+        if (modelName.empty()) continue;
+
+        // DBC names the .mdx; the shipped assets are .m2.
+        size_t dot = modelName.rfind('.');
+        std::string modelFile = (dot != std::string::npos ? modelName.substr(0, dot) : modelName) + ".m2";
+
+        pipeline::M2Model weaponModel;
+        std::string m2Path = "Item\\ObjectComponents\\Weapon\\" + modelFile;
+        if (!loadPreviewM2(m2Path, weaponModel)) {
+            m2Path = "Item\\ObjectComponents\\Shield\\" + modelFile;
+            if (!loadPreviewM2(m2Path, weaponModel)) {
+                LOG_WARNING("CharacterPreview: failed to load weapon model ", modelFile);
+                continue;
+            }
+        }
+
+        std::string texturePath;
+        if (!textureName.empty()) {
+            texturePath = "Item\\ObjectComponents\\Weapon\\" + textureName + ".blp";
+            if (!assetManager_->fileExists(texturePath)) {
+                texturePath = "Item\\ObjectComponents\\Shield\\" + textureName + ".blp";
+            }
+        }
+
+        charRenderer_->attachWeapon(instanceId_, ws.attachmentId, weaponModel, ws.modelId, texturePath);
+    }
+}
+
+void CharacterPreview::loadRacialBackdrop(game::Race race) {
+    if (!charRenderer_ || !assetManager_) return;
+    if (backdropRace_ == static_cast<int>(race) && backdropInstanceId_ != 0) return;  // already loaded
+
+    if (backdropInstanceId_ != 0) {
+        charRenderer_->removeInstance(backdropInstanceId_);
+        backdropInstanceId_ = 0;
+    }
+    backdropRace_ = static_cast<int>(race);
+
+    // The glue screens each stand the character in their racial home — humans in
+    // Stormwind, orcs in Durotar, and so on. Undead reuse the Scourge scene.
+    const char* sceneName = nullptr;
+    switch (race) {
+        case game::Race::HUMAN:     sceneName = "UI_Human";    break;
+        case game::Race::ORC:       sceneName = "UI_Orc";      break;
+        case game::Race::DWARF:     sceneName = "UI_Dwarf";    break;
+        case game::Race::NIGHT_ELF: sceneName = "UI_NightElf"; break;
+        case game::Race::UNDEAD:    sceneName = "UI_Scourge";  break;
+        case game::Race::TAUREN:    sceneName = "UI_Tauren";   break;
+        case game::Race::GNOME:     sceneName = "UI_Gnome";    break;
+        case game::Race::TROLL:     sceneName = "UI_Troll";    break;
+        case game::Race::BLOOD_ELF: sceneName = "UI_BloodElf"; break;
+        case game::Race::DRAENEI:   sceneName = "UI_Draenei";  break;
+        default: break;
+    }
+    if (!sceneName) return;
+
+    std::string scenePath = std::string("Interface\\Glues\\Models\\") + sceneName + "\\" +
+                            sceneName + ".m2";
+    pipeline::M2Model sceneModel;
+    if (!loadPreviewM2(scenePath, sceneModel)) {
+        LOG_WARNING("CharacterPreview: no racial backdrop at ", scenePath);
+        return;
+    }
+    if (!charRenderer_->loadModel(sceneModel, PREVIEW_BACKDROP_MODEL_ID)) {
+        LOG_WARNING("CharacterPreview: failed to load racial backdrop ", scenePath);
+        return;
+    }
+
+    backdropInstanceId_ = charRenderer_->createInstance(PREVIEW_BACKDROP_MODEL_ID, glm::vec3(0.0f));
+    if (backdropInstanceId_ != 0) {
+        LOG_INFO("CharacterPreview: racial backdrop ", scenePath);
+    }
 }
 
 void CharacterPreview::update(float deltaTime) {
@@ -1099,6 +1238,12 @@ void CharacterPreview::compositePass(VkCommandBuffer cmd, uint32_t frameIndex) {
     // Begin off-screen render pass
     VkClearColorValue clearColor = {{0.05f, 0.05f, 0.1f, 1.0f}};
     renderTarget_->beginPass(cmd, clearColor);
+
+    // Preview rendering bypasses Renderer::renderWorld(), so it must run the
+    // same resource-preparation hook itself after server appearance data has
+    // produced bone matrices. This preserves lazy data loading while keeping
+    // GPU allocation outside CharacterRenderer::render().
+    charRenderer_->prepareRender(fi);
 
     // Render the character model
     charRenderer_->render(cmd, previewPerFrameSet_[fi], *camera_);

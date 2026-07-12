@@ -202,6 +202,8 @@ public:
     uint8_t getSpellDispelType(uint32_t spellId) const;
     bool isSpellInterruptible(uint32_t spellId) const;
     uint32_t getSpellSchoolMask(uint32_t spellId) const;
+    /// Spell.dbc Targets mask (SpellCastTargetFlags): 0x10 = TARGET_FLAG_ITEM.
+    uint32_t getSpellTargetFlags(uint32_t spellId) const;
     const std::string& getSkillLineName(uint32_t spellId) const;
 
     // Cast state

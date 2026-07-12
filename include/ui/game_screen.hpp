@@ -22,6 +22,7 @@
 #include <imgui.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace wowee {
 namespace core { class AppearanceComposer; }
@@ -163,6 +164,7 @@ private:
     void renderUIErrors(game::GameHandler& gameHandler, float deltaTime);
     void renderQuestMarkers(game::GameHandler& gameHandler);
     void renderMinimapMarkers(game::GameHandler& gameHandler);
+    void refreshQuestObjectiveCache(game::GameHandler& gameHandler);
     void renderMicroMenu(game::GameHandler& gameHandler);
     void renderQuestObjectiveTracker(game::GameHandler& gameHandler);
     void renderNameplates(game::GameHandler& gameHandler);
@@ -189,6 +191,11 @@ private:
     std::unordered_map<uint32_t, uint32_t> spellIconIds_;
     bool spellIconDbLoaded_ = false;
     VkDescriptorSet getSpellIcon(uint32_t spellId, pipeline::AssetManager* am);
+
+    // Minimap quest-objective cache, rebuilt only when tracked quest progress changes.
+    uint64_t minimapQuestCacheSignature_ = 0;
+    std::unordered_set<uint32_t> minimapQuestCreatureEntries_;
+    std::unordered_set<uint32_t> minimapQuestGameObjectEntries_;
 
     // Death Knight rune bar: client-predicted fill (0.0=depleted, 1.0=ready) for smooth animation
     float runeClientFill_[6] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};

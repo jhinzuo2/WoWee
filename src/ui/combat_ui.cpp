@@ -7,6 +7,7 @@
 #include "ui/combat_ui.hpp"
 #include "ui/settings_panel.hpp"
 #include "ui/spellbook_screen.hpp"
+#include "ui/inventory_screen.hpp"
 #include "ui/ui_colors.hpp"
 #include "ui/ui_helpers.hpp"
 #include "core/application.hpp"
@@ -843,6 +844,7 @@ void CombatUI::renderDPSMeter(game::GameHandler& gameHandler,
 
 void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
                              SpellbookScreen& spellbookScreen,
+                             InventoryScreen& inventoryScreen,
                              SpellIconFn getSpellIcon) {
     const auto& auras = gameHandler.getPlayerAuras();
 
@@ -1075,20 +1077,28 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
             ImGui::PopStyleColor(2);
         }
 
-        // Temporary weapon enchant timers (Shaman imbues, Rogue poisons, whetstones, etc.)
+        // Temporary weapon enchant timers (Shaman imbues, Rogue poisons, sharpening
+        // stones, oils). Shown as the enchanted weapon's icon with its remaining time
+        // beneath, the way the retail client does — not as a labelled bar.
         {
             const auto& timers = gameHandler.getTempEnchantTimers();
             if (!timers.empty()) {
                 ImGui::Spacing();
                 ImGui::Separator();
+                static constexpr game::EquipSlot kWeaponEquipSlots[] = {
+                    game::EquipSlot::MAIN_HAND, game::EquipSlot::OFF_HAND, game::EquipSlot::RANGED
+                };
                 static constexpr ImVec4 kEnchantSlotColors[] = {
-                    colors::kOrange,  // main-hand: gold
+                    colors::kOrange,                 // main-hand: gold
                     ImVec4(0.5f, 0.8f, 0.9f, 1.0f),  // off-hand:  teal
                     ImVec4(0.7f, 0.5f, 0.9f, 1.0f),  // ranged:    purple
                 };
                 uint64_t enchNowMs = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now().time_since_epoch()).count());
+
+                const auto& inventory = gameHandler.getInventory();
+                int enchantsShown = 0;
 
                 for (const auto& t : timers) {
                     if (t.slot > 2) continue;
@@ -1113,18 +1123,62 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
                     else
                         snprintf(timeStr, sizeof(timeStr), "%ds", secs);
 
+                    const game::EquipSlot equipSlot = kWeaponEquipSlots[t.slot];
+                    const auto& weapon = inventory.getEquipSlot(equipSlot);
+
+                    if (enchantsShown > 0 && enchantsShown % ICONS_PER_ROW != 0) ImGui::SameLine();
                     ImGui::PushID(static_cast<int>(t.slot) + 5000);
+
+                    ImVec2 iconPos = ImGui::GetCursorScreenPos();
+                    VkDescriptorSet iconTex = (!weapon.empty() && weapon.item.displayInfoId != 0)
+                        ? inventoryScreen.getItemIcon(weapon.item.displayInfoId)
+                        : VK_NULL_HANDLE;
+
                     ImGui::PushStyleColor(ImGuiCol_Button, col);
-                    char label[40];
-                    snprintf(label, sizeof(label), "~%s  %s",
-                             game::GameHandler::kTempEnchantSlotNames[t.slot], timeStr);
-                    ImGui::Button(label, ImVec2(-1, 16));
-                    if (ImGui::IsItemHovered())
-                        ImGui::SetTooltip("Temporary weapon enchant: %s\nRemaining: %s",
-                                          game::GameHandler::kTempEnchantSlotNames[t.slot],
-                                          timeStr);
+                    if (iconTex) {
+                        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(2, 2));
+                        ImGui::ImageButton("##tempEnchant",
+                            (ImTextureID)(uintptr_t)iconTex,
+                            ImVec2(ICON_SIZE - 4, ICON_SIZE - 4));
+                        ImGui::PopStyleVar();
+                    } else {
+                        // No weapon icon (unknown display info): fall back to the slot initial.
+                        char fallback[8];
+                        snprintf(fallback, sizeof(fallback), "%.2s",
+                                 game::GameHandler::kTempEnchantSlotNames[t.slot]);
+                        ImGui::Button(fallback, ImVec2(ICON_SIZE, ICON_SIZE));
+                    }
                     ImGui::PopStyleColor();
+
+                    // Remaining time across the bottom of the icon
+                    {
+                        ImDrawList* dl = ImGui::GetWindowDrawList();
+                        ImVec2 textSize = ImGui::CalcTextSize(timeStr);
+                        ImVec2 textPos(iconPos.x + (ICON_SIZE - textSize.x) * 0.5f,
+                                       iconPos.y + ICON_SIZE - textSize.y - 1.0f);
+                        dl->AddRectFilled(ImVec2(textPos.x - 2.0f, textPos.y),
+                                          ImVec2(textPos.x + textSize.x + 2.0f,
+                                                 textPos.y + textSize.y),
+                                          IM_COL32(0, 0, 0, 160));
+                        dl->AddText(textPos, ImGui::ColorConvertFloat4ToU32(col), timeStr);
+                    }
+
+                    if (ImGui::IsItemHovered()) {
+                        std::string enchantName;
+                        uint64_t weaponGuid = gameHandler.getEquipSlotGuid(static_cast<int>(equipSlot));
+                        if (weaponGuid != 0) {
+                            auto [permEnchantId, tempEnchantId] = gameHandler.getItemEnchantIds(weaponGuid);
+                            if (tempEnchantId != 0) enchantName = gameHandler.getEnchantName(tempEnchantId);
+                        }
+                        ImGui::SetTooltip("%s (%s)\n%s\nRemaining: %s",
+                                          enchantName.empty() ? "Temporary weapon enchant"
+                                                              : enchantName.c_str(),
+                                          game::GameHandler::kTempEnchantSlotNames[t.slot],
+                                          weapon.empty() ? "" : weapon.item.name.c_str(),
+                                          timeStr);
+                    }
                     ImGui::PopID();
+                    ++enchantsShown;
                 }
             }
         }

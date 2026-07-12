@@ -691,17 +691,14 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
 
     constexpr float TRACKER_W = 220.0f;
     constexpr float RIGHT_MARGIN = 10.0f;
-    constexpr int   MAX_QUESTS = 5;
-
     // Build display list: tracked quests only, or all quests if none tracked
     const auto& trackedIds = gameHandler.getTrackedQuestIds();
     std::vector<const game::GameHandler::QuestLogEntry*> toShow;
-    toShow.reserve(MAX_QUESTS);
+    toShow.reserve(questLog.size());
     if (!trackedIds.empty()) {
         for (const auto& q : questLog) {
             if (q.questId == 0) continue;
             if (trackedIds.count(q.questId)) toShow.push_back(&q);
-            if (static_cast<int>(toShow.size()) >= MAX_QUESTS) break;
         }
     }
     // Fallback: show all quests if nothing is tracked
@@ -709,7 +706,6 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
         for (const auto& q : questLog) {
             if (q.questId == 0) continue;
             toShow.push_back(&q);
-            if (static_cast<int>(toShow.size()) >= MAX_QUESTS) break;
         }
     }
     if (toShow.empty()) return;
@@ -731,7 +727,6 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
     ImGui::SetNextWindowSize(questTrackerSize_, ImGuiCond_FirstUseEver);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
-                             ImGuiWindowFlags_NoScrollbar |
                              ImGuiWindowFlags_NoCollapse |
                              ImGuiWindowFlags_NoNav |
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
@@ -927,30 +922,20 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
     const uint64_t  playerGuid = gameHandler.getPlayerGuid();
     const uint64_t  targetGuid = gameHandler.getTargetGuid();
 
-    // Build set of creature entries that are kill objectives in active (incomplete) quests.
-    std::unordered_set<uint32_t> questKillEntries;
-    {
-        const auto& questLog = gameHandler.getQuestLog();
-        const auto& trackedIds = gameHandler.getTrackedQuestIds();
-        for (const auto& q : questLog) {
-            if (q.complete || q.questId == 0) continue;
-            // Only highlight for tracked quests (or all if nothing tracked).
-            if (!trackedIds.empty() && !trackedIds.count(q.questId)) continue;
-            for (const auto& obj : q.killObjectives) {
-                if (obj.npcOrGoId > 0 && obj.required > 0) {
-                    // Check if not already completed.
-                    auto it = q.killCounts.find(static_cast<uint32_t>(obj.npcOrGoId));
-                    if (it == q.killCounts.end() || it->second.first < it->second.second) {
-                        questKillEntries.insert(static_cast<uint32_t>(obj.npcOrGoId));
-                    }
-                }
-            }
-        }
-    }
+    refreshQuestObjectiveCache(gameHandler);
+    const auto& questKillEntries = minimapQuestCreatureEntries_;
 
     ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    static thread_local std::vector<std::shared_ptr<game::Entity>> nameplateEntities;
+    glm::vec3 playerCanonical(0.0f);
+    if (auto player = gameHandler.getEntityManager().getEntity(playerGuid))
+        playerCanonical = glm::vec3(player->getX(), player->getY(), player->getZ());
+    gameHandler.getEntityManager().getEntitiesNear(
+        playerCanonical.x, playerCanonical.y, 150.0f, nameplateEntities);
 
-    for (const auto& [guid, entityPtr] : gameHandler.getEntityManager().getEntities()) {
+    for (const auto& entityPtr : nameplateEntities) {
+        if (!entityPtr) continue;
+        const uint64_t guid = entityPtr->getGuid();
         if (!entityPtr || guid == playerGuid) continue;
 
         if (!entityPtr->isUnit()) continue;

@@ -87,6 +87,10 @@ public:
 private:
     bool loadWeaponM2(const std::string& m2Path, pipeline::M2Model& outModel);
 
+    // Attach the enchant visual (sharpening-stone glint, weapon glow) of the item in
+    // the given equipment slot to the weapon already attached at attachmentId.
+    void applyEnchantVisuals(uint32_t charInstanceId, int equipSlotIndex, uint32_t attachmentId);
+
     rendering::Renderer* renderer_;
     pipeline::AssetManager* assetManager_;
     game::GameHandler* gameHandler_;

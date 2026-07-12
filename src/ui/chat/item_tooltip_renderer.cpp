@@ -220,8 +220,7 @@ void ItemTooltipRenderer::render(
                 if (dbc && dbc->isLoaded()) {
                     const auto* lay = pipeline::getActiveDBCLayout()
                         ? pipeline::getActiveDBCLayout()->getLayout("SpellItemEnchantment") : nullptr;
-                    uint32_t nameField = lay ? lay->field("Name") : 8u;
-                    if (nameField == 0xFFFFFFFF) nameField = 8;
+                    uint32_t nameField = pipeline::detectEnchantmentNameField(dbc.get(), lay);
                     uint32_t fc = dbc->getFieldCount();
                     for (uint32_t r = 0; r < dbc->getRecordCount(); ++r) {
                         uint32_t eid = dbc->getUInt32(r, 0);

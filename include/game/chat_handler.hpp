@@ -70,6 +70,7 @@ private:
     // --- State ---
     std::deque<MessageChatData> chatHistory_;
     size_t maxChatHistory_ = 100;
+    uint64_t chatUidCounter_ = 0;  // monotonic uid for MessageChatData::uid
     std::vector<std::string> joinedChannels_;
     bool chatLogEnabled_ = false;
     bool chatLogInitialized_ = false;

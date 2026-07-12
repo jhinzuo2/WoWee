@@ -792,6 +792,10 @@ void GameHandler::handleLoginVerifyWorld(network::Packet& packet) {
         // Clear inspect caches on world entry to avoid showing stale data.
         inspectedPlayerAchievements_.clear();
 
+        // Buyback mirror persists across vendor windows within a session but
+        // must not leak into another character's session.
+        if (inventoryHandler_) inventoryHandler_->clearBuybackState();
+
         // Reset talent initialization so the first SMSG_TALENTS_INFO after login
         // correctly sets the active spec (static locals don't reset across logins).
         if (spellHandler_) spellHandler_->resetTalentState();
@@ -2545,6 +2549,22 @@ void GameHandler::useItemInBag(int bagIndex, int slotIndex) {
     if (inventoryHandler_) inventoryHandler_->useItemInBag(bagIndex, slotIndex);
 }
 
+bool GameHandler::isAwaitingItemTarget() const {
+    return inventoryHandler_ && inventoryHandler_->isAwaitingItemTarget();
+}
+
+uint32_t GameHandler::getPendingItemTargetSourceItemId() const {
+    return inventoryHandler_ ? inventoryHandler_->getPendingItemTargetSourceItemId() : 0;
+}
+
+void GameHandler::cancelItemTargeting() {
+    if (inventoryHandler_) inventoryHandler_->cancelItemTargeting();
+}
+
+void GameHandler::completeItemUseOnItem(uint64_t targetItemGuid) {
+    if (inventoryHandler_) inventoryHandler_->completeItemUseOnItem(targetItemGuid);
+}
+
 void GameHandler::openItemBySlot(int backpackIndex) {
     if (inventoryHandler_) inventoryHandler_->openItemBySlot(backpackIndex);
 }
@@ -2687,6 +2707,10 @@ float GameHandler::getSpellDuration(uint32_t spellId) const {
 const std::string& GameHandler::getSpellName(uint32_t spellId) const {
     if (spellHandler_) return spellHandler_->getSpellName(spellId);
     return EMPTY_STRING;
+}
+
+uint32_t GameHandler::getSpellTargetFlags(uint32_t spellId) const {
+    return spellHandler_ ? spellHandler_->getSpellTargetFlags(spellId) : 0;
 }
 
 const std::string& GameHandler::getSpellRank(uint32_t spellId) const {

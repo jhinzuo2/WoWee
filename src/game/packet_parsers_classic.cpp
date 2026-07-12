@@ -443,12 +443,15 @@ network::Packet ClassicPacketParsers::buildCastGameObjectSpell(uint32_t spellId,
 // ============================================================================
 network::Packet ClassicPacketParsers::buildUseItem(uint8_t bagIndex, uint8_t slotIndex,
                                                    uint64_t /*itemGuid*/, uint32_t /*spellId*/,
-                                                   uint64_t targetGuid) {
+                                                   uint64_t targetGuid, uint64_t itemTargetGuid) {
     network::Packet packet(wireOpcode(LogicalOpcode::CMSG_USE_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
     packet.writeUInt8(0);       // spell_index (which item spell to trigger, usually 0)
-    if (targetGuid != 0) {
+    if (itemTargetGuid != 0) {
+        packet.writeUInt16(0x0010); // TARGET_FLAG_ITEM
+        packet.writePackedGuid(itemTargetGuid);
+    } else if (targetGuid != 0) {
         packet.writeUInt16(0x0002); // TARGET_FLAG_UNIT
         packet.writePackedGuid(targetGuid);
     } else {

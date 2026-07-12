@@ -497,7 +497,7 @@ network::Packet AutostoreLootItemPacket::build(uint8_t slotIndex) {
 
 network::Packet UseItemPacket::build(uint8_t bagIndex, uint8_t slotIndex,
                                      uint64_t itemGuid, uint32_t spellId,
-                                     uint64_t targetGuid) {
+                                     uint64_t targetGuid, uint64_t itemTargetGuid) {
     network::Packet packet(wireOpcode(Opcode::CMSG_USE_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
@@ -506,7 +506,12 @@ network::Packet UseItemPacket::build(uint8_t bagIndex, uint8_t slotIndex,
     packet.writeUInt64(itemGuid); // full 8-byte GUID
     packet.writeUInt32(0); // glyph index
     packet.writeUInt8(0);  // cast flags
-    if (targetGuid != 0) {
+    if (itemTargetGuid != 0) {
+        // Sharpening stones, weightstones and weapon oils enchant another item:
+        // the server requires the target item in SpellCastTargets.
+        packet.writeUInt32(0x10); // TARGET_FLAG_ITEM
+        packet.writePackedGuid(itemTargetGuid);
+    } else if (targetGuid != 0) {
         packet.writeUInt32(0x02); // TARGET_FLAG_UNIT
         packet.writePackedGuid(targetGuid);
     } else {

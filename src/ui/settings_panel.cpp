@@ -9,6 +9,7 @@
 #include "ui/keybinding_manager.hpp"
 #include "core/application.hpp"
 #include "core/logger.hpp"
+#include "core/version.hpp"
 #include "rendering/renderer.hpp"
 #include "rendering/post_process_pipeline.hpp"
 #include "rendering/camera.hpp"
@@ -700,6 +701,14 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
 
     if (ImGui::Begin("##SettingsWindow", nullptr, flags)) {
         ImGui::Text("Settings");
+        ImGui::SameLine();
+        {
+            // Right-align the build version against the window's content edge.
+            const char* version = core::kVersionString;
+            float versionWidth = ImGui::CalcTextSize(version).x;
+            ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - versionWidth);
+            ImGui::TextDisabled("%s", version);
+        }
         ImGui::Separator();
 
         if (ImGui::BeginTabBar("SettingsTabs", ImGuiTabBarFlags_None)) {

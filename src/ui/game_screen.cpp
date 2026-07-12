@@ -414,7 +414,8 @@ void GameScreen::render(game::GameHandler& gameHandler) {
         [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); });
     actionBarPanel_.renderStanceBar(gameHandler, settingsPanel_, spellbookScreen,
         [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); });
-    actionBarPanel_.renderBagBar(gameHandler, settingsPanel_, inventoryScreen);
+    if (actionBarPanel_.renderBagBar(gameHandler, settingsPanel_, inventoryScreen))
+        saveSettings();
     renderMicroMenu(gameHandler);
     actionBarPanel_.renderXpBar(gameHandler, settingsPanel_);
     actionBarPanel_.renderRepBar(gameHandler, settingsPanel_);
@@ -438,7 +439,7 @@ void GameScreen::render(game::GameHandler& gameHandler) {
     dialogManager_.renderDialogs(gameHandler, inventoryScreen, chatPanel_);
     socialPanel_.renderGuildRoster(gameHandler, chatPanel_);
     socialPanel_.renderSocialFrame(gameHandler, chatPanel_);
-    combatUI_.renderBuffBar(gameHandler, spellbookScreen, spellIconFn);
+    combatUI_.renderBuffBar(gameHandler, spellbookScreen, inventoryScreen, spellIconFn);
     windowManager_.renderLootWindow(gameHandler, inventoryScreen, chatPanel_);
     windowManager_.renderGossipWindow(gameHandler, chatPanel_);
     windowManager_.renderQuestDetailsWindow(gameHandler, chatPanel_, inventoryScreen);
@@ -543,6 +544,9 @@ void GameScreen::render(game::GameHandler& gameHandler) {
 
     // Character screen (C key toggle handled inside render())
     inventoryScreen.renderCharacterScreen(gameHandler);
+
+    // Item-target cursor (sharpening stone / oil awaiting the item it applies to)
+    inventoryScreen.renderItemTargetCursor();
 
     // Insert item link into chat if player shift-clicked any inventory/equipment slot
     {

@@ -224,6 +224,7 @@
   "Spell": {
     "Attributes": 4,
     "AttributesEx": 5,
+    "Targets": 16,
     "CasterAuraState": 20,
     "CasterAuraStateNot": 22,
     "CastingTimeIndex": 28,
@@ -249,7 +250,7 @@
   },
   "SpellItemEnchantment": {
     "ID": 0,
-    "Name": 8
+    "Name": 14
   },
   "SpellRange": {
     "MinRange": 2,

@@ -679,6 +679,9 @@ struct MessageChatData {
     std::string channelName;  // For channel messages
     uint8_t chatTag = 0;      // Player flags (AFK, DND, GM, etc.)
     std::chrono::system_clock::time_point timestamp = std::chrono::system_clock::now();
+    // Monotonic id assigned by ChatHandler when the message enters history.
+    // Stable cache key for the chat UI's formatted/parsed line cache.
+    uint64_t uid = 0;
 
     bool isValid() const { return !message.empty(); }
 };
@@ -2057,7 +2060,7 @@ class UseItemPacket {
 public:
     static network::Packet build(uint8_t bagIndex, uint8_t slotIndex,
                                  uint64_t itemGuid, uint32_t spellId = 0,
-                                 uint64_t targetGuid = 0);
+                                 uint64_t targetGuid = 0, uint64_t itemTargetGuid = 0);
 };
 
 /** CMSG_OPEN_ITEM packet builder (for locked containers / lockboxes) */

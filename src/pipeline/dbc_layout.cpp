@@ -160,5 +160,78 @@ CharSectionsFields detectCharSectionsFields(const DBCFile* dbc, const DBCFieldMa
     return f;
 }
 
+uint32_t detectEnchantmentNameField(const DBCFile* dbc, const DBCFieldMap* sieL) {
+    if (!dbc || dbc->getRecordCount() == 0) return 14;
+
+    const uint32_t fieldCount = dbc->getFieldCount();
+
+    // The record width identifies the expansion: Vanilla=21, TBC=34, WotLK=38.
+    // Each added effect/gem columns ahead of the localized name block.
+    uint32_t nameField;
+    if (fieldCount >= 38)      nameField = 14;  // WotLK 3.3.5a
+    else if (fieldCount >= 34) nameField = 13;  // TBC 2.4.3
+    else                       nameField = 10;  // Vanilla 1.12 / Turtle
+
+    // A layout override wins, but only when it is in range — a stale index here
+    // reads an integer column as a string offset and garbles every enchant name.
+    if (sieL) {
+        uint32_t f = sieL->field("Name");
+        if (f != 0xFFFFFFFF && f < fieldCount) nameField = f;
+    }
+    if (nameField >= fieldCount) nameField = 0;
+    return nameField;
+}
+
+uint32_t detectEnchantmentItemVisualField(const DBCFile* dbc, const DBCFieldMap* sieL) {
+    if (!dbc || dbc->getRecordCount() == 0) return 31;
+
+    const uint32_t fieldCount = dbc->getFieldCount();
+
+    uint32_t visualField;
+    if (fieldCount >= 38)      visualField = 31;  // WotLK 3.3.5a
+    else if (fieldCount >= 34) visualField = 30;  // TBC 2.4.3
+    else                       visualField = 19;  // Vanilla 1.12 / Turtle
+
+    if (sieL) {
+        uint32_t f = sieL->field("ItemVisual");
+        if (f != 0xFFFFFFFF && f < fieldCount) visualField = f;
+    }
+    if (visualField >= fieldCount) return 0;
+    return visualField;
+}
+
+std::array<std::string, 5> resolveEnchantItemVisuals(uint32_t enchantId,
+                                                     const DBCFile* spellItemEnchantment,
+                                                     const DBCFile* itemVisuals,
+                                                     const DBCFile* itemVisualEffects,
+                                                     const DBCFieldMap* sieL) {
+    std::array<std::string, 5> models;
+    if (enchantId == 0 || !spellItemEnchantment || !itemVisuals || !itemVisualEffects) return models;
+
+    int32_t enchantRow = spellItemEnchantment->findRecordById(enchantId);
+    if (enchantRow < 0) return models;
+
+    const uint32_t visualField = detectEnchantmentItemVisualField(spellItemEnchantment, sieL);
+    const uint32_t visualId = spellItemEnchantment->getUInt32(static_cast<uint32_t>(enchantRow), visualField);
+    if (visualId == 0) return models;  // most enchants have no visual
+
+    int32_t visualRow = itemVisuals->findRecordById(visualId);
+    if (visualRow < 0) return models;
+
+    // ItemVisuals.dbc: ID + 5 effect slots. Slot i attaches at the item's
+    // attachment point i, so an empty slot must stay empty rather than shift.
+    for (uint32_t slot = 0; slot < 5; ++slot) {
+        const uint32_t field = slot + 1;
+        if (field >= itemVisuals->getFieldCount()) break;
+        uint32_t effectId = itemVisuals->getUInt32(static_cast<uint32_t>(visualRow), field);
+        if (effectId == 0) continue;
+
+        int32_t effectRow = itemVisualEffects->findRecordById(effectId);
+        if (effectRow < 0) continue;
+        models[slot] = itemVisualEffects->getString(static_cast<uint32_t>(effectRow), 1);
+    }
+    return models;
+}
+
 } // namespace pipeline
 } // namespace wowee

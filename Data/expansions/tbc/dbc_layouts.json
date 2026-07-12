@@ -208,6 +208,7 @@
   "Spell": {
     "Attributes": 5,
     "AttributesEx": 6,
+    "Targets": 14,
     "RecoveryTime": 23,
     "CategoryRecoveryTime": 24,
     "CastingTimeIndex": 22,
@@ -233,7 +234,7 @@
   },
   "SpellItemEnchantment": {
     "ID": 0,
-    "Name": 8
+    "Name": 13
   },
   "SpellRange": {
     "MinRange": 2,

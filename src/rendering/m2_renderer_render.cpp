@@ -1,5 +1,6 @@
 #include "rendering/m2_renderer.hpp"
 #include "rendering/m2_renderer_internal.h"
+#include "core/thread_pool.hpp"
 #include "rendering/m2_model_classifier.hpp"
 #include "rendering/hiz_system.hpp"
 #include "rendering/vk_context.hpp"
@@ -511,27 +512,33 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
                 const size_t chunkSize = animCount / numThreads;
                 const size_t remainder = animCount % numThreads;
 
+                auto processRange = [this](size_t begin, size_t end) {
+                    for (size_t j = begin; j < end; ++j) {
+                        size_t idx = boneWorkIndices_[j];
+                        if (idx >= instances.size()) continue;
+                        auto& inst = instances[idx];
+                        if (!inst.cachedModel) continue;
+                        computeBoneMatrices(*inst.cachedModel, inst);
+                    }
+                };
+
                 // Reuse persistent futures vector to avoid allocation
                 animFutures_.clear();
                 if (animFutures_.capacity() < numThreads) {
                     animFutures_.reserve(numThreads);
                 }
 
+                // Dispatch all but the last chunk to the shared pool; process the
+                // last chunk on this thread so this call always makes progress even
+                // when it itself runs on a pool worker (see ThreadPool docs).
                 size_t start = 0;
-                for (size_t t = 0; t < numThreads; ++t) {
+                for (size_t t = 0; t + 1 < numThreads; ++t) {
                     size_t end = start + chunkSize + (t < remainder ? 1 : 0);
-                    animFutures_.push_back(std::async(std::launch::async,
-                        [this, start, end]() {
-                            for (size_t j = start; j < end; ++j) {
-                                size_t idx = boneWorkIndices_[j];
-                                if (idx >= instances.size()) continue;
-                                auto& inst = instances[idx];
-                                if (!inst.cachedModel) continue;
-                                computeBoneMatrices(*inst.cachedModel, inst);
-                            }
-                        }));
+                    animFutures_.push_back(core::ThreadPool::frameWorkers().submit(
+                        [processRange, start, end]() { processRange(start, end); }));
                     start = end;
                 }
+                processRange(start, animCount);
 
                 for (auto& f : animFutures_) {
                     f.get();
@@ -582,12 +589,20 @@ void M2Renderer::prepareRender(uint32_t frameIndex, const Camera& camera) {
 
         instance.megaBoneOffset = nextSlot * MAX_BONES_PER_INSTANCE;
 
-        // Upload bone matrices to mega buffer
-        if (megaBoneMapped_[frameIndex]) {
+        // Upload bone matrices to mega buffer — only when they were recomputed
+        // since the last upload into this frame's buffer, or the instance's
+        // slot moved (animated set changed). Most animated instances are
+        // distance/frustum/frame-skip culled and keep their previous bones, so
+        // skipping their memcpy avoids megabytes of redundant writes per frame.
+        if (megaBoneMapped_[frameIndex] &&
+            (instance.bonesDirty[frameIndex] ||
+             instance.megaBoneUploadedSlot[frameIndex] != nextSlot)) {
             int numBones = std::min(static_cast<int>(instance.boneMatrices.size()),
                                     static_cast<int>(MAX_BONES_PER_INSTANCE));
             auto* dst = static_cast<glm::mat4*>(megaBoneMapped_[frameIndex]) + instance.megaBoneOffset;
             memcpy(dst, instance.boneMatrices.data(), numBones * sizeof(glm::mat4));
+            instance.bonesDirty[frameIndex] = false;
+            instance.megaBoneUploadedSlot[frameIndex] = nextSlot;
         }
 
         nextSlot++;
@@ -773,6 +788,8 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     glowSprites_.clear();
 
     lastDrawCallCount = 0;
+    const float lavaAnimSeconds = std::chrono::duration<float>(
+        std::chrono::steady_clock::now() - kLavaAnimStart).count();
 
     // GPU cull results — dispatchCullCompute() already updated smoothedRenderDist_.
     // Use the cached value (set by dispatchCullCompute or fallback below).
@@ -824,10 +841,13 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
 
     // Build sorted visible instance list
     sortedVisible_.clear();
+    transparentVisible_.clear();
     const size_t expectedVisible = std::min(instances.size() / 3, size_t(600));
     if (sortedVisible_.capacity() < expectedVisible) {
         sortedVisible_.reserve(expectedVisible);
     }
+    if (transparentVisible_.capacity() < expectedVisible / 4)
+        transparentVisible_.reserve(expectedVisible / 4);
 
     // GPU frustum culling — build frustum for CPU fallback path and overflow instances
     Frustum frustum;
@@ -882,7 +902,11 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
             }
         }
 
-        sortedVisible_.push_back({i, instance.modelId, distSq, effectiveMaxDistSq});
+        VisibleEntry visible{i, instance.modelId, distSq, effectiveMaxDistSq};
+        sortedVisible_.push_back(visible);
+        if (instance.cachedModel &&
+            (instance.cachedModel->hasTransparentBatches || instance.cachedModel->isSpellEffect))
+            transparentVisible_.push_back(visible);
     }
 
     // Two-pass rendering: opaque/alpha-test first (depth write ON), then transparent/additive
@@ -1168,9 +1192,8 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                                 uvOffset = glm::vec2(trans.x, trans.y);
                             }
                             if (model.isLavaModel && uvOffset == glm::vec2(0.0f)) {
-                                float t = std::chrono::duration<float>(
-                                    std::chrono::steady_clock::now() - kLavaAnimStart).count();
-                                uvOffset = glm::vec2(t * 0.03f, -t * 0.08f);
+                                uvOffset = glm::vec2(lavaAnimSeconds * 0.03f,
+                                                     -lavaAnimSeconds * 0.08f);
                             }
                             // Copy base entry and override uvOffset
                             instSSBO[instanceDataCount_] = instSSBO[groupSSBOOffset + (j - lodIdx)];
@@ -1257,7 +1280,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     // Transparent geometry must be drawn individually per instance in back-to-
     // front order for correct alpha compositing.  Each draw writes one
     // M2InstanceGPU entry and issues a single-instance indexed draw.
-    std::sort(sortedVisible_.begin(), sortedVisible_.end(),
+    std::sort(transparentVisible_.begin(), transparentVisible_.end(),
               [](const VisibleEntry& a, const VisibleEntry& b) { return a.distSq > b.distSq; });
 
     currentModelId = UINT32_MAX;
@@ -1266,7 +1289,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     currentPipeline = opaquePipeline_;
     currentMaterialSet = VK_NULL_HANDLE;
 
-    for (const auto& entry : sortedVisible_) {
+    for (const auto& entry : transparentVisible_) {
         if (entry.index >= instances.size()) continue;
         auto& instance = instances[entry.index];
 
@@ -1370,8 +1393,8 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                 }
             }
             if (model.isLavaModel && uvOffset == glm::vec2(0.0f)) {
-                float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - kLavaAnimStart).count();
-                uvOffset = glm::vec2(t * 0.03f, -t * 0.08f);
+                uvOffset = glm::vec2(lavaAnimSeconds * 0.03f,
+                                     -lavaAnimSeconds * 0.08f);
             }
 
             // Write single instance entry to SSBO

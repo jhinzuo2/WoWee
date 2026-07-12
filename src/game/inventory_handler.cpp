@@ -31,6 +31,8 @@ namespace {
 constexpr uint32_t kItemClassConsumable = 0;
 constexpr uint32_t kConsumableSubclassBandage = 7;
 constexpr uint32_t kConsumableSubclassItemEnhancement = 6;
+// SpellCastTargetFlags bit set by Spell.dbc for spells cast onto another item.
+constexpr uint32_t kSpellTargetFlagItem = 0x10;
 
 bool isBandageItem(const ItemQueryResponseData* info) {
     return info && info->valid &&
@@ -566,6 +568,31 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
             /*uint32_t vendorSlot =*/ packet.readUInt32();
             /*int32_t  newCount   =*/ static_cast<int32_t>(packet.readUInt32());
             uint32_t itemCount  = packet.readUInt32();
+            // Successful buyback: remove the entry from the local buyback list.
+            // Without this the pending slot lingered and a later unrelated
+            // SMSG_BUY_FAILED could misread it as a buyback retry.
+            if (pendingBuybackSlot_ >= 0) {
+                if (pendingBuybackSlot_ < static_cast<int>(buybackItems_.size())) {
+                    const auto& entry = buybackItems_[pendingBuybackSlot_];
+                    std::string label = entry.item.name.empty()
+                        ? "item #" + std::to_string(entry.item.itemId) : entry.item.name;
+                    owner_.addSystemChatMessage("Bought back: " +
+                        buildItemLink(entry.item.itemId,
+                                      static_cast<uint32_t>(entry.item.quality), label));
+                    buybackItems_.erase(buybackItems_.begin() + pendingBuybackSlot_);
+                }
+                pendingBuybackSlot_ = -1;
+                pendingBuybackWireSlot_ = 0;
+                if (auto* ac = owner_.services().audioCoordinator) {
+                    if (auto* sfx = ac->getUiSoundManager())
+                        sfx->playPickupBag();
+                }
+                if (owner_.addonEventCallbackRef()) {
+                    owner_.addonEventCallbackRef()("MERCHANT_UPDATE", {});
+                    owner_.addonEventCallbackRef()("BAG_UPDATE", {});
+                }
+                return;
+            }
             if (pendingBuyItemId_ != 0) {
                 std::string itemLabel;
                 uint32_t buyQuality = 1;
@@ -1002,7 +1029,6 @@ void InventoryHandler::handleLootRollWon(network::Packet& packet) {
 
 void InventoryHandler::openVendor(uint64_t npcGuid) {
     if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
-    buybackItems_.clear();
     auto packet = ListInventoryPacket::build(npcGuid);
     owner_.getSocket()->send(packet);
 }
@@ -1011,13 +1037,22 @@ void InventoryHandler::closeVendor() {
     bool wasOpen = vendorWindowOpen_;
     vendorWindowOpen_ = false;
     currentVendorItems_ = ListInventoryData{};
-    buybackItems_.clear();
-    pendingSellToBuyback_.clear();
+    // Keep buybackItems_ and pendingSellToBuyback_: buyback slots live on the
+    // player server-side (wire slots 74-85) and persist across vendor windows,
+    // so the local mirror must too — clearing here made the buyback list
+    // vanish when the vendor was reopened. The mirror resets on world entry.
     pendingBuybackSlot_ = -1;
     pendingBuybackWireSlot_ = 0;
     pendingBuyItemId_ = 0;
     pendingBuyItemSlot_ = 0;
     if (wasOpen && owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("MERCHANT_CLOSED", {});
+}
+
+void InventoryHandler::clearBuybackState() {
+    buybackItems_.clear();
+    pendingSellToBuyback_.clear();
+    pendingBuybackSlot_ = -1;
+    pendingBuybackWireSlot_ = 0;
 }
 
 void InventoryHandler::buyItem(uint64_t vendorGuid, uint32_t itemId, uint32_t slot, uint32_t count) {
@@ -1235,6 +1270,95 @@ void InventoryHandler::autoEquipItemInBag(int bagIndex, int slotIndex) {
     }
 }
 
+// Dispatches CMSG_USE_ITEM for an item already located at (wowBag, wowSlot).
+// Spells that enchant another item (sharpening stones, weightstones, weapon oils)
+// cannot be sent immediately: they need the target item's GUID, so the use is
+// parked and completed by completeItemUseOnItem() once the player picks a target.
+void InventoryHandler::dispatchUseItem(uint8_t wowBag, uint8_t wowSlot, uint64_t itemGuid,
+                                       const ItemDef& item) {
+    if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+    if (itemGuid == 0) {
+        LOG_WARNING("useItem: itemGuid=0 for item='", item.name, "' entry=", item.itemId,
+                    " — cannot use");
+        owner_.addSystemChatMessage("Cannot use that item right now.");
+        return;
+    }
+
+    const auto* itemInfo = owner_.getItemInfo(item.itemId);
+    uint32_t useSpellId = 0;
+    if (itemInfo) {
+        for (const auto& sp : itemInfo->spells) {
+            if (sp.spellId != 0 && (sp.spellTrigger == 0 || sp.spellTrigger == 5)) {
+                useSpellId = sp.spellId;
+                break;
+            }
+        }
+    }
+    LOG_DEBUG("useItem: bag=", (int)wowBag, " slot=", (int)wowSlot, " entry=", item.itemId,
+              " spellId=", useSpellId);
+
+    if (useSpellId != 0 &&
+        (owner_.getSpellTargetFlags(useSpellId) & kSpellTargetFlagItem) != 0) {
+        pendingItemTarget_ = PendingItemTarget{wowBag, wowSlot, itemGuid, useSpellId,
+                                               item.itemId, item.name};
+        owner_.addSystemChatMessage("Choose an item to apply " + item.name + " to.");
+        return;
+    }
+
+    if (isBandageItem(itemInfo)) synchronizeStationaryBandageCast(owner_);
+    sendUseItem(wowBag, wowSlot, itemGuid, useSpellId,
+                targetGuidForUseItem(owner_, itemInfo), 0);
+}
+
+void InventoryHandler::sendUseItem(uint8_t wowBag, uint8_t wowSlot, uint64_t itemGuid,
+                                   uint32_t spellId, uint64_t targetGuid, uint64_t itemTargetGuid) {
+    auto packet = owner_.getPacketParsers()
+        ? owner_.getPacketParsers()->buildUseItem(wowBag, wowSlot, itemGuid, spellId,
+                                                  targetGuid, itemTargetGuid)
+        : UseItemPacket::build(wowBag, wowSlot, itemGuid, spellId, targetGuid, itemTargetGuid);
+    LOG_INFO("Sending CMSG_USE_ITEM: bag=", (int)wowBag, " slot=", (int)wowSlot,
+             " spell=", spellId, " itemTarget=0x", std::hex, itemTargetGuid, std::dec,
+             " packetSize=", packet.getSize());
+    owner_.getSocket()->send(packet);
+}
+
+bool InventoryHandler::isAwaitingItemTarget() const {
+    if (!pendingItemTarget_) return false;
+    // Leaving the world abandons the pending use — the slot and GUID would be
+    // stale for the next character.
+    if (owner_.getState() != WorldState::IN_WORLD) {
+        pendingItemTarget_.reset();
+        return false;
+    }
+    return true;
+}
+
+uint32_t InventoryHandler::getPendingItemTargetSourceItemId() const {
+    return pendingItemTarget_ ? pendingItemTarget_->itemId : 0;
+}
+
+void InventoryHandler::cancelItemTargeting() {
+    pendingItemTarget_.reset();
+}
+
+void InventoryHandler::completeItemUseOnItem(uint64_t targetItemGuid) {
+    if (!isAwaitingItemTarget()) return;
+    const PendingItemTarget pending = *pendingItemTarget_;
+    pendingItemTarget_.reset();
+
+    if (targetItemGuid == 0 || !owner_.getSocket()) {
+        owner_.addSystemChatMessage("That is not a valid target.");
+        return;
+    }
+    // Applying to itself is never valid and the server would silently drop it.
+    if (targetItemGuid == pending.itemGuid) {
+        owner_.addSystemChatMessage("You cannot apply " + pending.itemName + " to itself.");
+        return;
+    }
+
+    sendUseItem(pending.bag, pending.slot, pending.itemGuid, pending.spellId, 0, targetItemGuid);
+}
+
 void InventoryHandler::useItemBySlot(int backpackIndex) {
     if (backpackIndex < 0 || backpackIndex >= owner_.inventoryRef().getBackpackSize()) return;
     const auto& slot = owner_.inventoryRef().getBackpackSlot(backpackIndex);
@@ -1245,30 +1369,8 @@ void InventoryHandler::useItemBySlot(int backpackIndex) {
         itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
     }
 
-    if (itemGuid != 0 && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
-        uint32_t useSpellId = 0;
-        if (auto* info = owner_.getItemInfo(slot.item.itemId)) {
-            for (const auto& sp : info->spells) {
-                if (sp.spellId != 0 && (sp.spellTrigger == 0 || sp.spellTrigger == 5)) {
-                    useSpellId = sp.spellId;
-                    break;
-                }
-            }
-            LOG_DEBUG("useItemBySlot: entry=", slot.item.itemId,
-                      " spellId=", useSpellId);
-        }
-        const auto* itemInfo = owner_.getItemInfo(slot.item.itemId);
-        if (isBandageItem(itemInfo)) synchronizeStationaryBandageCast(owner_);
-        const uint64_t targetGuid = targetGuidForUseItem(owner_, itemInfo);
-        auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId, targetGuid)
-            : UseItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId, targetGuid);
-        owner_.getSocket()->send(packet);
-    } else if (itemGuid == 0) {
-        LOG_WARNING("useItemBySlot: itemGuid=0 for item='", slot.item.name,
-                    "' entry=", slot.item.itemId, " — cannot use");
-        owner_.addSystemChatMessage("Cannot use that item right now.");
-    }
+    dispatchUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex),
+                    itemGuid, slot.item);
 }
 
 void InventoryHandler::useItemInBag(int bagIndex, int slotIndex) {
@@ -1292,30 +1394,8 @@ void InventoryHandler::useItemInBag(int bagIndex, int slotIndex) {
     LOG_INFO("useItemInBag: bag=", bagIndex, " slot=", slotIndex, " itemId=", slot.item.itemId,
              " itemGuid=0x", std::hex, itemGuid, std::dec);
 
-    if (itemGuid != 0 && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
-        uint32_t useSpellId = 0;
-        if (auto* info = owner_.getItemInfo(slot.item.itemId)) {
-            for (const auto& sp : info->spells) {
-                if (sp.spellId != 0 && (sp.spellTrigger == 0 || sp.spellTrigger == 5)) {
-                    useSpellId = sp.spellId;
-                    break;
-                }
-            }
-        }
-        uint8_t wowBag = static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex);
-        const auto* itemInfo = owner_.getItemInfo(slot.item.itemId);
-        if (isBandageItem(itemInfo)) synchronizeStationaryBandageCast(owner_);
-        const uint64_t targetGuid = targetGuidForUseItem(owner_, itemInfo);
-        auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId, targetGuid)
-            : UseItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId, targetGuid);
-        LOG_INFO("useItemInBag: sending CMSG_USE_ITEM, bag=", (int)wowBag, " slot=", slotIndex,
-                 " packetSize=", packet.getSize());
-        owner_.getSocket()->send(packet);
-    } else if (itemGuid == 0) {
-        LOG_WARNING("Use item in bag failed: missing item GUID for bag ", bagIndex, " slot ", slotIndex);
-        owner_.addSystemChatMessage("Cannot use that item right now.");
-    }
+    dispatchUseItem(static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex),
+                    static_cast<uint8_t>(slotIndex), itemGuid, slot.item);
 }
 
 void InventoryHandler::openItemBySlot(int backpackIndex) {
@@ -3175,14 +3255,26 @@ void InventoryHandler::rebuildOnlineInventory() {
         }
     }
 
-    // Only mark equipment dirty if equipped item displayInfoIds actually changed
+    // Only mark equipment dirty if equipped item displayInfoIds actually changed.
+    // Enchants count too: applying a sharpening stone leaves the displayInfoId alone
+    // but changes the visual effect hanging off the weapon.
     std::array<uint32_t, 19> currentEquipDisplayIds{};
+    std::array<uint64_t, 19> currentEquipEnchantIds{};
     for (int i = 0; i < 19; i++) {
         const auto& slot = owner_.inventoryRef().getEquipSlot(static_cast<EquipSlot>(i));
         if (!slot.empty()) currentEquipDisplayIds[i] = slot.item.displayInfoId;
+
+        uint64_t guid = owner_.equipSlotGuidsRef()[i];
+        if (guid != 0) {
+            auto [permEnchantId, tempEnchantId] = owner_.getItemEnchantIds(guid);
+            currentEquipEnchantIds[i] =
+                (static_cast<uint64_t>(permEnchantId) << 32) | tempEnchantId;
+        }
     }
-    if (currentEquipDisplayIds != owner_.lastEquipDisplayIdsRef()) {
+    if (currentEquipDisplayIds != owner_.lastEquipDisplayIdsRef() ||
+        currentEquipEnchantIds != lastEquipEnchantIds_) {
         owner_.lastEquipDisplayIdsRef() = currentEquipDisplayIds;
+        lastEquipEnchantIds_ = currentEquipEnchantIds;
         owner_.onlineEquipDirtyRef() = true;
     }
 

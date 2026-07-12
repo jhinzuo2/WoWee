@@ -10,6 +10,7 @@
 #include <memory>
 #include <optional>
 #include <mutex>
+#include <chrono>
 #include "math/spline.hpp"
 #include "game/flat_field_map.hpp"
 
@@ -439,6 +440,12 @@ public:
     // Check if entity exists
     bool hasEntity(uint64_t guid) const;
 
+    // Main-thread spatial query. The cell index is refreshed at most four times
+    // per second, avoiding a full entity-map distance scan every rendered frame.
+    std::vector<std::shared_ptr<Entity>> getEntitiesNear(float x, float y, float radius) const;
+    void getEntitiesNear(float x, float y, float radius,
+                         std::vector<std::shared_ptr<Entity>>& out) const;
+
     // Get all entities. MAIN-THREAD-ONLY: mutations happen via dispatchQueuedPackets()
     // on the main thread, and this reference is not lock-protected. Callers on any
     // other thread (e.g. the headless HTTP API thread) must use snapshotEntities()
@@ -462,6 +469,8 @@ public:
     void clear() {
         std::lock_guard<std::mutex> lock(mutex_);
         entities.clear();
+        spatialCells_.clear();
+        spatialDirty_ = true;
     }
 
     // Get entity count
@@ -479,6 +488,10 @@ private:
     // main-thread-only.
     mutable std::mutex mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<Entity>> entities;
+    static constexpr float kSpatialCellSize = 64.0f;
+    mutable std::unordered_map<int64_t, std::vector<std::shared_ptr<Entity>>> spatialCells_;
+    mutable std::chrono::steady_clock::time_point lastSpatialRebuild_{};
+    mutable bool spatialDirty_ = true;
 };
 
 } // namespace game

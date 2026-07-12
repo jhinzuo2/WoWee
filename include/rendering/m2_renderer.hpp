@@ -233,6 +233,10 @@ struct M2Instance {
     // Frame-skip optimization (update distant animations less frequently)
     uint8_t frameSkipCounter = 0;
     bool bonesDirty[2] = {false, false};  // Per-frame-index: set when bones recomputed, cleared after upload
+    // Mega-bone slot this instance's bones were last uploaded to, per frame
+    // index (0 = never uploaded; valid slots start at 1). Lets prepareRender
+    // skip the memcpy when the bones are unchanged and still at the same slot.
+    uint32_t megaBoneUploadedSlot[2] = {0, 0};
 
     // Per-instance bone SSBO (double-buffered) — legacy; see mega bone SSBO in M2Renderer
     ::VkBuffer boneBuffer[2] = {};
@@ -668,6 +672,7 @@ private:
         float effectiveMaxDistSq;
     };
     std::vector<VisibleEntry> sortedVisible_;  // Reused each frame
+    std::vector<VisibleEntry> transparentVisible_; // Only models needing pass 2
     struct GlowSprite {
         glm::vec3 worldPos;
         glm::vec4 color;

@@ -170,7 +170,9 @@ void CharacterScreen::render(game::GameHandler& gameHandler) {
 
     // ── Two-column layout: character list (left) | details (right) ──
     float availW = ImGui::GetContentRegionAvail().x;
-    float detailPanelW = 360.0f;
+    // The preview is the centrepiece of this screen — give it a wide panel, but
+    // never at the cost of the character list becoming unusable.
+    float detailPanelW = std::min(520.0f, std::max(360.0f, availW * 0.38f));
     float listW = availW - detailPanelW - ImGui::GetStyle().ItemSpacing.x;
     if (listW < 300.0f) { listW = availW; detailPanelW = 0.0f; }
 
@@ -346,13 +348,16 @@ void CharacterScreen::render(game::GameHandler& gameHandler) {
             float imgW = ImGui::GetContentRegionAvail().x;
             float imgH = imgW * (static_cast<float>(preview_->getHeight()) /
                                  static_cast<float>(preview_->getWidth()));
-            // Clamp to avoid taking the entire panel
-            float maxH = 320.0f;
+            // Take as much of the panel as the character's details will spare.
+            float maxH = std::max(320.0f, listH - 230.0f);
             if (imgH > maxH) {
                 imgH = maxH;
                 imgW = imgH * (static_cast<float>(preview_->getWidth()) /
                                static_cast<float>(preview_->getHeight()));
             }
+            // Keep it centred in the panel when the aspect clamp narrows it.
+            float indent = (ImGui::GetContentRegionAvail().x - imgW) * 0.5f;
+            if (indent > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + indent);
             ImGui::Image(
                 reinterpret_cast<ImTextureID>(preview_->getTextureId()),
                 ImVec2(imgW, imgH));

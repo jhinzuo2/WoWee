@@ -1,6 +1,7 @@
 // Entity, Unit, Player, GameObject, EntityManager tests
 #include <catch_amalgamated.hpp>
 #include "game/entity.hpp"
+#include <algorithm>
 #include <memory>
 
 using namespace wowee::game;
@@ -217,4 +218,23 @@ TEST_CASE("EntityManager getEntities returns all", "[entity]") {
     REQUIRE(all.count(10) == 1);
     REQUIRE(all.count(20) == 1);
     REQUIRE(all.count(30) == 1);
+}
+
+TEST_CASE("EntityManager spatial query filters nearby entities", "[entity][spatial]") {
+    EntityManager mgr;
+    auto origin = std::make_shared<Unit>(1);
+    origin->setPosition(-10.0f, -10.0f, 0.0f, 0.0f);
+    auto nearby = std::make_shared<Unit>(2);
+    nearby->setPosition(20.0f, 15.0f, 0.0f, 0.0f);
+    auto distant = std::make_shared<Unit>(3);
+    distant->setPosition(500.0f, 500.0f, 0.0f, 0.0f);
+    mgr.addEntity(1, origin);
+    mgr.addEntity(2, nearby);
+    mgr.addEntity(3, distant);
+
+    const auto result = mgr.getEntitiesNear(0.0f, 0.0f, 50.0f);
+    REQUIRE(result.size() == 2);
+    REQUIRE(std::any_of(result.begin(), result.end(), [](const auto& e) { return e->getGuid() == 1; }));
+    REQUIRE(std::any_of(result.begin(), result.end(), [](const auto& e) { return e->getGuid() == 2; }));
+    REQUIRE_FALSE(std::any_of(result.begin(), result.end(), [](const auto& e) { return e->getGuid() == 3; }));
 }

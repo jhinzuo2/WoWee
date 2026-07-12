@@ -27,6 +27,10 @@ public:
     /// Render character screen (C key). Standalone equipment window.
     void renderCharacterScreen(game::GameHandler& gameHandler);
 
+    /// Draw the item-target cursor armed by using a sharpening stone / weightstone /
+    /// weapon oil, and handle cancelling it. Call once per frame, after the windows.
+    void renderItemTargetCursor();
+
     bool isOpen() const { return open; }
     void toggle() { open = !open; }
     void setOpen(bool o) { open = o; }
@@ -36,6 +40,8 @@ public:
     void toggleBag(int idx);
     void openAllBags();
     void closeAllBags();
+    /// Toggle between independently positioned bag windows and one continuous grid.
+    void toggleCombinedBags();
     void setSeparateBags(bool sep) { separateBags_ = sep; }
     bool isSeparateBags() const { return separateBags_; }
     void toggleCompactBags() { compactBags_ = !compactBags_; }
@@ -135,6 +141,10 @@ private:
 
     // Slot rendering with interaction support
     enum class SlotKind { BACKPACK, EQUIPMENT };
+
+    // Frame the item-target cursor was armed on (-1 = not armed). Cancel input is
+    // ignored on that frame so the right-click that used the item doesn't cancel it.
+    int itemTargetArmedFrame_ = -1;
 
     // Click-and-hold pickup tracking
     bool pickupPending_ = false;

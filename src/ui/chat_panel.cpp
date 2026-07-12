@@ -258,6 +258,21 @@ void ChatPanel::render(game::GameHandler& gameHandler,
 
     auto nowTime = std::chrono::system_clock::now();
 
+    // Cached lines embed the mention highlight, which depends on the local
+    // player's name — invalidate everything when it changes (login/char swap).
+    if (chatCacheSelfName_ != selfNameLower) {
+        chatCacheSelfName_ = selfNameLower;
+        chatLineCache_.clear();
+    }
+    // Prune cache entries for messages that scrolled out of the history window.
+    if (!chatHistory.empty() && chatLineCache_.size() > chatHistory.size() * 2) {
+        const uint64_t minUid = chatHistory.front().uid;
+        for (auto it = chatLineCache_.begin(); it != chatLineCache_.end();) {
+            if (it->first < minUid) it = chatLineCache_.erase(it);
+            else ++it;
+        }
+    }
+
     int chatMsgIdx = 0;
     for (const auto& msg : chatHistory) {
         if (!tabManager_.shouldShowMessage(msg, activeChatTab)) continue;
@@ -274,8 +289,6 @@ void ChatPanel::render(game::GameHandler& gameHandler,
             }
         }
 
-        std::string processedMessage = chat_utils::replaceGenderPlaceholders(msg.message, gameHandler);
-
         const std::string& resolvedSenderName = [&]() -> const std::string& {
             if (!msg.senderName.empty()) return msg.senderName;
             if (msg.senderGuid == 0) return msg.senderName;
@@ -287,39 +300,61 @@ void ChatPanel::render(game::GameHandler& gameHandler,
         ImVec4 color = ChatTabManager::getChatTypeColor(msg.type);
         color.w *= msgAlpha;
 
-        std::string tsPrefix;
-        if (chatShowTimestamps) {
-            auto tt = std::chrono::system_clock::to_time_t(msg.timestamp);
-            std::tm tm{};
-#ifdef _WIN32
-            localtime_s(&tm, &tt);
-#else
-            localtime_r(&tt, &tm);
-#endif
-            char tsBuf[16];
-            snprintf(tsBuf, sizeof(tsBuf), "[%02d:%02d] ", tm.tm_hour, tm.tm_min);
-            tsPrefix = tsBuf;
-        }
-
-        std::string fullMsg = formatChatMessage(msg, processedMessage, resolvedSenderName, tsPrefix, gameHandler);
-
-        bool isMention = false;
-        if (!selfNameLower.empty() &&
-            msg.type != game::ChatType::WHISPER_INFORM &&
-            msg.type != game::ChatType::SYSTEM &&
-            fullMsg.size() >= selfNameLower.size()) {
-            const size_t nlen = selfNameLower.size();
-            const size_t last = fullMsg.size() - nlen;
-            for (size_t i = 0; i <= last && !isMention; ++i) {
-                bool match = true;
-                for (size_t j = 0; j < nlen; ++j) {
-                    unsigned char a = static_cast<unsigned char>(fullMsg[i + j]);
-                    unsigned char b = static_cast<unsigned char>(selfNameLower[j]);
-                    if (std::tolower(a) != b) { match = false; break; }
-                }
-                if (match) isMention = true;
+        // Fetch the formatted + parsed line from the cache; build it on first
+        // sight of the message (or when the sender name / timestamp toggle
+        // changed since it was built).
+        CachedChatLine* line = nullptr;
+        {
+            auto cIt = chatLineCache_.find(msg.uid);
+            if (cIt != chatLineCache_.end() &&
+                cIt->second.tsEnabled == chatShowTimestamps &&
+                cIt->second.senderNameUsed == resolvedSenderName) {
+                line = &cIt->second;
             }
         }
+        if (!line) {
+            std::string processedMessage = chat_utils::replaceGenderPlaceholders(msg.message, gameHandler);
+
+            std::string tsPrefix;
+            if (chatShowTimestamps) {
+                auto tt = std::chrono::system_clock::to_time_t(msg.timestamp);
+                std::tm tm{};
+#ifdef _WIN32
+                localtime_s(&tm, &tt);
+#else
+                localtime_r(&tt, &tm);
+#endif
+                char tsBuf[16];
+                snprintf(tsBuf, sizeof(tsBuf), "[%02d:%02d] ", tm.tm_hour, tm.tm_min);
+                tsPrefix = tsBuf;
+            }
+
+            std::string fullMsg = formatChatMessage(msg, processedMessage, resolvedSenderName, tsPrefix, gameHandler);
+
+            CachedChatLine built;
+            built.senderNameUsed = resolvedSenderName;
+            built.tsEnabled = chatShowTimestamps;
+            if (!selfNameLower.empty() &&
+                msg.type != game::ChatType::WHISPER_INFORM &&
+                msg.type != game::ChatType::SYSTEM &&
+                fullMsg.size() >= selfNameLower.size()) {
+                const size_t nlen = selfNameLower.size();
+                const size_t last = fullMsg.size() - nlen;
+                for (size_t i = 0; i <= last && !built.isMention; ++i) {
+                    bool match = true;
+                    for (size_t j = 0; j < nlen; ++j) {
+                        unsigned char a = static_cast<unsigned char>(fullMsg[i + j]);
+                        unsigned char b = static_cast<unsigned char>(selfNameLower[j]);
+                        if (std::tolower(a) != b) { match = false; break; }
+                    }
+                    if (match) built.isMention = true;
+                }
+            }
+            built.segments = markupParser_.parse(fullMsg);
+            built.fullMsg = std::move(fullMsg);
+            line = &chatLineCache_.insert_or_assign(msg.uid, std::move(built)).first->second;
+        }
+        const bool isMention = line->isMention;
 
         // Alternate row tinting for readability
         if (chatMsgIdx % 2 == 1) {
@@ -334,8 +369,7 @@ void ChatPanel::render(game::GameHandler& gameHandler,
         ImGui::BeginGroup();
         {
             ImVec4 renderColor = isMention ? ImVec4(1.0f, 0.9f, 0.35f, msgAlpha) : color;
-            auto segments = markupParser_.parse(fullMsg);
-            markupRenderer_.render(segments, renderColor, markupCtx);
+            markupRenderer_.render(line->segments, renderColor, markupCtx);
         }
         ImGui::EndGroup();
         if (isMention) {
@@ -381,7 +415,7 @@ void ChatPanel::render(game::GameHandler& gameHandler,
                 ImGui::Separator();
             }
             if (ImGui::MenuItem("Copy Message")) {
-                ImGui::SetClipboardText(fullMsg.c_str());
+                ImGui::SetClipboardText(line->fullMsg.c_str());
             }
             ImGui::EndPopup();
         }

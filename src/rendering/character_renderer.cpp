@@ -16,6 +16,7 @@
  */
 #include "rendering/character_renderer.hpp"
 #include "rendering/animation/animation_ids.hpp"
+#include "core/thread_pool.hpp"
 #include "rendering/vk_context.hpp"
 #include "rendering/vk_texture.hpp"
 #include "rendering/vk_pipeline.hpp"
@@ -240,7 +241,7 @@ bool CharacterRenderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFram
         bindings[0].descriptorCount = 1;
         bindings[0].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         bindings[1].binding = 1;
-        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
         bindings[1].descriptorCount = 1;
         bindings[1].stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
         bindings[2].binding = 2;
@@ -274,7 +275,7 @@ bool CharacterRenderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFram
     for (int i = 0; i < 2; i++) {
         VkDescriptorPoolSize sizes[] = {
             {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, MAX_MATERIAL_SETS * 2},  // diffuse + normal/height
-            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, MAX_MATERIAL_SETS},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, MAX_MATERIAL_SETS},
         };
         VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         ci.maxSets = MAX_MATERIAL_SETS;
@@ -1870,8 +1871,9 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
             }
         }
 
-        // Skip weapon instances for animation — their transforms are set by parent bones
-        if (inst.hasOverrideModelMatrix) continue;
+        // Skip weapon instances for animation — their transforms are set by parent
+        // bones. Enchant visuals are the exception: they are pure animated FX.
+        if (inst.hasOverrideModelMatrix && !inst.isEffectModel) continue;
 
         float distSq = glm::distance2(inst.position, cameraPos);
         if (distSq >= animUpdateRadiusSq) continue;
@@ -1943,22 +1945,28 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
             const size_t chunkSize = updatedCount / numThreads;
             const size_t remainder = updatedCount % numThreads;
 
+            auto processRange = [this](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; i++) {
+                    calculateBoneMatrices(toUpdate_[i].get());
+                }
+            };
+
             animFutures_.clear();
             if (animFutures_.capacity() < numThreads) {
                 animFutures_.reserve(numThreads);
             }
 
+            // Dispatch all but the last chunk to the shared pool; process the
+            // last chunk on this thread so the pool is never a hard dependency
+            // for finishing this frame's bone work.
             size_t start = 0;
-            for (size_t t = 0; t < numThreads; t++) {
+            for (size_t t = 0; t + 1 < numThreads; t++) {
                 size_t end = start + chunkSize + (t < remainder ? 1 : 0);
-                animFutures_.push_back(std::async(std::launch::async,
-                    [this, start, end]() {
-                        for (size_t i = start; i < end; i++) {
-                            calculateBoneMatrices(toUpdate_[i].get());
-                        }
-                    }));
+                animFutures_.push_back(core::ThreadPool::frameWorkers().submit(
+                    [processRange, start, end]() { processRange(start, end); }));
                 start = end;
             }
+            processRange(start, updatedCount);
 
             for (auto& f : animFutures_) {
                 f.get();
@@ -1991,9 +1999,22 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
             }
 
             // Weapon model matrix = character model * bone transform * offset translation
-            weapIt->second.overrideModelMatrix =
+            const glm::mat4 weaponMat =
                 charModelMat * boneMat * glm::translate(glm::mat4(1.0f), wa.offset);
+            weapIt->second.overrideModelMatrix = weaponMat;
             weapIt->second.hasOverrideModelMatrix = true;
+
+            // Enchant visuals ride the weapon, offset to their attachment point on it.
+            for (const auto& fx : wa.effects) {
+                auto fxIt = instances.find(fx.effectInstanceId);
+                if (fxIt == instances.end()) continue;
+                fxIt->second.overrideModelMatrix =
+                    weaponMat * glm::translate(glm::mat4(1.0f), fx.offset);
+                fxIt->second.hasOverrideModelMatrix = true;
+                // Keep the effect near the character so animation distance culling
+                // (which works off instance position) treats it like its wielder.
+                fxIt->second.position = instance.position;
+            }
         }
     }
 }
@@ -2324,6 +2345,8 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
     // 4.0 covers Tauren, mounted characters, and most creature models.
     constexpr float kDefaultCharacterCullRadius = 4.0f;
     const glm::vec3 camPos = camera.getPosition();
+    const float frameTimeSeconds = std::chrono::duration<float>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 
     // Extract frustum planes for per-instance visibility testing
     Frustum frustum;
@@ -2338,12 +2361,45 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
         if (materialDescPools_[frameSlot]) {
             vkResetDescriptorPool(vkCtx_->getDevice(), materialDescPools_[frameSlot], 0);
         }
+        materialDescriptorCache_[frameSlot].clear();
         lastMaterialPoolResetFrame_ = frameIndex;
     }
 
     // Pre-compute aligned UBO stride for ring buffer sub-allocation
     const uint32_t uboStride = (sizeof(CharMaterialUBO) + materialUboAlignment_ - 1) & ~(materialUboAlignment_ - 1);
     const uint32_t ringCapacityBytes = uboStride * MATERIAL_RING_CAPACITY;
+    auto getMaterialDescriptorSet = [&](VkTexture* diffuse, VkTexture* normal) -> VkDescriptorSet {
+        if (!diffuse || !normal) return VK_NULL_HANDLE;
+        const VkDescriptorImageInfo diffuseInfo = diffuse->descriptorInfo();
+        const VkDescriptorImageInfo normalInfo = normal->descriptorInfo();
+        const MaterialDescriptorKey key{diffuseInfo.imageView, normalInfo.imageView,
+                                        diffuseInfo.sampler, normalInfo.sampler};
+        auto& cache = materialDescriptorCache_[frameSlot];
+        if (auto it = cache.find(key); it != cache.end()) return it->second;
+
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool = materialDescPools_[frameSlot];
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts = &materialSetLayout_;
+        if (vkAllocateDescriptorSets(vkCtx_->getDevice(), &ai, &set) != VK_SUCCESS)
+            return VK_NULL_HANDLE;
+
+        VkDescriptorBufferInfo bufferInfo{};
+        bufferInfo.buffer = materialRingBuffer_[frameSlot];
+        bufferInfo.offset = 0;
+        bufferInfo.range = sizeof(CharMaterialUBO);
+        VkWriteDescriptorSet writes[3] = {};
+        writes[0] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 0, 0, 1,
+                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &diffuseInfo, nullptr, nullptr};
+        writes[1] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 1, 0, 1,
+                     VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, nullptr, &bufferInfo, nullptr};
+        writes[2] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, nullptr, set, 2, 0, 1,
+                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &normalInfo, nullptr, nullptr};
+        vkUpdateDescriptorSets(vkCtx_->getDevice(), 3, writes, 0, nullptr);
+        cache.emplace(key, set);
+        return set;
+    };
 
     // Bind per-frame descriptor set (set 0) -- shared across all draws
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -2400,58 +2456,9 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
         // Upload bone matrices to SSBO
         int numBones = std::min(static_cast<int>(instance.boneMatrices.size()), MAX_BONES);
         if (numBones > 0) {
-            // Lazy-allocate bone SSBO on first use
-            if (!instance.boneBuffer[frameIndex]) {
-                VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-                bci.size = MAX_BONES * sizeof(glm::mat4);
-                bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-                VmaAllocationCreateInfo aci{};
-                aci.usage = VMA_MEMORY_USAGE_CPU_TO_GPU;
-                aci.flags = VMA_ALLOCATION_CREATE_MAPPED_BIT;
-                VmaAllocationInfo allocInfo{};
-                vmaCreateBuffer(vkCtx_->getAllocator(), &bci, &aci,
-                                &instance.boneBuffer[frameIndex], &instance.boneAlloc[frameIndex], &allocInfo);
-                instance.boneMapped[frameIndex] = allocInfo.pMappedData;
-
-                // Initialize all bone slots to identity so out-of-range indices
-                // produce correct (neutral) transforms instead of GPU garbage
-                if (instance.boneMapped[frameIndex]) {
-                    auto* dst = static_cast<glm::mat4*>(instance.boneMapped[frameIndex]);
-                    for (int j = 0; j < MAX_BONES; j++) dst[j] = glm::mat4(1.0f);
-                }
-
-                // Allocate descriptor set for bone SSBO
-                VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-                ai.descriptorPool = boneDescPool_;
-                ai.descriptorSetCount = 1;
-                ai.pSetLayouts = &boneSetLayout_;
-                VkResult dsRes = vkAllocateDescriptorSets(vkCtx_->getDevice(), &ai, &instance.boneSet[frameIndex]);
-                if (dsRes != VK_SUCCESS) {
-                    LOG_ERROR("CharacterRenderer: bone descriptor allocation failed (instance=",
-                              instance.id, ", frame=", frameIndex, ", vk=", static_cast<int>(dsRes), ")");
-                    if (instance.boneBuffer[frameIndex]) {
-                        vmaDestroyBuffer(vkCtx_->getAllocator(),
-                                         instance.boneBuffer[frameIndex], instance.boneAlloc[frameIndex]);
-                        instance.boneBuffer[frameIndex] = VK_NULL_HANDLE;
-                        instance.boneAlloc[frameIndex] = VK_NULL_HANDLE;
-                        instance.boneMapped[frameIndex] = nullptr;
-                    }
-                }
-
-                if (instance.boneSet[frameIndex]) {
-                    VkDescriptorBufferInfo bufInfo{};
-                    bufInfo.buffer = instance.boneBuffer[frameIndex];
-                    bufInfo.offset = 0;
-                    bufInfo.range = bci.size;
-                    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-                    write.dstSet = instance.boneSet[frameIndex];
-                    write.dstBinding = 0;
-                    write.descriptorCount = 1;
-                    write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-                    write.pBufferInfo = &bufInfo;
-                    vkUpdateDescriptorSets(vkCtx_->getDevice(), 1, &write, 0, nullptr);
-                }
-            }
+            // GPU allocation is performed by prepareRender() before command
+            // recording. Never allocate buffers/descriptors from the draw loop.
+            if (!instance.boneBuffer[frameIndex] || !instance.boneSet[frameIndex]) continue;
 
             // Upload bone matrices
             if (instance.boneMapped[frameIndex]) {
@@ -2629,8 +2636,9 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
 
                 // Attached weapon models can include additive FX/card batches that
                 // appear as detached flat quads for some swords. Keep core geometry
-                // and drop FX-style passes for weapon attachments.
-                if (instance.hasOverrideModelMatrix && blendMode >= 3) {
+                // and drop FX-style passes for weapon attachments. Enchant visuals
+                // are entirely such batches, so they must survive this cull.
+                if (instance.hasOverrideModelMatrix && !instance.isEffectModel && blendMode >= 3) {
                     continue;
                 }
 
@@ -2681,12 +2689,19 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                                               (blendMode == 0 && alphaCutout) ||
                                               (blendMode >= 2 && !alphaCutout) ||
                                               hairMaterial;
-                const bool unlit = ((materialFlags & 0x01) != 0) || (blendMode >= 3);
+                // Enchant glows emit their own light; scene lighting must not tint them.
+                const bool unlit = ((materialFlags & 0x01) != 0) || (blendMode >= 3) ||
+                                   instance.isEffectModel;
 
                 // Hair textures are authored as alpha-cut cards. If they use the
                 // translucent pipeline they form a soft shell around the head.
                 VkPipeline desiredPipeline;
-                if (hairMaterial) {
+                if (instance.isEffectModel) {
+                    // Enchant visuals are glow cards drawn on black. Their materials
+                    // declare Mod/alpha blending, which would composite that black
+                    // background as an opaque quad — force additive so only the light adds.
+                    desiredPipeline = additivePipeline_;
+                } else if (hairMaterial) {
                     desiredPipeline = alphaTestPipeline_;
                 } else {
                     switch (blendMode) {
@@ -2707,28 +2722,14 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 glm::vec3 emissiveTint(1.0f, 1.0f, 1.0f);
                 const bool koboldCandleFlame = colorKeyBlack && gpuModel.isKoboldFlame;
                 if (unlit && koboldCandleFlame) {
-                    using clock = std::chrono::steady_clock;
-                    float t = std::chrono::duration<float>(clock::now().time_since_epoch()).count();
                     float phase = static_cast<float>(batch.submeshId) * 0.31f;
-                    float f1 = std::sin(t * 7.9f + phase);
-                    float f2 = std::sin(t * 12.7f + phase * 1.73f);
-                    float f3 = std::sin(t * 4.3f + phase * 2.11f);
+                    float f1 = std::sin(frameTimeSeconds * 7.9f + phase);
+                    float f2 = std::sin(frameTimeSeconds * 12.7f + phase * 1.73f);
+                    float f3 = std::sin(frameTimeSeconds * 4.3f + phase * 2.11f);
                     float flicker = 0.90f + 0.10f * f1 + 0.06f * f2 + 0.04f * f3;
                     flicker = std::clamp(flicker, 0.72f, 1.12f);
                     emissiveBoost = (blendMode >= 3) ? (2.4f * flicker) : (1.5f * flicker);
                     emissiveTint = glm::vec3(1.28f, 1.04f, 0.82f);
-                }
-
-                // Allocate and fill material descriptor set (set 1)
-                VkDescriptorSet materialSet = VK_NULL_HANDLE;
-                {
-                    VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-                    ai.descriptorPool = materialDescPools_[frameSlot];
-                    ai.descriptorSetCount = 1;
-                    ai.pSetLayouts = &materialSetLayout_;
-                    if (vkAllocateDescriptorSets(vkCtx_->getDevice(), &ai, &materialSet) != VK_SUCCESS) {
-                        continue; // Pool exhausted, skip this batch
-                    }
                 }
 
                 // Resolve normal/height map for this texture
@@ -2779,42 +2780,14 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 memcpy(static_cast<char*>(materialRingMapped_[frameSlot]) + matOffset, &matData, sizeof(CharMaterialUBO));
                 materialRingOffset_[frameSlot] = matOffset + uboStride;
 
-                // Write descriptor set: binding 0 = texture, binding 1 = material UBO, binding 2 = normal/height map
                 VkTexture* bindTex = (texPtr && texPtr->isValid()) ? texPtr : whiteTexture_.get();
-                VkDescriptorImageInfo imgInfo = bindTex->descriptorInfo();
-                VkDescriptorBufferInfo bufInfo{};
-                bufInfo.buffer = materialRingBuffer_[frameSlot];
-                bufInfo.offset = matOffset;
-                bufInfo.range = sizeof(CharMaterialUBO);
-                VkDescriptorImageInfo nhImgInfo = normalMap->descriptorInfo();
-
-                VkWriteDescriptorSet writes[3] = {};
-                writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[0].dstSet = materialSet;
-                writes[0].dstBinding = 0;
-                writes[0].descriptorCount = 1;
-                writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                writes[0].pImageInfo = &imgInfo;
-
-                writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[1].dstSet = materialSet;
-                writes[1].dstBinding = 1;
-                writes[1].descriptorCount = 1;
-                writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-                writes[1].pBufferInfo = &bufInfo;
-
-                writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-                writes[2].dstSet = materialSet;
-                writes[2].dstBinding = 2;
-                writes[2].descriptorCount = 1;
-                writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-                writes[2].pImageInfo = &nhImgInfo;
-
-                vkUpdateDescriptorSets(vkCtx_->getDevice(), 3, writes, 0, nullptr);
+                VkDescriptorSet materialSet = getMaterialDescriptorSet(bindTex, normalMap);
+                if (!materialSet) continue;
 
                 // Bind material descriptor set (set 1)
+                const uint32_t dynamicOffset = matOffset;
                 vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                        pipelineLayout_, 1, 1, &materialSet, 0, nullptr);
+                                        pipelineLayout_, 1, 1, &materialSet, 1, &dynamicOffset);
 
                 // Per-batch depth bias from materialLayer to separate coplanar
                 // armor pieces (chest/legs/gloves) that share identical depth.
@@ -2827,18 +2800,6 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
             // Draw entire model with first texture
             VkTexture* texPtr = !gpuModel.textureIds.empty() ? gpuModel.textureIds[0] : whiteTexture_.get();
             if (!texPtr || !texPtr->isValid()) texPtr = whiteTexture_.get();
-
-            // Allocate material descriptor set
-            VkDescriptorSet materialSet = VK_NULL_HANDLE;
-            {
-                VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-                ai.descriptorPool = materialDescPools_[frameSlot];
-                ai.descriptorSetCount = 1;
-                ai.pSetLayouts = &materialSetLayout_;
-                if (vkAllocateDescriptorSets(vkCtx_->getDevice(), &ai, &materialSet) != VK_SUCCESS) {
-                    continue;
-                }
-            }
 
             // POM quality → sample count
             int pomSamples2 = 32;
@@ -2877,39 +2838,12 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
             memcpy(static_cast<char*>(materialRingMapped_[frameSlot]) + matOffset2, &matData, sizeof(CharMaterialUBO));
             materialRingOffset_[frameSlot] = matOffset2 + uboStride;
 
-            VkDescriptorImageInfo imgInfo = texPtr->descriptorInfo();
-            VkDescriptorBufferInfo bufInfo{};
-            bufInfo.buffer = materialRingBuffer_[frameSlot];
-            bufInfo.offset = matOffset2;
-            bufInfo.range = sizeof(CharMaterialUBO);
-            VkDescriptorImageInfo nhImgInfo2 = flatNormalTexture_->descriptorInfo();
+            VkDescriptorSet materialSet = getMaterialDescriptorSet(texPtr, flatNormalTexture_.get());
+            if (!materialSet) continue;
 
-            VkWriteDescriptorSet writes[3] = {};
-            writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[0].dstSet = materialSet;
-            writes[0].dstBinding = 0;
-            writes[0].descriptorCount = 1;
-            writes[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[0].pImageInfo = &imgInfo;
-
-            writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[1].dstSet = materialSet;
-            writes[1].dstBinding = 1;
-            writes[1].descriptorCount = 1;
-            writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            writes[1].pBufferInfo = &bufInfo;
-
-            writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes[2].dstSet = materialSet;
-            writes[2].dstBinding = 2;
-            writes[2].descriptorCount = 1;
-            writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            writes[2].pImageInfo = &nhImgInfo2;
-
-            vkUpdateDescriptorSets(vkCtx_->getDevice(), 3, writes, 0, nullptr);
-
+            const uint32_t dynamicOffset = matOffset2;
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    pipelineLayout_, 1, 1, &materialSet, 0, nullptr);
+                                    pipelineLayout_, 1, 1, &materialSet, 1, &dynamicOffset);
 
             vkCmdDrawIndexed(cmd, gpuModel.indexCount, 1, 0, 0, 0);
         }
@@ -3655,12 +3589,75 @@ void CharacterRenderer::detachWeapon(uint32_t charInstanceId, uint32_t attachmen
 
     for (auto it = attachments.begin(); it != attachments.end(); ++it) {
         if (it->attachmentId == attachmentId) {
+            for (const auto& fx : it->effects) removeInstance(fx.effectInstanceId);
             removeInstance(it->weaponInstanceId);
             attachments.erase(it);
             core::Logger::getInstance().info("Detached weapon from instance ", charInstanceId,
                 " attachment ", attachmentId);
             return;
         }
+    }
+}
+
+bool CharacterRenderer::attachWeaponEffect(uint32_t charInstanceId, uint32_t attachmentId,
+                                           uint32_t visualSlot,
+                                           const pipeline::M2Model& effectModel,
+                                           uint32_t effectModelId) {
+    auto charIt = instances.find(charInstanceId);
+    if (charIt == instances.end()) return false;
+
+    auto& attachments = charIt->second.weaponAttachments;
+    auto waIt = std::find_if(attachments.begin(), attachments.end(),
+                             [attachmentId](const WeaponAttachment& wa) {
+                                 return wa.attachmentId == attachmentId;
+                             });
+    if (waIt == attachments.end()) return false;  // no weapon to hang the effect on
+
+    if (models.find(effectModelId) == models.end()) {
+        if (!loadModel(effectModel, effectModelId)) {
+            core::Logger::getInstance().warning("attachWeaponEffect: failed to load effect model ",
+                                                effectModelId);
+            return false;
+        }
+    }
+
+    // The ItemVisuals slot names the attachment point on the weapon model itself.
+    // Weapons carry few attachments, so fall back to the weapon's origin.
+    uint16_t boneIndex = 0;
+    glm::vec3 offset(0.0f);
+    if (!findAttachmentBone(waIt->weaponModelId, visualSlot, boneIndex, offset)) {
+        offset = glm::vec3(0.0f);
+    }
+
+    uint32_t effectInstanceId = createInstance(effectModelId, glm::vec3(0.0f));
+    if (effectInstanceId == 0) return false;
+
+    auto fxIt = instances.find(effectInstanceId);
+    if (fxIt == instances.end()) return false;
+    fxIt->second.hasOverrideModelMatrix = true;
+    fxIt->second.isEffectModel = true;
+    fxIt->second.animationLoop = true;
+
+    WeaponEffectAttachment fx;
+    fx.effectModelId = effectModelId;
+    fx.effectInstanceId = effectInstanceId;
+    fx.offset = offset;
+    waIt->effects.push_back(fx);
+
+    core::Logger::getInstance().debug("Attached enchant visual model ", effectModelId,
+        " to weapon at attachment ", attachmentId, " (visual slot ", visualSlot, ")");
+    return true;
+}
+
+void CharacterRenderer::detachWeaponEffects(uint32_t charInstanceId, uint32_t attachmentId) {
+    auto charIt = instances.find(charInstanceId);
+    if (charIt == instances.end()) return;
+
+    for (auto& wa : charIt->second.weaponAttachments) {
+        if (wa.attachmentId != attachmentId) continue;
+        for (const auto& fx : wa.effects) removeInstance(fx.effectInstanceId);
+        wa.effects.clear();
+        return;
     }
 }
 

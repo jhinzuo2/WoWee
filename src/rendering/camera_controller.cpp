@@ -1,6 +1,7 @@
 #include "rendering/camera_controller.hpp"
 #include <algorithm>
 #include <future>
+#include "core/thread_pool.hpp"
 #include <imgui.h>
 #include "rendering/terrain_manager.hpp"
 #include "rendering/wmo_renderer.hpp"
@@ -1029,7 +1030,7 @@ void CameraController::update(float deltaTime) {
                     float px = targetPos.x, py = targetPos.y;
                     if (wmoRenderer) {
                         wmoAsync = true;
-                        wmoFuture = std::async(std::launch::async,
+                        wmoFuture = core::ThreadPool::frameWorkers().submit(
                             [this, px, py, wmoProbeZ]() -> FloorResult {
                                 float nz = 1.0f;
                                 auto h = wmoRenderer->getFloorHeight(px, py, wmoProbeZ, &nz);
@@ -1038,7 +1039,7 @@ void CameraController::update(float deltaTime) {
                     }
                     if (m2Renderer && !externalFollow_) {
                         m2Async = true;
-                        m2Future = std::async(std::launch::async,
+                        m2Future = core::ThreadPool::frameWorkers().submit(
                             [this, px, py, wmoProbeZ]() -> FloorResult {
                                 float nz = 1.0f;
                                 auto h = m2Renderer->getFloorHeight(px, py, wmoProbeZ, &nz);

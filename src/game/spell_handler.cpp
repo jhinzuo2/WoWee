@@ -2096,6 +2096,14 @@ void SpellHandler::loadSpellNameCache() const {
         if (f != 0xFFFFFFFF && f < dbc->getFieldCount()) tooltipField = f;
     }
 
+    // Targets: SpellCastTargets mask the spell demands. Item-enhancement spells
+    // (sharpening stones, weightstones, weapon oils) set TARGET_FLAG_ITEM here.
+    uint32_t targetsField = 0xFFFFFFFF;
+    if (spellL) {
+        uint32_t f = spellL->field("Targets");
+        if (f != 0xFFFFFFFF && f < dbc->getFieldCount()) targetsField = f;
+    }
+
     // Cache field indices before the loop to avoid repeated layout lookups
     const uint32_t idField   = spellL ? (*spellL)["ID"]   : 0;
     const uint32_t nameField = spellL ? (*spellL)["Name"] : 136;
@@ -2136,6 +2144,9 @@ void SpellHandler::loadSpellNameCache() const {
             }
             if (hasAttrExField) {
                 entry.attrEx = dbc->getUInt32(i, attrExField);
+            }
+            if (targetsField != 0xFFFFFFFF) {
+                entry.targetFlags = dbc->getUInt32(i, targetsField);
             }
             // Load effect base points for $s1/$s2/$s3 tooltip substitution
             if (ebp0Field != 0xFFFFFFFF) entry.effectBasePoints[0] = static_cast<int32_t>(dbc->getUInt32(i, ebp0Field));
@@ -2312,9 +2323,12 @@ std::string SpellHandler::getEnchantName(uint32_t enchantId) const {
     if (!am || !am->isInitialized()) return {};
     auto dbc = am->loadDBC("SpellItemEnchantment.dbc");
     if (!dbc || !dbc->isLoaded()) return {};
+    const auto* sieL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("SpellItemEnchantment") : nullptr;
+    const uint32_t nameField = pipeline::detectEnchantmentNameField(dbc.get(), sieL);
     for (uint32_t i = 0; i < dbc->getRecordCount(); ++i) {
         if (dbc->getUInt32(i, 0) == enchantId) {
-            return dbc->getString(i, 14);
+            return dbc->getString(i, nameField);
         }
     }
     return {};
@@ -2339,6 +2353,13 @@ uint32_t SpellHandler::getSpellSchoolMask(uint32_t spellId) const {
     loadSpellNameCache();
     auto it = owner_.spellNameCacheRef().find(spellId);
     return (it != owner_.spellNameCacheRef().end()) ? it->second.schoolMask : 0;
+}
+
+uint32_t SpellHandler::getSpellTargetFlags(uint32_t spellId) const {
+    if (spellId == 0) return 0;
+    loadSpellNameCache();
+    auto it = owner_.spellNameCacheRef().find(spellId);
+    return (it != owner_.spellNameCacheRef().end()) ? it->second.targetFlags : 0;
 }
 
 const std::string& SpellHandler::getSkillLineName(uint32_t spellId) const {
@@ -3543,18 +3564,33 @@ void SpellHandler::handleClearExtraAuraInfo(network::Packet& packet) {
 }
 
 void SpellHandler::handleItemEnchantTimeUpdate(network::Packet& packet) {
-    // Format: uint64 itemGuid + uint32 slot + uint32 durationSec + uint64 playerGuid
-    // slot: 0=main-hand, 1=off-hand, 2=ranged
+    // Format: uint64 itemGuid + uint32 enchantmentSlot + uint32 durationSec + uint64 playerGuid
+    //
+    // The slot here is the item's *enchantment* slot (TEMP_ENCHANTMENT_SLOT = 1),
+    // not the equipment slot — reading it as one labels every temporary enchant
+    // "Off Hand", even on a two-hander. The item GUID is what says where it sits.
     if (!packet.hasRemaining(24)) {
         packet.skipAll(); return;
     }
-    /*uint64_t itemGuid =*/ packet.readUInt64();
-    uint32_t enchSlot    = packet.readUInt32();
+    uint64_t itemGuid    = packet.readUInt64();
+    /*uint32_t enchantmentSlot =*/ packet.readUInt32();
     uint32_t durationSec = packet.readUInt32();
     /*uint64_t playerGuid =*/ packet.readUInt64();
 
-    // Clamp to known slots (0-2)
-    if (enchSlot > 2) { return; }
+    if (itemGuid == 0) return;
+
+    // Map the enchanted item to the weapon slot it is equipped in.
+    static constexpr EquipSlot kWeaponSlots[] = {
+        EquipSlot::MAIN_HAND, EquipSlot::OFF_HAND, EquipSlot::RANGED
+    };
+    uint32_t enchSlot = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < 3; ++i) {
+        if (owner_.getEquipSlotGuid(static_cast<int>(kWeaponSlots[i])) == itemGuid) {
+            enchSlot = i;
+            break;
+        }
+    }
+    if (enchSlot > 2) return;  // enchanted item is not an equipped weapon
 
     uint64_t nowMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(

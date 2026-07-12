@@ -4,6 +4,7 @@
 #include "auth/crypto.hpp"
 #include "core/application.hpp"
 #include "core/logger.hpp"
+#include "core/version.hpp"
 #include "rendering/renderer.hpp"
 #include "rendering/vk_context.hpp"
 #include "pipeline/asset_manager.hpp"
@@ -199,6 +200,17 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
             bg->AddImage(reinterpret_cast<ImTextureID>(bgDescriptorSet),
                          ImVec2(0, 0), ImVec2(screenW, screenH), uv0, uv1);
         }
+    }
+
+    // Build version, bottom-left over the login art (as the retail client does).
+    {
+        ImVec2 screen = ImGui::GetIO().DisplaySize;
+        const char* version = core::kVersionString;
+        ImVec2 textSize = ImGui::CalcTextSize(version);
+        ImVec2 pos(12.0f, screen.y - textSize.y - 10.0f);
+        ImDrawList* fg = ImGui::GetForegroundDrawList();
+        fg->AddText(ImVec2(pos.x + 1.0f, pos.y + 1.0f), IM_COL32(0, 0, 0, 160), version);
+        fg->AddText(pos, IM_COL32(200, 200, 200, 180), version);
     }
 
     auto& app = core::Application::getInstance();

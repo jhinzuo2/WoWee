@@ -542,31 +542,27 @@ void GameHandler::updateAutoAttack(float deltaTime) {
 void GameHandler::updateEntityInterpolation(float deltaTime) {
 // Update entity movement interpolation (keeps targeting in sync with visuals)
 // Only update entities within reasonable distance for performance
-const float updateRadiusSq = game::ENTITY_UPDATE_RADIUS * game::ENTITY_UPDATE_RADIUS;  // 150 unit radius
 auto playerEntity = entityController_->getEntityManager().getEntity(playerGuid);
 glm::vec3 playerPos = playerEntity ? glm::vec3(playerEntity->getX(), playerEntity->getY(), playerEntity->getZ()) : glm::vec3(0.0f);
+const uint64_t attackTargetGuid = combatHandler_ ? combatHandler_->getAutoAttackTargetGuid() : 0;
+if (playerEntity) playerEntity->updateMovement(deltaTime);
+if (targetGuid != 0 && targetGuid != playerGuid) {
+    if (auto selected = entityController_->getEntityManager().getEntity(targetGuid))
+        selected->updateMovement(deltaTime);
+}
+if (attackTargetGuid != 0 && attackTargetGuid != playerGuid && attackTargetGuid != targetGuid) {
+    if (auto engaged = entityController_->getEntityManager().getEntity(attackTargetGuid))
+        engaged->updateMovement(deltaTime);
+}
 
-for (auto& [guid, entity] : entityController_->getEntityManager().getEntities()) {
-    // Always update player
-    if (guid == playerGuid) {
-        entity->updateMovement(deltaTime);
-        continue;
-    }
-    // Keep selected/engaged target interpolation exact for UI targeting circle.
-    if (guid == targetGuid || (combatHandler_ && guid == combatHandler_->getAutoAttackTargetGuid())) {
-        entity->updateMovement(deltaTime);
-        continue;
-    }
-
-    // Distance cull other entities (use latest position to avoid culling by stale origin).
-    // glm::dot takes its args by value, so passing (entityPos - playerPos) twice
-    // would build the diff vector twice — compute it once.
-    glm::vec3 entityPos(entity->getLatestX(), entity->getLatestY(), entity->getLatestZ());
-    glm::vec3 diff = entityPos - playerPos;
-    float distSq = glm::dot(diff, diff);
-    if (distSq < updateRadiusSq) {
-        entity->updateMovement(deltaTime);
-    }
+static thread_local std::vector<std::shared_ptr<Entity>> nearbyEntities;
+entityController_->getEntityManager().getEntitiesNear(
+    playerPos.x, playerPos.y, game::ENTITY_UPDATE_RADIUS, nearbyEntities);
+for (const auto& entity : nearbyEntities) {
+    if (!entity) continue;
+    const uint64_t guid = entity->getGuid();
+    if (guid == playerGuid || guid == targetGuid || guid == attackTargetGuid) continue;
+    entity->updateMovement(deltaTime);
 }
 }
 

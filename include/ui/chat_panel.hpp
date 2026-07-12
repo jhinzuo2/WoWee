@@ -14,6 +14,7 @@
 #include <vulkan/vulkan.h>
 #include <imgui.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <functional>
 
@@ -176,6 +177,20 @@ private:
     // Markup parser + renderer (Phase 2)
     ChatMarkupParser markupParser_;
     ChatMarkupRenderer markupRenderer_;
+
+    // Per-message render cache. A chat line's formatted text and parsed
+    // segments are immutable once built (modulo sender-name resolution and
+    // the timestamp toggle), so formatting + markup parsing runs once per
+    // message instead of once per message per frame.
+    struct CachedChatLine {
+        std::string senderNameUsed;  // rebuild when a name query resolves
+        bool tsEnabled = false;      // rebuild when timestamp toggle flips
+        bool isMention = false;
+        std::string fullMsg;         // plain text (for Copy Message)
+        std::vector<ChatSegment> segments;
+    };
+    std::unordered_map<uint64_t, CachedChatLine> chatLineCache_;
+    std::string chatCacheSelfName_;  // cache cleared when this changes
 
     // Tab-completion (Phase 5 — delegated to ChatTabCompleter)
     ChatTabCompleter tabCompleter_;

@@ -19,15 +19,15 @@ Protocol Compatible with **Vanilla (Classic) 1.12 + TBC 2.4.3 + WotLK 3.3.5a**.
 
 > **Legal Disclaimer**: This is an educational/research project. It does not include any Blizzard Entertainment assets, data files, or proprietary code. World of Warcraft and all related assets are the property of Blizzard Entertainment, Inc. This project is not affiliated with or endorsed by Blizzard Entertainment. Users are responsible for supplying their own legally obtained game data files and for ensuring compliance with all applicable laws in their jurisdiction.
 
-## Status & Direction (2026-07-09)
+## Status & Direction (2026-07-12)
 
 - **Compatibility**: **Vanilla (Classic) 1.12 + TBC 2.4.3 + WotLK 3.3.5a** are all supported via expansion profiles and per-expansion packet parsers. All three expansions are roughly on par.
 - **Tested against**: AzerothCore/ChromieCraft, TrinityCore, Mangos, and Turtle WoW (1.18).
 - **Current focus**: stability hardening after a large god-object decomposition pass — chasing down behavioral regressions that crept in during the refactor (NPC/UI hitboxes, packet handlers, periodic-spam guards, optimistic-state syncs).
 - **Warden**: Full module execution via Unicorn Engine CPU emulation. Decrypts (RC4→RSA→zlib), parses and relocates the PE module, executes via x86 emulation with Windows API interception. Module cache at `~/.local/share/wowee/warden_cache/`.
-- **CI**: GitHub Actions builds for Linux (x86-64, ARM64), Windows (MSYS2 x86-64 + ARM64), and macOS (ARM64). Security scans via CodeQL, Semgrep, and sanitizers. 31 unit-test suites covering protocol parsers, animation FSMs, world-map state, chat markup, macro evaluator, and editor units.
+- **CI**: GitHub Actions builds for Linux (x86-64, ARM64), Windows (MSYS2 x86-64 + ARM64), and macOS (ARM64). Security scans via CodeQL, Semgrep, and sanitizers. 32 unit-test suites covering protocol parsers, packet builders, DBC layouts, animation FSMs, world-map state, chat markup, macro evaluator, and editor units.
 - **Container builds**: Multi-platform Docker build system for Linux, macOS (arm64/x86_64 via osxcross), and Windows (LLVM-MinGW) cross-compilation.
-- **Release**: v1.9.7-preview — 530+ WoW API functions, 140+ events, broad opcode coverage across Classic / TBC / WotLK / Turtle.
+- **Release**: v2.0.4-preview — 530+ WoW API functions, 140+ events, broad opcode coverage across Classic / TBC / WotLK / Turtle. The running client reports its version (last tag + build date) on the login screen and in the settings window.
 
 ## World Editor
 
@@ -79,6 +79,7 @@ Exported zones auto-load in the wowee client from `custom_zones/` or `output/` d
 - **Combat** -- Auto-attack, spell casting with cooldowns, damage calculation, death handling, spirit healer resurrection
 - **Targeting** -- Tab-cycling with hostility filtering, click-to-target, faction-based hostility (using Faction.dbc)
 - **Inventory** -- 23 equipment slots, 16 backpack slots, drag-drop, auto-equip, item tooltips with weapon damage/speed, server-synced bag sort (quality/type/stack), independent bag windows
+- **Item Enhancements** -- Sharpening stones, weightstones and weapon oils apply to another item: using one arms a targeting cursor, and the resulting enchant shows its name in the tooltip and its visual effect (the glint) on the weapon model
 - **Bank** -- Full bank support for all expansions, bag slots, drag-drop, right-click deposit (non-equippable items)
 - **Spells** -- Spellbook with specialty, general, profession, mount, and companion tabs; drag-drop to action bar; item use support
 - **Talents** -- Talent tree UI with proper visuals and functionality
@@ -96,7 +97,7 @@ Exported zones auto-load in the wowee client from `custom_zones/` or `output/` d
 - **Map Exploration** -- Subzone-level fog-of-war reveal, world map with continent/zone views, quest POI markers, taxi node markers, party member dots
 - **NPC Voices** -- Race/gender-specific NPC greeting, farewell, vendor, pissed, aggro, and flee sounds for all playable races including Blood Elf and Draenei
 - **Warden** -- Warden anti-cheat module execution via Unicorn Engine x86 emulation (cross-platform, no Wine)
-- **UI** -- Loading screens with progress bar, settings window with graphics quality presets (LOW/MEDIUM/HIGH/ULTRA), shadow distance slider, minimap with zoom/rotation/square mode, top-right minimap mute speaker, separate bag windows with compact-empty mode (aggregate view)
+- **UI** -- Loading screens with progress bar, settings window with graphics quality presets (LOW/MEDIUM/HIGH/ULTRA), shadow distance slider, minimap with zoom/rotation/square mode, top-right minimap mute speaker, separate bag windows with compact-empty mode (aggregate view), build version and date on the login screen and in settings
 
 ## Graphics & Performance
 
