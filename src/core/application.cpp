@@ -97,6 +97,37 @@ bool envFlagEnabled(const char* key, bool defaultValue = false) {
              raw[0] == 'n' || raw[0] == 'N');
 }
 
+std::optional<float> movingEntityFloor(rendering::Renderer* renderer,
+                                        const glm::vec3& renderPos) {
+    if (!renderer) return std::nullopt;
+
+    // Server movement Z is the reference surface.  In WMO overlap regions the
+    // outdoor heightfield may be a roof many units above a tunnel/interior, so
+    // choose the closest reachable floor instead of blindly preferring terrain.
+    constexpr float kMaxStepUp = 1.5f;
+    constexpr float kMaxGroundDrop = 3.0f;
+    const float probeZ = renderPos.z + kMaxStepUp;
+    std::optional<float> best;
+
+    auto consider = [&](const std::optional<float>& floor) {
+        if (!floor || *floor > probeZ || *floor < renderPos.z - kMaxGroundDrop) return;
+        if (!best || std::abs(*floor - renderPos.z) < std::abs(*best - renderPos.z)) {
+            best = floor;
+        }
+    };
+
+    if (auto* terrain = renderer->getTerrainManager()) {
+        consider(terrain->getHeightAt(renderPos.x, renderPos.y));
+    }
+    if (auto* wmo = renderer->getWMORenderer()) {
+        consider(wmo->getFloorHeight(renderPos.x, renderPos.y, probeZ));
+    }
+    if (auto* m2 = renderer->getM2Renderer()) {
+        consider(m2->getFloorHeight(renderPos.x, renderPos.y, probeZ));
+    }
+    return best;
+}
+
 } // namespace
 
 Application* Application::instance = nullptr;
@@ -1845,14 +1876,14 @@ void Application::update(float deltaTime) {
                         inOverrun ? entity->getLatestZ() : entity->getZ());
                     glm::vec3 renderPos = core::coords::canonicalToRender(canonical);
 
-                    // Clamp creature Z to terrain surface during movement interpolation.
-                    // The server sends single-segment moves and expects the client to place
-                    // creatures on the ground.  Only clamp while actively moving — idle
-                    // creatures keep their server-authoritative Z (flight masters, etc.).
-                    if (entity->isActivelyMoving() && renderer->getTerrainManager()) {
-                        auto terrainZ = renderer->getTerrainManager()->getHeightAt(renderPos.x, renderPos.y);
-                        if (terrainZ.has_value()) {
-                            renderPos.z = terrainZ.value();
+                    // Ground-moving entities need client floor projection between server
+                    // spline points. Use the floor nearest server Z so outdoor terrain
+                    // above a tunnel cannot move the model into/onto the WMO shell.
+                    const bool groundCreature = !_creatureFlyingState.count(guid) &&
+                                                !_creatureSwimmingState.count(guid);
+                    if (entity->isActivelyMoving() && groundCreature) {
+                        if (auto floorZ = movingEntityFloor(renderer.get(), renderPos)) {
+                            renderPos.z = *floorZ;
                         }
                     }
 
@@ -2061,11 +2092,13 @@ void Application::update(float deltaTime) {
                         inOverrun ? entity->getLatestZ() : entity->getZ());
                     glm::vec3 renderPos = core::coords::canonicalToRender(canonical);
 
-                    // Clamp other players' Z to terrain surface during movement
-                    if (entity->isActivelyMoving() && renderer->getTerrainManager()) {
-                        auto terrainZ = renderer->getTerrainManager()->getHeightAt(renderPos.x, renderPos.y);
-                        if (terrainZ.has_value()) {
-                            renderPos.z = terrainZ.value();
+                    // Match creature projection: terrain alone is not a valid floor in
+                    // WMO overlap regions (tunnels, buildings, bridges).
+                    const bool groundPlayer = !_pCreatureFlyingState.count(guid) &&
+                                              !_pCreatureSwimmingState.count(guid);
+                    if (entity->isActivelyMoving() && groundPlayer) {
+                        if (auto floorZ = movingEntityFloor(renderer.get(), renderPos)) {
+                            renderPos.z = *floorZ;
                         }
                     }
 

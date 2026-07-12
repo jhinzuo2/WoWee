@@ -1110,8 +1110,24 @@ void CameraController::update(float deltaTime) {
                         } catch (const std::exception& e) { LOG_ERROR("M2 floor query: ", e.what()); }
                     }
 
-                    // Reject steep WMO slopes
-                    float minWalkableWmo = cachedInsideWMO ? MIN_WALKABLE_NORMAL_WMO : MIN_WALKABLE_NORMAL_TERRAIN;
+                    // A tunnel mouth can overlap the outdoor heightfield before the
+                    // player's eye point is inside the WMO bounds.  Treat a nearby WMO
+                    // floor below that terrain as transition space immediately; waiting
+                    // for cachedInsideWMO makes the outdoor terrain win one frame at a
+                    // time (climbing through the roof), while rejecting a steep entrance
+                    // ramp here makes the player fall through it.
+                    bool atTunnelSeam = false;
+                    if (terrainH && wmoH) {
+                        const float terrainAboveWmo = *terrainH - *wmoH;
+                        const float wmoDropFromPlayer = targetPos.z - *wmoH;
+                        atTunnelSeam = terrainAboveWmo > 1.2f && terrainAboveWmo < 12.0f &&
+                                       wmoDropFromPlayer >= -0.4f && wmoDropFromPlayer < 1.8f;
+                    }
+
+                    // Reject steep WMO slopes. Tunnel ramps use the more permissive WMO
+                    // limit even at the boundary, where isInsideWMO is not reliable yet.
+                    float minWalkableWmo = (cachedInsideWMO || atTunnelSeam)
+                        ? MIN_WALKABLE_NORMAL_WMO : MIN_WALKABLE_NORMAL_TERRAIN;
                     if (wmoH && wmoNormalZ < minWalkableWmo) {
                         wmoH = std::nullopt;  // Treat as unwalkable
                     }
@@ -1137,22 +1153,13 @@ void CameraController::update(float deltaTime) {
                         }
                     }
 
-                    if (cachedInsideWMO && wmoH) {
+                    if ((cachedInsideWMO || atTunnelSeam) && wmoH) {
                         // Transition seam (e.g. tunnel mouths): if terrain is much higher than
                         // nearby WMO walkable floor, prefer the WMO floor so we can enter.
-                        bool preferWmoAtSeam = false;
-                        if (terrainH) {
-                            float terrainAboveWmo = *terrainH - *wmoH;
-                            float wmoDropFromPlayer = targetPos.z - *wmoH;
-                            float playerVsTerrain = targetPos.z - *terrainH;
-                            bool descendingIntoTunnel = (verticalVelocity < -1.0f) || (playerVsTerrain < -0.35f);
-                            if (terrainAboveWmo > 1.2f && terrainAboveWmo < 8.0f &&
-                                wmoDropFromPlayer >= -0.4f && wmoDropFromPlayer < 1.8f &&
-                                *wmoH <= targetPos.z + stepUpBudget &&
-                                descendingIntoTunnel) {
-                                preferWmoAtSeam = true;
-                            }
-                        }
+                        // Do not require downward velocity or an already-inside state:
+                        // both arrive after a level tunnel entrance has begun choosing
+                        // between the two surfaces.
+                        bool preferWmoAtSeam = atTunnelSeam;
                         if (preferWmoAtSeam) {
                             groundH = wmoH;
                         } else if (terrainH) {
