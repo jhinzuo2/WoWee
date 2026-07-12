@@ -920,6 +920,7 @@ void GameHandler::update(float deltaTime) {
         // Update combat text (Phase 2)
         updateCombatText(deltaTime);
         tickMinimapPings(deltaTime);
+        tickMirrorTimers(deltaTime);
 
         // Tick logout countdown
         if (socialHandler_) socialHandler_->updateLogoutCountdown(deltaTime);

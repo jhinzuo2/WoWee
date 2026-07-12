@@ -1564,10 +1564,34 @@ public:
         int32_t scale    = 0;     // +1 = counting up, -1 = counting down
         bool    paused   = false;
         bool    active   = false;
+        float   pendingMs = 0.0f; // sub-millisecond carry for the local countdown
     };
     const MirrorTimer& getMirrorTimer(int type) const {
         static MirrorTimer empty;
         return (type >= 0 && type < 3) ? mirrorTimers_[type] : empty;
+    }
+    /**
+     * Count the mirror timers (breath, fatigue, feign death) down locally.
+     *
+     * The server sends SMSG_START_MIRROR_TIMER once with the remaining time and a
+     * scale, then only speaks again when something changes — so without this the
+     * breath bar just sits at whatever value it was handed and never moves.
+     * scale is ms of timer per ms of real time: -1 while drowning, +1 while the
+     * bar refills at the surface.
+     */
+    void tickMirrorTimers(float dt) {
+        if (dt <= 0.0f) return;
+        const float elapsedMs = dt * 1000.0f;
+        for (auto& t : mirrorTimers_) {
+            if (!t.active || t.paused || t.scale == 0 || t.maxValue <= 0) continue;
+            // Carry the sub-millisecond remainder: truncating each frame would lose
+            // most of a 144fps frame's 6.94ms and run the timer visibly slow.
+            t.pendingMs += elapsedMs;
+            const int32_t wholeMs = static_cast<int32_t>(t.pendingMs);
+            if (wholeMs == 0) continue;
+            t.pendingMs -= static_cast<float>(wholeMs);
+            t.value = std::clamp(t.value + t.scale * wholeMs, 0, t.maxValue);
+        }
     }
 
     // Combo points

@@ -249,19 +249,24 @@ void GameHandler::registerOpcodeHandlers() {
         }
     };
     dispatchTable_[Opcode::SMSG_START_MIRROR_TIMER] = [this](network::Packet& packet) {
+        // type(4) + value(4) + maxValue(4) + scale(4) + paused(1) + spellId(4).
+        // The last two were being read the other way round: harmless while the
+        // spell id is 0, but a non-zero one would land its high byte in paused and
+        // freeze the bar.
         if (!packet.hasRemaining(21)) return;
         uint32_t type  = packet.readUInt32();
         int32_t  value = static_cast<int32_t>(packet.readUInt32());
         int32_t  maxV  = static_cast<int32_t>(packet.readUInt32());
         int32_t  scale = static_cast<int32_t>(packet.readUInt32());
-        /*uint32_t tracker =*/ packet.readUInt32();
         uint8_t  paused = packet.readUInt8();
+        /*uint32_t spellId =*/ packet.readUInt32();
         if (type < 3) {
-            mirrorTimers_[type].value    = value;
-            mirrorTimers_[type].maxValue = maxV;
-            mirrorTimers_[type].scale    = scale;
-            mirrorTimers_[type].paused   = (paused != 0);
-            mirrorTimers_[type].active   = true;
+            mirrorTimers_[type].value     = value;
+            mirrorTimers_[type].maxValue  = maxV;
+            mirrorTimers_[type].scale     = scale;
+            mirrorTimers_[type].paused    = (paused != 0);
+            mirrorTimers_[type].active    = true;
+            mirrorTimers_[type].pendingMs = 0.0f;  // server re-sync; drop the local carry
                             fireAddonEvent("MIRROR_TIMER_START", {
                     std::to_string(type), std::to_string(value),
                     std::to_string(maxV), std::to_string(scale),
