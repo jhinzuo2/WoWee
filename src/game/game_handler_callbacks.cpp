@@ -792,6 +792,10 @@ void GameHandler::handleLoginVerifyWorld(network::Packet& packet) {
         // Clear inspect caches on world entry to avoid showing stale data.
         inspectedPlayerAchievements_.clear();
 
+        // Buyback mirror persists across vendor windows within a session but
+        // must not leak into another character's session.
+        if (inventoryHandler_) inventoryHandler_->clearBuybackState();
+
         // Reset talent initialization so the first SMSG_TALENTS_INFO after login
         // correctly sets the active spec (static locals don't reset across logins).
         if (spellHandler_) spellHandler_->resetTalentState();

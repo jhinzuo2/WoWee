@@ -106,6 +106,8 @@ public:
     };
     void openVendor(uint64_t npcGuid);
     void closeVendor();
+    // Drop the session-persistent buyback mirror (fresh character world entry).
+    void clearBuybackState();
     void buyItem(uint64_t vendorGuid, uint32_t itemId, uint32_t slot, uint32_t count);
     void sellItem(uint64_t vendorGuid, uint64_t itemGuid, uint32_t count);
     void sellItemBySlot(int backpackIndex);

@@ -566,6 +566,31 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
             /*uint32_t vendorSlot =*/ packet.readUInt32();
             /*int32_t  newCount   =*/ static_cast<int32_t>(packet.readUInt32());
             uint32_t itemCount  = packet.readUInt32();
+            // Successful buyback: remove the entry from the local buyback list.
+            // Without this the pending slot lingered and a later unrelated
+            // SMSG_BUY_FAILED could misread it as a buyback retry.
+            if (pendingBuybackSlot_ >= 0) {
+                if (pendingBuybackSlot_ < static_cast<int>(buybackItems_.size())) {
+                    const auto& entry = buybackItems_[pendingBuybackSlot_];
+                    std::string label = entry.item.name.empty()
+                        ? "item #" + std::to_string(entry.item.itemId) : entry.item.name;
+                    owner_.addSystemChatMessage("Bought back: " +
+                        buildItemLink(entry.item.itemId,
+                                      static_cast<uint32_t>(entry.item.quality), label));
+                    buybackItems_.erase(buybackItems_.begin() + pendingBuybackSlot_);
+                }
+                pendingBuybackSlot_ = -1;
+                pendingBuybackWireSlot_ = 0;
+                if (auto* ac = owner_.services().audioCoordinator) {
+                    if (auto* sfx = ac->getUiSoundManager())
+                        sfx->playPickupBag();
+                }
+                if (owner_.addonEventCallbackRef()) {
+                    owner_.addonEventCallbackRef()("MERCHANT_UPDATE", {});
+                    owner_.addonEventCallbackRef()("BAG_UPDATE", {});
+                }
+                return;
+            }
             if (pendingBuyItemId_ != 0) {
                 std::string itemLabel;
                 uint32_t buyQuality = 1;
@@ -1002,7 +1027,6 @@ void InventoryHandler::handleLootRollWon(network::Packet& packet) {
 
 void InventoryHandler::openVendor(uint64_t npcGuid) {
     if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
-    buybackItems_.clear();
     auto packet = ListInventoryPacket::build(npcGuid);
     owner_.getSocket()->send(packet);
 }
@@ -1011,13 +1035,22 @@ void InventoryHandler::closeVendor() {
     bool wasOpen = vendorWindowOpen_;
     vendorWindowOpen_ = false;
     currentVendorItems_ = ListInventoryData{};
-    buybackItems_.clear();
-    pendingSellToBuyback_.clear();
+    // Keep buybackItems_ and pendingSellToBuyback_: buyback slots live on the
+    // player server-side (wire slots 74-85) and persist across vendor windows,
+    // so the local mirror must too — clearing here made the buyback list
+    // vanish when the vendor was reopened. The mirror resets on world entry.
     pendingBuybackSlot_ = -1;
     pendingBuybackWireSlot_ = 0;
     pendingBuyItemId_ = 0;
     pendingBuyItemSlot_ = 0;
     if (wasOpen && owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("MERCHANT_CLOSED", {});
+}
+
+void InventoryHandler::clearBuybackState() {
+    buybackItems_.clear();
+    pendingSellToBuyback_.clear();
+    pendingBuybackSlot_ = -1;
+    pendingBuybackWireSlot_ = 0;
 }
 
 void InventoryHandler::buyItem(uint64_t vendorGuid, uint32_t itemId, uint32_t slot, uint32_t count) {
