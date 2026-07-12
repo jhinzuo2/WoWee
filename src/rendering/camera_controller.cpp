@@ -446,7 +446,8 @@ void CameraController::update(float deltaTime) {
     // Blocked while mounted
     bool prevSitting = sitting;
     bool xDown = !uiWantsKeyboard && input.isKeyPressed(SDL_SCANCODE_X);
-    if (xDown && !xKeyWasDown && !mounted_) {
+    // While swimming, X dives down instead of toggling sit
+    if (xDown && !xKeyWasDown && !mounted_ && !swimming) {
         sitting = !sitting;
     }
     if (mounted_) sitting = false;
@@ -539,7 +540,12 @@ void CameraController::update(float deltaTime) {
                 if (waterType && *waterType != 0) {
                     isOcean = (((*waterType - 1) % 4) == 1);
                 }
-                bool depthAllowed = isOcean || ((*waterH - targetPos.z) <= MAX_SWIM_DEPTH_FROM_SURFACE);
+                // Depth gate only applies when ENTERING swim (e.g. don't start
+                // swimming in a dry cave beneath a lake's water plane). Once
+                // swimming, any depth is fine — you can only get deep by
+                // deliberately diving through the water column.
+                bool depthAllowed = swimming || isOcean ||
+                                    ((*waterH - targetPos.z) <= MAX_SWIM_DEPTH_FROM_SURFACE);
                 if (depthAllowed) {
                     std::optional<float> terrainH;
                     std::optional<float> wmoH;
@@ -563,7 +569,7 @@ void CameraController::update(float deltaTime) {
                         bool nearSurface = depthFromFeet <= 1.45f;
                         bool reachableRamp = (floorDelta >= -0.30f && floorDelta <= 1.10f);
                         bool shallowRampWater = waterOverFloor <= 1.55f;
-                        bool notDiving = forward3D.z > -0.20f;
+                        bool notDiving = forward3D.z > -0.20f && !xDown;
                         if (nearSurface && reachableRamp && shallowRampWater && notDiving) {
                             inWater = false;
                         }
@@ -571,7 +577,7 @@ void CameraController::update(float deltaTime) {
 
                     // Forward plank/ramp assist: sample structure floors ahead so water exit
                     // can happen when the ramp is in front of us (not only under our feet).
-                    if (swimming && inWater && nowForward && forward3D.z > -0.20f) {
+                    if (swimming && inWater && nowForward && forward3D.z > -0.20f && !xDown) {
                         auto queryFloorAt = [&](float x, float y, float probeZ) -> std::optional<float> {
                             std::optional<float> best;
                             if (terrainManager) {
@@ -666,10 +672,13 @@ void CameraController::update(float deltaTime) {
                 targetPos += swimMove * applySpeed * physicsDeltaTime;
             }
 
-            // Spacebar = swim up (continuous, not a jump)
-            bool diveIntent = nowForward && (forward3D.z < -0.28f);
+            // Spacebar = swim up, X = swim down (both continuous, not a jump)
+            bool diveKey = xDown;
+            bool diveIntent = diveKey || (nowForward && (forward3D.z < -0.28f));
             if (nowJump) {
                 verticalVelocity = SWIM_BUOYANCY;
+            } else if (diveKey) {
+                verticalVelocity = -SWIM_BUOYANCY;
             } else {
                 // Gentle sink when not pressing space
                 verticalVelocity += SWIM_GRAVITY * physicsDeltaTime;
