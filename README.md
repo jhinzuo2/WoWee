@@ -27,7 +27,7 @@ Protocol Compatible with **Vanilla (Classic) 1.12 + TBC 2.4.3 + WotLK 3.3.5a**.
 - **Warden**: Full module execution via Unicorn Engine CPU emulation. Decrypts (RC4→RSA→zlib), parses and relocates the PE module, executes via x86 emulation with Windows API interception. Module cache at `~/.local/share/wowee/warden_cache/`.
 - **CI**: GitHub Actions builds for Linux (x86-64, ARM64), Windows (MSYS2 x86-64 + ARM64), and macOS (ARM64). Security scans via CodeQL, Semgrep, and sanitizers. 32 unit-test suites covering protocol parsers, packet builders, DBC layouts, animation FSMs, world-map state, chat markup, macro evaluator, and editor units.
 - **Container builds**: Multi-platform Docker build system for Linux, macOS (arm64/x86_64 via osxcross), and Windows (LLVM-MinGW) cross-compilation.
-- **Release**: v2.0.3-preview — 530+ WoW API functions, 140+ events, broad opcode coverage across Classic / TBC / WotLK / Turtle.
+- **Release**: v2.0.4-preview — 530+ WoW API functions, 140+ events, broad opcode coverage across Classic / TBC / WotLK / Turtle. The running client reports its version (last tag + build date) on the login screen and in the settings window.
 
 ## World Editor
 
@@ -97,7 +97,7 @@ Exported zones auto-load in the wowee client from `custom_zones/` or `output/` d
 - **Map Exploration** -- Subzone-level fog-of-war reveal, world map with continent/zone views, quest POI markers, taxi node markers, party member dots
 - **NPC Voices** -- Race/gender-specific NPC greeting, farewell, vendor, pissed, aggro, and flee sounds for all playable races including Blood Elf and Draenei
 - **Warden** -- Warden anti-cheat module execution via Unicorn Engine x86 emulation (cross-platform, no Wine)
-- **UI** -- Loading screens with progress bar, settings window with graphics quality presets (LOW/MEDIUM/HIGH/ULTRA), shadow distance slider, minimap with zoom/rotation/square mode, top-right minimap mute speaker, separate bag windows with compact-empty mode (aggregate view)
+- **UI** -- Loading screens with progress bar, settings window with graphics quality presets (LOW/MEDIUM/HIGH/ULTRA), shadow distance slider, minimap with zoom/rotation/square mode, top-right minimap mute speaker, separate bag windows with compact-empty mode (aggregate view), build version and date on the login screen and in settings
 
 ## Graphics & Performance
 

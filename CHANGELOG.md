@@ -1,5 +1,17 @@
 # Changelog
 
+## [v2.0.4-preview] — 2026-07-12
+
+### UI
+- Show the build version and date bottom-left on the login screen and right-aligned in the settings window
+- `core/version.hpp` is generated from `git describe --tags --abbrev=0` by `cmake/GitVersion.cmake`, so the client always reports the last tagged release. It regenerates on every build rather than only when cmake reconfigures, and rewrites the header only when the version actually changed
+- The build stamp is a date, not a timestamp: a clock time would change the header every build and force a full recompile of everything including it
+
+### Build
+- Un-ignore `cmake/*.cmake`. The repo's blanket `*.cmake` rule targets CMake build output and would have silently excluded the new hand-written module from the tree, breaking a fresh clone
+
+---
+
 ## [v2.0.3-preview] — 2026-07-12
 
 ### Item Enhancements (sharpening stones, weightstones, weapon oils)
