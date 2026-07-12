@@ -200,22 +200,13 @@ uint32_t detectEnchantmentItemVisualField(const DBCFile* dbc, const DBCFieldMap*
     return visualField;
 }
 
-std::array<std::string, 5> resolveEnchantItemVisuals(uint32_t enchantId,
-                                                     const DBCFile* spellItemEnchantment,
-                                                     const DBCFile* itemVisuals,
-                                                     const DBCFile* itemVisualEffects,
-                                                     const DBCFieldMap* sieL) {
+std::array<std::string, 5> resolveItemVisualModels(uint32_t itemVisualId,
+                                                   const DBCFile* itemVisuals,
+                                                   const DBCFile* itemVisualEffects) {
     std::array<std::string, 5> models;
-    if (enchantId == 0 || !spellItemEnchantment || !itemVisuals || !itemVisualEffects) return models;
+    if (itemVisualId == 0 || !itemVisuals || !itemVisualEffects) return models;
 
-    int32_t enchantRow = spellItemEnchantment->findRecordById(enchantId);
-    if (enchantRow < 0) return models;
-
-    const uint32_t visualField = detectEnchantmentItemVisualField(spellItemEnchantment, sieL);
-    const uint32_t visualId = spellItemEnchantment->getUInt32(static_cast<uint32_t>(enchantRow), visualField);
-    if (visualId == 0) return models;  // most enchants have no visual
-
-    int32_t visualRow = itemVisuals->findRecordById(visualId);
+    int32_t visualRow = itemVisuals->findRecordById(itemVisualId);
     if (visualRow < 0) return models;
 
     // ItemVisuals.dbc: ID + 5 effect slots. Slot i attaches at the item's
@@ -231,6 +222,24 @@ std::array<std::string, 5> resolveEnchantItemVisuals(uint32_t enchantId,
         models[slot] = itemVisualEffects->getString(static_cast<uint32_t>(effectRow), 1);
     }
     return models;
+}
+
+std::array<std::string, 5> resolveEnchantItemVisuals(uint32_t enchantId,
+                                                     const DBCFile* spellItemEnchantment,
+                                                     const DBCFile* itemVisuals,
+                                                     const DBCFile* itemVisualEffects,
+                                                     const DBCFieldMap* sieL) {
+    std::array<std::string, 5> models;
+    if (enchantId == 0 || !spellItemEnchantment) return models;
+
+    int32_t enchantRow = spellItemEnchantment->findRecordById(enchantId);
+    if (enchantRow < 0) return models;
+
+    const uint32_t visualField = detectEnchantmentItemVisualField(spellItemEnchantment, sieL);
+    const uint32_t visualId = spellItemEnchantment->getUInt32(static_cast<uint32_t>(enchantRow), visualField);
+    if (visualId == 0) return models;  // most enchants have no visual
+
+    return resolveItemVisualModels(visualId, itemVisuals, itemVisualEffects);
 }
 
 } // namespace pipeline

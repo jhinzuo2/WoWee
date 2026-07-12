@@ -129,5 +129,15 @@ std::array<std::string, 5> resolveEnchantItemVisuals(uint32_t enchantId,
                                                      const DBCFile* itemVisualEffects,
                                                      const DBCFieldMap* sieL);
 
+/**
+ * The tail of that chain, entered directly with an ItemVisuals.dbc id.
+ *
+ * SMSG_CHAR_ENUM reports an equipped item's enchant as its ItemVisual id already,
+ * so the character-select preview has no SpellItemEnchantment lookup to do.
+ */
+std::array<std::string, 5> resolveItemVisualModels(uint32_t itemVisualId,
+                                                   const DBCFile* itemVisuals,
+                                                   const DBCFile* itemVisualEffects);
+
 } // namespace pipeline
 } // namespace wowee

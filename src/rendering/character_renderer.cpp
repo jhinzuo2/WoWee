@@ -1876,7 +1876,7 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
         if (inst.hasOverrideModelMatrix && !inst.isEffectModel) continue;
 
         float distSq = glm::distance2(inst.position, cameraPos);
-        if (distSq >= animUpdateRadiusSq) continue;
+        if (distSq >= animUpdateRadiusSq && !inst.ignoreCulling) continue;
 
         // Advance global sequence timer (accumulates independently of animation wrapping)
         inst.globalSequenceTime += deltaTime * 1000.0f;
@@ -2416,7 +2416,7 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
         if (!instance.visible) continue;
 
         // Character instance culling: test both distance and frustum visibility
-        if (!instance.hasOverrideModelMatrix) {
+        if (!instance.hasOverrideModelMatrix && !instance.ignoreCulling) {
             glm::vec3 toInst = instance.position - camPos;
             float distSq = glm::dot(toInst, toInst);
 
@@ -3647,6 +3647,11 @@ bool CharacterRenderer::attachWeaponEffect(uint32_t charInstanceId, uint32_t att
     core::Logger::getInstance().debug("Attached enchant visual model ", effectModelId,
         " to weapon at attachment ", attachmentId, " (visual slot ", visualSlot, ")");
     return true;
+}
+
+void CharacterRenderer::setInstanceIgnoreCulling(uint32_t instanceId, bool ignore) {
+    auto it = instances.find(instanceId);
+    if (it != instances.end()) it->second.ignoreCulling = ignore;
 }
 
 void CharacterRenderer::detachWeaponEffects(uint32_t charInstanceId, uint32_t attachmentId) {

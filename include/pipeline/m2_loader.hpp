@@ -130,6 +130,17 @@ struct M2Attachment {
     glm::vec3 position; // Offset from bone pivot
 };
 
+// Camera baked into the model. Scene models (the character-select glue screens,
+// cinematics) carry the framing the artist authored them for; without it, a scene
+// whose geometry sits hundreds of units from its origin cannot be placed sensibly.
+struct M2Camera {
+    float fov = 0.0f;      // radians
+    float farClip = 0.0f;
+    float nearClip = 0.0f;
+    glm::vec3 positionBase{0.0f};
+    glm::vec3 targetBase{0.0f};  // the point the camera looks at
+};
+
 // FBlock: particle lifetime curve (color/alpha/scale over particle life)
 struct M2FBlock {
     std::vector<float> timestamps;      // Normalized 0..1
@@ -231,6 +242,7 @@ struct M2Model {
 
     // Attachment points (for weapon/effect anchoring)
     std::vector<M2Attachment> attachments;
+    std::vector<M2Camera> cameras;
     std::vector<uint16_t> attachmentLookup; // attachment ID → index
 
     // Particle emitters

@@ -357,6 +357,37 @@ struct M2AttachmentDiskVanilla {
     uint8_t trackData[28]; // M2TrackDiskVanilla (28 bytes)
 };
 
+// M2 camera (on-disk, WotLK — 100 bytes; tracks are 20 bytes)
+struct M2CameraDisk {
+    uint32_t type;
+    float fov;
+    float farClip;
+    float nearClip;
+    uint8_t positionTrack[20];
+    float positionBase[3];
+    uint8_t targetTrack[20];
+    float targetBase[3];
+    uint8_t rollTrack[20];
+};
+
+// M2 camera (on-disk, vanilla — 124 bytes; tracks are 28 bytes)
+struct M2CameraDiskVanilla {
+    uint32_t type;
+    float fov;
+    float farClip;
+    float nearClip;
+    uint8_t positionTrack[28];
+    float positionBase[3];
+    uint8_t targetTrack[28];
+    float targetBase[3];
+    uint8_t rollTrack[28];
+};
+
+// A wrong stride here reads garbage positions and would fling the backdrop
+// somewhere arbitrary rather than fail.
+static_assert(sizeof(M2CameraDisk) == 100, "M2CameraDisk must match the WotLK on-disk layout");
+static_assert(sizeof(M2CameraDiskVanilla) == 124, "M2CameraDiskVanilla must match the vanilla on-disk layout");
+
 template<typename T>
 T readValue(const std::vector<uint8_t>& data, uint32_t offset) {
     if (offset + sizeof(T) > data.size()) {
@@ -377,6 +408,7 @@ constexpr uint32_t kMaxM2Bones        = 65536;
 constexpr uint32_t kMaxM2Animations   = 65536;
 constexpr uint32_t kMaxM2UVAnims      = 16384;
 constexpr uint32_t kMaxM2Attachments  = 4096;
+constexpr uint32_t kMaxM2Cameras      = 64;
 
 inline uint32_t capCount(uint32_t value, uint32_t maxValue, const char* what) {
     if (value > maxValue) {
@@ -1203,6 +1235,35 @@ M2Model M2Loader::load(const std::vector<uint8_t>& m2Data) {
     // Read attachment lookup
     if (header.nAttachmentLookup > 0 && header.ofsAttachmentLookup > 0) {
         model.attachmentLookup = readArray<uint16_t>(m2Data, header.ofsAttachmentLookup, header.nAttachmentLookup);
+    }
+
+    // Cameras — only the static base position/target are used; scene models keep
+    // their framing here, and animated camera tracks are not needed for a backdrop.
+    if (header.nCameras > 0 && header.ofsCameras > 0) {
+        const uint32_t cameraCount = capCount(header.nCameras, kMaxM2Cameras, "nCameras");
+        model.cameras.reserve(cameraCount);
+        auto pushCamera = [&model](uint32_t type, float fov, float farClip, float nearClip,
+                                   const float* posBase, const float* tgtBase) {
+            // type 0xFFFFFFFF marks the model's own portrait/scene camera.
+            (void)type;
+            M2Camera cam;
+            cam.fov = fov;
+            cam.farClip = farClip;
+            cam.nearClip = nearClip;
+            cam.positionBase = glm::vec3(posBase[0], posBase[1], posBase[2]);
+            cam.targetBase = glm::vec3(tgtBase[0], tgtBase[1], tgtBase[2]);
+            model.cameras.push_back(cam);
+        };
+        if (header.version < 264) {
+            auto disk = readArray<M2CameraDiskVanilla>(m2Data, header.ofsCameras, cameraCount);
+            for (const auto& dc : disk)
+                pushCamera(dc.type, dc.fov, dc.farClip, dc.nearClip, dc.positionBase, dc.targetBase);
+        } else {
+            auto disk = readArray<M2CameraDisk>(m2Data, header.ofsCameras, cameraCount);
+            for (const auto& dc : disk)
+                pushCamera(dc.type, dc.fov, dc.farClip, dc.nearClip, dc.positionBase, dc.targetBase);
+        }
+        core::Logger::getInstance().debug("  Cameras: ", model.cameras.size());
     }
 
     // Parse particle emitters — struct size differs between versions:

@@ -74,6 +74,9 @@ private:
     bool loadPreviewM2(const std::string& m2Path, pipeline::M2Model& outModel);
     // Hang the character's weapons off the preview model's hand attachments.
     void attachWeapons(const std::vector<game::EquipmentItem>& equipment);
+    // Put the weapon's enchant glint on it (char enum reports the ItemVisual id directly).
+    void attachWeaponEnchantVisual(uint32_t attachmentId, uint32_t weaponModelId,
+                                   uint32_t itemVisualId);
     // Load the race's glue scene (Stormwind for humans, Orgrimmar for orcs, ...) as a backdrop.
     void loadRacialBackdrop(game::Race race);
 
