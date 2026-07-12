@@ -1277,7 +1277,7 @@ void SocialHandler::requestLogout(bool exitAfterLogout) {
     owner_.getSocket()->send(packet);
     loggingOut_ = true;
     exitAfterLogout_ = exitAfterLogout;
-    LOG_INFO("Sent logout request (exitAfterLogout=", exitAfterLogout ? "yes" : "no", ")");
+    LOG_WARNING("Sent logout request (exitAfterLogout=", exitAfterLogout ? "yes" : "no", ")");  // temporary
 }
 
 void SocialHandler::cancelLogout() {
@@ -2398,7 +2398,7 @@ void SocialHandler::handleLogoutComplete(network::Packet& /*packet*/) {
     const bool exiting = exitAfterLogout_;
     owner_.addSystemChatMessage("Logout complete.");
     loggingOut_ = false; exitAfterLogout_ = false; logoutCountdown_ = 0.0f;
-    LOG_INFO("Logout complete (exiting=", exiting ? "yes" : "no", ")");
+    LOG_WARNING("Logout complete (exiting=", exiting ? "yes" : "no", ")");  // temporary: visible at default log level
     if (owner_.logoutCompleteCallbackRef()) owner_.logoutCompleteCallbackRef()(exiting);
 }
 

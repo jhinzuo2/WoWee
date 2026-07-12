@@ -848,7 +848,8 @@ void GameHandler::registerOpcodeHandlers() {
             standState_ = packet.readUInt8();
             // 0=stand, 1=sit, 2-6=sit variants, 7=dead, 8=kneel. Logged because a
             // wrong state here is indistinguishable, in-game, from a wrong animation.
-            LOG_INFO("SMSG_STANDSTATE_UPDATE: standState=", static_cast<int>(standState_));
+            // At warning level: the file log filters info out by default.
+            LOG_WARNING("SMSG_STANDSTATE_UPDATE: standState=", static_cast<int>(standState_));
             if (standStateCallback_) standStateCallback_(standState_);
         }
     };
