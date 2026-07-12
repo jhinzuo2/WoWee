@@ -62,6 +62,7 @@ public:
 
     // Action bar error-flash: spellId → wall-clock time (seconds) when the flash ends
     std::unordered_map<uint32_t, float> actionFlashEndTimes_;
+    std::unordered_map<uint32_t, float> itemSpellCooldownTotals_;
     static constexpr float kActionFlashDuration = 0.5f;
 
     // Action bar drag state (-1 = not dragging)

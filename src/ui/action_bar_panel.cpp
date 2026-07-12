@@ -304,6 +304,30 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         const auto& slot = bar[absSlot];
         bool onCooldown = !slot.isReady();
 
+        // Item cooldowns are frequently reported against the item's on-use spell
+        // (especially on Wrath) rather than against the action-slot item ID.
+        // Resolve that shared spell cooldown just as macro buttons do.
+        float itemCooldownRemaining = 0.0f;
+        float itemCooldownTotal = 0.0f;
+        if (slot.type == game::ActionBarSlot::ITEM && slot.id != 0 && !onCooldown) {
+            if (const auto* item = gameHandler.getItemInfo(slot.id); item && item->valid) {
+                for (const auto& itemSpell : item->spells) {
+                    if (itemSpell.spellId == 0 ||
+                        (itemSpell.spellTrigger != 0 && itemSpell.spellTrigger != 5)) continue;
+                    const float cooldown = gameHandler.getSpellCooldown(itemSpell.spellId);
+                    if (cooldown > itemCooldownRemaining) itemCooldownRemaining = cooldown;
+                }
+            }
+            if (itemCooldownRemaining > 0.0f) {
+                float& rememberedTotal = itemSpellCooldownTotals_[slot.id];
+                rememberedTotal = std::max(rememberedTotal, itemCooldownRemaining);
+                itemCooldownTotal = rememberedTotal;
+                onCooldown = true;
+            } else {
+                itemSpellCooldownTotals_.erase(slot.id);
+            }
+        }
+
         // Macro cooldown: check the cached primary spell's cooldown.
         float macroCooldownRemaining = 0.0f;
         float macroCooldownTotal = 0.0f;
@@ -744,8 +768,12 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             auto* dl = ImGui::GetWindowDrawList();
 
             // For macros, use the resolved primary spell cooldown instead of the slot's own.
-            float effCdTotal = (macroCooldownTotal > 0.0f) ? macroCooldownTotal : slot.cooldownTotal;
-            float effCdRemaining = (macroCooldownRemaining > 0.0f) ? macroCooldownRemaining : slot.cooldownRemaining;
+            float effCdTotal = (macroCooldownTotal > 0.0f) ? macroCooldownTotal
+                               : (itemCooldownTotal > 0.0f) ? itemCooldownTotal
+                               : slot.cooldownTotal;
+            float effCdRemaining = (macroCooldownRemaining > 0.0f) ? macroCooldownRemaining
+                                   : (itemCooldownRemaining > 0.0f) ? itemCooldownRemaining
+                                   : slot.cooldownRemaining;
             float total       = (effCdTotal > 0.0f) ? effCdTotal : 1.0f;
             float elapsed     = total - effCdRemaining;
             float elapsedFrac = std::min(1.0f, std::max(0.0f, elapsed / total));

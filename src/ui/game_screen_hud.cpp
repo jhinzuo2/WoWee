@@ -691,17 +691,14 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
 
     constexpr float TRACKER_W = 220.0f;
     constexpr float RIGHT_MARGIN = 10.0f;
-    constexpr int   MAX_QUESTS = 5;
-
     // Build display list: tracked quests only, or all quests if none tracked
     const auto& trackedIds = gameHandler.getTrackedQuestIds();
     std::vector<const game::GameHandler::QuestLogEntry*> toShow;
-    toShow.reserve(MAX_QUESTS);
+    toShow.reserve(questLog.size());
     if (!trackedIds.empty()) {
         for (const auto& q : questLog) {
             if (q.questId == 0) continue;
             if (trackedIds.count(q.questId)) toShow.push_back(&q);
-            if (static_cast<int>(toShow.size()) >= MAX_QUESTS) break;
         }
     }
     // Fallback: show all quests if nothing is tracked
@@ -709,7 +706,6 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
         for (const auto& q : questLog) {
             if (q.questId == 0) continue;
             toShow.push_back(&q);
-            if (static_cast<int>(toShow.size()) >= MAX_QUESTS) break;
         }
     }
     if (toShow.empty()) return;
@@ -731,7 +727,6 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
     ImGui::SetNextWindowSize(questTrackerSize_, ImGuiCond_FirstUseEver);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
-                             ImGuiWindowFlags_NoScrollbar |
                              ImGuiWindowFlags_NoCollapse |
                              ImGuiWindowFlags_NoNav |
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
