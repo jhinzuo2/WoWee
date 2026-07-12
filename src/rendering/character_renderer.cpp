@@ -1876,7 +1876,7 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
         if (inst.hasOverrideModelMatrix && !inst.isEffectModel) continue;
 
         float distSq = glm::distance2(inst.position, cameraPos);
-        if (distSq >= animUpdateRadiusSq && !inst.ignoreCulling) continue;
+        if (distSq >= animUpdateRadiusSq && !inst.isSceneModel) continue;
 
         // Advance global sequence timer (accumulates independently of animation wrapping)
         inst.globalSequenceTime += deltaTime * 1000.0f;
@@ -2416,7 +2416,7 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
         if (!instance.visible) continue;
 
         // Character instance culling: test both distance and frustum visibility
-        if (!instance.hasOverrideModelMatrix && !instance.ignoreCulling) {
+        if (!instance.hasOverrideModelMatrix && !instance.isSceneModel) {
             glm::vec3 toInst = instance.position - camPos;
             float distSq = glm::dot(toInst, toInst);
 
@@ -2631,8 +2631,11 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 const bool hairTexture = batchUsesTextureType(gpuModel, batch, 6);
                 const bool hairGeoset = (submeshGroup == 1) ||
                                         (submeshGroup == 0 && batch.submeshId > 0 && batch.submeshId <= 99);
-                const bool hairMaterial = hairTexture ||
-                                          (hairGeoset && (blendMode != 0 || batch.textureCount > 1));
+                // Scene models have no hair, and their submesh ids are all 0, which
+                // would otherwise satisfy the hair-geoset guess for every batch.
+                const bool hairMaterial = !instance.isSceneModel &&
+                                          (hairTexture ||
+                                           (hairGeoset && (blendMode != 0 || batch.textureCount > 1)));
 
                 // Attached weapon models can include additive FX/card batches that
                 // appear as detached flat quads for some swords. Keep core geometry
@@ -2643,7 +2646,7 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 }
 
                 // For body/equipment parts with white/fallback texture, use skin (type 1) texture.
-                if (texPtr == whiteTexture_.get()) {
+                if (texPtr == whiteTexture_.get() && !instance.isSceneModel) {
                     uint16_t group = batchGroup;
                     bool isSkinGroup = (group == 0 || group == 3 || group == 4 || group == 5 ||
                                         group == 8 || group == 9 || group == 13);
@@ -2685,10 +2688,17 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                         colorKeyBlack = pit->second.colorKeyBlack;
                     }
                 }
-                const bool blendNeedsCutout = (blendMode == 1) ||
-                                              (blendMode == 0 && alphaCutout) ||
-                                              (blendMode >= 2 && !alphaCutout) ||
-                                              hairMaterial;
+                // A scene means what its materials say. Stormwind's walls are DXT5 with
+                // an unused alpha channel — every texel below the 0.5 cutoff — so
+                // inferring a cutout from "the texture has alpha" discards the whole
+                // building and leaves the sky showing through it. Only an alpha-key
+                // material (blendMode 1) cuts out here.
+                const bool blendNeedsCutout = instance.isSceneModel
+                    ? (blendMode == 1)
+                    : ((blendMode == 1) ||
+                       (blendMode == 0 && alphaCutout) ||
+                       (blendMode >= 2 && !alphaCutout) ||
+                       hairMaterial);
                 // Enchant glows emit their own light; scene lighting must not tint them.
                 const bool unlit = ((materialFlags & 0x01) != 0) || (blendMode >= 3) ||
                                    instance.isEffectModel;
@@ -3649,9 +3659,9 @@ bool CharacterRenderer::attachWeaponEffect(uint32_t charInstanceId, uint32_t att
     return true;
 }
 
-void CharacterRenderer::setInstanceIgnoreCulling(uint32_t instanceId, bool ignore) {
+void CharacterRenderer::setInstanceSceneModel(uint32_t instanceId, bool isScene) {
     auto it = instances.find(instanceId);
-    if (it != instances.end()) it->second.ignoreCulling = ignore;
+    if (it != instances.end()) it->second.isSceneModel = isScene;
 }
 
 void CharacterRenderer::detachWeaponEffects(uint32_t charInstanceId, uint32_t attachmentId) {

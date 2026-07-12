@@ -128,8 +128,8 @@ public:
     /** Remove all enchant visuals from the weapon at the given attachment point. */
     void detachWeaponEffects(uint32_t charInstanceId, uint32_t attachmentId);
 
-    /** Exempt an instance from distance/frustum culling (scene backdrops). */
-    void setInstanceIgnoreCulling(uint32_t instanceId, bool ignore);
+    /** Mark an instance as a scene backdrop: no culling, no character material heuristics. */
+    void setInstanceSceneModel(uint32_t instanceId, bool isScene);
 
 
     /** Get the world-space transform of an attachment point on an instance. */
@@ -233,10 +233,13 @@ private:
         // needs its animation advanced even though its transform comes from the parent.
         bool isEffectModel = false;
 
-        // Scene backdrops (the character-select glue screens) keep their authored
-        // coordinates, so their origin can sit hundreds of units from the geometry
-        // and from the camera. Distance culling would drop them on that basis alone.
-        bool ignoreCulling = false;
+        // A scene rather than a character: the glue-screen backdrops. Two things
+        // follow. Their origin can sit hundreds of units from their geometry, so
+        // culling on it would drop them. And the material heuristics below exist to
+        // rescue character textures — applied to a scene they erase it, because
+        // Stormwind's walls are DXT5 with an unused alpha channel that the opaque
+        // batches must ignore, exactly as the blend mode says.
+        bool isSceneModel = false;
 
 
         // Bone update throttling for characters outside normal gameplay range.
