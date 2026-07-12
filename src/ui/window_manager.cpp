@@ -47,6 +47,23 @@ namespace {
     // Common ImGui window flags for popup dialogs
     const ImGuiWindowFlags kDialogFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
 
+    // Total count of an item across the backpack and equipped bags.
+    uint32_t countItemInInventory(const wowee::game::Inventory& inv, uint32_t itemId) {
+        uint32_t total = 0;
+        for (int i = 0; i < inv.getBackpackSize(); ++i) {
+            const auto& slot = inv.getBackpackSlot(i);
+            if (!slot.empty() && slot.item.itemId == itemId) total += slot.item.stackCount;
+        }
+        for (int bag = 0; bag < wowee::game::Inventory::NUM_BAG_SLOTS; ++bag) {
+            int bagSize = inv.getBagSize(bag);
+            for (int s = 0; s < bagSize; ++s) {
+                const auto& slot = inv.getBagSlot(bag, s);
+                if (!slot.empty() && slot.item.itemId == itemId) total += slot.item.stackCount;
+            }
+        }
+        return total;
+    }
+
     // Build a WoW-format item link string for chat insertion.
     std::string buildItemChatLink(uint32_t itemId, uint8_t quality, const std::string& name) {
         static constexpr const char* kQualHex[] = {"9d9d9d","ffffff","1eff00","0070dd","a335ee","ff8000","e6cc80","e6cc80"};
@@ -574,22 +591,6 @@ void WindowManager::renderQuestRequestItemsWindow(game::GameHandler& gameHandler
 
     bool open = true;
     const auto& quest = gameHandler.getQuestRequestItems();
-    auto countItemInInventory = [&](uint32_t itemId) -> uint32_t {
-        const auto& inv = gameHandler.getInventory();
-        uint32_t total = 0;
-        for (int i = 0; i < inv.getBackpackSize(); ++i) {
-            const auto& slot = inv.getBackpackSlot(i);
-            if (!slot.empty() && slot.item.itemId == itemId) total += slot.item.stackCount;
-        }
-        for (int bag = 0; bag < game::Inventory::NUM_BAG_SLOTS; ++bag) {
-            int bagSize = inv.getBagSize(bag);
-            for (int s = 0; s < bagSize; ++s) {
-                const auto& slot = inv.getBagSlot(bag, s);
-                if (!slot.empty() && slot.item.itemId == itemId) total += slot.item.stackCount;
-            }
-        }
-        return total;
-    };
 
     std::string processedTitle = chat_utils::replaceGenderPlaceholders(quest.title, gameHandler);
     if (ImGui::Begin(processedTitle.c_str(), &open, ImGuiWindowFlags_NoCollapse)) {
@@ -604,7 +605,7 @@ void WindowManager::renderQuestRequestItemsWindow(game::GameHandler& gameHandler
             ImGui::Separator();
             ImGui::TextColored(ui::colors::kTooltipGold, "Required Items:");
             for (const auto& item : quest.requiredItems) {
-                uint32_t have = countItemInInventory(item.itemId);
+                uint32_t have = countItemInInventory(gameHandler.getInventory(), item.itemId);
                 bool enough = have >= item.count;
                 ImVec4 textCol = enough ? colors::kLightGreen : ImVec4(1.0f, 0.6f, 0.6f, 1.0f);
                 auto* info = gameHandler.getItemInfo(item.itemId);
@@ -1725,6 +1726,7 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
                     }
 
                     // Show selected recipe details
+                    bool hasAllReagents = true;
                     if (selectedCraftSpell != 0) {
                         auto cacheIt = gameHandler.spellNameCacheRef().find(selectedCraftSpell);
                         if (cacheIt != gameHandler.spellNameCacheRef().end()) {
@@ -1796,6 +1798,12 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
                                     if (rId == 0 || rCount == 0) continue;
                                     gameHandler.ensureItemInfo(rId);
                                     const auto* rInfo = gameHandler.getItemInfo(rId);
+                                    // Live have/need count so consumed reagents update as you craft
+                                    uint32_t have = countItemInInventory(gameHandler.getInventory(), rId);
+                                    bool enough = have >= rCount;
+                                    if (!enough) hasAllReagents = false;
+                                    ImVec4 haveCol = enough ? colors::kLightGreen
+                                                            : ImVec4(1.0f, 0.6f, 0.6f, 1.0f);
                                     ImGui::Indent(24.0f);
                                     if (rInfo && rInfo->displayInfoId) {
                                         VkDescriptorSet icon = inventoryScreen.getItemIcon(rInfo->displayInfoId);
@@ -1807,9 +1815,13 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
                                     if (rInfo && !rInfo->name.empty()) {
                                         ImVec4 rCol = InventoryScreen::getQualityColor(
                                             static_cast<game::ItemQuality>(rInfo->quality));
-                                        ImGui::TextColored(rCol, "%s x%u", rInfo->name.c_str(), rCount);
+                                        ImGui::TextColored(rCol, "%s", rInfo->name.c_str());
+                                        ImGui::SameLine(0, 6);
+                                        ImGui::TextColored(haveCol, "%u/%u", have, rCount);
                                     } else {
-                                        ImGui::Text("Item #%u x%u", rId, rCount);
+                                        ImGui::Text("Item #%u", rId);
+                                        ImGui::SameLine(0, 6);
+                                        ImGui::TextColored(haveCol, "%u/%u", have, rCount);
                                     }
                                     ImGui::Unindent(24.0f);
                                 }
@@ -1824,7 +1836,8 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
                     if (craftQuantity < 1) craftQuantity = 1;
                     if (craftQuantity > 99) craftQuantity = 99;
                     ImGui::SameLine();
-                    bool canCraft = selectedCraftSpell != 0 && !gameHandler.isCasting();
+                    bool canCraft = selectedCraftSpell != 0 && !gameHandler.isCasting() &&
+                                    hasAllReagents;
                     if (!canCraft) ImGui::BeginDisabled();
                     if (ImGui::Button("Create")) {
                         if (craftQuantity == 1)
