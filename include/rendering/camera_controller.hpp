@@ -292,6 +292,12 @@ private:
     // Helper to get cached floor height (reduces expensive queries)
     std::optional<float> getCachedFloorHeight(float x, float y, float z);
 
+    // Ray-march the terrain heightfield along pivot→camDir and return the
+    // farthest camera distance that keeps clearance above the terrain surface.
+    // Returns maxDist when the ray stays clear (or terrain is unavailable).
+    float raymarchTerrainCameraLimit(const glm::vec3& pivot, const glm::vec3& camDir,
+                                     float maxDist) const;
+
     // Swimming
     bool swimming = false;
     bool wasSwimming = false;
