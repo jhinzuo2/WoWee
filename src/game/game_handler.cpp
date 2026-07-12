@@ -2666,6 +2666,14 @@ const std::unordered_map<uint32_t, GameHandler::TaxiNode>& GameHandler::getTaxiN
     static const std::unordered_map<uint32_t, TaxiNode> empty;
     return empty;
 }
+bool GameHandler::isKnownTaxiNode(uint32_t nodeId) const {
+    // Was reading a GameHandler-local knownTaxiMask_ that nothing ever wrote
+    // to (handleShowTaxiNodes only updates MovementHandler's own copy), so
+    // this always returned false - broke the world map's discovered-node
+    // display and the Lua IsTaxiNodeKnown-equivalent. Delegate like the
+    // other taxi accessors above.
+    return movementHandler_ && movementHandler_->isKnownTaxiNode(nodeId);
+}
 
 } // namespace game
 } // namespace wowee
