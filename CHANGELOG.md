@@ -1,5 +1,23 @@
 # Changelog
 
+## [v2.0.3-preview] — 2026-07-12
+
+### Item Enhancements (sharpening stones, weightstones, weapon oils)
+- Send TARGET_FLAG_ITEM in CMSG_USE_ITEM. Item-enhancement consumables cast their spell onto another item, but the client only ever wrote a unit or self target, so the server dropped the cast and the item did nothing
+- Using such an item now reads the on-use spell's Spell.dbc Targets mask and arms an item-targeting cursor; the next item clicked (in bags or equipped) receives the enchant. Escape or right-click cancels
+- Add the Spell.dbc `Targets` column to all four expansion layouts (Classic 13, TBC 14, WotLK 16)
+- Weapon enchant visuals: resolve SpellItemEnchantment → ItemVisuals → ItemVisualEffects and attach the effect M2 (e.g. the sharpening-stone glint) to the weapon model's item-visual attachment points, rendered additive and unlit
+- Applying an enchant now marks equipment dirty even though the displayInfoId is unchanged, so the visual appears without re-equipping
+
+### Bug Fixes
+- Read enchant names from the correct SpellItemEnchantment.dbc column. The name moved across expansions (Vanilla 10, TBC 13, WotLK 14) but every caller used field 8, an integer column that getString() treated as a string-block offset — so names came back garbled mid-string ("Sharpened (+2 Damage)" surfaced as "ockbiter 3"). Resolved from the record width via `detectEnchantmentNameField()`
+
+### Tests
+- New `test_use_item_packet` suite: CMSG_USE_ITEM SpellCastTargets encoding for WotLK, Classic and TBC (item, unit, and self targeting)
+- DBC tests for enchant name/ItemVisual column detection and the enchant → effect-model resolution chain
+
+---
+
 ## [v1.9.7-preview] — 2026-07-09
 
 ### Bug Fixes
