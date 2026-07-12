@@ -886,9 +886,14 @@ void GameHandler::registerOpcodeHandlers() {
                                    | (static_cast<uint64_t>(go->getField(7)) << 32);
                 if (createdBy == playerGuid) {
                     auto* info = getCachedGameObjectInfo(go->getEntry());
-                    if (info && info->type == 17) {
-                        addUIError("A fish is on your line!");
-                        addSystemChatMessage("A fish is on your line!");
+                    // The bite can arrive before GAMEOBJECT_QUERY_RESPONSE. An
+                    // owned GO with unknown metadata is safe to remember here;
+                    // once metadata exists, still require FISHINGNODE (type 17).
+                    if (!info || info->type == 17) {
+                        hookedFishingBobberGuid_ = guid;
+                        setTarget(guid);
+                        addUIError("A fish is on your line! Right-click to reel it in.");
+                        addSystemChatMessage("A fish is on your line! Right-click to reel it in.");
                         withSoundManager(&audio::AudioCoordinator::getUiSoundManager, [](auto* sfx) { sfx->playQuestUpdate(); });
                     }
                 }
@@ -927,9 +932,11 @@ void GameHandler::registerOpcodeHandlers() {
         handleAllAchievementData(packet);
     };
     dispatchTable_[Opcode::SMSG_FISH_NOT_HOOKED] = [this](network::Packet& /*packet*/) {
+        hookedFishingBobberGuid_ = 0;
         addSystemChatMessage("Your fish got away.");
     };
     dispatchTable_[Opcode::SMSG_FISH_ESCAPED] = [this](network::Packet& /*packet*/) {
+        hookedFishingBobberGuid_ = 0;
         addSystemChatMessage("Your fish escaped!");
     };
 

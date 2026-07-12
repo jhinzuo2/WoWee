@@ -2999,6 +2999,9 @@ private:
     uint32_t armorProficiency_  = 0;  // bitmask from SMSG_SET_PROFICIENCY itemClass=4
     std::vector<MinimapPing> minimapPings_;
     uint64_t pendingGameObjectInteractGuid_ = 0;
+    // Owned fishing bobber whose bite animation has fired. Keeping this explicit
+    // lets the UI target/reel it even while GAMEOBJECT_QUERY metadata is pending.
+    uint64_t hookedFishingBobberGuid_ = 0;
 
     // Talents (dual-spec support)
     uint8_t activeTalentSpec_ = 0;                              // Currently active spec (0 or 1)

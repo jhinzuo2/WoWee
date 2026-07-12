@@ -2215,7 +2215,10 @@ void GameHandler::performGameObjectInteractionNow(uint64_t guid) {
         float dy = entity->getY() - movementInfo.y;
         float dz = entity->getZ() - movementInfo.z;
         float dist3d = std::sqrt(dx * dx + dy * dy + dz * dz);
-        if (dist3d > 10.0f) {
+        // Fishing bobbers are intentionally cast beyond normal GO-use range.
+        // Only the owned bobber whose bite we observed gets the extended range.
+        const float maxInteractDistance = (guid == hookedFishingBobberGuid_) ? 30.0f : 10.0f;
+        if (dist3d > maxInteractDistance) {
             addSystemChatMessage("Too far away.");
             return;
         }
@@ -2312,6 +2315,7 @@ void GameHandler::performGameObjectInteractionNow(uint64_t guid) {
     auto usePacket = GameObjectUsePacket::build(guid);
     socket->send(usePacket);
     lastInteractedGoGuid_ = guid;
+    if (guid == hookedFishingBobberGuid_) hookedFishingBobberGuid_ = 0;
 
     if (chestLike || metadataPending) {
         // Don't send CMSG_LOOT immediately — the server may start a timed cast
