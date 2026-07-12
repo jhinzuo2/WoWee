@@ -1394,8 +1394,8 @@ void GameHandler::removeIgnore(const std::string& playerName) {
     if (socialHandler_) socialHandler_->removeIgnore(playerName);
 }
 
-void GameHandler::requestLogout() {
-    if (socialHandler_) socialHandler_->requestLogout();
+void GameHandler::requestLogout(bool exitAfterLogout) {
+    if (socialHandler_) socialHandler_->requestLogout(exitAfterLogout);
 }
 
 void GameHandler::cancelLogout() {

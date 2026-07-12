@@ -1270,13 +1270,14 @@ void SocialHandler::randomRoll(uint32_t minRoll, uint32_t maxRoll) {
 // Logout
 // ============================================================
 
-void SocialHandler::requestLogout() {
+void SocialHandler::requestLogout(bool exitAfterLogout) {
     if (!owner_.getSocket()) return;
     if (loggingOut_) { owner_.addSystemChatMessage("Already logging out."); return; }
     auto packet = LogoutRequestPacket::build();
     owner_.getSocket()->send(packet);
     loggingOut_ = true;
-    LOG_INFO("Sent logout request");
+    exitAfterLogout_ = exitAfterLogout;
+    LOG_INFO("Sent logout request (exitAfterLogout=", exitAfterLogout ? "yes" : "no", ")");
 }
 
 void SocialHandler::cancelLogout() {
@@ -1285,6 +1286,7 @@ void SocialHandler::cancelLogout() {
     auto packet = LogoutCancelPacket::build();
     owner_.getSocket()->send(packet);
     loggingOut_ = false;
+    exitAfterLogout_ = false;
     logoutCountdown_ = 0.0f;
     owner_.addSystemChatMessage("Logout cancelled.");
     LOG_INFO("Cancelled logout");
@@ -2385,13 +2387,19 @@ void SocialHandler::handleLogoutResponse(network::Packet& packet) {
         if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("PLAYER_LOGOUT", {});
     } else {
         owner_.addSystemChatMessage("Cannot logout right now.");
-        loggingOut_ = false; logoutCountdown_ = 0.0f;
+        loggingOut_ = false; exitAfterLogout_ = false; logoutCountdown_ = 0.0f;
     }
 }
 
 void SocialHandler::handleLogoutComplete(network::Packet& /*packet*/) {
+    // The countdown finishing is not the end of it: the server says when the
+    // character is actually out of the world, and only then can the client leave —
+    // to character select, or out of the game entirely for /quit and /exit.
+    const bool exiting = exitAfterLogout_;
     owner_.addSystemChatMessage("Logout complete.");
-    loggingOut_ = false; logoutCountdown_ = 0.0f;
+    loggingOut_ = false; exitAfterLogout_ = false; logoutCountdown_ = 0.0f;
+    LOG_INFO("Logout complete (exiting=", exiting ? "yes" : "no", ")");
+    if (owner_.logoutCompleteCallbackRef()) owner_.logoutCompleteCallbackRef()(exiting);
 }
 
 // ============================================================

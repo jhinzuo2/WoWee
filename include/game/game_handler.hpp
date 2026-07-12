@@ -486,8 +486,9 @@ public:
     // Network latency (milliseconds, updated each PONG response)
     uint32_t getLatencyMs() const { return lastLatency; }
 
-    // Logout commands
-    void requestLogout();
+    // Logout commands. exitAfterLogout: /quit and /exit leave the game; /logout and
+    // /camp drop back to character select.
+    void requestLogout(bool exitAfterLogout = false);
     void cancelLogout();
 
     // Instance difficulty
@@ -933,6 +934,13 @@ public:
     // standState: 0=stand, 1-6=sit variants, 7=dead, 8=kneel
     using StandStateCallback = std::function<void(uint8_t standState)>;
     void setStandStateCallback(StandStateCallback cb) { standStateCallback_ = std::move(cb); }
+
+    // Logout complete callback — fired when SMSG_LOGOUT_COMPLETE says the character
+    // is out of the world. exiting is true for /quit and /exit (leave the game),
+    // false for /logout and /camp (back to character select).
+    using LogoutCompleteCallback = std::function<void(bool exiting)>;
+    void setLogoutCompleteCallback(LogoutCompleteCallback cb) { logoutCompleteCallback_ = std::move(cb); }
+    auto& logoutCompleteCallbackRef() { return logoutCompleteCallback_; }
 
     // Appearance changed callback — fired when PLAYER_BYTES or facial features update (barber shop, etc.)
     using AppearanceChangedCallback = std::function<void()>;
@@ -3508,6 +3516,7 @@ private:
     NpcAggroCallback npcAggroCallback_;
     NpcRespawnCallback npcRespawnCallback_;
     StandStateCallback standStateCallback_;
+    LogoutCompleteCallback logoutCompleteCallback_;
     AppearanceChangedCallback appearanceChangedCallback_;
     GhostStateCallback ghostStateCallback_;
     MeleeSwingCallback meleeSwingCallback_;

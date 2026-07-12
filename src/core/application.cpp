@@ -1017,6 +1017,21 @@ void Application::setState(AppState newState) {
                 gameHandler->setRangedWeaponSwapCallback([this](bool show) {
                     if (appearanceComposer_) appearanceComposer_->showRangedWeapon(show);
                 });
+                // The logout countdown finishing is not the end of it: the server
+                // confirms with SMSG_LOGOUT_COMPLETE, and only then does the client
+                // leave. Without this the countdown ran out and nothing happened.
+                gameHandler->setLogoutCompleteCallback([this](bool exiting) {
+                    if (exiting) {
+                        if (auto* ac = getAudioCoordinator()) {
+                            if (auto* music = ac->getMusicManager()) music->stopMusic(0.0f);
+                        }
+                        LOG_INFO("Logout complete — quitting");
+                        if (window) window->setShouldClose(true);
+                    } else {
+                        LOG_INFO("Logout complete — returning to character select");
+                        logoutToLogin();
+                    }
+                });
                 gameHandler->setKnockBackCallback([this](float vcos, float vsin, float hspeed, float vspeed) {
                     if (renderer && renderer->getCameraController()) {
                         renderer->getCameraController()->applyKnockBack(vcos, vsin, hspeed, vspeed);
