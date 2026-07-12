@@ -16,6 +16,7 @@
  */
 #include "rendering/character_renderer.hpp"
 #include "rendering/animation/animation_ids.hpp"
+#include "core/thread_pool.hpp"
 #include "rendering/vk_context.hpp"
 #include "rendering/vk_texture.hpp"
 #include "rendering/vk_pipeline.hpp"
@@ -1943,22 +1944,28 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
             const size_t chunkSize = updatedCount / numThreads;
             const size_t remainder = updatedCount % numThreads;
 
+            auto processRange = [this](size_t begin, size_t end) {
+                for (size_t i = begin; i < end; i++) {
+                    calculateBoneMatrices(toUpdate_[i].get());
+                }
+            };
+
             animFutures_.clear();
             if (animFutures_.capacity() < numThreads) {
                 animFutures_.reserve(numThreads);
             }
 
+            // Dispatch all but the last chunk to the shared pool; process the
+            // last chunk on this thread so the pool is never a hard dependency
+            // for finishing this frame's bone work.
             size_t start = 0;
-            for (size_t t = 0; t < numThreads; t++) {
+            for (size_t t = 0; t + 1 < numThreads; t++) {
                 size_t end = start + chunkSize + (t < remainder ? 1 : 0);
-                animFutures_.push_back(std::async(std::launch::async,
-                    [this, start, end]() {
-                        for (size_t i = start; i < end; i++) {
-                            calculateBoneMatrices(toUpdate_[i].get());
-                        }
-                    }));
+                animFutures_.push_back(core::ThreadPool::frameWorkers().submit(
+                    [processRange, start, end]() { processRange(start, end); }));
                 start = end;
             }
+            processRange(start, updatedCount);
 
             for (auto& f : animFutures_) {
                 f.get();

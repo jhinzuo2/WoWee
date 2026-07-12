@@ -1,5 +1,6 @@
 #include "rendering/m2_renderer.hpp"
 #include "rendering/m2_renderer_internal.h"
+#include "core/thread_pool.hpp"
 #include "rendering/m2_model_classifier.hpp"
 #include "rendering/hiz_system.hpp"
 #include "rendering/vk_context.hpp"
@@ -511,27 +512,33 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
                 const size_t chunkSize = animCount / numThreads;
                 const size_t remainder = animCount % numThreads;
 
+                auto processRange = [this](size_t begin, size_t end) {
+                    for (size_t j = begin; j < end; ++j) {
+                        size_t idx = boneWorkIndices_[j];
+                        if (idx >= instances.size()) continue;
+                        auto& inst = instances[idx];
+                        if (!inst.cachedModel) continue;
+                        computeBoneMatrices(*inst.cachedModel, inst);
+                    }
+                };
+
                 // Reuse persistent futures vector to avoid allocation
                 animFutures_.clear();
                 if (animFutures_.capacity() < numThreads) {
                     animFutures_.reserve(numThreads);
                 }
 
+                // Dispatch all but the last chunk to the shared pool; process the
+                // last chunk on this thread so this call always makes progress even
+                // when it itself runs on a pool worker (see ThreadPool docs).
                 size_t start = 0;
-                for (size_t t = 0; t < numThreads; ++t) {
+                for (size_t t = 0; t + 1 < numThreads; ++t) {
                     size_t end = start + chunkSize + (t < remainder ? 1 : 0);
-                    animFutures_.push_back(std::async(std::launch::async,
-                        [this, start, end]() {
-                            for (size_t j = start; j < end; ++j) {
-                                size_t idx = boneWorkIndices_[j];
-                                if (idx >= instances.size()) continue;
-                                auto& inst = instances[idx];
-                                if (!inst.cachedModel) continue;
-                                computeBoneMatrices(*inst.cachedModel, inst);
-                            }
-                        }));
+                    animFutures_.push_back(core::ThreadPool::frameWorkers().submit(
+                        [processRange, start, end]() { processRange(start, end); }));
                     start = end;
                 }
+                processRange(start, animCount);
 
                 for (auto& f : animFutures_) {
                     f.get();

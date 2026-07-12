@@ -15,6 +15,7 @@
 #include "rendering/lightning.hpp"
 #include "rendering/lighting_manager.hpp"
 #include "core/profiler.hpp"
+#include "core/thread_pool.hpp"
 #include "rendering/sky_system.hpp"
 #include "rendering/swim_effects.hpp"
 #include "rendering/mount_dust.hpp"
@@ -1362,7 +1363,7 @@ void Renderer::update(float deltaTime) {
         float m2DeltaTime = deltaTime;
         glm::vec3 m2CamPos = camera->getPosition();
         glm::mat4 m2ViewProj = camera->getProjectionMatrix() * camera->getViewMatrix();
-        m2AnimFuture = std::async(std::launch::async,
+        m2AnimFuture = core::ThreadPool::frameWorkers().submit(
             [this, m2DeltaTime, m2CamPos, m2ViewProj]() {
                 m2Renderer->update(m2DeltaTime, m2CamPos, m2ViewProj);
             });
@@ -1576,7 +1577,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
         std::future<double> terrainFuture, wmoFuture, m2Future;
 
         if (terrainRenderer && camera && terrainEnabled && !skipTerrain) {
-            terrainFuture = std::async(std::launch::async, [&]() -> double {
+            terrainFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
                 auto t0 = std::chrono::steady_clock::now();
                 VkCommandBuffer cmd = beginSecondary(SEC_TERRAIN);
                 setSecondaryViewportScissor(cmd);
@@ -1588,7 +1589,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
         }
 
         if (wmoRenderer && camera && !skipWMO) {
-            wmoFuture = std::async(std::launch::async, [&]() -> double {
+            wmoFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
                 auto t0 = std::chrono::steady_clock::now();
                 VkCommandBuffer cmd = beginSecondary(SEC_WMO);
                 setSecondaryViewportScissor(cmd);
@@ -1600,7 +1601,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
         }
 
         if (m2Renderer && camera && !skipM2) {
-            m2Future = std::async(std::launch::async, [&]() -> double {
+            m2Future = core::ThreadPool::frameWorkers().submit([&]() -> double {
                 auto t0 = std::chrono::steady_clock::now();
                 VkCommandBuffer cmd = beginSecondary(SEC_M2);
                 setSecondaryViewportScissor(cmd);
