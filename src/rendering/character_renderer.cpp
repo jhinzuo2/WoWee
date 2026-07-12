@@ -174,6 +174,17 @@ static constexpr int kBaseTexSize    = 256;  // NPC baked texture default
 static constexpr int kUpscaleTexSize = 512;  // Target size for region compositing
 static constexpr int32_t kPreviewSimpleTextureMode = -31336;
 
+// WOWEE_SCENE_DIAG=1 — dump what each glue-scene backdrop batch is handed at draw
+// time. The scene renders through the character path, so when it comes out wrong
+// the question is always which texture, blend mode and shader path it actually got.
+static bool sceneDiagEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("WOWEE_SCENE_DIAG");
+        return v && v[0] != '\0' && v[0] != '0';
+    }();
+    return enabled;
+}
+
 // CharMaterial UBO layout (matches character.frag.glsl set=1 binding=1)
 struct CharMaterialUBO {
     float opacity;
@@ -2782,6 +2793,26 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                     matData.enableNormalMap = 0;
                     matData.enablePOM = kPreviewSimpleTextureMode;
                     matData.heightMapVariance = 0.0f;
+                }
+
+                // WOWEE_SCENE_DIAG=1 dumps what each backdrop batch is actually told to
+                // draw — texture, blend mode, shader path — once per scene model.
+                static int sceneDiagLines = 0;
+                if (instance.isSceneModel && sceneDiagEnabled() && sceneDiagLines++ < 40) {
+                    std::string texName = "<white>";
+                    if (batch.textureIndex < gpuModel.data.textureLookup.size()) {
+                        uint16_t lk = gpuModel.data.textureLookup[batch.textureIndex];
+                        if (lk < gpuModel.data.textures.size())
+                            texName = gpuModel.data.textures[lk].filename;
+                    }
+                    core::Logger::getInstance().info(
+                        "SCENE DIAG batch submesh=", batch.submeshId,
+                        " blend=", blendMode, " matFlags=0x", std::hex, materialFlags, std::dec,
+                        " alphaTest=", matData.alphaTest,
+                        " unlit=", matData.unlit,
+                        " simplePath=", (matData.enablePOM == kPreviewSimpleTextureMode ? 1 : 0),
+                        " whiteFallback=", (texPtr == whiteTexture_.get() ? 1 : 0),
+                        " tex=", texName);
                 }
 
                 // Sub-allocate material UBO from ring buffer
