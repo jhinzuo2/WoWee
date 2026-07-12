@@ -405,7 +405,11 @@ endif()
 # Function to compile GLSL shaders to SPIR-V
 function(compile_shaders TARGET_NAME)
     set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders)
-    set(SPV_DIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/shaders)
+    # Compile in place, next to the GLSL. The .spv files are tracked (they are the
+    # fallback when glslc is absent), and the POST_BUILD step below copies the whole
+    # source assets/ tree over the runtime one — so compiling into the runtime tree
+    # would just be overwritten by the committed .spv, silently running stale shaders.
+    set(SPV_DIR ${SHADER_DIR})
     file(MAKE_DIRECTORY ${SPV_DIR})
 
     file(GLOB GLSL_SOURCES "${SHADER_DIR}/*.glsl")
