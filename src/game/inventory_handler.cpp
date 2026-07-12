@@ -3255,14 +3255,26 @@ void InventoryHandler::rebuildOnlineInventory() {
         }
     }
 
-    // Only mark equipment dirty if equipped item displayInfoIds actually changed
+    // Only mark equipment dirty if equipped item displayInfoIds actually changed.
+    // Enchants count too: applying a sharpening stone leaves the displayInfoId alone
+    // but changes the visual effect hanging off the weapon.
     std::array<uint32_t, 19> currentEquipDisplayIds{};
+    std::array<uint64_t, 19> currentEquipEnchantIds{};
     for (int i = 0; i < 19; i++) {
         const auto& slot = owner_.inventoryRef().getEquipSlot(static_cast<EquipSlot>(i));
         if (!slot.empty()) currentEquipDisplayIds[i] = slot.item.displayInfoId;
+
+        uint64_t guid = owner_.equipSlotGuidsRef()[i];
+        if (guid != 0) {
+            auto [permEnchantId, tempEnchantId] = owner_.getItemEnchantIds(guid);
+            currentEquipEnchantIds[i] =
+                (static_cast<uint64_t>(permEnchantId) << 32) | tempEnchantId;
+        }
     }
-    if (currentEquipDisplayIds != owner_.lastEquipDisplayIdsRef()) {
+    if (currentEquipDisplayIds != owner_.lastEquipDisplayIdsRef() ||
+        currentEquipEnchantIds != lastEquipEnchantIds_) {
         owner_.lastEquipDisplayIdsRef() = currentEquipDisplayIds;
+        lastEquipEnchantIds_ = currentEquipEnchantIds;
         owner_.onlineEquipDirtyRef() = true;
     }
 

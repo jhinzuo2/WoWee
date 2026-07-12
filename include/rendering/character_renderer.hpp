@@ -26,6 +26,14 @@ class Camera;
 class VkContext;
 class VkTexture;
 
+// Enchant visual (glint, glow) attached to a weapon at one of the weapon model's
+// own item-visual attachment points.
+struct WeaponEffectAttachment {
+    uint32_t effectModelId;
+    uint32_t effectInstanceId;
+    glm::vec3 offset;          // attachment position on the weapon model
+};
+
 // Weapon attached to a character instance at a bone attachment point
 struct WeaponAttachment {
     uint32_t weaponModelId;
@@ -33,6 +41,7 @@ struct WeaponAttachment {
     uint32_t attachmentId;     // 1=RightHand, 2=LeftHand
     uint16_t boneIndex;
     glm::vec3 offset;
+    std::vector<WeaponEffectAttachment> effects;
 };
 
 /**
@@ -105,8 +114,19 @@ public:
                       const pipeline::M2Model& weaponModel, uint32_t weaponModelId,
                       const std::string& texturePath);
 
-    /** Detach a weapon from the given attachment point. */
+    /** Detach a weapon from the given attachment point (drops its enchant effects too). */
     void detachWeapon(uint32_t charInstanceId, uint32_t attachmentId);
+
+    /**
+     * Attach an enchant visual to the weapon at the given attachment point.
+     * visualSlot is the ItemVisuals.dbc slot (0-4), which selects the attachment
+     * point on the weapon model the effect hangs from.
+     */
+    bool attachWeaponEffect(uint32_t charInstanceId, uint32_t attachmentId, uint32_t visualSlot,
+                            const pipeline::M2Model& effectModel, uint32_t effectModelId);
+
+    /** Remove all enchant visuals from the weapon at the given attachment point. */
+    void detachWeaponEffects(uint32_t charInstanceId, uint32_t attachmentId);
 
     /** Get the world-space transform of an attachment point on an instance. */
     bool getAttachmentTransform(uint32_t instanceId, uint32_t attachmentId, glm::mat4& outTransform);
@@ -203,6 +223,11 @@ private:
         // Override model matrix (used for weapon instances positioned by parent bone)
         bool hasOverrideModelMatrix = false;
         glm::mat4 overrideModelMatrix{1.0f};
+
+        // Enchant visual attached to a weapon. Such a model is nothing but the
+        // additive FX batches that attached weapons otherwise drop, and it still
+        // needs its animation advanced even though its transform comes from the parent.
+        bool isEffectModel = false;
 
         // Bone update throttling for characters outside normal gameplay range.
         uint32_t boneUpdateCounter = 0;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <string>
 #include <unordered_map>
@@ -105,6 +106,28 @@ CharSectionsFields detectCharSectionsFields(const DBCFile* dbc, const DBCFieldMa
  * @return Name field index for this particular DBC binary.
  */
 uint32_t detectEnchantmentNameField(const DBCFile* dbc, const DBCFieldMap* sieL);
+
+/**
+ * Resolve the SpellItemEnchantment.dbc ItemVisual field index, which likewise
+ * shifted with the record: Vanilla/Turtle=19, TBC=30, WotLK=31.
+ */
+uint32_t detectEnchantmentItemVisualField(const DBCFile* dbc, const DBCFieldMap* sieL);
+
+/**
+ * Model paths for the effect an enchant puts on the item it is applied to — the
+ * glint on a freshly sharpened blade.
+ *
+ * Chain: SpellItemEnchantment.ItemVisual → ItemVisuals.dbc (5 effect slots) →
+ * ItemVisualEffects.dbc (M2 path). Slot index is meaningful: it selects which
+ * attachment point on the item model the effect hangs from, so gaps are kept.
+ *
+ * @return Per-slot model paths; empty strings for unused slots.
+ */
+std::array<std::string, 5> resolveEnchantItemVisuals(uint32_t enchantId,
+                                                     const DBCFile* spellItemEnchantment,
+                                                     const DBCFile* itemVisuals,
+                                                     const DBCFile* itemVisualEffects,
+                                                     const DBCFieldMap* sieL);
 
 } // namespace pipeline
 } // namespace wowee

@@ -1871,8 +1871,9 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
             }
         }
 
-        // Skip weapon instances for animation — their transforms are set by parent bones
-        if (inst.hasOverrideModelMatrix) continue;
+        // Skip weapon instances for animation — their transforms are set by parent
+        // bones. Enchant visuals are the exception: they are pure animated FX.
+        if (inst.hasOverrideModelMatrix && !inst.isEffectModel) continue;
 
         float distSq = glm::distance2(inst.position, cameraPos);
         if (distSq >= animUpdateRadiusSq) continue;
@@ -1998,9 +1999,22 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
             }
 
             // Weapon model matrix = character model * bone transform * offset translation
-            weapIt->second.overrideModelMatrix =
+            const glm::mat4 weaponMat =
                 charModelMat * boneMat * glm::translate(glm::mat4(1.0f), wa.offset);
+            weapIt->second.overrideModelMatrix = weaponMat;
             weapIt->second.hasOverrideModelMatrix = true;
+
+            // Enchant visuals ride the weapon, offset to their attachment point on it.
+            for (const auto& fx : wa.effects) {
+                auto fxIt = instances.find(fx.effectInstanceId);
+                if (fxIt == instances.end()) continue;
+                fxIt->second.overrideModelMatrix =
+                    weaponMat * glm::translate(glm::mat4(1.0f), fx.offset);
+                fxIt->second.hasOverrideModelMatrix = true;
+                // Keep the effect near the character so animation distance culling
+                // (which works off instance position) treats it like its wielder.
+                fxIt->second.position = instance.position;
+            }
         }
     }
 }
@@ -2622,8 +2636,9 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
 
                 // Attached weapon models can include additive FX/card batches that
                 // appear as detached flat quads for some swords. Keep core geometry
-                // and drop FX-style passes for weapon attachments.
-                if (instance.hasOverrideModelMatrix && blendMode >= 3) {
+                // and drop FX-style passes for weapon attachments. Enchant visuals
+                // are entirely such batches, so they must survive this cull.
+                if (instance.hasOverrideModelMatrix && !instance.isEffectModel && blendMode >= 3) {
                     continue;
                 }
 
@@ -2674,12 +2689,19 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                                               (blendMode == 0 && alphaCutout) ||
                                               (blendMode >= 2 && !alphaCutout) ||
                                               hairMaterial;
-                const bool unlit = ((materialFlags & 0x01) != 0) || (blendMode >= 3);
+                // Enchant glows emit their own light; scene lighting must not tint them.
+                const bool unlit = ((materialFlags & 0x01) != 0) || (blendMode >= 3) ||
+                                   instance.isEffectModel;
 
                 // Hair textures are authored as alpha-cut cards. If they use the
                 // translucent pipeline they form a soft shell around the head.
                 VkPipeline desiredPipeline;
-                if (hairMaterial) {
+                if (instance.isEffectModel) {
+                    // Enchant visuals are glow cards drawn on black. Their materials
+                    // declare Mod/alpha blending, which would composite that black
+                    // background as an opaque quad — force additive so only the light adds.
+                    desiredPipeline = additivePipeline_;
+                } else if (hairMaterial) {
                     desiredPipeline = alphaTestPipeline_;
                 } else {
                     switch (blendMode) {
@@ -3567,12 +3589,75 @@ void CharacterRenderer::detachWeapon(uint32_t charInstanceId, uint32_t attachmen
 
     for (auto it = attachments.begin(); it != attachments.end(); ++it) {
         if (it->attachmentId == attachmentId) {
+            for (const auto& fx : it->effects) removeInstance(fx.effectInstanceId);
             removeInstance(it->weaponInstanceId);
             attachments.erase(it);
             core::Logger::getInstance().info("Detached weapon from instance ", charInstanceId,
                 " attachment ", attachmentId);
             return;
         }
+    }
+}
+
+bool CharacterRenderer::attachWeaponEffect(uint32_t charInstanceId, uint32_t attachmentId,
+                                           uint32_t visualSlot,
+                                           const pipeline::M2Model& effectModel,
+                                           uint32_t effectModelId) {
+    auto charIt = instances.find(charInstanceId);
+    if (charIt == instances.end()) return false;
+
+    auto& attachments = charIt->second.weaponAttachments;
+    auto waIt = std::find_if(attachments.begin(), attachments.end(),
+                             [attachmentId](const WeaponAttachment& wa) {
+                                 return wa.attachmentId == attachmentId;
+                             });
+    if (waIt == attachments.end()) return false;  // no weapon to hang the effect on
+
+    if (models.find(effectModelId) == models.end()) {
+        if (!loadModel(effectModel, effectModelId)) {
+            core::Logger::getInstance().warning("attachWeaponEffect: failed to load effect model ",
+                                                effectModelId);
+            return false;
+        }
+    }
+
+    // The ItemVisuals slot names the attachment point on the weapon model itself.
+    // Weapons carry few attachments, so fall back to the weapon's origin.
+    uint16_t boneIndex = 0;
+    glm::vec3 offset(0.0f);
+    if (!findAttachmentBone(waIt->weaponModelId, visualSlot, boneIndex, offset)) {
+        offset = glm::vec3(0.0f);
+    }
+
+    uint32_t effectInstanceId = createInstance(effectModelId, glm::vec3(0.0f));
+    if (effectInstanceId == 0) return false;
+
+    auto fxIt = instances.find(effectInstanceId);
+    if (fxIt == instances.end()) return false;
+    fxIt->second.hasOverrideModelMatrix = true;
+    fxIt->second.isEffectModel = true;
+    fxIt->second.animationLoop = true;
+
+    WeaponEffectAttachment fx;
+    fx.effectModelId = effectModelId;
+    fx.effectInstanceId = effectInstanceId;
+    fx.offset = offset;
+    waIt->effects.push_back(fx);
+
+    core::Logger::getInstance().debug("Attached enchant visual model ", effectModelId,
+        " to weapon at attachment ", attachmentId, " (visual slot ", visualSlot, ")");
+    return true;
+}
+
+void CharacterRenderer::detachWeaponEffects(uint32_t charInstanceId, uint32_t attachmentId) {
+    auto charIt = instances.find(charInstanceId);
+    if (charIt == instances.end()) return;
+
+    for (auto& wa : charIt->second.weaponAttachments) {
+        if (wa.attachmentId != attachmentId) continue;
+        for (const auto& fx : wa.effects) removeInstance(fx.effectInstanceId);
+        wa.effects.clear();
+        return;
     }
 }
 

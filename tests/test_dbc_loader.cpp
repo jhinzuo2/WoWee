@@ -377,3 +377,50 @@ TEST_CASE("detectEnchantmentNameField ignores an out-of-range layout override", 
     REQUIRE(detectEnchantmentNameField(&dbc, &layout) == 14);
     REQUIRE(dbc.getString(0, 14) == "Sharpened (+2 Damage)");
 }
+
+// Enchant → ItemVisuals → ItemVisualEffects is what puts the glint on a freshly
+// sharpened blade. The ItemVisual column moves with the record like the name does
+// (Vanilla 19, TBC 30, WotLK 31).
+TEST_CASE("resolveEnchantItemVisuals walks enchant to effect model paths", "[dbc][enchant]") {
+    using namespace wowee::pipeline;
+
+    std::string strings;
+    strings += '\0';
+    const uint32_t sparkleOffset = static_cast<uint32_t>(strings.size());
+    strings += "Spells\\Enchantments\\Sparkle_A.mdx";
+    strings += '\0';
+
+    // WotLK SpellItemEnchantment: enchant 40 (Rough Sharpening Stone) → ItemVisual 28.
+    std::vector<uint32_t> enchantRec(38, 0);
+    enchantRec[0] = 40;
+    enchantRec[31] = 28;
+    auto enchantData = buildSyntheticDBC(1, 38, {enchantRec}, std::string(1, '\0'));
+    DBCFile sie;
+    REQUIRE(sie.load(enchantData));
+
+    // ItemVisuals: ID + 5 effect slots. Slot 0 used, rest empty.
+    std::vector<uint32_t> visualRec(6, 0);
+    visualRec[0] = 28;
+    visualRec[1] = 777;
+    auto visualData = buildSyntheticDBC(1, 6, {visualRec}, std::string(1, '\0'));
+    DBCFile visuals;
+    REQUIRE(visuals.load(visualData));
+
+    // ItemVisualEffects: ID + model path.
+    auto effectData = buildSyntheticDBC(1, 2, {{777, sparkleOffset}}, strings);
+    DBCFile effects;
+    REQUIRE(effects.load(effectData));
+
+    auto models = resolveEnchantItemVisuals(40, &sie, &visuals, &effects, nullptr);
+    REQUIRE(models[0] == "Spells\\Enchantments\\Sparkle_A.mdx");
+    for (size_t i = 1; i < models.size(); ++i) REQUIRE(models[i].empty());
+
+    // An enchant with no visual (ItemVisual 0) yields nothing rather than slot 0's model.
+    std::vector<uint32_t> plainRec(38, 0);
+    plainRec[0] = 2629;   // Brilliant Mana Oil — no item visual
+    auto plainData = buildSyntheticDBC(1, 38, {plainRec}, std::string(1, '\0'));
+    DBCFile plain;
+    REQUIRE(plain.load(plainData));
+    auto none = resolveEnchantItemVisuals(2629, &plain, &visuals, &effects, nullptr);
+    for (const auto& m : none) REQUIRE(m.empty());
+}

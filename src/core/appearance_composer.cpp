@@ -295,6 +295,58 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
     return activeGeosets;
 }
 
+void AppearanceComposer::applyEnchantVisuals(uint32_t charInstanceId, int equipSlotIndex,
+                                             uint32_t attachmentId) {
+    auto* charRenderer = renderer_ ? renderer_->getCharacterRenderer() : nullptr;
+    if (!charRenderer || !gameHandler_ || !assetManager_ || !entitySpawner_) return;
+
+    charRenderer->detachWeaponEffects(charInstanceId, attachmentId);
+
+    uint64_t itemGuid = gameHandler_->getEquipSlotGuid(equipSlotIndex);
+    if (itemGuid == 0) return;
+
+    // A temporary enchant (sharpening stone, oil) masks the permanent one's visual.
+    auto [permEnchantId, tempEnchantId] = gameHandler_->getItemEnchantIds(itemGuid);
+    uint32_t enchantId = (tempEnchantId != 0) ? tempEnchantId : permEnchantId;
+    if (enchantId == 0) return;
+
+    auto sieDbc     = assetManager_->loadDBC("SpellItemEnchantment.dbc");
+    auto visualsDbc = assetManager_->loadDBC("ItemVisuals.dbc");
+    auto effectsDbc = assetManager_->loadDBC("ItemVisualEffects.dbc");
+    if (!sieDbc || !sieDbc->isLoaded() || !visualsDbc || !visualsDbc->isLoaded() ||
+        !effectsDbc || !effectsDbc->isLoaded()) {
+        return;
+    }
+
+    const auto* sieL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("SpellItemEnchantment") : nullptr;
+    auto effectModels = pipeline::resolveEnchantItemVisuals(enchantId, sieDbc.get(),
+                                                            visualsDbc.get(), effectsDbc.get(), sieL);
+
+    for (uint32_t visualSlot = 0; visualSlot < effectModels.size(); ++visualSlot) {
+        const std::string& modelName = effectModels[visualSlot];
+        if (modelName.empty()) continue;
+
+        // DBC stores .mdx paths; the shipped assets are .m2.
+        std::string m2Path = modelName;
+        size_t dotPos = m2Path.rfind('.');
+        m2Path = (dotPos != std::string::npos ? m2Path.substr(0, dotPos) : m2Path) + ".m2";
+
+        pipeline::M2Model effectModel;
+        if (!loadWeaponM2(m2Path, effectModel)) {
+            LOG_WARNING("Enchant visual: failed to load ", m2Path);
+            continue;
+        }
+
+        uint32_t effectModelId = entitySpawner_->allocateWeaponModelId();
+        if (charRenderer->attachWeaponEffect(charInstanceId, attachmentId, visualSlot,
+                                             effectModel, effectModelId)) {
+            LOG_INFO("Enchant visual: ", m2Path, " on attachment ", attachmentId,
+                     " (enchant ", enchantId, ", visual slot ", visualSlot, ")");
+        }
+    }
+}
+
 bool AppearanceComposer::loadWeaponM2(const std::string& m2Path, pipeline::M2Model& outModel) {
     auto m2Data = assetManager_->readFile(m2Path);
     if (m2Data.empty()) return false;
@@ -414,6 +466,7 @@ void AppearanceComposer::loadEquippedWeapons() {
         if (ok) {
             LOG_INFO("Equipped weapon: ", m2Path, " at attachment ", ws.attachmentId);
             if (ws.attachmentId == 1) rightHandFilled = true;
+            applyEnchantVisuals(charInstanceId, static_cast<int>(ws.slot), ws.attachmentId);
         }
     }
 

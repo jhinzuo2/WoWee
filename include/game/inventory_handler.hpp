@@ -310,6 +310,10 @@ private:
     // mutable: isAwaitingItemTarget() drops the pending use when out of world.
     mutable std::optional<PendingItemTarget> pendingItemTarget_;
 
+    // Per-equip-slot (permanentEnchant << 32 | temporaryEnchant), so an enchant
+    // change marks equipment dirty even though the displayInfoId is unchanged.
+    std::array<uint64_t, 19> lastEquipEnchantIds_{};
+
     // ---- Item text state ----
     bool        itemTextOpen_   = false;
     std::string itemText_;
