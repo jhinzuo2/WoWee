@@ -589,12 +589,20 @@ void M2Renderer::prepareRender(uint32_t frameIndex, const Camera& camera) {
 
         instance.megaBoneOffset = nextSlot * MAX_BONES_PER_INSTANCE;
 
-        // Upload bone matrices to mega buffer
-        if (megaBoneMapped_[frameIndex]) {
+        // Upload bone matrices to mega buffer — only when they were recomputed
+        // since the last upload into this frame's buffer, or the instance's
+        // slot moved (animated set changed). Most animated instances are
+        // distance/frustum/frame-skip culled and keep their previous bones, so
+        // skipping their memcpy avoids megabytes of redundant writes per frame.
+        if (megaBoneMapped_[frameIndex] &&
+            (instance.bonesDirty[frameIndex] ||
+             instance.megaBoneUploadedSlot[frameIndex] != nextSlot)) {
             int numBones = std::min(static_cast<int>(instance.boneMatrices.size()),
                                     static_cast<int>(MAX_BONES_PER_INSTANCE));
             auto* dst = static_cast<glm::mat4*>(megaBoneMapped_[frameIndex]) + instance.megaBoneOffset;
             memcpy(dst, instance.boneMatrices.data(), numBones * sizeof(glm::mat4));
+            instance.bonesDirty[frameIndex] = false;
+            instance.megaBoneUploadedSlot[frameIndex] = nextSlot;
         }
 
         nextSlot++;

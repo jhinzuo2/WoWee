@@ -255,6 +255,13 @@ bool M2Renderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFrameLayout
                 vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
             }
         }
+
+        // Fresh buffers hold no bone data — invalidate any per-instance upload
+        // tracking so prepareRender() re-uploads everything (defensive: instances
+        // are normally empty when this runs, but re-init must not skip uploads).
+        for (auto& inst : instances) {
+            inst.megaBoneUploadedSlot[0] = inst.megaBoneUploadedSlot[1] = 0;
+        }
     }
 
     // Instance data SSBO — per-frame buffer holding per-instance transforms, fade, bones.
