@@ -3099,11 +3099,75 @@ void MovementHandler::cancelFollow() {
         return;
     }
     owner_.followTargetGuidRef() = 0;
+    if (followMoveMoving_) {
+        sendMovement(Opcode::MSG_MOVE_STOP);
+        followMoveMoving_ = false;
+    }
     if (owner_.autoFollowCallbackRef()) {
         owner_.autoFollowCallbackRef()(nullptr);
     }
     owner_.addSystemChatMessage("You stop following.");
     owner_.fireAddonEvent("AUTOFOLLOW_END", {});
+}
+
+// Same straight-line step used by the headless client's single-shot
+// /movement/goto (updateMovementTask() in tools/headless_client/main.cpp),
+// but the target position is read fresh from the live entity every call
+// instead of a stored waypoint, and stops at kFollowStopDistance rather
+// than snapping onto the target.
+void MovementHandler::updateFollowMovement(float deltaTime) {
+    const uint64_t guid = owner_.followTargetGuidRef();
+    if (guid == 0) {
+        return;
+    }
+    if (owner_.getState() != WorldState::IN_WORLD) {
+        return;
+    }
+    if (isPlayerRooted() || !isServerMovementAllowed() || isOnTaxiFlight()) {
+        if (followMoveMoving_) {
+            sendMovement(Opcode::MSG_MOVE_STOP);
+            followMoveMoving_ = false;
+        }
+        return;
+    }
+
+    auto target = owner_.getEntityManager().getEntity(guid);
+    if (!target) {
+        // cancelFollow() (called from GameHandler::update()'s
+        // followRenderPos_ refresh) handles the disappeared-target case;
+        // just stay quiet here rather than duplicate that check.
+        return;
+    }
+
+    constexpr float kFollowStopDistance = 1.0f;
+    const float dx = target->getX() - movementInfo.x;
+    const float dy = target->getY() - movementInfo.y;
+    const float dz = target->getZ() - movementInfo.z;
+    const float horizontalDist = std::sqrt(dx * dx + dy * dy);
+    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+    if (distance <= kFollowStopDistance) {
+        if (followMoveMoving_) {
+            sendMovement(Opcode::MSG_MOVE_STOP);
+            followMoveMoving_ = false;
+        }
+        return;
+    }
+
+    if (horizontalDist > 0.001f) {
+        setOrientation(std::atan2(-dy, dx));
+        sendMovement(Opcode::MSG_MOVE_SET_FACING);
+    }
+    if (!followMoveMoving_) {
+        sendMovement(Opcode::MSG_MOVE_START_FORWARD);
+        followMoveMoving_ = true;
+    }
+
+    const float speed = std::max(0.1f, getServerRunSpeed());
+    const float step = std::min(distance - kFollowStopDistance, speed * std::max(0.0f, deltaTime));
+    const float t = distance > 0.001f ? (step / distance) : 0.0f;
+    setPosition(movementInfo.x + dx * t, movementInfo.y + dy * t, movementInfo.z + dz * t);
+    sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
 }
 
 } // namespace game

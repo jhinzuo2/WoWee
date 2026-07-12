@@ -189,7 +189,7 @@ public:
         return {};
     }
     std::vector<std::string> aliases() const override { return {"follow", "f"}; }
-    std::string helpText() const override { return "Follow target"; }
+    std::string helpText() const override { return "Walk toward and camera-follow your current target"; }
 };
 
 // --- /stopfollow ---

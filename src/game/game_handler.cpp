@@ -809,6 +809,7 @@ void GameHandler::update(float deltaTime) {
         if (followEnt) {
             followRenderPos_ = core::coords::canonicalToRender(
                 glm::vec3(followEnt->getX(), followEnt->getY(), followEnt->getZ()));
+            if (movementHandler_) movementHandler_->updateFollowMovement(deltaTime);
         } else {
             cancelFollow();
         }

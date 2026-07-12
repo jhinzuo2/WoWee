@@ -37,6 +37,14 @@ public:
     // Follow target (moved from GameHandler)
     void followTarget();
     void cancelFollow();
+    // Per-frame movement toward the followed target's live position, called
+    // from GameHandler::update() alongside the existing followRenderPos_
+    // refresh. A no-op when no follow target is set. Recomputes the target
+    // position fresh every call (from the live entity, not a stored point),
+    // so it doesn't need the long-distance Z-interpolation guard the
+    // headless client's single-shot /movement/goto needs - there's never a
+    // large stale remaining distance to interpolate across.
+    void updateFollowMovement(float deltaTime);
 
     // Area trigger detection
     void loadAreaTriggerDbc();
@@ -287,6 +295,8 @@ private:
     uint32_t knownTaxiMask_[12] = {};
     bool taxiMaskInitialized_ = false;
     std::unordered_map<uint32_t, uint32_t> taxiCostMap_;
+
+    bool followMoveMoving_ = false;  // whether MSG_MOVE_START_FORWARD has been sent for the current follow
 };
 
 } // namespace game
