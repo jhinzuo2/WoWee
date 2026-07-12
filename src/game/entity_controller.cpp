@@ -837,6 +837,14 @@ EntityController::UnitFieldUpdateResult EntityController::applyUnitFieldsOnUpdat
             if (block.guid == owner_.getPlayerGuid() && owner_.stunStateCallbackRef()) {
                 bool wasStunned = (oldFlags & UNIT_FLAG_STUNNED) != 0;
                 bool nowStunned = (val & UNIT_FLAG_STUNNED) != 0;
+                // The server stuns the player for the logout countdown, to root them
+                // in place — it sits them down in the same breath. That is a movement
+                // restriction, not a stun: playing the stun animation over it leaves
+                // the character slumped rather than seated. Clearing the flag is still
+                // honoured, so a cancelled logout recovers.
+                if (nowStunned && owner_.isLoggingOut()) {
+                    nowStunned = false;
+                }
                 if (wasStunned != nowStunned) {
                     owner_.stunStateCallbackRef()(nowStunned);
                 }

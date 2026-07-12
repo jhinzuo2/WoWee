@@ -2857,6 +2857,15 @@ void GameHandler::handlePacket(network::Packet& packet) {
         }
     }
 
+    // TEMP: the logout countdown expires and SMSG_LOGOUT_COMPLETE never reaches its
+    // handler, so trace everything the server sends while a logout is pending.
+    if (isLoggingOut()) {
+        LOG_WARNING("RX during logout: wire=0x", std::hex, opcode, std::dec,
+                    " logical=", static_cast<int>(*logicalOp),
+                    " size=", packet.getSize(),
+                    " handled=", (dispatchTable_.count(*logicalOp) ? 1 : 0));
+    }
+
     // Dispatch via the opcode handler table
     auto it = dispatchTable_.find(*logicalOp);
     if (it != dispatchTable_.end()) {
