@@ -1541,16 +1541,20 @@ void Application::update(float deltaTime) {
                             m2Floor = renderer->getM2Renderer()->getFloorHeight(p.x, p.y, p.z + 40.0f);
                         }
 
+                        // Prefer WMO/M2 structural floors over raw terrain height. Terrain has
+                        // no notion of being underground (e.g. a WMO tunnel beneath a mountain,
+                        // like Ironforge's flight point) - comparing it against a WMO/M2 floor
+                        // with "highest wins" can snap the player up onto outdoor terrain that
+                        // happens to sit above where they're actually standing. Live-confirmed:
+                        // Ironforge landing clamp saw terrainFloor=769 (the mountain surface)
+                        // vs. the correct wmoFloor=502 (the tunnel floor) and picked the wrong
+                        // one. Terrain is now only used when no WMO/M2 floor is found at all.
                         std::optional<float> targetFloor;
                         const char* pickedFrom = "none";
-                        if (terrainFloor) { targetFloor = terrainFloor; pickedFrom = "terrain"; }
-                        if (wmoFloor && (!targetFloor || *wmoFloor > *targetFloor)) { targetFloor = wmoFloor; pickedFrom = "wmo"; }
+                        if (wmoFloor) { targetFloor = wmoFloor; pickedFrom = "wmo"; }
                         if (m2Floor && (!targetFloor || *m2Floor > *targetFloor)) { targetFloor = m2Floor; pickedFrom = "m2"; }
+                        if (!targetFloor && terrainFloor) { targetFloor = terrainFloor; pickedFrom = "terrain"; }
 
-                        // Diagnostic for the Ironforge-style case (flight point inside a mountain):
-                        // raw terrain height has no notion of the WMO tunnel above/below it, so
-                        // logging every candidate here shows whether "highest floor wins" is
-                        // picking outdoor terrain over the correct (lower) interior WMO floor.
                         LOG_INFO("Taxi landing clamp: pos=(", p.x, ", ", p.y, ", ", p.z, ") ",
                                  "terrainFloor=", terrainFloor ? std::to_string(*terrainFloor) : "none", " ",
                                  "wmoFloor=", wmoFloor ? std::to_string(*wmoFloor) : "none", " ",
