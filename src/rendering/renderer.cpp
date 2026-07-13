@@ -1574,7 +1574,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
         if (characterRenderer) characterRenderer->prepareRender(frameIdx);
 
         // --- Dispatch worker threads (terrain + WMO + M2) ---
-        std::future<double> terrainFuture, wmoFuture, m2Future;
+        std::future<double> terrainFuture, wmoFuture, charFuture, m2Future, postFuture;
 
         if (terrainRenderer && camera && terrainEnabled && !skipTerrain) {
             terrainFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
@@ -1643,9 +1643,9 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             vkEndCommandBuffer(cmd);
         }
 
-        // --- Main thread: record characters + selection circle (SEC_CHARS) ---
+        // --- Main thread: record selection circle before overlay state is used by post ---
         {
-            VkCommandBuffer cmd = beginSecondary(SEC_CHARS);
+            VkCommandBuffer cmd = beginSecondary(SEC_SELECTION);
             setSecondaryViewportScissor(cmd);
             if (overlaySystem_) {
                 overlaySystem_->renderSelectionCircle(view, projection, cmd,
@@ -1653,25 +1653,28 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                     wmoRenderer ? OverlaySystem::HeightQuery3D([&](float x, float y, float z) { return wmoRenderer->getFloorHeight(x, y, z); }) : OverlaySystem::HeightQuery3D{},
                     m2Renderer ? OverlaySystem::HeightQuery3D([&](float x, float y, float z) { return m2Renderer->getFloorHeight(x, y, z); }) : OverlaySystem::HeightQuery3D{});
             }
+            vkEndCommandBuffer(cmd);
+        }
+
+        // Character recording is independent after prepareRender() and no
+        // longer shares the selection-circle overlay command buffer.
+        charFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
+            auto t0 = std::chrono::steady_clock::now();
+            VkCommandBuffer cmd = beginSecondary(SEC_CHARS);
+            setSecondaryViewportScissor(cmd);
             if (characterRenderer && camera && !skipChars) {
                 characterRenderer->render(cmd, perFrameSet, *camera);
             }
             vkEndCommandBuffer(cmd);
-        }
+            return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        });
 
-        // --- Wait for workers ---
-        // Guard with try-catch: future::get() re-throws any exception from the
-        // async task. Without this, a single bad_alloc in a render worker would
-        // propagate as an unhandled exception and terminate the process.
-        try { if (terrainFuture.valid()) lastTerrainRenderMs = terrainFuture.get(); }
-        catch (const std::exception& e) { LOG_ERROR("Terrain render worker: ", e.what()); }
-        try { if (wmoFuture.valid()) lastWMORenderMs = wmoFuture.get(); }
-        catch (const std::exception& e) { LOG_ERROR("WMO render worker: ", e.what()); }
-        try { if (m2Future.valid()) lastM2RenderMs = m2Future.get(); }
-        catch (const std::exception& e) { LOG_ERROR("M2 render worker: ", e.what()); }
-
-        // --- Main thread: record post-opaque (SEC_POST) ---
-        {
+        // Post-world systems are disjoint from terrain/WMO/M2/characters. Start
+        // this after selection recording so OverlaySystem is never used from
+        // two threads at once.
+        postFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
+            auto t0 = std::chrono::steady_clock::now();
             VkCommandBuffer cmd = beginSecondary(SEC_POST);
             setSecondaryViewportScissor(cmd);
             if (waterRenderer && camera)
@@ -1683,7 +1686,6 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             if (chargeEffect && camera) chargeEffect->render(cmd, perFrameSet);
             if (questMarkerRenderer && camera) questMarkerRenderer->render(cmd, perFrameSet, *camera);
 
-            // Underwater overlay + minimap
             if (overlaySystem_ && waterRenderer && camera) {
                 glm::vec3 camPos = camera->getPosition();
                 auto waterH = waterRenderer->getNearestWaterHeightAt(camPos.x, camPos.y, camPos.z);
@@ -1699,14 +1701,12 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                     glm::vec4 tint = canal
                         ? glm::vec4(0.01f, 0.04f, 0.10f, fogStrength)
                         : glm::vec4(0.03f, 0.09f, 0.18f, fogStrength);
-                    if (overlaySystem_) overlaySystem_->renderOverlay(tint, cmd);
+                    overlaySystem_->renderOverlay(tint, cmd);
                 }
             }
-            // Ghost mode desaturation: cold blue-grey overlay when dead/ghost
             if (ghostMode_ && overlaySystem_) {
                 overlaySystem_->renderOverlay(glm::vec4(0.30f, 0.35f, 0.42f, 0.45f), cmd);
             }
-            // Brightness overlay (applied before minimap so it doesn't affect UI)
             if (overlaySystem_) {
                 float br = postProcessPipeline_ ? postProcessPipeline_->getBrightness() : 1.0f;
                 if (br < 0.99f) {
@@ -1723,15 +1723,9 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                 float minimapPlayerOrientation = 0.0f;
                 bool hasMinimapPlayerOrientation = false;
                 if (cameraController) {
-                    // Render-space character yaw faces north at 180 degrees; the
-                    // minimap shader arrow faces north at 0. Match the mirrored
-                    // minimap texture by flipping the visual arrow vertically.
                     minimapPlayerOrientation = glm::radians(characterYaw);
                     hasMinimapPlayerOrientation = true;
                 } else if (gameHandler) {
-                    // movementInfo.orientation is canonical yaw: north is 0, east is +pi/2.
-                    // Match the mirrored minimap texture by flipping the visual
-                    // arrow vertically.
                     minimapPlayerOrientation = glm::pi<float>() - gameHandler->getMovementInfo().orientation;
                     hasMinimapPlayerOrientation = true;
                 }
@@ -1740,7 +1734,24 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                                 minimapPlayerOrientation, hasMinimapPlayerOrientation);
             }
             vkEndCommandBuffer(cmd);
-        }
+            return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        });
+
+        // --- Wait for workers ---
+        // Guard with try-catch: future::get() re-throws any exception from the
+        // async task. Without this, a single bad_alloc in a render worker would
+        // propagate as an unhandled exception and terminate the process.
+        try { if (terrainFuture.valid()) lastTerrainRenderMs = terrainFuture.get(); }
+        catch (const std::exception& e) { LOG_ERROR("Terrain render worker: ", e.what()); }
+        try { if (wmoFuture.valid()) lastWMORenderMs = wmoFuture.get(); }
+        catch (const std::exception& e) { LOG_ERROR("WMO render worker: ", e.what()); }
+        try { if (m2Future.valid()) lastM2RenderMs = m2Future.get(); }
+        catch (const std::exception& e) { LOG_ERROR("M2 render worker: ", e.what()); }
+        try { if (charFuture.valid()) (void)charFuture.get(); }
+        catch (const std::exception& e) { LOG_ERROR("Character render worker: ", e.what()); }
+        try { if (postFuture.valid()) (void)postFuture.get(); }
+        catch (const std::exception& e) { LOG_ERROR("Post render worker: ", e.what()); }
 
         // --- Execute all secondary buffers in correct draw order ---
         VkCommandBuffer validCmds[6];
@@ -1750,6 +1761,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             validCmds[numCmds++] = secondaryCmds_[SEC_TERRAIN][frameIdx];
         if (wmoRenderer && camera && !skipWMO)
             validCmds[numCmds++] = secondaryCmds_[SEC_WMO][frameIdx];
+        validCmds[numCmds++] = secondaryCmds_[SEC_SELECTION][frameIdx];
         validCmds[numCmds++] = secondaryCmds_[SEC_CHARS][frameIdx];
         if (m2Renderer && camera && !skipM2)
             validCmds[numCmds++] = secondaryCmds_[SEC_M2][frameIdx];
@@ -2469,8 +2481,8 @@ bool Renderer::createSecondaryCommandResources() {
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
     allocInfo.commandBufferCount = 1;
 
-    // Worker secondaries: SEC_TERRAIN=1, SEC_WMO=2, SEC_M2=4 → worker pools 0,1,2
-    const uint32_t workerSecondaries[] = { SEC_TERRAIN, SEC_WMO, SEC_M2 };
+    // Each concurrently recorded worker secondary owns a dedicated command pool.
+    const uint32_t workerSecondaries[] = { SEC_TERRAIN, SEC_WMO, SEC_CHARS, SEC_M2, SEC_POST };
     for (uint32_t w = 0; w < NUM_WORKERS; ++w) {
         allocInfo.commandPool = workerCmdPools_[w];
         for (uint32_t f = 0; f < MAX_FRAMES; ++f) {
@@ -2481,8 +2493,7 @@ bool Renderer::createSecondaryCommandResources() {
         }
     }
 
-    // Main-thread secondaries: SEC_SKY=0, SEC_CHARS=3, SEC_POST=5, SEC_IMGUI=6
-    const uint32_t mainSecondaries[] = { SEC_SKY, SEC_CHARS, SEC_POST, SEC_IMGUI };
+    const uint32_t mainSecondaries[] = { SEC_SKY, SEC_SELECTION, SEC_IMGUI };
     for (uint32_t idx : mainSecondaries) {
         allocInfo.commandPool = mainSecondaryCmdPool_;
         for (uint32_t f = 0; f < MAX_FRAMES; ++f) {

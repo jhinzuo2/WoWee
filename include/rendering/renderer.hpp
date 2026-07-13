@@ -327,15 +327,16 @@ private:
 
     // ── Multithreaded secondary command buffer recording ──
     // Indices into secondaryCmds_ arrays
-    static constexpr uint32_t SEC_SKY     = 0;  // sky (main thread)
-    static constexpr uint32_t SEC_TERRAIN = 1;  // terrain (worker 0)
-    static constexpr uint32_t SEC_WMO     = 2;  // WMO (worker 1)
-    static constexpr uint32_t SEC_CHARS   = 3;  // selection circle + characters (main thread)
-    static constexpr uint32_t SEC_M2      = 4;  // M2 + particles + glow (worker 2)
-    static constexpr uint32_t SEC_POST    = 5;  // water + weather + effects (main thread)
-    static constexpr uint32_t SEC_IMGUI   = 6;  // ImGui (main thread, non-FSR only)
-    static constexpr uint32_t NUM_SECONDARIES = 7;
-    static constexpr uint32_t NUM_WORKERS = 3;  // terrain, WMO, M2
+    static constexpr uint32_t SEC_SKY       = 0;  // sky (main thread)
+    static constexpr uint32_t SEC_TERRAIN   = 1;  // terrain (worker 0)
+    static constexpr uint32_t SEC_WMO       = 2;  // WMO (worker 1)
+    static constexpr uint32_t SEC_SELECTION = 3;  // selection circle (main thread)
+    static constexpr uint32_t SEC_CHARS     = 4;  // characters (worker 2)
+    static constexpr uint32_t SEC_M2        = 5;  // M2 + particles + glow (worker 3)
+    static constexpr uint32_t SEC_POST      = 6;  // water + weather + effects (worker 4)
+    static constexpr uint32_t SEC_IMGUI     = 7;  // ImGui (main thread, non-FSR only)
+    static constexpr uint32_t NUM_SECONDARIES = 8;
+    static constexpr uint32_t NUM_WORKERS = 5;
 
     // Per-worker command pools (thread-safe: one pool per thread)
     VkCommandPool workerCmdPools_[NUM_WORKERS] = {};
