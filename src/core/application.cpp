@@ -2369,7 +2369,7 @@ void Application::setupUICallbacks() {
 
     // ── Animation: death, respawn, swing, hit, spell, emote, charge, etc. ──
     animationCallbacks_ = std::make_unique<AnimationCallbackHandler>(
-        *entitySpawner_, *renderer, *gameHandler);
+        *entitySpawner_, *renderer, *gameHandler, *appearanceComposer_);
     animationCallbacks_->setupCallbacks();
 
     // ── NPC interaction: greeting, farewell, vendor, aggro voice ──

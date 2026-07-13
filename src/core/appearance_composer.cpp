@@ -417,6 +417,14 @@ bool AppearanceComposer::loadWeaponM2(const std::string& m2Path, pipeline::M2Mod
 }
 
 void AppearanceComposer::loadEquippedWeapons() {
+    // Equipment refreshes can arrive during a gather cast. Keep the temporary
+    // tool authoritative until the cast-end callback restores real equipment.
+    const uint32_t currentInstanceId = renderer_ ? renderer_->getCharacterInstanceId() : 0;
+    if (showingMiningPick_ && currentInstanceId == miningPickInstanceId_) return;
+    if (showingMiningPick_) {
+        showingMiningPick_ = false;
+        miningPickInstanceId_ = 0;
+    }
     showingRanged_ = false;
     if (!renderer_ || !renderer_->getCharacterRenderer() || !assetManager_ || !assetManager_->isInitialized())
         return;
@@ -589,6 +597,75 @@ void AppearanceComposer::loadEquippedWeapons() {
                 }
             }
         }
+    }
+}
+
+void AppearanceComposer::showMiningPick(bool show) {
+    if (show == showingMiningPick_) return;
+
+    if (!show) {
+        showingMiningPick_ = false;
+        miningPickInstanceId_ = 0;
+        loadEquippedWeapons();
+        return;
+    }
+
+    if (!renderer_ || !renderer_->getCharacterRenderer() || !assetManager_ ||
+        !assetManager_->isInitialized() || !entitySpawner_) {
+        return;
+    }
+
+    auto* charRenderer = renderer_->getCharacterRenderer();
+    const uint32_t charInstanceId = renderer_->getCharacterInstanceId();
+    if (charInstanceId == 0) return;
+
+    // Item 2901 (Mining Pick) resolves to ItemDisplayInfo 6568 in the WotLK DBC.
+    constexpr uint32_t kMiningPickDisplayId = 6568;
+    auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
+    if (!displayInfoDbc) return;
+
+    const int32_t recIdx = displayInfoDbc->findRecordById(kMiningPickDisplayId);
+    if (recIdx < 0) {
+        LOG_WARNING("showMiningPick: displayInfoId ", kMiningPickDisplayId,
+                    " not found in DBC");
+        return;
+    }
+
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    std::string modelName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModel"] : 1);
+    std::string textureName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModelTexture"] : 3);
+    if (modelName.empty()) return;
+
+    const size_t dotPos = modelName.rfind('.');
+    std::string modelFile = dotPos == std::string::npos
+        ? modelName + ".m2" : modelName.substr(0, dotPos) + ".m2";
+    const std::string m2Path = "Item\\ObjectComponents\\Weapon\\" + modelFile;
+
+    pipeline::M2Model pickModel;
+    if (!loadWeaponM2(m2Path, pickModel)) {
+        LOG_WARNING("showMiningPick: failed to load ", m2Path);
+        return;
+    }
+
+    std::string texturePath;
+    if (!textureName.empty()) {
+        texturePath = "Item\\ObjectComponents\\Weapon\\" + textureName + ".blp";
+    }
+
+    charRenderer->detachWeapon(charInstanceId, kAttachRightHand);
+    const uint32_t modelId = entitySpawner_->allocateWeaponModelId();
+    if (charRenderer->attachWeapon(charInstanceId, kAttachRightHand, pickModel,
+                                   modelId, texturePath)) {
+        showingMiningPick_ = true;
+        miningPickInstanceId_ = charInstanceId;
+        showingRanged_ = false;
+        LOG_INFO("Mining pick attached at right hand: ", m2Path);
+    } else {
+        // Do not leave the player empty-handed if the temporary model failed.
+        loadEquippedWeapons();
     }
 }
 
