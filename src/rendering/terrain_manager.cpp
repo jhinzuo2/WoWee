@@ -1444,8 +1444,16 @@ void TerrainManager::processPendingUnloads() {
     ZoneScopedN("TerrainManager::processPendingUnloads");
     if (pendingUnloadQueue_.empty()) return;
 
+    // Time-budgeted rather than count-capped (see pendingUnloadQueue_'s comment) so
+    // throughput scales with whatever time is actually available this frame instead
+    // of a fixed tile count that can't keep pace when frame rate drops or the queue
+    // is unusually large (e.g. after a long, fast taxi flight). Taxi mode gets a
+    // larger budget, matching processReadyTiles()'s existing taxi-aware budget.
+    const auto budgetStart = std::chrono::steady_clock::now();
+    const float budgetMs = taxiStreamingMode_ ? 16.0f : 8.0f;
+
     size_t unloaded = 0;
-    while (!pendingUnloadQueue_.empty() && unloaded < maxTileUnloadsPerFrame_) {
+    while (!pendingUnloadQueue_.empty()) {
         TileCoord coord = pendingUnloadQueue_.front();
         pendingUnloadQueue_.pop_front();
 
@@ -1458,6 +1466,10 @@ void TerrainManager::processPendingUnloads() {
 
         unloadTile(coord.x, coord.y);
         unloaded++;
+
+        const float elapsed = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - budgetStart).count();
+        if (elapsed >= budgetMs) break;
     }
 
     if (unloaded > 0) {
@@ -2526,7 +2538,7 @@ void TerrainManager::streamTiles() {
 
     // Unload tiles beyond unload radius (well past the camera far clip).
     // Queue them rather than unloading synchronously here — processPendingUnloads()
-    // drains a bounded batch per frame instead (see maxTileUnloadsPerFrame_ comment).
+    // drains a time-budgeted batch per frame instead (see pendingUnloadQueue_'s comment).
     std::unordered_set<TileCoord, TileCoord::Hash> alreadyQueued(
         pendingUnloadQueue_.begin(), pendingUnloadQueue_.end());
     size_t queuedNow = 0;
