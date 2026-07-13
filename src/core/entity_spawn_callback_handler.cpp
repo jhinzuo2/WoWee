@@ -141,7 +141,9 @@ void EntitySpawnCallbackHandler::setupCallbacks() {
             glm::vec3 renderPos = core::coords::canonicalToRender(glm::vec3(x, y, z));
             float durationSec = static_cast<float>(durationMs) / 1000.0f;
             renderer_.getCharacterRenderer()->moveInstanceTo(instanceId, renderPos, durationSec);
-            // Play Run animation (anim 5) for the duration of the spline move.
+            // Play the server-selected ground locomotion animation for the
+            // duration of the spline move. Monster patrols report Walk through
+            // SMSG_MONSTER_MOVE's spline flags before this callback runs.
             // WoW M2 animation IDs: 4=Walk, 5=Run.
             // Don't override Death animation (1). The per-frame sync loop will return to
             // Stand when movement stops.
@@ -153,9 +155,11 @@ void EntitySpawnCallbackHandler::setupCallbacks() {
                     uint32_t curAnimId = 0; float curT = 0.0f, curDur = 0.0f;
                     auto* cr = renderer_.getCharacterRenderer();
                     bool gotState = cr->getAnimationState(instanceId, curAnimId, curT, curDur);
-                    // Only start Run if not already running and not in Death animation.
-                    if (!gotState || (curAnimId != rendering::anim::DEATH && curAnimId != rendering::anim::RUN)) {
-                        cr->playAnimation(instanceId, rendering::anim::RUN, /*loop=*/true);
+                    const bool walking = entitySpawner_.getCreatureWalkingState().count(guid) > 0;
+                    const uint32_t targetAnim = walking ? rendering::anim::WALK : rendering::anim::RUN;
+                    // Only restart when the selected locomotion animation changed.
+                    if (!gotState || (curAnimId != rendering::anim::DEATH && curAnimId != targetAnim)) {
+                        cr->playAnimation(instanceId, targetAnim, /*loop=*/true);
                     }
                     entitySpawner_.getCreatureWasMoving()[guid] = true;
                 }
