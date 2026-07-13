@@ -900,20 +900,16 @@ void Renderer::beginFrame() {
     updatePerFrameUBO();
 
     // ── Early compute: M2 frustum culling ──
-    // GPU frustum cull keeps draw call counts low.  The HiZ occlusion pyramid
-    // is skipped for now — building ~11 mip levels with per-level barriers
-    // behind a blocking fence was the main frame-rate bottleneck.  Frustum-
-    // only culling is fast enough that the fence wait is negligible.
+    // beginFrame() has already waited for this frame slot's previous fence, so
+    // its mapped visibility output is complete and safe for the CPU to reuse.
+    // Read/invalidate that completed output, then record the next cull dispatch
+    // directly into the normal frame command buffer. The old path submitted a
+    // separate command buffer and synchronously waited on a fence every frame,
+    // serializing CPU and GPU work solely to obtain same-frame cull results.
     if (m2Renderer && camera && vkCtx) {
-        VkCommandBuffer computeCmd = vkCtx->beginSingleTimeCommands();
         uint32_t frame = vkCtx->getCurrentFrame();
-
-        // Dispatch GPU frustum culling (HiZ disabled → frustum-only pipeline)
-        m2Renderer->dispatchCullCompute(computeCmd, frame, *camera);
-
-        vkCtx->endSingleTimeCommands(computeCmd);
-
         m2Renderer->invalidateCullOutput(frame);
+        m2Renderer->dispatchCullCompute(currentCmd, frame, *camera);
     }
 
     // --- Off-screen pre-passes ---

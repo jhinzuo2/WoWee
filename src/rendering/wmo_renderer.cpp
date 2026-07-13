@@ -869,12 +869,10 @@ void WMORenderer::cleanupUnusedModels() {
         }
     }
 
-    // Delete GPU resources and remove from map.
-    // Ensure all in-flight frames are complete before freeing vertex/index buffers —
-    // the GPU may still be reading them from the previous frame's command buffer.
-    if (!toRemove.empty() && vkCtx_) {
-        vkDeviceWaitIdle(vkCtx_->getDevice());
-    }
+    // unloadModel() routes every group buffer, material UBO, and descriptor
+    // through deferAfterAllFrameFences(). Do not stall the entire device here;
+    // periodic cleanup can otherwise introduce a visible hitch every time a
+    // streamed WMO leaves the active set.
     for (uint32_t id : toRemove) {
         unloadModel(id);
     }

@@ -609,10 +609,9 @@ void M2Renderer::prepareRender(uint32_t frameIndex, const Camera& camera) {
     }
 }
 
-// Dispatch GPU frustum culling compute shader.
-// Called on the primary command buffer BEFORE the render pass begins so that
-// compute dispatch and memory barrier complete before secondary command buffers
-// read the visibility output in render().
+// Dispatch GPU frustum culling compute shader into the primary frame command
+// buffer. render() consumes the completed output left in this frame slot from
+// its previous use; this dispatch produces results for the slot's next reuse.
 void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, const Camera& camera) {
     if (!cullPipeline_ || instances.empty()) return;
 
@@ -740,7 +739,8 @@ void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, c
     const uint32_t groupCount = (numInstances + 63) / 64;
     vkCmdDispatch(cmd, groupCount, 1, 1);
 
-    // --- Memory barrier: compute writes → host reads ---
+    // Make writes available to the host after this frame's fence signals. The
+    // CPU invalidates and reads them when this frame slot is reused.
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
