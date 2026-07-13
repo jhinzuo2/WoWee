@@ -13,6 +13,8 @@
 #include <unordered_set>
 #include <cmath>
 #include <chrono>
+#include <limits>
+#include <utility>
 #include "core/spawn_presets.hpp"
 #include "core/logger.hpp"
 #include "core/memory_monitor.hpp"
@@ -1521,7 +1523,15 @@ void Application::update(float deltaTime) {
                     renderer->getCameraController()->clearMovementInputs();
                     // Keep clamping until terrain loads at landing position.
                     // Timer only counts down once a valid floor is found.
-                    if (worldEntryCallbacks_) worldEntryCallbacks_->setTaxiLandingClampTimer(2.0f);
+                    if (worldEntryCallbacks_) {
+                        worldEntryCallbacks_->setTaxiLandingClampTimer(2.0f);
+                        // Capture where the flight itself left the player, before terrain/WMO
+                        // streaming has a chance to move things around - this is the ground
+                        // truth the floor-selection below picks the closest candidate to.
+                        if (renderer) {
+                            worldEntryCallbacks_->setTaxiLandingReferenceZ(renderer->getCharacterPosition().z);
+                        }
+                    }
                 }
                 if (landingClampActive) {
                     if (renderer && gameHandler) {
@@ -1541,21 +1551,36 @@ void Application::update(float deltaTime) {
                             m2Floor = renderer->getM2Renderer()->getFloorHeight(p.x, p.y, p.z + 40.0f);
                         }
 
-                        // Prefer WMO/M2 structural floors over raw terrain height. Terrain has
-                        // no notion of being underground (e.g. a WMO tunnel beneath a mountain,
-                        // like Ironforge's flight point) - comparing it against a WMO/M2 floor
-                        // with "highest wins" can snap the player up onto outdoor terrain that
-                        // happens to sit above where they're actually standing. Live-confirmed:
-                        // Ironforge landing clamp saw terrainFloor=769 (the mountain surface)
-                        // vs. the correct wmoFloor=502 (the tunnel floor) and picked the wrong
-                        // one. Terrain is now only used when no WMO/M2 floor is found at all.
+                        // Pick whichever floor candidate is closest to where the taxi flight
+                        // itself left the player, rather than unconditionally preferring
+                        // WMO/M2 over terrain. Unconditionally preferring WMO/M2 fixed
+                        // underground landings (terrain has no notion of being underground -
+                        // e.g. a WMO tunnel beneath a mountain, like Ironforge's flight point,
+                        // where terrainFloor=769 the mountain surface beat the correct
+                        // wmoFloor=502 the tunnel floor with "highest wins"), but could just as
+                        // easily snap an *outdoor* landing down onto an unrelated structure
+                        // sitting underneath it. referenceZ - captured once when the clamp
+                        // armed, from wherever the flight simulation actually left the player -
+                        // is ground truth for which candidate is plausible.
+                        const float referenceZ = worldEntryCallbacks_
+                            ? worldEntryCallbacks_->getTaxiLandingReferenceZ() : p.z;
                         std::optional<float> targetFloor;
                         const char* pickedFrom = "none";
-                        if (wmoFloor) { targetFloor = wmoFloor; pickedFrom = "wmo"; }
-                        if (m2Floor && (!targetFloor || *m2Floor > *targetFloor)) { targetFloor = m2Floor; pickedFrom = "m2"; }
-                        if (!targetFloor && terrainFloor) { targetFloor = terrainFloor; pickedFrom = "terrain"; }
+                        float bestDist = std::numeric_limits<float>::max();
+                        const std::pair<std::optional<float>, const char*> floorCandidates[] = {
+                            {wmoFloor, "wmo"}, {m2Floor, "m2"}, {terrainFloor, "terrain"}};
+                        for (const auto& [candidate, name] : floorCandidates) {
+                            if (!candidate) continue;
+                            float dist = std::abs(*candidate - referenceZ);
+                            if (dist < bestDist) {
+                                bestDist = dist;
+                                targetFloor = candidate;
+                                pickedFrom = name;
+                            }
+                        }
 
                         LOG_INFO("Taxi landing clamp: pos=(", p.x, ", ", p.y, ", ", p.z, ") ",
+                                 "referenceZ=", referenceZ, " ",
                                  "terrainFloor=", terrainFloor ? std::to_string(*terrainFloor) : "none", " ",
                                  "wmoFloor=", wmoFloor ? std::to_string(*wmoFloor) : "none", " ",
                                  "m2Floor=", m2Floor ? std::to_string(*m2Floor) : "none", " ",

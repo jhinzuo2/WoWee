@@ -43,6 +43,12 @@ public:
     void setLastTaxiFlight(bool v) { lastTaxiFlight_ = v; }
     float getTaxiLandingClampTimer() const { return taxiLandingClampTimer_; }
     void setTaxiLandingClampTimer(float t) { taxiLandingClampTimer_ = t; }
+    // Character render-position Z captured the moment the landing clamp arms,
+    // i.e. wherever the taxi flight itself left the player. Used to pick whichever
+    // floor candidate (terrain/WMO/M2) is closest to the real landing point instead
+    // of unconditionally preferring WMO/M2 over terrain (see application.cpp).
+    float getTaxiLandingReferenceZ() const { return taxiLandingReferenceZ_; }
+    void setTaxiLandingReferenceZ(float z) { taxiLandingReferenceZ_ = z; }
 
 private:
     /// Sample best floor height at (x, y) from terrain, WMO, and M2 (eliminates 3x duplication)
@@ -72,6 +78,7 @@ private:
     float worldEntryMovementGraceTimer_ = 0.0f;
     bool lastTaxiFlight_ = false;
     float taxiLandingClampTimer_ = 0.0f;
+    float taxiLandingReferenceZ_ = 0.0f;
 };
 
 } // namespace core
