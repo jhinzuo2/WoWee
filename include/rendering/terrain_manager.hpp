@@ -294,6 +294,9 @@ public:
     /** Process a bounded batch of ready tiles with async GPU upload (no sync wait) */
     void processReadyTiles();
 
+    /** Unload a bounded batch of distant tiles queued by streamTiles() (no frame-spike) */
+    void processPendingUnloads();
+
 private:
     /**
      * Get tile coordinates from GL world position
@@ -430,6 +433,14 @@ private:
     // (prevents re-parsing thousands of doodads when same WMO spans multiple tiles)
     std::unordered_set<uint32_t> preparedWmoUniqueIds_;
     std::mutex preparedWmoUniqueIdsMutex_;
+
+    // MAIN-THREAD-ONLY: tiles beyond unloadRadius, queued by streamTiles() and drained a
+    // few at a time by processPendingUnloads() each frame. Unloading them all synchronously
+    // in one call (e.g. ~100 tiles right after a taxi landing snaps the radius down) caused
+    // multi-second main-thread stalls — live-confirmed via "SLOW terrainManager->update:
+    // 1943.71ms" immediately after "Unloaded 103 distant tiles" in a real flight-landing log.
+    std::deque<TileCoord> pendingUnloadQueue_;
+    static constexpr size_t maxTileUnloadsPerFrame_ = 8;
 
     // MAIN-THREAD-ONLY: checked and modified in processReadyTiles() and unloadDistantTiles(),
     // both of which run exclusively on the main thread.

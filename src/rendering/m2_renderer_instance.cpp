@@ -552,8 +552,14 @@ void M2Renderer::cleanupUnusedModels() {
     // buffers — the previous frame's command buffer may still be referencing
     // vertex/index buffers that are about to be freed. Without this wait,
     // the GPU reads freed memory, which can cause VK_ERROR_DEVICE_LOST.
+    // Suspected (not yet confirmed) contributor to multi-second freezes seen
+    // right after taxi landings — timed here so the next repro pins it down.
     if (!toRemove.empty() && vkCtx_) {
+        const auto waitStart = std::chrono::steady_clock::now();
         vkDeviceWaitIdle(vkCtx_->getDevice());
+        const float waitMs = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - waitStart).count();
+        LOG_INFO("M2 cleanup: vkDeviceWaitIdle took ", waitMs, "ms (", toRemove.size(), " models to remove)");
     }
     for (uint32_t id : toRemove) {
         auto it = models.find(id);
