@@ -2425,6 +2425,16 @@ void MovementHandler::finishClientTaxiFlight(bool snapToFinalWaypoint) {
     LOG_INFO("Taxi flight landed (client path)");
 }
 
+bool MovementHandler::isNearTaxiDestination(float maxDistance) const {
+    if (!taxiClientActive_ || taxiClientPath_.empty()) return false;
+
+    const glm::vec3& destination = taxiClientPath_.back();
+    const float dx = movementInfo.x - destination.x;
+    const float dy = movementInfo.y - destination.y;
+    const float dz = movementInfo.z - destination.z;
+    return dx * dx + dy * dy + dz * dz <= maxDistance * maxDistance;
+}
+
 void MovementHandler::updateClientTaxi(float deltaTime) {
     // Live-confirmed: a CMSG_ACTIVATETAXI the server can't make sense of (e.g.
     // a stale start node vs. the player's actual position) can go completely

@@ -514,7 +514,11 @@ void EntityController::detectPlayerMountChange(uint32_t newMountDisplayId,
         if (playerUnit) {
             serverStillTaxiing = (playerUnit->getUnitFlags() & UNIT_FLAG_TAXI_FLIGHT) != 0;
         }
-        if (serverStillTaxiing) {
+        const bool nearDestination = owner_.getMovementHandler()->isNearTaxiDestination();
+        if (serverStillTaxiing || !nearDestination) {
+            if (!nearDestination) {
+                LOG_WARNING("Ignoring premature taxi mount clear before destination");
+            }
             return;
         }
         // Authoritative server completion ahead of our own spline - stop the

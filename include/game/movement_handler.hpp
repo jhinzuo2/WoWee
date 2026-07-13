@@ -150,6 +150,9 @@ public:
     // MovementHandler (SMSG_DISMOUNT / UNIT_FIELD_MOUNTDISPLAYID handlers reacting
     // to an authoritative server completion signal) should pass false.
     void finishClientTaxiFlight(bool snapToFinalWaypoint);
+    // Server cores can clear taxi flags/dismount before the client spline reaches
+    // its final waypoint. Only treat those signals as authoritative near arrival.
+    bool isNearTaxiDestination(float maxDistance = 96.0f) const;
     uint32_t nextMovementTimestampMs();
     void sanitizeMovementForTaxi();
 

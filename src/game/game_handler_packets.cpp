@@ -622,9 +622,15 @@ void GameHandler::registerOpcodeHandlers() {
                 serverStillTaxiing = (playerUnit->getUnitFlags() & UNIT_FLAG_TAXI_FLIGHT) != 0;
             }
         }
+        const bool nearDestination = onTaxiFlight && movementHandler_ &&
+                                     movementHandler_->isNearTaxiDestination();
         LOG_INFO("SMSG_DISMOUNT received: onTaxiFlight=", onTaxiFlight,
-                 " serverStillTaxiing=", serverStillTaxiing);
-        if (onTaxiFlight && serverStillTaxiing) return;
+                 " serverStillTaxiing=", serverStillTaxiing,
+                 " nearDestination=", nearDestination);
+        if (onTaxiFlight && (serverStillTaxiing || !nearDestination)) {
+            LOG_WARNING("Ignoring premature SMSG_DISMOUNT before taxi destination");
+            return;
+        }
         if (onTaxiFlight && movementHandler_) {
             // Authoritative server completion ahead of our own spline - stop the
             // client flight now rather than snapping to a final waypoint that may
