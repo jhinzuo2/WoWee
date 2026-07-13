@@ -26,6 +26,7 @@
 #include "rendering/vk_frame_data.hpp"
 #include "rendering/camera.hpp"
 #include "rendering/frustum.hpp"
+#include "rendering/m2_model_classifier.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/blp_loader.hpp"
 #include "core/logger.hpp"
@@ -1596,6 +1597,10 @@ bool CharacterRenderer::loadModel(const pipeline::M2Model& model, uint32_t id) {
 
     M2ModelGPU gpuModel;
     gpuModel.data = model;
+    const auto classification = classifyM2Model(
+        model.name, model.boundMin, model.boundMax,
+        model.vertices.size(), model.particleEmitters.size());
+    gpuModel.isSkyBird = classification.isSkyBird;
 
     // Batch all GPU uploads (VB, IB, textures) into a single command buffer
     // submission with one fence wait, instead of one fence wait per upload.
@@ -1856,6 +1861,12 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
     // Distance culling for animation updates in dense areas.
     const float animUpdateRadius = static_cast<float>(envSizeOrDefault("WOWEE_CHAR_ANIM_RADIUS", 120));
     const float animUpdateRadiusSq = animUpdateRadius * animUpdateRadius;
+    // Creature birds are rendered by this path rather than M2Renderer.  Their
+    // rapid wing motion remains conspicuous at distance, and the render radius
+    // can be larger than the generic animation radius.  Use the same boundary
+    // as rendering so a visible bird never holds its last bone pose.
+    const float birdUpdateRadius = static_cast<float>(envSizeOrDefault("WOWEE_CHAR_RENDER_RADIUS", 130));
+    const float birdUpdateRadiusSq = birdUpdateRadius * birdUpdateRadius;
 
     // Single pass: fade-in, movement, and animation bone collection
     toUpdate_.clear();
@@ -1889,7 +1900,9 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
         if (inst.hasOverrideModelMatrix && !inst.isEffectModel) continue;
 
         float distSq = glm::distance2(inst.position, cameraPos);
-        if (distSq >= animUpdateRadiusSq && !inst.isSceneModel) continue;
+        const bool isSkyBird = inst.cachedModel && inst.cachedModel->isSkyBird;
+        const float updateRadiusSq = isSkyBird ? birdUpdateRadiusSq : animUpdateRadiusSq;
+        if (distSq > updateRadiusSq && !inst.isSceneModel) continue;
 
         // Advance global sequence timer (accumulates independently of animation wrapping)
         inst.globalSequenceTime += deltaTime * 1000.0f;
@@ -1929,8 +1942,10 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
         // Reserve frame skipping for models far enough away that bone detail is
         // much less noticeable, consistent with the generic M2 renderer.
         uint32_t boneInterval = 1;
-        if (distSq > 90.0f * 90.0f) boneInterval = 4;
-        else if (distSq > 45.0f * 45.0f) boneInterval = 2;
+        if (!isSkyBird) {
+            if (distSq > 90.0f * 90.0f) boneInterval = 4;
+            else if (distSq > 45.0f * 45.0f) boneInterval = 2;
+        }
 
         inst.boneUpdateCounter++;
         bool needsBones = (inst.boneUpdateCounter >= boneInterval) || inst.boneMatrices.empty();
