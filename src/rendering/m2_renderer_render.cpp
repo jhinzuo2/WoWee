@@ -858,55 +858,86 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     const float maxPossibleDistSq = maxRenderDistanceSq * 4.0f;
 
     const uint32_t totalInstances = static_cast<uint32_t>(instances.size());
-    for (uint32_t i = 0; i < totalInstances; ++i) {
-        const auto& instance = instances[i];
+    struct VisibleChunk {
+        std::vector<VisibleEntry> opaque;
+        std::vector<VisibleEntry> transparent;
+    };
 
-        float distSq;
-        float effectiveMaxDistSq;
+    // Visibility classification is independent per instance and was the
+    // remaining monolithic M2 CPU pass. Split dense scenes across a few pool
+    // workers; the caller handles the final chunk so nested use from the M2
+    // render worker cannot deadlock the shared pool.
+    const uint32_t chunkCount = totalInstances >= 2048
+        ? std::min<uint32_t>(4, (totalInstances + 1023) / 1024)
+        : 1;
+    std::vector<VisibleChunk> chunks(chunkCount);
+    auto classifyRange = [&](uint32_t chunk, uint32_t begin, uint32_t end) {
+        auto& out = chunks[chunk];
+        out.opaque.reserve((end - begin) / 3);
+        out.transparent.reserve((end - begin) / 12);
+        for (uint32_t i = begin; i < end; ++i) {
+            const auto& instance = instances[i];
+            float distSq;
+            float effectiveMaxDistSq;
 
-        // effectiveMaxDistSqFactor and paddedRadius are precomputed per-instance
-        // by recomputeCachedCullFactors(); per-frame work is just the dot product
-        // and a single multiply.
-        if (forceNoCull_) {
-            if (!instance.cachedIsValid) continue;
-            glm::vec3 toCam = instance.position - camPos;
-            distSq = glm::dot(toCam, toCam);
-            effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
-        } else if (gpuCullAvailable && i < numInstances) {
-            if (!visibility[i]) continue;
-            glm::vec3 toCam = instance.position - camPos;
-            distSq = glm::dot(toCam, toCam);
-            effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
-        } else {
-            // CPU fallback: distSq used twice (early-out + visibility), so compute once.
-            if (!instance.cachedIsValid || instance.cachedIsSmoke || instance.cachedIsInvisibleTrap) continue;
-
-            glm::vec3 toCam = instance.position - camPos;
-            distSq = glm::dot(toCam, toCam);
-            if (distSq > maxPossibleDistSq) continue;
-
-            effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
-            if (distSq > effectiveMaxDistSq) continue;
-
-            float paddedRadius = instance.cachedPaddedRadius;
-            if (paddedRadius > 0.0f && !frustum.intersectsSphere(instance.position, paddedRadius)) continue;
-        }
-
-        // Animated sky birds: cap render distance to bone-update range so they
-        // fade in only when close enough for animation, hiding frozen poses.
-        if (instance.cachedIsSkyBird && instance.cachedHasAnimation && !instance.cachedDisableAnimation) {
-            constexpr float kBirdMaxDistSq = rendering::M2_LOD3_DISTANCE * rendering::M2_LOD3_DISTANCE;
-            if (effectiveMaxDistSq > kBirdMaxDistSq) {
-                effectiveMaxDistSq = kBirdMaxDistSq;
+            if (forceNoCull_) {
+                if (!instance.cachedIsValid) continue;
+                glm::vec3 toCam = instance.position - camPos;
+                distSq = glm::dot(toCam, toCam);
+                effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
+            } else if (gpuCullAvailable && i < numInstances) {
+                if (!visibility[i]) continue;
+                glm::vec3 toCam = instance.position - camPos;
+                distSq = glm::dot(toCam, toCam);
+                effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
+            } else {
+                if (!instance.cachedIsValid || instance.cachedIsSmoke || instance.cachedIsInvisibleTrap) continue;
+                glm::vec3 toCam = instance.position - camPos;
+                distSq = glm::dot(toCam, toCam);
+                if (distSq > maxPossibleDistSq) continue;
+                effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
                 if (distSq > effectiveMaxDistSq) continue;
+                float paddedRadius = instance.cachedPaddedRadius;
+                if (paddedRadius > 0.0f && !frustum.intersectsSphere(instance.position, paddedRadius)) continue;
+            }
+
+            if (instance.cachedIsSkyBird && instance.cachedHasAnimation && !instance.cachedDisableAnimation) {
+                constexpr float kBirdMaxDistSq = rendering::M2_LOD3_DISTANCE * rendering::M2_LOD3_DISTANCE;
+                if (effectiveMaxDistSq > kBirdMaxDistSq) {
+                    effectiveMaxDistSq = kBirdMaxDistSq;
+                    if (distSq > effectiveMaxDistSq) continue;
+                }
+            }
+
+            VisibleEntry visible{i, instance.modelId, distSq, effectiveMaxDistSq};
+            out.opaque.push_back(visible);
+            if (instance.cachedModel &&
+                (instance.cachedModel->hasTransparentBatches || instance.cachedModel->isSpellEffect)) {
+                out.transparent.push_back(visible);
             }
         }
+    };
 
-        VisibleEntry visible{i, instance.modelId, distSq, effectiveMaxDistSq};
-        sortedVisible_.push_back(visible);
-        if (instance.cachedModel &&
-            (instance.cachedModel->hasTransparentBatches || instance.cachedModel->isSpellEffect))
-            transparentVisible_.push_back(visible);
+    std::vector<std::future<void>> visibilityFutures;
+    visibilityFutures.reserve(chunkCount > 0 ? chunkCount - 1 : 0);
+    const uint32_t chunkSize = (totalInstances + chunkCount - 1) / chunkCount;
+    for (uint32_t chunk = 0; chunk + 1 < chunkCount; ++chunk) {
+        const uint32_t begin = chunk * chunkSize;
+        const uint32_t end = std::min(totalInstances, begin + chunkSize);
+        visibilityFutures.push_back(core::ThreadPool::frameWorkers().submit(
+            [&, chunk, begin, end]() { classifyRange(chunk, begin, end); }));
+    }
+    const uint32_t lastChunk = chunkCount - 1;
+    classifyRange(lastChunk, lastChunk * chunkSize, totalInstances);
+    for (auto& future : visibilityFutures) future.get();
+
+    for (auto& chunk : chunks) {
+        sortedVisible_.insert(sortedVisible_.end(),
+                              std::make_move_iterator(chunk.opaque.begin()),
+                              std::make_move_iterator(chunk.opaque.end()));
+        transparentVisible_.insert(transparentVisible_.end(),
+                                   std::make_move_iterator(chunk.transparent.begin()),
+                                   std::make_move_iterator(chunk.transparent.end()));
     }
 
     // Two-pass rendering: opaque/alpha-test first (depth write ON), then transparent/additive

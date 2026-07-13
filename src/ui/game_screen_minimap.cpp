@@ -1507,7 +1507,8 @@ void GameScreen::saveSettings() {
     out << "mount_volume=" << settingsPanel_.pendingMountVolume << "\n";
     out << "activity_volume=" << settingsPanel_.pendingActivityVolume << "\n";
 
-    // Gameplay
+    // Gameplay / display pacing
+    out << "vsync=" << (settingsPanel_.pendingVsync ? 1 : 0) << "\n";
     out << "auto_loot=" << (settingsPanel_.pendingAutoLoot ? 1 : 0) << "\n";
     out << "auto_sell_grey=" << (settingsPanel_.pendingAutoSellGrey ? 1 : 0) << "\n";
     out << "auto_repair=" << (settingsPanel_.pendingAutoRepair ? 1 : 0) << "\n";
@@ -1661,7 +1662,8 @@ void GameScreen::loadSettings() {
             else if (key == "npc_voice_volume") settingsPanel_.pendingNpcVoiceVolume = std::clamp(std::stoi(val), 0, 100);
             else if (key == "mount_volume") settingsPanel_.pendingMountVolume = std::clamp(std::stoi(val), 0, 100);
             else if (key == "activity_volume") settingsPanel_.pendingActivityVolume = std::clamp(std::stoi(val), 0, 100);
-            // Gameplay
+            // Gameplay / display pacing
+            else if (key == "vsync") settingsPanel_.pendingVsync = (std::stoi(val) != 0);
             else if (key == "auto_loot") settingsPanel_.pendingAutoLoot = (std::stoi(val) != 0);
             else if (key == "auto_sell_grey") settingsPanel_.pendingAutoSellGrey = (std::stoi(val) != 0);
             else if (key == "auto_repair") settingsPanel_.pendingAutoRepair = (std::stoi(val) != 0);

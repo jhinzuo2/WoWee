@@ -884,6 +884,14 @@ std::shared_ptr<PendingTile> TerrainManager::prepareTile(int x, int y) {
                     }
                     auto blp = assetManager->loadTexture(blpKey);
                     if (blp.isValid()) {
+                        float variance = 0.0f;
+                        auto normalPixels = WMORenderer::generateNormalHeightMapPixels(
+                            blp.data.data(), static_cast<uint32_t>(blp.width),
+                            static_cast<uint32_t>(blp.height), variance);
+                        if (normalPixels.isValid()) {
+                            pending->preloadedWMONormalMaps[blpKey] = std::move(normalPixels);
+                            pending->preloadedWMONormalMapVariances[blpKey] = variance;
+                        }
                         pending->preloadedWMOTextures[blpKey] = std::move(blp);
                     }
                 }
@@ -1086,8 +1094,12 @@ bool TerrainManager::advanceFinalization(FinalizingTile& ft) {
         if (wmoRenderer && assetManager) {
             if (!wmoRenderer->initialize(nullptr, VK_NULL_HANDLE, assetManager))
                 LOG_WARNING("WMORenderer terrain re-init failed");
-            // Set pre-decoded BLP cache and defer normal maps during streaming
+            // Diffuse decode and normal/height generation were completed by the
+            // terrain worker. The main thread only uploads those prepared pixels.
             wmoRenderer->setPredecodedBLPCache(&pending->preloadedWMOTextures);
+            wmoRenderer->setPredecodedNormalMapCache(
+                &pending->preloadedWMONormalMaps,
+                &pending->preloadedWMONormalMapVariances);
             wmoRenderer->setDeferNormalMaps(true);
 
             bool wmoWorkersIdle;
@@ -1109,9 +1121,8 @@ bool TerrainManager::advanceFinalization(FinalizingTile& ft) {
             }
             wmoRenderer->setDeferNormalMaps(false);
             wmoRenderer->setPredecodedBLPCache(nullptr);
+            wmoRenderer->setPredecodedNormalMapCache(nullptr, nullptr);
             if (ft.wmoModelIndex < pending->wmoModels.size()) return false;
-            // All WMO models loaded — backfill normal/height maps that were skipped during streaming
-            wmoRenderer->backfillNormalMaps();
         }
         ft.phase = FinalizationPhase::WMO_INSTANCES;
         return false;

@@ -5,6 +5,7 @@
 #include "core/application.hpp"
 #include "core/logger.hpp"
 #include "core/version.hpp"
+#include "core/window.hpp"
 #include "rendering/renderer.hpp"
 #include "rendering/vk_context.hpp"
 #include "pipeline/asset_manager.hpp"
@@ -976,25 +977,25 @@ void AuthScreen::applyPresetToState(LoginGraphicsState& s, int preset) {
         s.shadows = false; s.shadowDistance = 75.0f; s.antiAliasing = 0;
         s.fxaa = false; s.normalMapping = false; s.pom = false; s.pomQuality = 1;
         s.upscalingMode = 0; s.waterRefraction = false; s.groundClutter = 25;
-        s.brightness = 50; s.vsync = false; s.fullscreen = false;
+        s.brightness = 50; s.vsync = true; s.fullscreen = false;
         break;
     case 2: // Medium
         s.shadows = true; s.shadowDistance = 150.0f; s.antiAliasing = 0;
         s.fxaa = false; s.normalMapping = true; s.pom = true; s.pomQuality = 1;
         s.upscalingMode = 0; s.waterRefraction = true; s.groundClutter = 100;
-        s.brightness = 50; s.vsync = false; s.fullscreen = false;
+        s.brightness = 50; s.vsync = true; s.fullscreen = false;
         break;
     case 3: // High
         s.shadows = true; s.shadowDistance = 250.0f; s.antiAliasing = 1;
         s.fxaa = true; s.normalMapping = true; s.pom = true; s.pomQuality = 1;
         s.upscalingMode = 0; s.waterRefraction = true; s.groundClutter = 130;
-        s.brightness = 50; s.vsync = false; s.fullscreen = false;
+        s.brightness = 50; s.vsync = true; s.fullscreen = false;
         break;
     case 4: // Ultra
         s.shadows = true; s.shadowDistance = 400.0f; s.antiAliasing = 2;
         s.fxaa = true; s.normalMapping = true; s.pom = true; s.pomQuality = 2;
         s.upscalingMode = 0; s.waterRefraction = true; s.groundClutter = 150;
-        s.brightness = 50; s.vsync = false; s.fullscreen = false;
+        s.brightness = 50; s.vsync = true; s.fullscreen = false;
         break;
     default: // Custom — no change
         break;
@@ -1171,6 +1172,10 @@ void AuthScreen::renderLoginSettingsWindow() {
         ImGui::SameLine();
         if (ImGui::Button("Apply", ImVec2(100, 32))) {
             saveLoginGraphicsState();
+            if (services_.window &&
+                services_.window->isVsyncEnabled() != loginGfx_.vsync) {
+                services_.window->setVsync(loginGfx_.vsync);
+            }
             ImGui::CloseCurrentPopup();
         }
 

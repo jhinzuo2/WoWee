@@ -95,14 +95,17 @@ private:
     void dumpRecentPacketHistoryLocked(const char* reason, size_t bufferedBytes);
 
     socket_t sockfd = INVALID_SOCK;           // THREAD-SAFE: protected by ioMutex_
-    bool connected = false;                    // THREAD-SAFE: protected by ioMutex_
+    // Read every frame by GameHandler while the async receive pump may hold
+    // ioMutex_ for a packet burst. Atomic state avoids turning that harmless
+    // status check into a 50ms main-thread mutex stall.
+    std::atomic<bool> connected{false};
     bool encryptionEnabled = false;            // THREAD-SAFE: protected by ioMutex_
     bool useVanillaCrypt = false;  // true = XOR cipher, false = RC4
     bool useAsyncPump_ = true;
     std::thread asyncPumpThread_;
     std::atomic<bool> asyncPumpStop_{false};   // THREAD-SAFE: atomic
     std::atomic<bool> asyncPumpRunning_{false}; // THREAD-SAFE: atomic
-    // Guards sockfd, connected, encryptionEnabled, receiveBuffer, cipher state,
+    // Guards sockfd, encryptionEnabled, receiveBuffer, cipher state,
     // headerBytesDecrypted, and recentPacketHistory_.
     mutable std::mutex ioMutex_;
     // Guards pendingPacketCallbacks_ (asyncPumpThread_ produces, main thread consumes).

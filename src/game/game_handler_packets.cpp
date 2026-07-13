@@ -886,7 +886,11 @@ void GameHandler::registerOpcodeHandlers() {
     // Taxi
     dispatchTable_[Opcode::SMSG_STANDSTATE_UPDATE] = [this](network::Packet& packet) {
         if (packet.hasRemaining(1)) {
-            standState_ = packet.readUInt8();
+            const uint8_t newStandState = packet.readUInt8();
+            if (newStandState == standState_) {
+                return;
+            }
+            standState_ = newStandState;
             // 0=stand, 1=sit, 2-6=sit variants, 7=dead, 8=kneel. Logged because a
             // wrong state here is indistinguishable, in-game, from a wrong animation.
             // At warning level: the file log filters info out by default.

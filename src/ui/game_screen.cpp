@@ -134,6 +134,12 @@ GameScreen::GameScreen() {
 // Set UI services and propagate to child components
 void GameScreen::setServices(const UIServices& services) {
     services_ = services;
+    // Settings are loaded by the constructor before services are injected.
+    // Apply the saved display pacing as soon as the actual window is available.
+    if (services_.window &&
+        services_.window->isVsyncEnabled() != settingsPanel_.pendingVsync) {
+        services_.window->setVsync(settingsPanel_.pendingVsync);
+    }
     // Update legacy pointer for compatibility
     appearanceComposer_ = services.appearanceComposer;
     // Propagate to child panels

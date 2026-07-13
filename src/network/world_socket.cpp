@@ -267,8 +267,7 @@ void WorldSocket::tracePacketsFor(std::chrono::milliseconds duration, const std:
 }
 
 bool WorldSocket::isConnected() const {
-    std::lock_guard<std::mutex> lock(ioMutex_);
-    return connected;
+    return connected.load(std::memory_order_acquire);
 }
 
 void WorldSocket::closeSocketNoJoin() {

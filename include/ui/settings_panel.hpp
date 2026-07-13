@@ -30,7 +30,7 @@ public:
 
     // ---- Pending video / graphics settings ----
     bool pendingFullscreen = false;
-    bool pendingVsync = false;
+    bool pendingVsync = true;
     int pendingResIndex = 0;
     bool pendingShadows = true;
     float pendingShadowDistance = 300.0f;

@@ -150,7 +150,7 @@ private:
         bool waterRefraction = true;
         int  groundClutter   = 100; // 0-150
         int  brightness      = 50;  // 0-100
-        bool vsync           = false;
+        bool vsync           = true;
         bool fullscreen      = false;
     };
     LoginGraphicsState loginGfx_;
