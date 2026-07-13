@@ -1328,6 +1328,10 @@ void Application::update(float deltaTime) {
                 const bool uiWantsKeyboard = ImGui::GetIO().WantCaptureKeyboard;
                 auto& input = Input::getInstance();
                 if (!uiWantsKeyboard && input.isKeyJustPressed(SDL_SCANCODE_Z) && appearanceComposer_) {
+                    const bool sheathing = !appearanceComposer_->isWeaponsSheathed();
+                    if (renderer && renderer->getAnimationController()) {
+                        renderer->getAnimationController()->playWeaponSheathAnimation(sheathing);
+                    }
                     appearanceComposer_->toggleWeaponsSheathed();
                     appearanceComposer_->loadEquippedWeapons();
                 }

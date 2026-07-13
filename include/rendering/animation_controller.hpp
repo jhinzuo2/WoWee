@@ -60,6 +60,8 @@ public:
 
     // ── Emote support ──────────────────────────────────────────────────────
     void playEmote(const std::string& emoteName);
+    /// Play the one-shot reach animation used by the manual Z sheath toggle.
+    void playWeaponSheathAnimation(bool sheathing);
     void cancelEmote();
     bool isEmoteActive() const { return characterAnimator_.getActivity().isEmoteActive(); }
     static std::string getEmoteText(const std::string& emoteName,

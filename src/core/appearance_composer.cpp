@@ -8,9 +8,62 @@
 #include "pipeline/dbc_loader.hpp"
 #include "pipeline/dbc_layout.hpp"
 #include "game/game_handler.hpp"
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace wowee {
 namespace core {
+
+namespace {
+
+constexpr uint32_t kAttachShield = 0;
+constexpr uint32_t kAttachRightHand = 1;
+constexpr uint32_t kAttachLeftHand = 2;
+constexpr uint32_t kAttachRightHip = 9;
+constexpr uint32_t kAttachLeftHip = 10;
+constexpr uint32_t kAttachBack = 12;
+
+uint32_t weaponAttachment(bool sheathed, game::EquipSlot slot, uint8_t inventoryType) {
+    if (!sheathed) {
+        return slot == game::EquipSlot::OFF_HAND ? kAttachLeftHand : kAttachRightHand;
+    }
+
+    if (inventoryType == game::InvType::TWO_HAND) return kAttachBack;
+    if (inventoryType == game::InvType::SHIELD) return kAttachShield;
+    if (inventoryType == game::InvType::ONE_HAND ||
+        inventoryType == game::InvType::MAIN_HAND) {
+        return slot == game::EquipSlot::OFF_HAND ? kAttachLeftHip : kAttachRightHip;
+    }
+
+    // Holdables and other items with no sheath position are hidden, matching
+    // the original client rather than pinning books/orbs to an arbitrary bone.
+    return UINT32_MAX;
+}
+
+glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
+                               uint8_t inventoryType) {
+    glm::mat4 transform(1.0f);
+    if (!sheathed || inventoryType == game::InvType::SHIELD) return transform;
+
+    if (inventoryType == game::InvType::TWO_HAND) {
+        // Weapon models are authored for a hand with their long axis pointing
+        // forward. Stand that axis up, cant it across the back, and move it off
+        // the spine so the grip sits below the opposite shoulder.
+        // Weapon models are authored along local X, which is also the character's
+        // front/back axis. First rotate weapon X completely onto character Z, then
+        // cant that vertical axis within the Y/Z back plane. This ordering is
+        // important: rotating around X cannot change an X-aligned blade.
+        transform = glm::translate(transform, glm::vec3(-0.01f, 0.0f, 0.04f));
+        transform = glm::rotate(transform, glm::radians(35.0f), glm::vec3(1, 0, 0));
+        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(0, 1, 0));
+    } else {
+        // Hip-sheathed one-handers have the same X-aligned long axis. Rotate it
+        // onto -Z so the blade points down alongside the leg.
+        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(0, 1, 0));
+    }
+    return transform;
+}
+
+} // namespace
 
 AppearanceComposer::AppearanceComposer(rendering::Renderer* renderer,
                                        pipeline::AssetManager* assetManager,
@@ -381,22 +434,25 @@ void AppearanceComposer::loadEquippedWeapons() {
         LOG_WARNING("loadEquippedWeapons: failed to load ItemDisplayInfo.dbc");
         return;
     }
-    // Mapping: EquipSlot → attachment ID (1=RightHand, 2=LeftHand)
+    // Mapping: EquipSlot → held attachment. Sheathed attachment is resolved
+    // from the item's InventoryType below.
     struct WeaponSlot {
         game::EquipSlot slot;
         uint32_t attachmentId;
     };
     WeaponSlot weaponSlots[] = {
-        { game::EquipSlot::MAIN_HAND, 1 },
-        { game::EquipSlot::OFF_HAND,  2 },
+        { game::EquipSlot::MAIN_HAND, kAttachRightHand },
+        { game::EquipSlot::OFF_HAND,  kAttachLeftHand },
     };
 
-    if (weaponsSheathed_) {
-        for (const auto& ws : weaponSlots) {
-            charRenderer->detachWeapon(charInstanceId, ws.attachmentId);
-        }
-        charRenderer->detachWeapon(charInstanceId, 1); // ranged may also use right hand
-        return;
+    // Equipment reloads and Z toggles can move models between these points.
+    // Clear both held and sheathed locations so old copies never remain behind.
+    const uint32_t weaponAttachmentPoints[] = {
+        kAttachShield, kAttachRightHand, kAttachLeftHand,
+        kAttachRightHip, kAttachLeftHip, kAttachBack
+    };
+    for (uint32_t attachmentId : weaponAttachmentPoints) {
+        charRenderer->detachWeapon(charInstanceId, attachmentId);
     }
 
     bool rightHandFilled = false;
@@ -409,6 +465,10 @@ void AppearanceComposer::loadEquippedWeapons() {
             charRenderer->detachWeapon(charInstanceId, ws.attachmentId);
             continue;
         }
+
+        const uint32_t attachmentId = weaponAttachment(
+            weaponsSheathed_, ws.slot, equipSlot.item.inventoryType);
+        if (attachmentId == UINT32_MAX) continue;
 
         uint32_t displayInfoId = equipSlot.item.displayInfoId;
         int32_t recIdx = displayInfoDbc->findRecordById(displayInfoId);
@@ -461,12 +521,16 @@ void AppearanceComposer::loadEquippedWeapons() {
         }
 
         uint32_t weaponModelId = entitySpawner_->allocateWeaponModelId();
-        bool ok = charRenderer->attachWeapon(charInstanceId, ws.attachmentId,
-                                              weaponModel, weaponModelId, texturePath);
+        const glm::mat4 localTransform = weaponLocalTransform(
+            weaponsSheathed_, ws.slot, equipSlot.item.inventoryType);
+        bool ok = charRenderer->attachWeapon(charInstanceId, attachmentId,
+                                              weaponModel, weaponModelId, texturePath,
+                                              localTransform);
         if (ok) {
-            LOG_INFO("Equipped weapon: ", m2Path, " at attachment ", ws.attachmentId);
-            if (ws.attachmentId == 1) rightHandFilled = true;
-            applyEnchantVisuals(charInstanceId, static_cast<int>(ws.slot), ws.attachmentId);
+            LOG_INFO("Equipped weapon: ", m2Path, " at attachment ", attachmentId,
+                     weaponsSheathed_ ? " (sheathed)" : " (held)");
+            if (ws.slot == game::EquipSlot::MAIN_HAND) rightHandFilled = true;
+            applyEnchantVisuals(charInstanceId, static_cast<int>(ws.slot), attachmentId);
         }
     }
 
@@ -509,10 +573,18 @@ void AppearanceComposer::loadEquippedWeapons() {
                     }
 
                     uint32_t weaponModelId = entitySpawner_->allocateWeaponModelId();
-                    bool ok = charRenderer->attachWeapon(charInstanceId, 1,
-                                                          weaponModel, weaponModelId, texturePath);
+                    const uint32_t rangedAttachment = weaponsSheathed_
+                        ? kAttachBack : kAttachRightHand;
+                    const glm::mat4 localTransform = weaponsSheathed_
+                        ? weaponLocalTransform(true, game::EquipSlot::MAIN_HAND,
+                                               game::InvType::TWO_HAND)
+                        : glm::mat4(1.0f);
+                    bool ok = charRenderer->attachWeapon(charInstanceId, rangedAttachment,
+                                                          weaponModel, weaponModelId, texturePath,
+                                                          localTransform);
                     if (ok) {
-                        LOG_INFO("Equipped ranged weapon: ", m2Path, " at attachment 1 (right hand)");
+                        LOG_INFO("Equipped ranged weapon: ", m2Path, " at attachment ",
+                                 rangedAttachment, weaponsSheathed_ ? " (sheathed)" : " (held)");
                     }
                 }
             }

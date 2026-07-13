@@ -41,6 +41,7 @@ struct WeaponAttachment {
     uint32_t attachmentId;     // 1=RightHand, 2=LeftHand
     uint16_t boneIndex;
     glm::vec3 offset;
+    glm::mat4 localTransform{1.0f}; // sheath/hand orientation after attachment point
     std::vector<WeaponEffectAttachment> effects;
 };
 
@@ -112,7 +113,8 @@ public:
     /** Attach a weapon model to a character instance at the given attachment point. */
     bool attachWeapon(uint32_t charInstanceId, uint32_t attachmentId,
                       const pipeline::M2Model& weaponModel, uint32_t weaponModelId,
-                      const std::string& texturePath);
+                      const std::string& texturePath,
+                      const glm::mat4& localTransform = glm::mat4(1.0f));
 
     /** Detach a weapon from the given attachment point (drops its enchant effects too). */
     void detachWeapon(uint32_t charInstanceId, uint32_t attachmentId);

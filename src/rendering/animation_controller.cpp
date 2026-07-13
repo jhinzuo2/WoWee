@@ -99,6 +99,29 @@ void AnimationController::playEmote(const std::string& emoteName) {
     }
 }
 
+void AnimationController::playWeaponSheathAnimation(bool sheathing) {
+    if (!renderer_) return;
+    auto* characterRenderer = renderer_->getCharacterRenderer();
+    const uint32_t characterInstanceId = renderer_->getCharacterInstanceId();
+    if (!characterRenderer || characterInstanceId == 0) return;
+
+    uint32_t animId = sheathing ? anim::SHEATHE : anim::UNSHEATHE;
+    if (!characterRenderer->hasAnimation(characterInstanceId, animId)) {
+        if (sheathing && characterRenderer->hasAnimation(characterInstanceId, anim::HIP_SHEATHE)) {
+            animId = anim::HIP_SHEATHE;
+        } else {
+            return;
+        }
+    }
+
+    // ActivityFSM owns the one-shot until completion so locomotion/combat does
+    // not replace the reach animation on the next frame.
+    characterAnimator_.playEmote(animId, false);
+    characterRenderer->playAnimation(characterInstanceId, animId, false);
+    lastPlayerAnimRequest_ = animId;
+    lastPlayerAnimLoopRequest_ = false;
+}
+
 void AnimationController::cancelEmote() {
     characterAnimator_.cancelEmote();
 }

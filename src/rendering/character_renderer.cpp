@@ -2011,9 +2011,11 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
                 boneMat = instance.boneMatrices[wa.boneIndex];
             }
 
-            // Weapon model matrix = character model * bone transform * offset translation
+            // Weapon model matrix = character model * bone transform * attachment
+            // offset * item/sheath orientation.
             const glm::mat4 weaponMat =
-                charModelMat * boneMat * glm::translate(glm::mat4(1.0f), wa.offset);
+                charModelMat * boneMat * glm::translate(glm::mat4(1.0f), wa.offset) *
+                wa.localTransform;
             weapIt->second.overrideModelMatrix = weaponMat;
             weapIt->second.hasOverrideModelMatrix = true;
 
@@ -3541,7 +3543,8 @@ bool CharacterRenderer::findAttachmentBone(uint32_t modelId, uint32_t attachment
 
 bool CharacterRenderer::attachWeapon(uint32_t charInstanceId, uint32_t attachmentId,
                                       const pipeline::M2Model& weaponModel, uint32_t weaponModelId,
-                                      const std::string& texturePath) {
+                                      const std::string& texturePath,
+                                      const glm::mat4& localTransform) {
     auto charIt = instances.find(charInstanceId);
     if (charIt == instances.end()) {
         core::Logger::getInstance().warning("attachWeapon: character instance ", charInstanceId, " not found");
@@ -3595,6 +3598,7 @@ bool CharacterRenderer::attachWeapon(uint32_t charInstanceId, uint32_t attachmen
     wa.attachmentId = attachmentId;
     wa.boneIndex = boneIndex;
     wa.offset = offset;
+    wa.localTransform = localTransform;
     charInstance.weaponAttachments.push_back(wa);
 
     core::Logger::getInstance().debug("Attached weapon model ", weaponModelId,
