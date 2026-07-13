@@ -36,8 +36,48 @@ void QuestPOILayer::render(const LayerContext& ctx) {
         float px = ctx.imgMin.x + uv.x * ctx.displayW;
         float py = ctx.imgMin.y + uv.y * ctx.displayH;
 
-        ctx.drawList->AddCircleFilled(ImVec2(px, py), 5.0f, IM_COL32(0, 210, 255, 220));
-        ctx.drawList->AddCircle(ImVec2(px, py), 5.0f, IM_COL32(255, 215, 0, 220), 0, 1.5f);
+        const char* marker = nullptr;
+        ImU32 fill = IM_COL32(0, 210, 255, 220);
+        ImU32 outline = IM_COL32(255, 215, 0, 220);
+        const char* description = "Quest Objective";
+        switch (qp.kind) {
+            case QuestPOI::Kind::AVAILABLE:
+                marker = "!";
+                fill = IM_COL32(255, 210, 0, 255);
+                outline = IM_COL32(80, 55, 0, 230);
+                description = "Has a quest for you";
+                break;
+            case QuestPOI::Kind::AVAILABLE_LOW:
+                marker = "!";
+                fill = IM_COL32(160, 160, 160, 255);
+                outline = IM_COL32(50, 50, 50, 230);
+                description = "Has a low-level quest for you";
+                break;
+            case QuestPOI::Kind::REWARD:
+                marker = "?";
+                fill = IM_COL32(255, 210, 0, 255);
+                outline = IM_COL32(80, 55, 0, 230);
+                description = "Quest ready to turn in";
+                break;
+            case QuestPOI::Kind::INCOMPLETE:
+                marker = "?";
+                fill = IM_COL32(160, 160, 160, 255);
+                outline = IM_COL32(50, 50, 50, 230);
+                description = "Quest in progress";
+                break;
+            case QuestPOI::Kind::OBJECTIVE:
+                break;
+        }
+
+        ctx.drawList->AddCircleFilled(ImVec2(px, py), 5.0f, fill);
+        ctx.drawList->AddCircle(ImVec2(px, py), 5.0f, outline, 0, 1.5f);
+        if (marker) {
+            const float markerSize = ImGui::GetFontSize() * 0.8f;
+            ImVec2 markerSz = qFont->CalcTextSizeA(markerSize, FLT_MAX, 0.0f, marker);
+            ctx.drawList->AddText(qFont, markerSize,
+                                  ImVec2(px - markerSz.x * 0.5f, py - markerSz.y * 0.5f),
+                                  IM_COL32(0, 0, 0, 255), marker);
+        }
 
         if (!qp.name.empty()) {
             ImVec2 nameSz = qFont->CalcTextSizeA(ImGui::GetFontSize() * 0.85f, FLT_MAX, 0.0f, qp.name.c_str());
@@ -50,7 +90,7 @@ void QuestPOILayer::render(const LayerContext& ctx) {
         }
         float mdx = mp.x - px, mdy = mp.y - py;
         if (mdx * mdx + mdy * mdy < 49.0f && !qp.name.empty()) {
-            ImGui::SetTooltip("%s\n(Quest Objective)", qp.name.c_str());
+            ImGui::SetTooltip("%s\n(%s)", qp.name.c_str(), description);
         }
     }
 }

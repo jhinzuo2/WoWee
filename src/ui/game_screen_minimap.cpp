@@ -516,6 +516,9 @@ void GameScreen::renderMinimapMarkers(game::GameHandler& gameHandler) {
             for (const auto& entity : minimapUnits) {
                 auto unit = std::static_pointer_cast<game::Unit>(entity);
                 if (!unit || unit->getHealth() == 0) continue;
+                // A quest giver/turn-in marker is more specific than an objective
+                // marker at the same NPC. Do not paint the objective X over ! or ?.
+                if (statuses.find(entity->getGuid()) != statuses.end()) continue;
                 auto infoIt = killInfoMap.find(unit->getEntry());
                 if (infoIt == killInfoMap.end()) continue;
 
