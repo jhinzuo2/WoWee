@@ -400,6 +400,12 @@ void GameHandler::updateNetworking(float deltaTime) {
 }
 
 void GameHandler::updateTaxiAndMountState(float deltaTime) {
+// MovementHandler owns the active taxi path state. Always let it advance its
+// client path; updateClientTaxi() is a cheap no-op when no taxi is active.
+// Gating this on GameHandler's legacy duplicate onTaxiFlight_ flag stranded
+// every route at waypoint zero after taxi handling was extracted.
+updateClientTaxi(deltaTime);
+
 // Update taxi landing cooldown
 if (taxiLandingCooldown_ > 0.0f) {
     taxiLandingCooldown_ -= deltaTime;
@@ -415,18 +421,14 @@ if (playerTransportStickyTimer_ > 0.0f) {
     }
 }
 
-// Drive the actual flight simulation off MovementHandler's real taxi state.
-// GameHandler used to gate this on its own separate onTaxiFlight_ copy, which
-// activateTaxi() never sets (only MovementHandler's copy is set there), so
-// updateClientTaxi() was never called during a normal flight - no animation,
-// no movement, and the flight never completed/cleared MovementHandler's own
-// onTaxiFlight_, leaving movement locked until a full process restart.
-// MovementHandler::updateClientTaxi() already does correct landing detection
-// and cleanup (mount callback, MSG_MOVE_STOP/HEARTBEAT, state reset) using its
-// own real state, so no duplicate landing logic is needed here.
-if (movementHandler_ && movementHandler_->isOnTaxiFlight()) {
-    movementHandler_->updateClientTaxi(deltaTime);
-}
+// Landing detection/cleanup already happens inside MovementHandler::updateClientTaxi()'s
+// finishTaxiFlight() (called unconditionally above, using MovementHandler's own real taxi
+// state) - mount callback, MSG_MOVE_STOP/HEARTBEAT, state reset, all handled there. Upstream
+// independently discovered the same "updateClientTaxi() never called" bug and fixed it by
+// making the call above unconditional, but kept this landing-detection duplicate gated on
+// GameHandler's onTaxiFlight_ - the same legacy copy noted above, never set true reachably
+// (activateTaxi() only sets MovementHandler's copy), so it's dead code here. Dropped rather
+// than merged in to avoid double-processing landing every frame a flight completes.
 
 // Safety: if taxi flight ended but mount is still active, force dismount.
 // Guard against transient taxi-state flicker.

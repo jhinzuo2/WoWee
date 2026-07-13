@@ -1815,7 +1815,7 @@ void QuestHandler::handleQuestPoiQueryResponse(network::Packet& packet) {
         for (uint32_t pi = 0; pi < poiCount; ++pi) {
             if (!packet.hasRemaining(32)) return;
             packet.readUInt32();  // poiId
-            packet.readUInt32();  // objIndex (int32)
+            const int32_t objIndex = static_cast<int32_t>(packet.readUInt32());
             const uint32_t mapId    = packet.readUInt32();
             packet.readUInt32();  // areaId
             packet.readUInt32();  // floorId
@@ -1842,6 +1842,7 @@ void QuestHandler::handleQuestPoiQueryResponse(network::Packet& packet) {
             poi.y    = sumX / static_cast<float>(pointCount);
             poi.icon = 6;  // generic quest POI icon
             poi.data = questId;
+            poi.questObjectiveIndex = objIndex;
             poi.name = questTitle.empty() ? "Quest objective" : questTitle;
             LOG_DEBUG("Quest POI: questId=", questId, " mapId=", mapId,
                       " centroid=(", poi.x, ",", poi.y, ") title=", poi.name);

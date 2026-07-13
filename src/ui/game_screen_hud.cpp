@@ -472,14 +472,74 @@ void GameScreen::renderWorldMap(game::GameHandler& gameHandler) {
         wm->setTaxiNodes(std::move(taxiNodes));
     }
 
-    // Quest POI markers on world map (from SMSG_QUEST_POI_QUERY_RESPONSE / gossip POIs)
+    // Quest objective and quest-giver markers on the world map.
     {
         std::vector<rendering::WorldMap::QuestPoi> qpois;
+        const auto& questStatuses = gameHandler.getNpcQuestStatuses();
+        // Add authoritative NPC statuses first. Some servers also emit a
+        // generic POI at the NPC's position; that duplicate is filtered below
+        // so it cannot leave a teal objective circle on a quest giver.
+        for (const auto& [guid, status] : questStatuses) {
+            auto entity = gameHandler.getEntityManager().getEntity(guid);
+            if (!entity || entity->getType() != game::ObjectType::UNIT) continue;
+
+            rendering::WorldMap::QuestPoi qp;
+            qp.wowX = entity->getX();
+            qp.wowY = entity->getY();
+            qp.name = std::static_pointer_cast<game::Unit>(entity)->getName();
+            switch (status) {
+                case game::QuestGiverStatus::AVAILABLE:
+                    qp.kind = rendering::WorldMap::QuestPoi::Kind::AVAILABLE;
+                    break;
+                case game::QuestGiverStatus::AVAILABLE_LOW:
+                    qp.kind = rendering::WorldMap::QuestPoi::Kind::AVAILABLE_LOW;
+                    break;
+                case game::QuestGiverStatus::REWARD:
+                case game::QuestGiverStatus::REWARD_REP:
+                    qp.kind = rendering::WorldMap::QuestPoi::Kind::REWARD;
+                    break;
+                case game::QuestGiverStatus::INCOMPLETE:
+                    qp.kind = rendering::WorldMap::QuestPoi::Kind::INCOMPLETE;
+                    break;
+                default:
+                    continue;
+            }
+            qpois.push_back(std::move(qp));
+        }
+
+        constexpr float kQuestGiverPoiMergeDistance = 15.0f;
+        constexpr float kQuestGiverPoiMergeDistanceSq =
+            kQuestGiverPoiMergeDistance * kQuestGiverPoiMergeDistance;
         for (const auto& poi : gameHandler.getGossipPois()) {
+            bool duplicatesQuestGiver = false;
+            for (const auto& existing : qpois) {
+                if (existing.kind == rendering::WorldMap::QuestPoi::Kind::OBJECTIVE) continue;
+                const float dx = existing.wowX - poi.x;
+                const float dy = existing.wowY - poi.y;
+                if (dx * dx + dy * dy <= kQuestGiverPoiMergeDistanceSq) {
+                    duplicatesQuestGiver = true;
+                    break;
+                }
+            }
+            if (duplicatesQuestGiver) continue;
+
             rendering::WorldMap::QuestPoi qp;
             qp.wowX = poi.x;
             qp.wowY = poi.y;
             qp.name = poi.name;
+            if (poi.questObjectiveIndex == -1) {
+                // A quest POI with no objective index is the quest endpoint,
+                // not an objective area. Completed quests use a yellow ?,
+                // while in-progress endpoints use a gray ?.
+                qp.kind = rendering::WorldMap::QuestPoi::Kind::INCOMPLETE;
+                for (const auto& quest : gameHandler.getQuestLog()) {
+                    if (quest.questId != poi.data) continue;
+                    if (quest.complete) {
+                        qp.kind = rendering::WorldMap::QuestPoi::Kind::REWARD;
+                    }
+                    break;
+                }
+            }
             qpois.push_back(std::move(qp));
         }
         wm->setQuestPois(std::move(qpois));

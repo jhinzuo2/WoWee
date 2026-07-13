@@ -2392,6 +2392,10 @@ void MovementHandler::updateClientTaxi(float deltaTime) {
             taxiMountActive_ = false;
             taxiMountDisplayId_ = 0;
             owner_.currentMountDisplayIdRef() = 0;
+            // Some WotLK servers expose the taxi mount through vehicle data.
+            // Clear that cached ID at landing so the dismount control does not
+            // remain visible after the flight has completed.
+            owner_.vehicleIdRef() = 0;
             taxiClientPath_.clear();
             taxiRecoverPending_ = false;
             movementInfo.flags = 0;
