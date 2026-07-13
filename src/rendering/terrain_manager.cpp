@@ -1318,34 +1318,9 @@ bool TerrainManager::advanceFinalization(FinalizingTile& ft) {
 }
 
 void TerrainManager::workerLoop() {
-    // Keep worker threads off core 0 (reserved for main thread)
-    {
-        int numCores = static_cast<int>(std::thread::hardware_concurrency());
-        if (numCores >= 2) {
-#ifdef __linux__
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            for (int i = 1; i < numCores; i++) {
-                CPU_SET(i, &cpuset);
-            }
-            pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-#elif defined(_WIN32)
-            DWORD_PTR mask = 0;
-            for (int i = 1; i < numCores && i < 64; i++) {
-                mask |= (static_cast<DWORD_PTR>(1) << i);
-            }
-            SetThreadAffinityMask(GetCurrentThread(), mask);
-#elif defined(__APPLE__)
-            // Use affinity tag 2 for workers (separate from main thread tag 1)
-            thread_affinity_policy_data_t policy = { 2 };
-            thread_policy_set(
-                pthread_mach_thread_np(pthread_self()),
-                THREAD_AFFINITY_POLICY,
-                reinterpret_cast<thread_policy_t>(&policy),
-                THREAD_AFFINITY_POLICY_COUNT);
-#endif
-        }
-    }
+    // Leave placement to the OS scheduler. Artificially reserving CPU 0 made
+    // this worker policy depend on the old main-thread pin and reduced the
+    // scheduler's ability to balance streaming with render workers.
     LOG_INFO("Terrain worker thread started");
 
     while (workerRunning.load()) {
