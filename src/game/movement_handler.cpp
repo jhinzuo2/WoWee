@@ -2426,6 +2426,35 @@ void MovementHandler::finishClientTaxiFlight(bool snapToFinalWaypoint) {
 }
 
 void MovementHandler::updateClientTaxi(float deltaTime) {
+    // Live-confirmed: a CMSG_ACTIVATETAXI the server can't make sense of (e.g.
+    // a stale start node vs. the player's actual position) can go completely
+    // unanswered - no SMSG_ACTIVATETAXIREPLY at all, success or failure. Before
+    // activation was deferred to the reply (see activateTaxi()'s comment), the
+    // speculative flight start accidentally "recovered" from this since it
+    // never waited on a reply in the first place. Now that it correctly does,
+    // a dropped reply left taxiActivatePending_ true forever - every future
+    // activateTaxi() call silently no-ops on its pending-guard, permanently
+    // soft-locking the player's taxi system until relog. Time out and clear
+    // pending state the same way an explicit failure reply would.
+    if (taxiActivatePending_) {
+        taxiActivateTimer_ += deltaTime;
+        if (taxiActivateTimer_ > kTaxiActivateReplyTimeoutSeconds) {
+            LOG_WARNING("Taxi activation reply timed out after ",
+                        kTaxiActivateReplyTimeoutSeconds, "s - clearing pending state");
+            taxiActivatePending_ = false;
+            taxiActivateTimer_ = 0.0f;
+            taxiClientPath_.clear();
+            taxiClientIndex_ = 0;
+            taxiClientSegmentProgress_ = 0.0f;
+            if (taxiMountActive_ && owner_.mountCallbackRef()) {
+                owner_.mountCallbackRef()(0);
+            }
+            taxiMountActive_ = false;
+            taxiMountDisplayId_ = 0;
+            onTaxiFlight_ = false;
+        }
+    }
+
     if (!taxiClientActive_ || taxiClientPath_.size() < 2) return;
     auto playerEntity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid());
 

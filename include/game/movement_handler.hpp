@@ -291,6 +291,9 @@ private:
     uint32_t taxiMountDisplayId_ = 0;
     bool taxiActivatePending_ = false;
     float taxiActivateTimer_ = 0.0f;
+    // How long to wait for SMSG_ACTIVATETAXIREPLY before giving up - see
+    // updateClientTaxi()'s comment on why a dropped reply needs this now.
+    static constexpr float kTaxiActivateReplyTimeoutSeconds = 8.0f;
     bool taxiClientActive_ = false;
     float taxiLandingCooldown_ = 0.0f;
     float taxiStartGrace_ = 0.0f;
