@@ -2417,7 +2417,7 @@ void MovementHandler::beginTaxiFlightMotion() {
 }
 
 // Ends the active client-simulated taxi flight. snapToFinalWaypoint controls
-// whether the player is teleported to taxiClientPath_'s last waypoint first:
+// whether the player is teleported to the known landing position first:
 // - true: natural completion (the client spline reached its own end) - our
 //   own path data is authoritative for where "arrived" means.
 // - false: an authoritative server signal (SMSG_DISMOUNT with
@@ -2438,16 +2438,35 @@ void MovementHandler::beginTaxiFlightMotion() {
 //   treat this as that same normal "client finished slightly early" case
 //   and snap there - safety net for whatever spline/server pacing drift
 //   remains despite arc-length-parameterizing taxiClientPath_'s pacing (see
-//   taxiClientSegmentArcLengths_). Live-confirmed a ~90 yard gap on one long
-//   flight even before that fix could be verified against a from-scratch
-//   pacing recompute, so this net stays regardless. Beyond the sanity
-//   distance, stay conservative and leave the player where the spline
-//   currently has them, per the original caution.
+//   taxiClientSegmentArcLengths_). Beyond the sanity distance, stay
+//   conservative and leave the player where the spline currently has them,
+//   per the original caution.
+//
+// The "known final waypoint" itself is taxiNodes_[taxiDestNodeId_]'s own
+// registered position (TaxiNodes.dbc), NOT taxiClientPath_.back() (the last
+// entry of the separate TaxiPathNode.dbc waypoint trace) - live-confirmed
+// the two can disagree by 100+ yards, since a taxi path's waypoint trace
+// doesn't necessarily terminate exactly on the destination node's actual
+// coordinate. TaxiNodes.dbc's own position is what GM teleports/.gps
+// validated as accurate throughout this whole effort, so it's the correct
+// "true destination" to trust here. Falls back to taxiClientPath_.back()
+// only if the destination node can't be resolved for some reason.
 void MovementHandler::finishClientTaxiFlight(bool snapToFinalWaypoint) {
-    if (!snapToFinalWaypoint && !taxiClientPath_.empty()) {
+    glm::vec3 landingPos(0.0f);
+    bool haveLandingPos = false;
+    auto destNodeIt = taxiNodes_.find(taxiDestNodeId_);
+    if (destNodeIt != taxiNodes_.end()) {
+        landingPos = core::coords::serverToCanonical(
+            glm::vec3(destNodeIt->second.x, destNodeIt->second.y, destNodeIt->second.z));
+        haveLandingPos = true;
+    } else if (!taxiClientPath_.empty()) {
+        landingPos = taxiClientPath_.back();
+        haveLandingPos = true;
+    }
+
+    if (!snapToFinalWaypoint && haveLandingPos) {
         constexpr float kAuthoritativeLandingSnapDist = 300.0f;
-        const auto& finalPos = taxiClientPath_.back();
-        glm::vec3 gap = finalPos - glm::vec3(movementInfo.x, movementInfo.y, movementInfo.z);
+        glm::vec3 gap = landingPos - glm::vec3(movementInfo.x, movementInfo.y, movementInfo.z);
         if (glm::length(gap) <= kAuthoritativeLandingSnapDist) {
             LOG_INFO("Taxi landing (authoritative early completion): within sanity "
                      "distance of known final waypoint, snapping there instead of "
@@ -2455,9 +2474,8 @@ void MovementHandler::finishClientTaxiFlight(bool snapToFinalWaypoint) {
             snapToFinalWaypoint = true;
         }
     }
-    if (snapToFinalWaypoint && !taxiClientPath_.empty()) {
+    if (snapToFinalWaypoint && haveLandingPos) {
         auto playerEntity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid());
-        const auto& landingPos = taxiClientPath_.back();
         if (playerEntity) {
             playerEntity->setPosition(landingPos.x, landingPos.y, landingPos.z,
                                       movementInfo.orientation);
@@ -2482,6 +2500,7 @@ void MovementHandler::finishClientTaxiFlight(bool snapToFinalWaypoint) {
     // remain visible after the flight has completed.
     owner_.vehicleIdRef() = 0;
     taxiClientPath_.clear();
+    taxiDestNodeId_ = 0;
     taxiServerCompletionPending_ = false;
     taxiRecoverPending_ = false;
     movementInfo.flags = 0;
@@ -2697,6 +2716,7 @@ void MovementHandler::handleActivateTaxiReply(network::Packet& packet) {
         taxiClientPath_.clear();
         taxiClientIndex_ = 0;
         taxiClientSegmentProgress_ = 0.0f;
+        taxiDestNodeId_ = 0;
         if (taxiMountActive_ && owner_.mountCallbackRef()) {
             owner_.mountCallbackRef()(0);
         }
@@ -2767,6 +2787,8 @@ void MovementHandler::activateTaxi(uint32_t destNodeId) {
 
     uint32_t startNode = currentTaxiData_.nearestNode;
     if (startNode == 0 || destNodeId == 0 || startNode == destNodeId) return;
+
+    taxiDestNodeId_ = destNodeId;
 
     if (owner_.isMounted()) {
         LOG_INFO("Taxi activate: dismounting current mount");

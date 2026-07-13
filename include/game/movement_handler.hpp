@@ -300,6 +300,13 @@ private:
     uint64_t taxiNpcGuid_ = 0;
     bool onTaxiFlight_ = false;
     std::string taxiDestName_;
+    // Set in activateTaxi(); used by finishClientTaxiFlight() to snap to the
+    // destination TaxiNodes.dbc entry's own registered position rather than
+    // taxiClientPath_'s last waypoint (from the separate TaxiPathNode.dbc
+    // table) - live-confirmed the two can disagree by 100+ yards, since a
+    // taxi path's own waypoint trace doesn't necessarily terminate exactly on
+    // the node's registered coordinate the way GM teleports/.gps do.
+    uint32_t taxiDestNodeId_ = 0;
     bool taxiMountActive_ = false;
     uint32_t taxiMountDisplayId_ = 0;
     bool taxiActivatePending_ = false;
