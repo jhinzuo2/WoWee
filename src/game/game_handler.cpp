@@ -400,6 +400,12 @@ void GameHandler::updateNetworking(float deltaTime) {
 }
 
 void GameHandler::updateTaxiAndMountState(float deltaTime) {
+// MovementHandler owns the active taxi path state. Always let it advance its
+// client path; updateClientTaxi() is a cheap no-op when no taxi is active.
+// Gating this on GameHandler's legacy duplicate onTaxiFlight_ flag stranded
+// every route at waypoint zero after taxi handling was extracted.
+updateClientTaxi(deltaTime);
+
 // Update taxi landing cooldown
 if (taxiLandingCooldown_ > 0.0f) {
     taxiLandingCooldown_ -= deltaTime;
@@ -417,7 +423,6 @@ if (playerTransportStickyTimer_ > 0.0f) {
 
 // Detect taxi flight landing: UNIT_FLAG_TAXI_FLIGHT (0x00000100) cleared
 if (onTaxiFlight_) {
-    updateClientTaxi(deltaTime);
     auto playerEntity = entityController_->getEntityManager().getEntity(playerGuid);
     auto unit = std::dynamic_pointer_cast<Unit>(playerEntity);
     if (unit &&

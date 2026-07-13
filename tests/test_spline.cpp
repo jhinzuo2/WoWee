@@ -68,6 +68,34 @@ TEST_CASE("WotLK compressed create spline remains supported as fallback", "[spli
     REQUIRE(packet.readUInt32() == 0x55667788);
 }
 
+TEST_CASE("WotLK taxi spline accepts vertical acceleration without effect start", "[spline][packet][taxi]") {
+    wowee::network::Packet packet;
+    packet.writeUInt32(wowee::game::SplineFlag::FINAL_POINT);
+    packet.writeFloat(-9215.0f); packet.writeFloat(43.0f); packet.writeFloat(85.0f);
+    packet.writeUInt32(0);       // time passed
+    packet.writeUInt32(12000);   // duration
+    packet.writeUInt32(9);       // spline id
+    packet.writeFloat(1.0f);     // duration mod
+    packet.writeFloat(0.0f);     // duration mod next
+    packet.writeFloat(0.0f);     // vertical acceleration
+    packet.writeUInt32(4);       // point count; this layout has no effect start time
+    for (int i = 0; i < 4; ++i) {
+        packet.writeFloat(-9200.0f + static_cast<float>(i) * 10.0f);
+        packet.writeFloat(50.0f + static_cast<float>(i));
+        packet.writeFloat(90.0f + static_cast<float>(i));
+    }
+    packet.writeUInt8(1);        // spline mode
+    packet.writeFloat(-9160.0f); packet.writeFloat(54.0f); packet.writeFloat(94.0f);
+    packet.writeUInt32(0xCAFEBABE);
+
+    wowee::game::SplineBlockData data;
+    REQUIRE(wowee::game::parseWotlkMoveUpdateSpline(packet, data));
+    REQUIRE(packet.getRemainingSize() == 4);
+    REQUIRE(packet.readUInt32() == 0xCAFEBABE);
+    REQUIRE(data.hasEndPoint);
+    REQUIRE(data.endPoint.x == Catch::Approx(-9160.0f));
+}
+
 // ── Helper: build a simple 4-point linear path ─────────────────────
 static std::vector<SplineKey> linearKeys() {
     // Straight line along X axis: (0,0,0) → (10,0,0) → (20,0,0) → (30,0,0)

@@ -356,6 +356,25 @@ bool parseWotlkMoveUpdateSpline(
         }
     }
 
+    // Some WotLK cores serialize verticalAcceleration for every create spline,
+    // but omit effectStartTime unless the spline is actually parabolic. Taxi
+    // splines commonly use that layout. Treating the following pointCount as
+    // effectStartTime shifts the path and rejects the whole player update.
+    if (!splineParsed && !(out.splineFlags & SplineFlag::PARABOLIC_MU)) {
+        packet.setReadPos(beforeSplineHeader);
+        if (bytesAvailable(12)) {
+            packet.readFloat(); // durationMod
+            packet.readFloat(); // durationModNext
+            packet.readFloat(); // verticalAcceleration
+            splineParsed = tryParseSplinePoints(false, "wotlk-vertical-no-effect-start");
+            if (!splineParsed) {
+                bool useCompressed = (out.splineFlags & SplineFlag::UNCOMPRESSED_MASK) == 0;
+                splineParsed = tryParseSplinePoints(useCompressed,
+                                                    "wotlk-vertical-no-effect-start-compressed");
+            }
+        }
+    }
+
     // Try 2: ANIMATION present but vertAccel+effectStart gated by PARABOLIC
     if (!splineParsed && (out.splineFlags & SplineFlag::ANIMATION)) {
         packet.setReadPos(beforeSplineHeader);
