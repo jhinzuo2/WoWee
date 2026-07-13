@@ -1075,7 +1075,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colors::kLowHealthRed);
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.4f, 0.0f, 0.0f, 1.0f));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
-            if (ImGui::Button("Leave Vehicle", ImVec2(btnW - 8.0f, btnH - 8.0f))) {
+            if (ImGui::Button("Dismount", ImVec2(btnW - 8.0f, btnH - 8.0f))) {
                 gameHandler.sendRequestVehicleExit();
             }
             ImGui::PopStyleVar();
