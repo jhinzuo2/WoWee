@@ -5,6 +5,7 @@
 // battleground score HUD, combat log, threat window, BG scoreboard.
 // ============================================================
 #include "ui/combat_ui.hpp"
+#include "ui/buff_bar_layout.hpp"
 #include "ui/settings_panel.hpp"
 #include "ui/spellbook_screen.hpp"
 #include "ui/inventory_screen.hpp"
@@ -870,43 +871,22 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
 
     auto* assetMgr = services_.assetManager;
 
-    // Single row along the top of the screen, right of centre. The row is right-aligned
-    // so it ends just left of the minimap (200x200 at 10px margin, so its left edge sits
-    // at screenW-210) and grows leftwards towards the centre as auras are gained.
+    // Layout arithmetic lives in buff_bar_layout.hpp so it can be tested.
     ImVec2 displaySize = ImGui::GetIO().DisplaySize;
-    float screenW = displaySize.x > 0.0f ? displaySize.x : 1280.0f;
-    float screenH = displaySize.y > 0.0f ? displaySize.y : 720.0f;
+    const float screenW = displaySize.x > 0.0f ? displaySize.x : 1280.0f;
+    const float screenH = displaySize.y > 0.0f ? displaySize.y : 720.0f;
+    const BuffBarLayout layout = computeBuffBarLayout(
+        screenW, screenH, settings.pendingBuffBarScale, activeCount, enchantCount);
 
-    // Icons track the window size so the bar keeps its proportions at any resolution,
-    // with the Buff Bar Scale setting layered on top. 1080p is the reference height.
-    const float autoScale = std::clamp(screenH / 1080.0f, 0.75f, 2.0f);
-    const float uiScale = autoScale * settings.pendingBuffBarScale;
+    const float uiScale = buffBarScale(screenH, settings.pendingBuffBarScale);
+    const float ICON_SIZE = layout.iconSize;
+    const float ICON_SPACING = layout.iconSpacing;
+    const int enchantShown = layout.enchantShown;
+    const int auraShown = layout.auraShown;
+    const int iconCount = layout.iconCount;
 
-    const float ICON_SIZE = 40.0f * uiScale;  // 25% larger than the old 32px icons
-    const float ICON_SPACING = 2.0f * uiScale;
-    const float WINDOW_PADDING = 16.0f;       // 8px each side
-
-    // Keep the row on-screen: it may not run past the minimap on the right, nor off the
-    // left edge. Anything that does not fit is dropped rather than wrapped to a new row.
-    constexpr float MINIMAP_LEFT_EDGE = 210.0f;  // from the right edge of the screen
-    constexpr float RIGHT_GAP = 10.0f;
-    const float availableW = screenW - MINIMAP_LEFT_EDGE - RIGHT_GAP - 10.0f;
-    const int maxIcons = std::max(1, static_cast<int>(
-        (availableW - WINDOW_PADDING + ICON_SPACING) / (ICON_SIZE + ICON_SPACING)));
-    // Enchants get first claim on the row so a wall of buffs cannot push them off it.
-    const int enchantShown = std::min(enchantCount, maxIcons);
-    const int auraShown = std::min(activeCount, maxIcons - enchantShown);
-    const int iconCount = auraShown + enchantShown;
-
-    float barW = WINDOW_PADDING;
-    if (iconCount > 0) {
-        barW += iconCount * ICON_SIZE + (iconCount - 1) * ICON_SPACING;
-    }
-    barW = std::max(barW, 140.0f * uiScale);  // floor: the Dismiss Pet button needs room
-
-    const float barX = std::max(10.0f, screenW - MINIMAP_LEFT_EDGE - RIGHT_GAP - barW);
-    ImGui::SetNextWindowPos(ImVec2(barX, 10.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(barW, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowPos(ImVec2(layout.barX, layout.barY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(layout.barWidth, 0), ImGuiCond_Always);
 
     // No AlwaysAutoResize: the width is computed above so the row can be right-aligned.
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |

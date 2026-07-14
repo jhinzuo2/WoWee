@@ -543,6 +543,17 @@ target_link_libraries(test_expansion_profile PRIVATE catch2_main)
 add_test(NAME expansion_profile COMMAND test_expansion_profile)
 register_test_target(test_expansion_profile)
 
+# ── test_buff_bar_layout ────────────────────────────────────
+# Header-only layout arithmetic — no ImGui needed.
+add_executable(test_buff_bar_layout
+    test_buff_bar_layout.cpp
+)
+target_include_directories(test_buff_bar_layout PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_buff_bar_layout SYSTEM PRIVATE ${TEST_SYSTEM_INCLUDE_DIRS})
+target_link_libraries(test_buff_bar_layout PRIVATE catch2_main)
+add_test(NAME buff_bar_layout COMMAND test_buff_bar_layout)
+register_test_target(test_buff_bar_layout)
+
 # ── test_dbc_layouts ────────────────────────────────────────
 # Reads the layout files shipped in Data/expansions, so it needs the source dir.
 add_executable(test_dbc_layouts
