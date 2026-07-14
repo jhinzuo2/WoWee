@@ -98,6 +98,8 @@ bool isGatherSpellId(uint32_t spellId) {
     return false;
 }
 
+// The three ranged weapon auto-attacks. Used only to pick the shot animation —
+// melee classification comes from the spell's range, not from this list.
 bool isRangedWeaponAttackSpell(uint32_t spellId) {
     // Client spell IDs shared by the supported legacy expansions.
     return spellId == 75 ||    // Auto Shot
@@ -497,13 +499,17 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
         facingHandled = true;
     }
 
-    // Instant melee abilities: client-side range + facing check
+    // Instant melee abilities: client-side range + facing check.
+    // Melee is decided by the spell's own range, not by its school. SpellRange calls
+    // melee "Combat Range" (5 yards), while physical-school abilities that are cast at
+    // range — Steady Shot, Multi-Shot, Taunt, Deadly Throw — carry a 30-35 yard range.
+    // Testing the school instead would range-check those at 8 yards and swallow the cast.
+    // An unknown range (SpellRange.dbc unavailable) is not treated as melee, so the
+    // server arbitrates rather than the client blocking a legitimate cast.
     if (!facingHandled) {
-        owner_.loadSpellNameCache();
-        auto cacheIt = owner_.spellNameCacheRef().find(spellId);
-        bool isMeleeAbility = (cacheIt != owner_.spellNameCacheRef().end() &&
-                               cacheIt->second.schoolMask == 1 &&
-                               !isRangedWeaponAttackSpell(spellId));
+        constexpr float kCombatRangeYards = 5.0f;
+        const float spellMaxRange = getSpellMaxRange(spellId);
+        const bool isMeleeAbility = (spellMaxRange > 0.0f && spellMaxRange <= kCombatRangeYards);
         if (isMeleeAbility && target != 0) {
             auto entity = owner_.getEntityManager().getEntity(target);
             if (entity) {
@@ -1287,14 +1293,14 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
             owner_.suppressNextMeleeSwingAnim();
         }
 
-        // Instant melee abilities → trigger attack animation
+        // Instant melee abilities → trigger attack animation. Range decides this, not
+        // school: physical abilities cast at range (Steady Shot, Taunt) would otherwise
+        // play a melee swing.
         bool isMeleeAbility = false;
-        if (!owner_.isProfessionSpell(sid)) {
-            owner_.loadSpellNameCache();
-            auto cacheIt = owner_.spellNameCacheRef().find(sid);
-            if (cacheIt != owner_.spellNameCacheRef().end() &&
-                cacheIt->second.schoolMask == 1 &&
-                !isRangedWeaponAttackSpell(sid)) {
+        if (!owner_.isProfessionSpell(sid) && !isRangedWeaponAttackSpell(sid)) {
+            constexpr float kCombatRangeYards = 5.0f;
+            const float sidRange = getSpellMaxRange(sid);
+            if (sidRange > 0.0f && sidRange <= kCombatRangeYards) {
                 isMeleeAbility = (currentCastSpellId_ != sid);
             }
         }
@@ -2489,6 +2495,13 @@ uint32_t SpellHandler::resolveHighestKnownRank(uint32_t spellId) const {
 
     LOG_INFO("Superseded rank: casting ", best, " instead of ", spellId, " (", name, ")");
     return best;
+}
+
+float SpellHandler::getSpellMaxRange(uint32_t spellId) const {
+    if (spellId == 0) return -1.0f;
+    loadSpellNameCache();
+    auto it = owner_.spellNameCacheRef().find(spellId);
+    return (it != owner_.spellNameCacheRef().end()) ? it->second.maxRange : -1.0f;
 }
 
 bool SpellHandler::isSelfCastSpell(uint32_t spellId) const {

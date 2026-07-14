@@ -204,6 +204,9 @@ public:
     uint32_t getSpellSchoolMask(uint32_t spellId) const;
     /// Spell.dbc Targets mask (SpellCastTargetFlags): 0x10 = TARGET_FLAG_ITEM.
     uint32_t getSpellTargetFlags(uint32_t spellId) const;
+    /// Spell.dbc RangeIndex resolved via SpellRange.dbc, in yards. Melee ("Combat
+    /// Range") is 5; self-only is 0; negative means SpellRange.dbc was unavailable.
+    float getSpellMaxRange(uint32_t spellId) const;
     /// True for "Self Only" range spells (shouts, self-buffs): they always land on
     /// the caster, so they take no explicit target and skip melee range checks.
     bool isSelfCastSpell(uint32_t spellId) const;
