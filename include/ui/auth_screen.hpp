@@ -56,6 +56,7 @@ private:
         std::string username;
         std::string passwordHash;  // SHA1 hex (UPPER(user):UPPER(pass))
         std::string expansionId;   // "wotlk", "tbc", "classic", "turtle", ...
+        std::string assetProfileId; // empty=match protocol, "legacy"=root manifest
     };
 
     // UI state
@@ -65,6 +66,7 @@ private:
     char pinCode[32] = "";
     int port = 3724;
     int expansionIndex = 0;     // Index into expansion registry profiles
+    std::string assetProfileId_; // Empty follows expansionIndex automatically
     bool authenticating = false;
     bool showPassword = false;
     bool pinAutoSubmitted_ = false;

@@ -4,6 +4,8 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <cstdlib>
+#include <limits>
 
 // Minimal JSON parsing (no external dependency) — expansion.json is tiny and flat.
 // We parse the subset we need: strings, integers, arrays of integers.
@@ -123,10 +125,27 @@ size_t ExpansionRegistry::initialize(const std::string& dataRoot) {
     std::sort(profiles_.begin(), profiles_.end(),
               [](const ExpansionProfile& a, const ExpansionProfile& b) { return a.build < b.build; });
 
-    // Default to WotLK if available, otherwise the last (highest build)
+    // Prefer WotLK when it has extracted assets. Otherwise choose the highest
+    // extracted profile so a single-expansion installation can initialize its
+    // asset manager without requiring a legacy root Data/manifest.json.
     if (!profiles_.empty()) {
+        auto hasManifest = [](const ExpansionProfile& p) {
+            std::error_code existsEc;
+            return std::filesystem::exists(p.dataPath + "/manifest.json", existsEc);
+        };
         auto it = std::find_if(profiles_.begin(), profiles_.end(),
-                               [](const ExpansionProfile& p) { return p.id == "wotlk"; });
+                               [&](const ExpansionProfile& p) {
+                                   return p.id == "wotlk" && hasManifest(p);
+                               });
+        if (it == profiles_.end()) {
+            it = std::find_if(profiles_.rbegin(), profiles_.rend(), hasManifest).base();
+            if (it != profiles_.begin()) --it;
+            else if (!hasManifest(*it)) it = profiles_.end();
+        }
+        if (it == profiles_.end()) {
+            it = std::find_if(profiles_.begin(), profiles_.end(),
+                              [](const ExpansionProfile& p) { return p.id == "wotlk"; });
+        }
         activeId_ = (it != profiles_.end()) ? it->id : profiles_.back().id;
     }
 
@@ -173,6 +192,27 @@ bool ExpansionRegistry::loadProfile(const std::string& jsonPath, const std::stri
 
     p.build = static_cast<uint16_t>(jsonInt(json, "build"));
     p.worldBuild = static_cast<uint16_t>(jsonInt(json, "worldBuild", p.build));
+    // Custom clients sometimes advance their authentication build without
+    // changing the underlying Vanilla world protocol. Permit a profile-scoped
+    // override so archived/private servers on an older Turtle revision remain
+    // usable without editing tracked expansion metadata.
+    const std::string buildEnv = jsonValue(json, "buildEnv");
+    if (!buildEnv.empty()) {
+        if (const char* raw = std::getenv(buildEnv.c_str()); raw && *raw) {
+            try {
+                const unsigned long overrideBuild = std::stoul(raw);
+                if (overrideBuild == 0 || overrideBuild > std::numeric_limits<uint16_t>::max()) {
+                    throw std::out_of_range("client build");
+                }
+                p.build = static_cast<uint16_t>(overrideBuild);
+                LOG_WARNING("ExpansionRegistry: overriding auth build via ", buildEnv,
+                            "=", p.build);
+            } catch (...) {
+                LOG_WARNING("ExpansionRegistry: ignoring invalid ", buildEnv,
+                            "='", raw, "'");
+            }
+        }
+    }
     p.protocolVersion = static_cast<uint8_t>(jsonInt(json, "protocolVersion"));
     // Optional client header fields (LOGON_CHALLENGE)
     {

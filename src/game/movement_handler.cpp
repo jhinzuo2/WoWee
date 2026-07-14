@@ -1502,6 +1502,22 @@ void MovementHandler::handleMonsterMove(network::Packet& packet) {
         return;
     }
 
+    // Classic/TBC creature patrols encode ground locomotion in the spline:
+    // RUNMODE set means Run, while a clear bit means Walk. Publish it before
+    // the render callback. WotLK uses the separate spline mode opcodes already
+    // registered above, and 0x100 means DONE there, so do not reinterpret it.
+    const bool usesPreWotlkSplineFlags = isActiveExpansion("classic") ||
+                                          isActiveExpansion("turtle") ||
+                                          isActiveExpansion("tbc");
+    if (usesPreWotlkSplineFlags && entity->getType() == ObjectType::UNIT &&
+        owner_.unitMoveFlagsCallbackRef()) {
+        const uint32_t locomotionFlags =
+            isPreWotlkSplineWalking(data.splineFlags)
+                ? static_cast<uint32_t>(MovementFlags::WALKING)
+                : 0u;
+        owner_.unitMoveFlagsCallbackRef()(data.guid, locomotionFlags);
+    }
+
     if (data.hasDest) {
         glm::vec3 destCanonical = core::coords::serverToCanonical(
             glm::vec3(data.destX, data.destY, data.destZ));
@@ -1675,6 +1691,18 @@ void MovementHandler::handleMonsterMoveTransport(network::Packet& packet) {
     float destLocalY = spline.hasDest ? spline.destination.y : localY;
     float destLocalZ = spline.hasDest ? spline.destination.z : localZ;
     bool hasDest = spline.hasDest;
+
+    const bool usesPreWotlkSplineFlags = isActiveExpansion("classic") ||
+                                          isActiveExpansion("turtle") ||
+                                          isActiveExpansion("tbc");
+    if (usesPreWotlkSplineFlags && entity->getType() == ObjectType::UNIT &&
+        owner_.unitMoveFlagsCallbackRef()) {
+        const uint32_t locomotionFlags =
+            isPreWotlkSplineWalking(splineFlags)
+                ? static_cast<uint32_t>(MovementFlags::WALKING)
+                : 0u;
+        owner_.unitMoveFlagsCallbackRef()(moverGuid, locomotionFlags);
+    }
 
     if (!owner_.getTransportManager()) {
         LOG_WARNING("SMSG_MONSTER_MOVE_TRANSPORT: TransportManager not available for mover 0x",

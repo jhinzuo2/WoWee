@@ -33,6 +33,10 @@ constexpr uint32_t kConsumableSubclassBandage = 7;
 constexpr uint32_t kConsumableSubclassItemEnhancement = 6;
 // SpellCastTargetFlags bit set by Spell.dbc for spells cast onto another item.
 constexpr uint32_t kSpellTargetFlagItem = 0x10;
+constexpr uint32_t kBuybackWireSlotStart = 74;
+constexpr uint32_t kBuybackWireSlotCount = 12;
+constexpr uint32_t kBuybackWireSlotEnd =
+    kBuybackWireSlotStart + kBuybackWireSlotCount;
 
 bool isBandageItem(const ItemQueryResponseData* info) {
     return info && info->valid &&
@@ -352,7 +356,14 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                      " itemGuid=0x", itemGuid, std::dec,
                      " result=", static_cast<int>(result));
             if (result == 0) {
-                pendingSellToBuyback_.erase(itemGuid);
+                auto pending = pendingSellToBuyback_.find(itemGuid);
+                if (pending != pendingSellToBuyback_.end()) {
+                    pendingSellToBuyback_.erase(pending);
+                    reconcileBuybackSlots();
+                } else {
+                    LOG_WARNING("Successful sale had no pending buyback entry: itemGuid=0x",
+                                std::hex, itemGuid, std::dec);
+                }
                 if (auto* ac = owner_.services().audioCoordinator) {
                     if (auto* sfx = ac->getUiSoundManager())
                         sfx->playDropOnGround();
@@ -362,31 +373,16 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                     owner_.addonEventCallbackRef()("PLAYER_MONEY", {});
                 }
             } else {
-                bool removedPending = false;
                 auto it = pendingSellToBuyback_.find(itemGuid);
                 if (it != pendingSellToBuyback_.end()) {
-                    for (auto bit = buybackItems_.begin(); bit != buybackItems_.end(); ++bit) {
-                        if (bit->itemGuid == itemGuid) {
-                            buybackItems_.erase(bit);
-                            return;
-                        }
-                    }
                     pendingSellToBuyback_.erase(it);
-                    removedPending = true;
                 }
-                if (!removedPending) {
-                    if (!buybackItems_.empty()) {
-                        uint64_t backGuid = buybackItems_.back().itemGuid;
-                        if (pendingSellToBuyback_.erase(backGuid) > 0) {
-                            buybackItems_.pop_back();
-                            removedPending = true;
-                        }
-                    }
-                }
-                if (!removedPending && !pendingSellToBuyback_.empty()) {
-                    pendingSellToBuyback_.clear();
-                    buybackItems_.clear();
-                }
+                const auto rejected = std::find_if(
+                    buybackItems_.begin(), buybackItems_.end(),
+                    [itemGuid](const BuybackItem& item) {
+                        return item.itemGuid == itemGuid;
+                    });
+                if (rejected != buybackItems_.end()) buybackItems_.erase(rejected);
                 static const char* sellErrors[] = {
                     "OK", "Can't find item", "Can't sell item",
                     "Can't find vendor", "You don't own that item",
@@ -399,7 +395,9 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                     if (auto* sfx = ac->getUiSoundManager())
                         sfx->playError();
                 }
-                LOG_WARNING("SMSG_SELL_ITEM error: ", (int)result, " (", msg, ")");
+                LOG_WARNING("SMSG_SELL_ITEM error: ", (int)result, " (", msg,
+                            ") itemGuid=0x", std::hex, itemGuid,
+                            " vendorGuid=0x", vendorGuid, std::dec);
             }
         }
     };
@@ -519,26 +517,21 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                      " pendingBuyItemSlot=", pendingBuyItemSlot_);
             if (pendingBuybackSlot_ >= 0) {
                 if (errCode == 0) {
-                    constexpr uint32_t kBuybackSlotEnd = 85;
-                    if (pendingBuybackWireSlot_ >= 74 && pendingBuybackWireSlot_ < kBuybackSlotEnd &&
-                        owner_.getSocket() && owner_.getState() == WorldState::IN_WORLD && currentVendorItems_.vendorGuid != 0) {
-                        ++pendingBuybackWireSlot_;
-                        LOG_INFO("Buyback retry: vendorGuid=0x", std::hex, currentVendorItems_.vendorGuid,
-                                 std::dec, " uiSlot=", pendingBuybackSlot_,
-                                 " wireSlot=", pendingBuybackWireSlot_);
-                        owner_.getSocket()->send(BuybackItemPacket::build(
-                            currentVendorItems_.vendorGuid, pendingBuybackWireSlot_));
-                        return;
-                    }
-                    if (pendingBuybackSlot_ < static_cast<int>(buybackItems_.size())) {
-                        buybackItems_.erase(buybackItems_.begin() + pendingBuybackSlot_);
-                    }
+                    // A missing slot is stale local state.  Never scan adjacent
+                    // slots: another item may legitimately occupy them.
+                    const auto stale = std::find_if(
+                        buybackItems_.begin(), buybackItems_.end(),
+                        [this](const BuybackItem& item) {
+                            return item.wireSlot == pendingBuybackWireSlot_;
+                        });
+                    if (stale != buybackItems_.end()) buybackItems_.erase(stale);
                     pendingBuybackSlot_ = -1;
                     pendingBuybackWireSlot_ = 0;
                     if (currentVendorItems_.vendorGuid != 0 && owner_.getSocket() && owner_.getState() == WorldState::IN_WORLD) {
                         auto pkt = ListInventoryPacket::build(currentVendorItems_.vendorGuid);
                         owner_.getSocket()->send(pkt);
                     }
+                    owner_.addUIError("That buyback item is no longer available.");
                     return;
                 }
                 pendingBuybackSlot_ = -1;
@@ -572,14 +565,19 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
             // Without this the pending slot lingered and a later unrelated
             // SMSG_BUY_FAILED could misread it as a buyback retry.
             if (pendingBuybackSlot_ >= 0) {
-                if (pendingBuybackSlot_ < static_cast<int>(buybackItems_.size())) {
-                    const auto& entry = buybackItems_[pendingBuybackSlot_];
+                const auto bought = std::find_if(
+                    buybackItems_.begin(), buybackItems_.end(),
+                    [this](const BuybackItem& item) {
+                        return item.wireSlot == pendingBuybackWireSlot_;
+                    });
+                if (bought != buybackItems_.end()) {
+                    const auto& entry = *bought;
                     std::string label = entry.item.name.empty()
                         ? "item #" + std::to_string(entry.item.itemId) : entry.item.name;
                     owner_.addSystemChatMessage("Bought back: " +
                         buildItemLink(entry.item.itemId,
                                       static_cast<uint32_t>(entry.item.quality), label));
-                    buybackItems_.erase(buybackItems_.begin() + pendingBuybackSlot_);
+                    buybackItems_.erase(bought);
                 }
                 pendingBuybackSlot_ = -1;
                 pendingBuybackWireSlot_ = 0;
@@ -1051,8 +1049,48 @@ void InventoryHandler::closeVendor() {
 void InventoryHandler::clearBuybackState() {
     buybackItems_.clear();
     pendingSellToBuyback_.clear();
+    buybackSlotGuids_.fill(0);
     pendingBuybackSlot_ = -1;
     pendingBuybackWireSlot_ = 0;
+}
+
+void InventoryHandler::reconcileBuybackSlots() {
+    for (auto it = buybackItems_.begin(); it != buybackItems_.end();) {
+        const auto slot = std::find(buybackSlotGuids_.begin(),
+                                    buybackSlotGuids_.end(), it->itemGuid);
+        if (slot != buybackSlotGuids_.end()) {
+            it->wireSlot = kBuybackWireSlotStart +
+                static_cast<uint32_t>(std::distance(buybackSlotGuids_.begin(), slot));
+            pendingSellToBuyback_.erase(it->itemGuid);
+            ++it;
+        } else if (it->wireSlot != 0) {
+            // A previously confirmed item disappeared from the server-owned
+            // buyback fields (purchase or ring replacement).
+            it = buybackItems_.erase(it);
+        } else {
+            // SMSG_SELL_ITEM and the player-field delta may arrive in either
+            // order. Keep the just-sold entry hidden from clicks until mapped.
+            ++it;
+        }
+    }
+
+    // A ring slot can only identify one entry. Remove any stale duplicate that
+    // may remain after a replacement update.
+    for (uint32_t wire = kBuybackWireSlotStart; wire < kBuybackWireSlotEnd; ++wire) {
+        bool kept = false;
+        for (auto it = buybackItems_.begin(); it != buybackItems_.end();) {
+            if (it->wireSlot != wire) {
+                ++it;
+                continue;
+            }
+            if (!kept) {
+                kept = true;
+                ++it;
+            } else {
+                it = buybackItems_.erase(it);
+            }
+        }
+    }
 }
 
 void InventoryHandler::buyItem(uint64_t vendorGuid, uint32_t itemId, uint32_t slot, uint32_t count) {
@@ -1099,10 +1137,9 @@ void InventoryHandler::sellItemBySlot(int backpackIndex) {
         return;
     }
 
-    uint64_t itemGuid = owner_.backpackSlotGuidsRef()[backpackIndex];
-    if (itemGuid == 0) {
-        itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
-    }
+    uint64_t itemGuid = slot.item.guid;
+    if (itemGuid == 0) itemGuid = owner_.backpackSlotGuidsRef()[backpackIndex];
+    if (itemGuid == 0) itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
     LOG_DEBUG("sellItemBySlot: slot=", backpackIndex,
               " item=", slot.item.name,
               " itemGuid=0x", std::hex, itemGuid, std::dec,
@@ -1112,9 +1149,8 @@ void InventoryHandler::sellItemBySlot(int backpackIndex) {
         sold.itemGuid = itemGuid;
         sold.item = slot.item;
         sold.count = 1;
-        buybackItems_.push_back(sold);
-        if (buybackItems_.size() > 12) buybackItems_.pop_front();
         pendingSellToBuyback_[itemGuid] = sold;
+        buybackItems_.push_back(sold);
         sellItem(currentVendorItems_.vendorGuid, itemGuid, 1);
     } else if (itemGuid == 0) {
         owner_.addSystemChatMessage("Cannot sell: item not found in inventory.");
@@ -1141,9 +1177,9 @@ void InventoryHandler::sellItemInBag(int bagIndex, int slotIndex) {
         return;
     }
 
-    uint64_t itemGuid = 0;
+    uint64_t itemGuid = slot.item.guid;
     uint64_t bagGuid = owner_.equipSlotGuidsRef()[Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex];
-    if (bagGuid != 0) {
+    if (itemGuid == 0 && bagGuid != 0) {
         auto it = owner_.containerContentsRef().find(bagGuid);
         if (it != owner_.containerContentsRef().end() && slotIndex < static_cast<int>(it->second.numSlots)) {
             itemGuid = it->second.slotGuids[slotIndex];
@@ -1158,9 +1194,8 @@ void InventoryHandler::sellItemInBag(int bagIndex, int slotIndex) {
         sold.itemGuid = itemGuid;
         sold.item = slot.item;
         sold.count = 1;
-        buybackItems_.push_back(sold);
-        if (buybackItems_.size() > 12) buybackItems_.pop_front();
         pendingSellToBuyback_[itemGuid] = sold;
+        buybackItems_.push_back(sold);
         sellItem(currentVendorItems_.vendorGuid, itemGuid, 1);
     } else if (itemGuid == 0) {
         owner_.addSystemChatMessage("Cannot sell: item not found.");
@@ -1171,8 +1206,13 @@ void InventoryHandler::sellItemInBag(int bagIndex, int slotIndex) {
 
 void InventoryHandler::buyBackItem(uint32_t buybackSlot) {
     if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket() || currentVendorItems_.vendorGuid == 0) return;
-    constexpr uint32_t kBuybackSlotStart = 74;
-    uint32_t wireSlot = kBuybackSlotStart + buybackSlot;
+    if (buybackSlot >= buybackItems_.size()) return;
+    const uint32_t wireSlot = buybackItems_[buybackSlot].wireSlot;
+    if (wireSlot < kBuybackWireSlotStart || wireSlot >= kBuybackWireSlotEnd) {
+        LOG_WARNING("Buyback request rejected: row ", buybackSlot,
+                    " has invalid wire slot ", wireSlot);
+        return;
+    }
     pendingBuyItemId_ = 0;
     pendingBuyItemSlot_ = 0;
     LOG_INFO("Buyback request: vendorGuid=0x", std::hex, currentVendorItems_.vendorGuid,
@@ -2784,10 +2824,15 @@ void InventoryHandler::handleItemQueryResponse(network::Packet& packet) {
 
 uint64_t InventoryHandler::resolveOnlineItemGuid(uint32_t itemId) const {
     if (itemId == 0) return 0;
+    uint64_t candidate = 0;
     for (const auto& [guid, info] : owner_.onlineItemsRef()) {
-        if (info.entry == itemId) return guid;
+        if (info.entry != itemId) continue;
+        // Item IDs are templates, not identities. Only use this compatibility
+        // fallback when the matching online object is unambiguous.
+        if (candidate != 0) return 0;
+        candidate = guid;
     }
-    return 0;
+    return candidate;
 }
 
 void InventoryHandler::detectInventorySlotBases(const FlatFieldMap& fields) {
@@ -2877,6 +2922,7 @@ void InventoryHandler::detectInventorySlotBases(const FlatFieldMap& fields) {
 
 bool InventoryHandler::applyInventoryFields(const FlatFieldMap& fields) {
     bool slotsChanged = false;
+    bool buybackSlotsChanged = false;
     int equipBase = (owner_.invSlotBaseRef() >= 0) ? owner_.invSlotBaseRef() : static_cast<int>(fieldIndex(UF::PLAYER_FIELD_INV_SLOT_HEAD));
     int packBase = (owner_.packSlotBaseRef() >= 0) ? owner_.packSlotBaseRef() : static_cast<int>(fieldIndex(UF::PLAYER_FIELD_PACK_SLOT_1));
     int bankBase = static_cast<int>(fieldIndex(UF::PLAYER_FIELD_BANK_SLOT_1));
@@ -2889,6 +2935,8 @@ bool InventoryHandler::applyInventoryFields(const FlatFieldMap& fields) {
     }
 
     int keyringBase = static_cast<int>(fieldIndex(UF::PLAYER_FIELD_KEYRING_SLOT_1));
+    const int buybackBase = bankBagBase != 0xFFFF
+        ? bankBagBase + (effectiveBankBagSlots_ * 2) : 0xFFFF;
     if (keyringBase == 0xFFFF && bankBagBase != 0xFFFF) {
         // Layout fallback for profiles that don't define PLAYER_FIELD_KEYRING_SLOT_1.
         // Bank bag slots are followed by 12 vendor buyback slots (24 fields), then keyring.
@@ -2950,7 +2998,22 @@ bool InventoryHandler::applyInventoryFields(const FlatFieldMap& fields) {
                 slotsChanged = true;
             }
         }
+
+        // The server owns the buyback ring. Bind local item metadata to these
+        // GUID fields rather than assuming displayed row N means wire slot 74+N.
+        if (buybackBase != 0xFFFF && key >= static_cast<uint16_t>(buybackBase) &&
+            key <= static_cast<uint16_t>(buybackBase) +
+                   (kBuybackWireSlotCount * 2 - 1)) {
+            const int slotIndex = (key - buybackBase) / 2;
+            const bool isLow = ((key - buybackBase) % 2 == 0);
+            uint64_t& guid = buybackSlotGuids_[slotIndex];
+            if (isLow) guid = (guid & 0xFFFFFFFF00000000ULL) | val;
+            else guid = (guid & 0x00000000FFFFFFFFULL) | (uint64_t(val) << 32);
+            buybackSlotsChanged = true;
+        }
     }
+
+    if (buybackSlotsChanged) reconcileBuybackSlots();
 
     return slotsChanged;
 }
@@ -2989,6 +3052,7 @@ ItemDef InventoryHandler::buildItemDef(uint32_t entry, uint32_t stackCount,
                                        uint32_t curDur, uint32_t maxDur, uint64_t guid) {
     ItemDef def;
     def.itemId = entry;
+    def.guid = guid;
     def.stackCount = stackCount;
     def.curDurability = curDur;
     def.maxDurability = maxDur;

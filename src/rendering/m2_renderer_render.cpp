@@ -461,6 +461,12 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
         glm::vec3 toCam = instance.position - cachedCamPos_;
         float distSq = glm::dot(toCam, toCam);
         float effectiveMaxDistSq = cachedMaxRenderDistSq_ * instance.cachedEffectiveMaxDistSqFactor;
+        if (instance.cachedIsSkyBird) {
+            constexpr float kBirdMaxDistSq =
+                rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE *
+                rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE;
+            effectiveMaxDistSq = std::min(effectiveMaxDistSq, kBirdMaxDistSq);
+        }
         if (distSq > effectiveMaxDistSq) continue;
         float paddedRadius = instance.cachedPaddedRadius;
         if (paddedRadius > 0.0f && !updateFrustum.intersectsSphere(instance.position, paddedRadius)) continue;
@@ -473,8 +479,10 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
 
         // Distance-based frame skipping: update distant bones less frequently
         uint32_t boneInterval = 1;
-        if (distSq > rendering::M2_BONE_SKIP_DIST_FAR * rendering::M2_BONE_SKIP_DIST_FAR) boneInterval = 4;
-        else if (distSq > rendering::M2_BONE_SKIP_DIST_MID * rendering::M2_BONE_SKIP_DIST_MID) boneInterval = 2;
+        if (!instance.cachedIsSkyBird) {
+            if (distSq > rendering::M2_BONE_SKIP_DIST_FAR * rendering::M2_BONE_SKIP_DIST_FAR) boneInterval = 4;
+            else if (distSq > rendering::M2_BONE_SKIP_DIST_MID * rendering::M2_BONE_SKIP_DIST_MID) boneInterval = 2;
+        }
         instance.frameSkipCounter++;
         if ((instance.frameSkipCounter % boneInterval) != 0) continue;
 
@@ -700,6 +708,12 @@ void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, c
         for (uint32_t i = 0; i < numInstances; i++) {
             const auto& inst = instances[i];
             float effectiveMaxDistSq = maxRenderDistanceSq * inst.cachedEffectiveMaxDistSqFactor;
+            if (inst.cachedIsSkyBird && inst.cachedHasAnimation && !inst.cachedDisableAnimation) {
+                constexpr float kBirdMaxDistSq =
+                    rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE *
+                    rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE;
+                effectiveMaxDistSq = std::min(effectiveMaxDistSq, kBirdMaxDistSq);
+            }
 
             uint32_t flags = 0;
             if (inst.cachedIsValid)          flags |= 1u;
@@ -902,11 +916,11 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
             }
 
             if (instance.cachedIsSkyBird && instance.cachedHasAnimation && !instance.cachedDisableAnimation) {
-                constexpr float kBirdMaxDistSq = rendering::M2_LOD3_DISTANCE * rendering::M2_LOD3_DISTANCE;
-                if (effectiveMaxDistSq > kBirdMaxDistSq) {
-                    effectiveMaxDistSq = kBirdMaxDistSq;
-                    if (distSq > effectiveMaxDistSq) continue;
-                }
+                constexpr float kBirdMaxDistSq =
+                    rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE *
+                    rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE;
+                effectiveMaxDistSq = std::min(effectiveMaxDistSq, kBirdMaxDistSq);
+                if (distSq > effectiveMaxDistSq) continue;
             }
 
             VisibleEntry visible{i, instance.modelId, distSq, effectiveMaxDistSq};

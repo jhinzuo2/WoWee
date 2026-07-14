@@ -7,6 +7,7 @@
 #include "game/expansion_profile.hpp"
 #include "game/world_packets.hpp"
 #include "pipeline/asset_manager.hpp"
+#include <cstdlib>
 
 namespace wowee { namespace core {
 
@@ -51,6 +52,17 @@ void UIScreenCallbackHandler::setupCallbacks() {
             host = realmAddress.substr(0, colonPos);
             try { port = static_cast<uint16_t>(std::stoi(realmAddress.substr(colonPos + 1))); }
             catch (...) { LOG_WARNING("Invalid port in realm address: ", realmAddress); }
+        }
+
+        // LAN clients are often handed a public realm address by MaNGOS. On
+        // routers without NAT reflection that address cannot hairpin back to
+        // the local world server. Allow a client-side host override while
+        // retaining the realm-advertised port and authentication identity.
+        if (const char* overrideHost = std::getenv("WOWEE_REALM_HOST_OVERRIDE");
+            overrideHost && *overrideHost) {
+            LOG_WARNING("Overriding realm host '", host, "' with '", overrideHost,
+                        "' via WOWEE_REALM_HOST_OVERRIDE");
+            host = overrideHost;
         }
 
         // Connect to world server

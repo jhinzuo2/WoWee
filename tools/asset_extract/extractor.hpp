@@ -16,8 +16,9 @@ public:
     struct Options {
         std::string mpqDir;       // Path to WoW Data directory
         std::string outputDir;    // Output directory for extracted assets
-        std::string expansion;    // "classic", "tbc", "wotlk", or "" for auto-detect
+        std::string expansion;    // "classic", "turtle", "tbc", "wotlk", or "" for auto-detect
         std::string locale;       // "enUS", "deDE", etc., or "" for auto-detect
+        bool expansionSubdir = false; // Write under outputDir/expansions/<expansion>
         int threads = 0;          // 0 = auto-detect
         bool verify = false;      // CRC32 verify after extraction
         bool verbose = false;     // Verbose logging
@@ -48,7 +49,7 @@ public:
 
     /**
      * Auto-detect expansion from files in mpqDir.
-     * @return "classic", "tbc", "wotlk", or "" if unknown
+     * @return "classic", "turtle", "tbc", "wotlk", or "" if unknown
      */
     static std::string detectExpansion(const std::string& mpqDir);
 

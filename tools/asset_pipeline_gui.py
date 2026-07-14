@@ -229,7 +229,7 @@ class PipelineManager:
         self.save_state()
 
     def rebuild_override(self) -> dict[str, int]:
-        out_dir = Path(self.state.output_data_dir)
+        out_dir = self.effective_output_dir()
         override_dir = out_dir / "override"
         if override_dir.exists():
             shutil.rmtree(override_dir)
@@ -262,6 +262,26 @@ class PipelineManager:
         self.state.last_override_build_at = self.now_str()
         self.save_state()
         return {"copied": copied, "replaced": replaced}
+
+    def effective_output_dir(self) -> Path:
+        """Return the isolated extraction selected by the GUI.
+
+        Auto mode resolves to the most recently written expansion manifest;
+        explicit modes resolve deterministically even before first extraction.
+        A legacy root manifest remains supported.
+        """
+        root = Path(self.state.output_data_dir)
+        expansion = (self.state.expansion or "auto").strip().lower()
+        if expansion != "auto":
+            isolated = root / "expansions" / expansion
+            if (isolated / "manifest.json").exists() or not (root / "manifest.json").exists():
+                return isolated
+        else:
+            candidates = list((root / "expansions").glob("*/manifest.json"))
+            if candidates:
+                newest = max(candidates, key=lambda path: path.stat().st_mtime)
+                return newest.parent
+        return root
 
     def _resolve_extractor(self) -> list[str] | None:
         configured = self.state.extractor_path.strip()
@@ -310,7 +330,8 @@ class PipelineManager:
                 cmd.append(self.state.expansion)
             return cmd
 
-        cmd = [*extractor, "--mpq-dir", mpq_dir, "--output", output_dir]
+        cmd = [*extractor, "--mpq-dir", mpq_dir, "--output", output_dir,
+               "--expansion-subdir"]
         if self.state.expansion and self.state.expansion != "auto":
             cmd.extend(["--expansion", self.state.expansion])
         if self.state.locale and self.state.locale != "auto":
@@ -328,7 +349,7 @@ class PipelineManager:
         return cmd
 
     def summarize_state(self) -> dict[str, Any]:
-        output_dir = Path(self.state.output_data_dir)
+        output_dir = self.effective_output_dir()
         manifest_path = output_dir / "manifest.json"
         override_dir = output_dir / "override"
 
@@ -578,7 +599,7 @@ class AssetPipelineGUI:
         self._browser_load_manifest()
 
     def _browser_load_manifest(self) -> None:
-        output_dir = Path(self.manager.state.output_data_dir)
+        output_dir = self.manager.effective_output_dir()
         manifest_path = output_dir / "manifest.json"
         if not manifest_path.exists():
             self._browser_count_var.set("No manifest.json found")
@@ -764,7 +785,7 @@ class AssetPipelineGUI:
         if entry is None:
             return None
         rel = entry.get("p", manifest_path)
-        output_dir = Path(self.manager.state.output_data_dir)
+        output_dir = self.manager.effective_output_dir()
         full = output_dir / rel
         if full.exists():
             return full

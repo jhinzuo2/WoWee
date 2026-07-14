@@ -39,7 +39,7 @@ The app uses Python's built-in `tkinter` module. If `tkinter` is missing, instal
 | Field | Description |
 |-------|-------------|
 | **WoW Data (MPQ source)** | Path to your WoW client's `Data/` folder containing `.MPQ` files |
-| **Output Data directory** | Where extracted assets land. Defaults to `<project root>/Data` |
+| **Output Data directory** | Root for isolated assets. Each extraction lands in `expansions/<expansion>/`; defaults to `<project root>/Data` |
 | **Extractor binary/script** | Optional. Leave blank for auto-detection (see below) |
 
 ### Extractor Auto-Detection

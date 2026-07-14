@@ -24,6 +24,13 @@ void writeWotlkCreateSplineHeader(wowee::network::Packet& packet, uint32_t nodeC
 
 } // namespace
 
+TEST_CASE("Pre-WotLK monster-move run mode has the protocol spline bit", "[spline][packet][movement]") {
+    REQUIRE(wowee::game::SplineFlag::PRE_WOTLK_RUNMODE == 0x00000100u);
+    REQUIRE(wowee::game::isPreWotlkSplineWalking(0u));
+    REQUIRE_FALSE(wowee::game::isPreWotlkSplineWalking(
+        wowee::game::SplineFlag::PRE_WOTLK_RUNMODE));
+}
+
 TEST_CASE("WotLK AzerothCore create spline consumes uncompressed nodes", "[spline][packet]") {
     wowee::network::Packet packet;
     writeWotlkCreateSplineHeader(packet, 2);

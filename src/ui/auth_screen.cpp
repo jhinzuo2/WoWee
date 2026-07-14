@@ -101,16 +101,22 @@ void AuthScreen::selectServerProfile(int index) {
         password[0] = '\0';
     }
 
+    auto& app = core::Application::getInstance();
     if (!s.expansionId.empty()) {
-        auto* expReg = core::Application::getInstance().getExpansionRegistry();
+        auto* expReg = app.getExpansionRegistry();
         if (expReg && expReg->setActive(s.expansionId)) {
             auto& profiles = expReg->getAllProfiles();
             for (int i = 0; i < static_cast<int>(profiles.size()); ++i) {
                 if (profiles[i].id == s.expansionId) { expansionIndex = i; break; }
             }
-            core::Application::getInstance().reloadExpansionData();
         }
     }
+    assetProfileId_ = s.assetProfileId;
+    if (!app.setAssetExpansionOverride(assetProfileId_)) {
+        assetProfileId_.clear();
+        app.setAssetExpansionOverride({});
+    }
+    app.reloadExpansionData();
 }
 
 void AuthScreen::upsertCurrentServerProfile(bool includePasswordHash) {
@@ -133,6 +139,7 @@ void AuthScreen::upsertCurrentServerProfile(bool includePasswordHash) {
     s.port = port;
     s.username = username;
     s.expansionId = currentExpansionId();
+    s.assetProfileId = assetProfileId_;
     if (includePasswordHash && !savedPasswordHash.empty()) {
         s.passwordHash = savedPasswordHash;
     } else if (foundIndex >= 0) {
@@ -169,6 +176,16 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
     if (!loginInfoLoaded) {
         loadLoginInfo();
         loginInfoLoaded = true;
+        auto* registry = core::Application::getInstance().getExpansionRegistry();
+        if (registry && registry->getActive()) {
+            const auto& profiles = registry->getAllProfiles();
+            for (int i = 0; i < static_cast<int>(profiles.size()); ++i) {
+                if (profiles[i].id == registry->getActive()->id) {
+                    expansionIndex = i;
+                    break;
+                }
+            }
+        }
     }
 
     if (!bgInitAttempted) {
@@ -375,6 +392,57 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
                 if (selected) ImGui::SetItemDefaultFocus();
             }
             ImGui::EndCombo();
+        }
+
+        const auto* protocolProfile = registry->getActive();
+        std::string assetPreview = protocolProfile
+            ? "Match protocol (" + protocolProfile->shortName + ")"
+            : "Match protocol";
+        if (assetProfileId_ == "legacy") {
+            assetPreview = "Legacy root Data";
+        } else if (!assetProfileId_.empty()) {
+            if (const auto* assetProfile = registry->getProfile(assetProfileId_)) {
+                assetPreview = assetProfile->shortName + " assets";
+            }
+        }
+
+        if (ImGui::BeginCombo("Assets", assetPreview.c_str())) {
+            const bool matching = assetProfileId_.empty();
+            if (ImGui::Selectable("Match protocol", matching)) {
+                assetProfileId_.clear();
+                core::Application::getInstance().setAssetExpansionOverride({});
+                core::Application::getInstance().reloadExpansionData();
+            }
+            if (matching) ImGui::SetItemDefaultFocus();
+
+            ImGui::Separator();
+            for (const auto& candidate : profiles) {
+                if (!std::filesystem::exists(candidate.dataPath + "/manifest.json")) continue;
+                const std::string label = candidate.shortName + " assets";
+                const bool selected = assetProfileId_ == candidate.id;
+                if (ImGui::Selectable(label.c_str(), selected)) {
+                    assetProfileId_ = candidate.id;
+                    core::Application::getInstance().setAssetExpansionOverride(assetProfileId_);
+                    core::Application::getInstance().reloadExpansionData();
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+
+            const char* dataPathEnv = std::getenv("WOW_DATA_PATH");
+            const std::filesystem::path baseData = dataPathEnv ? dataPathEnv : "./Data";
+            if (std::filesystem::exists(baseData / "manifest.json")) {
+                const bool selected = assetProfileId_ == "legacy";
+                if (ImGui::Selectable("Legacy root Data", selected)) {
+                    assetProfileId_ = "legacy";
+                    core::Application::getInstance().setAssetExpansionOverride("legacy");
+                    core::Application::getInstance().reloadExpansionData();
+                }
+                if (selected) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
+        if (!assetProfileId_.empty()) {
+            ImGui::TextDisabled("Override active; cross-expansion DBC/model formats may differ.");
         }
     } else {
         ImGui::Text("Expansion: WotLK 3.3.5a (default)");
@@ -655,7 +723,7 @@ void AuthScreen::saveLoginInfo(bool includePasswordHash) {
         return;
     }
 
-    out << "version=2\n";
+    out << "version=3\n";
     out << "active=" << makeServerKey(hostname, port) << "\n";
 
     for (const auto& s : servers_) {
@@ -666,6 +734,9 @@ void AuthScreen::saveLoginInfo(bool includePasswordHash) {
         }
         if (!s.expansionId.empty()) {
             out << "expansion=" << s.expansionId << "\n";
+        }
+        if (!s.assetProfileId.empty()) {
+            out << "assets=" << s.assetProfileId << "\n";
         }
     }
 
@@ -702,11 +773,12 @@ void AuthScreen::loadLoginInfo() {
             s.username = kv["username"];
             s.passwordHash = kv["password_hash"];
             s.expansionId = kv["expansion"];
+            s.assetProfileId = kv["assets"];
             servers_.push_back(std::move(s));
             selectServerProfile(0);
         }
 
-        LOG_INFO("Login info loaded from ", path, " (migrated v1 -> v2)");
+        LOG_INFO("Login info loaded from ", path, " (migrated legacy profile -> v3)");
         return;
     }
 
@@ -779,6 +851,7 @@ void AuthScreen::loadLoginInfo() {
         if (key == "username") current.username = val;
         else if (key == "password_hash") current.passwordHash = val;
         else if (key == "expansion") current.expansionId = val;
+        else if (key == "assets") current.assetProfileId = val;
     }
     flushServer();
 

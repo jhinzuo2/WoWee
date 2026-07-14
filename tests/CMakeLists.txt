@@ -525,6 +525,18 @@ endif()
 add_test(NAME editor_units COMMAND test_editor_units)
 register_test_target(test_editor_units)
 
+# ── test_expansion_profile ──────────────────────────────────
+add_executable(test_expansion_profile
+    test_expansion_profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/expansion_profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/logger.cpp
+)
+target_include_directories(test_expansion_profile PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_expansion_profile SYSTEM PRIVATE ${TEST_SYSTEM_INCLUDE_DIRS})
+target_link_libraries(test_expansion_profile PRIVATE catch2_main)
+add_test(NAME expansion_profile COMMAND test_expansion_profile)
+register_test_target(test_expansion_profile)
+
 # ── ASAN / UBSan for test targets ────────────────────────────
 if(WOWEE_ENABLE_ASAN AND NOT MSVC)
     foreach(_t IN LISTS ALL_TEST_TARGETS)

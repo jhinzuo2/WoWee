@@ -628,6 +628,8 @@ std::string WardenMemory::findWowExe(uint16_t build) const {
             candidateDirs.push_back(std::string(home) + "/twmoa_1180");
         }
     }
+    candidateDirs.push_back("Data/expansions/turtle/misc");
+    candidateDirs.push_back("Data/expansions/classic/misc");
     candidateDirs.push_back("Data/misc");
     candidateDirs.push_back("Data/expansions/turtle/overlay/misc");
 

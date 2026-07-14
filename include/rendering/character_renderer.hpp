@@ -179,6 +179,7 @@ private:
 
         // Pre-classified at load time to avoid per-batch string ops in render loop
         bool isKoboldFlame = false;
+        bool isSkyBird = false;
     };
 
     // Character instance

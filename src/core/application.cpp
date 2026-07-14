@@ -1075,6 +1075,22 @@ void Application::setState(AppState newState) {
     }
 }
 
+bool Application::setAssetExpansionOverride(const std::string& id) {
+    if (id.empty() || id == "legacy") {
+        assetExpansionOverrideId_ = id;
+        return true;
+    }
+    if (!expansionRegistry_) return false;
+    const auto* profile = expansionRegistry_->getProfile(id);
+    if (!profile || !std::filesystem::exists(profile->dataPath + "/manifest.json")) {
+        LOG_WARNING("Cannot select asset profile '", id,
+                    "': no extracted manifest is available");
+        return false;
+    }
+    assetExpansionOverrideId_ = id;
+    return true;
+}
+
 void Application::reloadExpansionData() {
     if (!expansionRegistry_ || !gameHandler) return;
     auto* profile = expansionRegistry_->getActive();
@@ -1106,6 +1122,28 @@ void Application::reloadExpansionData() {
 
     // Update expansion data path for CSV DBC lookups and clear DBC cache
     if (assetManager && !profile->dataPath.empty()) {
+        const char* dataPathEnv = std::getenv("WOW_DATA_PATH");
+        const std::string baseDataPath = dataPathEnv ? dataPathEnv : "./Data";
+        const game::ExpansionProfile* assetProfile = profile;
+        if (!assetExpansionOverrideId_.empty() &&
+            assetExpansionOverrideId_ != "legacy") {
+            if (const auto* selected = expansionRegistry_->getProfile(assetExpansionOverrideId_)) {
+                assetProfile = selected;
+            }
+        }
+        const std::string assetManifest = assetProfile->dataPath + "/manifest.json";
+        const bool useLegacyAssets = assetExpansionOverrideId_ == "legacy";
+        const std::string desiredAssetPath = !useLegacyAssets &&
+                                                  std::filesystem::exists(assetManifest)
+            ? assetProfile->dataPath
+            : baseDataPath;
+        if (desiredAssetPath != assetManager->getDataPath() &&
+            assetManager->switchDataPath(desiredAssetPath) &&
+            desiredAssetPath != baseDataPath) {
+            assetManager->setBaseFallbackPath(baseDataPath);
+        }
+        LOG_INFO("Protocol profile '", profile->id, "' using asset source '",
+                 useLegacyAssets ? std::string("legacy") : assetProfile->id, "'");
         assetManager->setExpansionDataPath(profile->dataPath);
         assetManager->clearDBCCache();
     }
@@ -2331,7 +2369,7 @@ void Application::setupUICallbacks() {
 
     // ── Animation: death, respawn, swing, hit, spell, emote, charge, etc. ──
     animationCallbacks_ = std::make_unique<AnimationCallbackHandler>(
-        *entitySpawner_, *renderer, *gameHandler);
+        *entitySpawner_, *renderer, *gameHandler, *appearanceComposer_);
     animationCallbacks_->setupCallbacks();
 
     // ── NPC interaction: greeting, farewell, vendor, aggro voice ──

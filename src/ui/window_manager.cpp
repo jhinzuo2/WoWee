@@ -1013,6 +1013,7 @@ void WindowManager::renderVendorWindow(game::GameHandler& gameHandler,
                     uint32_t s = static_cast<uint32_t>((price / 100) % 100);
                     uint32_t c = static_cast<uint32_t>(price % 100);
                     bool canAfford = money >= price;
+                    const bool slotReady = entry.wireSlot >= 74 && entry.wireSlot < 86;
 
                     ImGui::TableNextRow();
                     ImGui::PushID(8000 + i);
@@ -1044,13 +1045,16 @@ void WindowManager::renderVendorWindow(game::GameHandler& gameHandler,
                         ImGui::TextColored(kColorRed, "%ug %us %uc", g, s, c);
                     }
                     ImGui::TableSetColumnIndex(3);
-                    if (!canAfford) ImGui::BeginDisabled();
+                    if (!canAfford || !slotReady) ImGui::BeginDisabled();
                     char bbLabel[32];
                     snprintf(bbLabel, sizeof(bbLabel), "Buy Back##bb%d", i);
                     if (ImGui::SmallButton(bbLabel)) {
                         gameHandler.buyBackItem(static_cast<uint32_t>(i));
                     }
-                    if (!canAfford) ImGui::EndDisabled();
+                    if (!canAfford || !slotReady) ImGui::EndDisabled();
+                    if (!slotReady && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+                        ImGui::SetTooltip("Waiting for server buyback slot");
+                    }
                     ImGui::PopID();
                 }
                 ImGui::EndTable();

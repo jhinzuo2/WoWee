@@ -85,6 +85,29 @@ bool AssetManager::initialize(const std::string& dataPath_) {
     return true;
 }
 
+bool AssetManager::switchDataPath(const std::string& newDataPath) {
+    if (newDataPath.empty()) return false;
+    if (initialized && newDataPath == dataPath) return true;
+
+    const std::string manifestPath = newDataPath + "/manifest.json";
+    AssetManifest nextManifest;
+    if (!std::filesystem::exists(manifestPath) || !nextManifest.load(manifestPath)) {
+        LOG_ERROR("Cannot switch asset path; valid manifest not found in: ", newDataPath);
+        return false;
+    }
+
+    clearCache();
+    manifest_ = std::move(nextManifest);
+    baseFallbackManifest_ = AssetManifest{};
+    baseFallbackDataPath_.clear();
+    dataPath = newDataPath;
+    overridePath_ = dataPath + "/override";
+    initialized = true;
+    LOG_INFO("Switched asset manager to: ", dataPath, " (",
+             manifest_.getEntryCount(), " files indexed)");
+    return true;
+}
+
 void AssetManager::setupFileCacheBudget() {
     auto& memMonitor = core::MemoryMonitor::getInstance();
     size_t recommendedBudget = memMonitor.getRecommendedCacheBudget();

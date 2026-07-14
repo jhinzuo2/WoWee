@@ -81,6 +81,8 @@ public:
     addons::AddonManager* getAddonManager() { return addonManager_.get(); }
     game::ExpansionRegistry* getExpansionRegistry() { return expansionRegistry_.get(); }
     pipeline::DBCLayout* getDBCLayout() { return dbcLayout_.get(); }
+    bool setAssetExpansionOverride(const std::string& id);
+    const std::string& getAssetExpansionOverride() const { return assetExpansionOverrideId_; }
     void reloadExpansionData(); // Reload DBC layouts, opcodes, etc. after expansion change
 
     // Singleton access
@@ -139,6 +141,9 @@ private:
     std::unique_ptr<addons::AddonManager> addonManager_;
     bool addonsLoaded_ = false;
     std::unique_ptr<game::ExpansionRegistry> expansionRegistry_;
+    // Empty means assets follow the active protocol profile. "legacy" selects
+    // the root WOW_DATA_PATH manifest; otherwise this is an expansion id.
+    std::string assetExpansionOverrideId_;
     std::unique_ptr<pipeline::DBCLayout> dbcLayout_;
     std::unique_ptr<EntitySpawner> entitySpawner_;
     std::unique_ptr<AppearanceComposer> appearanceComposer_;

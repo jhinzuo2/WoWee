@@ -1,4 +1,5 @@
 #include "core/animation_callback_handler.hpp"
+#include "core/appearance_composer.hpp"
 #include "core/entity_spawner.hpp"
 #include "core/coordinates.hpp"
 #include "core/logger.hpp"
@@ -19,10 +20,12 @@ namespace wowee { namespace core {
 AnimationCallbackHandler::AnimationCallbackHandler(
     EntitySpawner& entitySpawner,
     rendering::Renderer& renderer,
-    game::GameHandler& gameHandler)
+    game::GameHandler& gameHandler,
+    AppearanceComposer& appearanceComposer)
     : entitySpawner_(entitySpawner)
     , renderer_(renderer)
     , gameHandler_(gameHandler)
+    , appearanceComposer_(appearanceComposer)
 {
 }
 
@@ -409,6 +412,7 @@ void AnimationCallbackHandler::setupCallbacks() {
             }
 
             if (isMining) {
+                appearanceComposer_.showMiningPick(true);
                 uint32_t mineAnim = pickFirst({
                     rendering::anim::ATTACK_1H,
                     rendering::anim::EMOTE_WORK,
@@ -542,6 +546,7 @@ void AnimationCallbackHandler::setupCallbacks() {
         } else {
             // Cast/channel ended — plays finalization anim completely then returns to idle
             if (isLocalPlayer) {
+                appearanceComposer_.showMiningPick(false);
                 auto* ac = renderer_.getAnimationController();
                 if (ac) ac->stopSpellCast();
             } else if (isChannel) {

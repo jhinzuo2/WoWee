@@ -18,6 +18,8 @@ static void printUsage(const char* prog) {
               << "\n"
               << "Options:\n"
               << "  --expansion <id>    Expansion: classic, turtle, tbc, wotlk (default: auto-detect)\n"
+              << "  --expansion-subdir Write into <output>/expansions/<id> so multiple clients\n"
+              << "                      cannot overwrite one another\n"
               << "  --locale <id>       Locale: enUS, deDE, frFR, etc. (default: auto-detect)\n"
               << "  --only-used-dbcs    Extract only the DBCs wowee uses (no other assets)\n"
               << "  --skip-dbc          Do not extract DBFilesClient/*.dbc (visual assets only)\n"
@@ -76,6 +78,8 @@ int main(int argc, char** argv) {
             expansion = argv[++i];
         } else if (std::strcmp(argv[i], "--locale") == 0 && i + 1 < argc) {
             locale = argv[++i];
+        } else if (std::strcmp(argv[i], "--expansion-subdir") == 0) {
+            opts.expansionSubdir = true;
         } else if (std::strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
             opts.threads = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--only-used-dbcs") == 0) {
@@ -303,6 +307,13 @@ int main(int argc, char** argv) {
     }
     opts.expansion = expansion;
 
+    if (expansion != "classic" && expansion != "turtle" &&
+        expansion != "tbc" && expansion != "wotlk") {
+        std::cerr << "Error: Unsupported expansion '" << expansion
+                  << "'. Expected classic, turtle, tbc, or wotlk.\n";
+        return 1;
+    }
+
     // Auto-detect locale if not specified
     if (locale.empty() || locale == "auto") {
         locale = wowee::tools::Extractor::detectLocale(opts.mpqDir);
@@ -336,6 +347,9 @@ int main(int argc, char** argv) {
     std::cout << "MPQ directory: " << opts.mpqDir << "\n";
     std::cout << "Output:        " << opts.outputDir << "\n";
     std::cout << "Expansion:     " << expansion << "\n";
+    if (opts.expansionSubdir) {
+        std::cout << "Layout:        isolated (expansions/" << expansion << ")\n";
+    }
     if (!locale.empty()) {
         std::cout << "Locale:        " << locale << "\n";
     }

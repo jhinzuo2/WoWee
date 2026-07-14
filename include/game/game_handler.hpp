@@ -2005,6 +2005,7 @@ public:
         uint64_t itemGuid = 0;
         ItemDef item;
         uint32_t count = 1;
+        uint32_t wireSlot = 0;
     };
     void buyBackItem(uint32_t buybackSlot);
     void repairItem(uint64_t vendorGuid, uint64_t itemGuid);

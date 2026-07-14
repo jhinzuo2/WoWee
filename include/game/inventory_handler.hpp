@@ -104,6 +104,9 @@ public:
         uint64_t itemGuid = 0;
         ItemDef item;
         uint32_t count = 1;
+        // Inventory slot sent in CMSG_BUYBACK_ITEM (74..85).  This is server
+        // identity, not the item's current row in the buyback UI.
+        uint32_t wireSlot = 0;
     };
     void openVendor(uint64_t npcGuid);
     void closeVendor();
@@ -354,10 +357,13 @@ private:
     ListInventoryData currentVendorItems_;
     std::deque<BuybackItem> buybackItems_;
     std::unordered_map<uint64_t, BuybackItem> pendingSellToBuyback_;
+    std::array<uint64_t, 12> buybackSlotGuids_{};
     int pendingBuybackSlot_ = -1;
     uint32_t pendingBuybackWireSlot_ = 0;
     uint32_t pendingBuyItemId_ = 0;
     uint32_t pendingBuyItemSlot_ = 0;
+
+    void reconcileBuybackSlots();
 
     // ---- Mail state ----
     bool mailboxOpen_ = false;

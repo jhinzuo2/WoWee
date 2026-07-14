@@ -188,17 +188,28 @@ For a cross-platform GUI workflow (extraction + texture pack management + active
 
 ```
 Data/
-  manifest.json
-  interface/
-  sound/
-  world/
   expansions/
+    classic/
+      manifest.json
+    turtle/
+      manifest.json
+    tbc/
+      manifest.json
+    wotlk/
+      manifest.json
 ```
 
 Notes:
 
 - `StormLib` is required to build/run the extractor (`asset_extract`), but the main client does not require StormLib at runtime.
 - `extract_assets.sh` / `extract_assets.ps1` support `classic`, `turtle`, `tbc`, `wotlk` targets.
+- Wrapper extractions are isolated under `Data/expansions/<target>/`. You can safely
+  extract all four clients without later runs overwriting shared asset paths.
+- The login screen's **Assets** selector follows the selected server expansion by
+  default. It can be overridden per saved server profile when testing compatible
+  asset variants; cross-expansion DBC and model formats may not be interchangeable.
+- Turtle defaults to 1.18.1 authentication build 7272. For an older Turtle-derived
+  server, set `WOWEE_TURTLE_AUTH_BUILD=7234` before launching WoWee.
 
 #### 2) Point wowee at the extracted data
 
@@ -206,6 +217,14 @@ By default, wowee looks for `./Data/`. You can override with:
 
 ```bash
 export WOW_DATA_PATH=/path/to/extracted/Data
+```
+
+If a MaNGOS realm advertises a public world address that is unreachable from your
+LAN, set `WOWEE_REALM_HOST_OVERRIDE` to the server's local IP. The advertised world
+port is preserved:
+
+```bash
+export WOWEE_REALM_HOST_OVERRIDE=192.168.1.50
 ```
 
 ### Compile & Run
