@@ -48,10 +48,10 @@ void SettingsPanel::renderSettingsInterfaceTab(std::function<void()> saveCallbac
 ImGui::Spacing();
 ImGui::BeginChild("InterfaceSettings", ImVec2(0, 360), true);
 
-ImGui::SeparatorText("Scale");
+ImGui::SeparatorText("Buff Bar");
 ImGui::Spacing();
 ImGui::SetNextItemWidth(200.0f);
-if (ImGui::SliderFloat("UI Scale", &pendingUiScale, 0.75f, 1.5f, "%.2fx")) {
+if (ImGui::SliderFloat("Buff Bar Scale", &pendingBuffBarScale, 0.75f, 1.5f, "%.2fx")) {
     saveCallback();
 }
 ImGui::SameLine();

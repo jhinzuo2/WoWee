@@ -78,9 +78,10 @@ public:
     // ---- Pending soundtrack ----
     bool pendingUseOriginalSoundtrack = true;
 
-    // ---- Pending UI layout ----
-    // User multiplier on top of the automatic resolution scaling (0.75–1.5).
-    float pendingUiScale = 1.0f;
+    // ---- Pending buff bar layout ----
+    // Multiplier for the buff/debuff bar icons, on top of the automatic
+    // resolution scaling (0.75–1.5).
+    float pendingBuffBarScale = 1.0f;
 
     // ---- Pending action bar layout ----
     bool pendingShowActionBar2 = true;   // Show bottom-left extra action bar above main bar

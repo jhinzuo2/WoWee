@@ -878,9 +878,9 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
     float screenH = displaySize.y > 0.0f ? displaySize.y : 720.0f;
 
     // Icons track the window size so the bar keeps its proportions at any resolution,
-    // with the UI Scale setting layered on top. 1080p is the reference height.
+    // with the Buff Bar Scale setting layered on top. 1080p is the reference height.
     const float autoScale = std::clamp(screenH / 1080.0f, 0.75f, 2.0f);
-    const float uiScale = autoScale * settings.pendingUiScale;
+    const float uiScale = autoScale * settings.pendingBuffBarScale;
 
     const float ICON_SIZE = 40.0f * uiScale;  // 25% larger than the old 32px icons
     const float ICON_SPACING = 2.0f * uiScale;
