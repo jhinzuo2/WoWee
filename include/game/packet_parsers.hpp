@@ -378,9 +378,15 @@ public:
     // TBC 2.4.3 CMSG_QUESTGIVER_QUERY_QUEST: guid(8) + questId(4) — no trailing
     // isDialogContinued byte that WotLK added
     network::Packet buildQueryQuestPacket(uint64_t npcGuid, uint32_t questId) override;
-    // TBC/Classic SMSG_QUESTGIVER_QUEST_DETAILS lacks informUnit(u64), flags(u32),
-    // isFinished(u8) that WotLK added; uses variable item counts + emote section.
-    bool parseQuestDetails(network::Packet& packet, QuestDetailsData& data) override;
+    // TBC 2.4.3 SMSG_QUESTGIVER_QUEST_DETAILS (cmangos-tbc GossipDef.cpp):
+    // u32 activateAccept + u32 suggestedPlayers, variable reward arrays, money,
+    // then honor/spell/title trailing and the emote block LAST.
+    bool parseQuestDetails(network::Packet& packet, QuestDetailsData& data) override {
+        return parseQuestDetailsPreWotlk(packet, data, /*hasSuggestedPlayers=*/true);
+    }
+    // Shared vanilla/TBC quest-details layout; vanilla omits suggestedPlayers.
+    static bool parseQuestDetailsPreWotlk(network::Packet& packet, QuestDetailsData& data,
+                                          bool hasSuggestedPlayers);
     // TBC 2.4.3 SMSG_GUILD_ROSTER: same rank structure as WotLK (variable rankCount +
     // goldLimit + bank tabs), but NO gender byte per member (WotLK added it)
     bool parseGuildRoster(network::Packet& packet, GuildRosterData& data) override;
@@ -452,7 +458,11 @@ public:
     uint8_t readQuestGiverStatus(network::Packet& packet) override;
     network::Packet buildQueryQuestPacket(uint64_t npcGuid, uint32_t questId) override;
     network::Packet buildAcceptQuestPacket(uint64_t npcGuid, uint32_t questId) override;
-    // parseQuestDetails inherited from TbcPacketParsers (same format as TBC 2.4.3)
+    // Classic 1.12 SMSG_QUESTGIVER_QUEST_DETAILS (vmangos Quest.cpp): like TBC
+    // but WITHOUT the suggestedPlayers field after activateAccept.
+    bool parseQuestDetails(network::Packet& packet, QuestDetailsData& data) override {
+        return parseQuestDetailsPreWotlk(packet, data, /*hasSuggestedPlayers=*/false);
+    }
     uint8_t questLogStride() const override { return 3; }
     // Classic 1.12 has 64 explored-zone uint32 fields (zone IDs fit in 2048 bits).
     // TBC/WotLK use 128 (needed for Outland/Northrend zone IDs up to 4095).

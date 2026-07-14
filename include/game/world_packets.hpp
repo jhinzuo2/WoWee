@@ -2278,10 +2278,33 @@ struct QuestOfferRewardData {
     std::vector<QuestRewardItem> fixedRewards;   // Always given
 };
 
+/** Protocol era for quest packets whose layout differs per expansion. */
+enum class QuestPacketEra { CLASSIC, TBC, WOTLK };
+
 /** SMSG_QUESTGIVER_OFFER_REWARD parser */
 class QuestOfferRewardParser {
 public:
+    /** Era resolved from the active expansion profile. */
     static bool parse(network::Packet& packet, QuestOfferRewardData& data);
+    static bool parse(network::Packet& packet, QuestOfferRewardData& data, QuestPacketEra era);
+};
+
+/** Reward block extracted from SMSG_QUEST_QUERY_RESPONSE (quest log rewards). */
+struct QuestQueryRewardsData {
+    int32_t  rewardMoney = 0;
+    std::array<uint32_t, 4> itemId{};
+    std::array<uint32_t, 4> itemCount{};
+    std::array<uint32_t, 6> choiceItemId{};
+    std::array<uint32_t, 6> choiceItemCount{};
+    bool valid = false;
+};
+
+/** Fixed-offset reward extractor for SMSG_QUEST_QUERY_RESPONSE.
+ *  `data` is the full packet payload (starting at questId);
+ *  `questLogStride` selects the expansion layout (3=Classic, 4=TBC, 5=WotLK). */
+class QuestQueryRewardsParser {
+public:
+    static QuestQueryRewardsData parse(const std::vector<uint8_t>& data, uint8_t questLogStride);
 };
 
 /** CMSG_QUESTGIVER_COMPLETE_QUEST packet builder */

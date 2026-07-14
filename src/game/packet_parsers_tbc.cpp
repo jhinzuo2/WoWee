@@ -804,7 +804,19 @@ network::Packet TbcPacketParsers::buildAcceptQuestPacket(uint64_t npcGuid, uint3
 //   + rewardCount(4) + [itemId(4)+count(4)+displayInfo(4)] × rewardCount
 //   + rewardMoney(4) + rewardXp(4)
 // ============================================================================
-bool TbcPacketParsers::parseQuestDetails(network::Packet& packet, QuestDetailsData& data) {
+// Verified against vmangos (Server/Packets/Quest.cpp) and cmangos-tbc
+// (Entities/GossipDef.cpp):
+//   guid(8) + questId(4) + title + details + objectives +
+//   activateAccept(u32)                     ← uint32 on BOTH, not uint8
+//   [TBC only] suggestedPlayers(u32)
+//   choiceCount(u32) + choiceCount × (itemId, count, displayId)   ← variable
+//   rewardCount(u32) + rewardCount × (itemId, count, displayId)   ← variable
+//   money(u32)
+//   trailing: Classic = rewSpell; TBC = honor + rewSpell + rewSpellCast + title
+//   emote block LAST (count + pairs) — never before the reward arrays.
+// QUEST_FLAGS_HIDDEN_REWARDS quests serialize counts of 0 and money 0.
+bool TbcPacketParsers::parseQuestDetailsPreWotlk(network::Packet& packet, QuestDetailsData& data,
+                                                 bool hasSuggestedPlayers) {
     if (packet.getSize() < 16) return false;
 
     data.npcGuid = packet.readUInt64();
@@ -813,26 +825,19 @@ bool TbcPacketParsers::parseQuestDetails(network::Packet& packet, QuestDetailsDa
     data.details    = normalizeWowTextTokens(packet.readString());
     data.objectives = normalizeWowTextTokens(packet.readString());
 
-    if (!packet.hasRemaining(5)) {
+    if (!packet.hasRemaining(4)) {
         LOG_DEBUG("Quest details tbc/classic (short): id=", data.questId, " title='", data.title, "'");
         return !data.title.empty() || data.questId != 0;
     }
 
-    /*activateAccept*/ packet.readUInt8();
-    data.suggestedPlayers = packet.readUInt32();
-
-    // TBC/Classic: emote section before reward items
-    if (packet.hasRemaining(4)) {
-        uint32_t emoteCount = packet.readUInt32();
-        for (uint32_t i = 0; i < emoteCount && packet.hasRemaining(8); ++i) {
-            packet.readUInt32(); // delay
-            packet.readUInt32(); // type
-        }
-    }
+    /*activateAccept*/ packet.readUInt32();
+    if (hasSuggestedPlayers && packet.hasRemaining(4))
+        data.suggestedPlayers = packet.readUInt32();
 
     // Choice reward items (variable count, up to QUEST_REWARD_CHOICES_COUNT)
     if (packet.hasRemaining(4)) {
         uint32_t choiceCount = packet.readUInt32();
+        if (choiceCount > 6) choiceCount = 0; // misaligned stream guard
         for (uint32_t i = 0; i < choiceCount && packet.hasRemaining(12); ++i) {
             uint32_t itemId = packet.readUInt32();
             uint32_t count  = packet.readUInt32();
@@ -849,6 +854,7 @@ bool TbcPacketParsers::parseQuestDetails(network::Packet& packet, QuestDetailsDa
     // Fixed reward items (variable count, up to QUEST_REWARDS_COUNT)
     if (packet.hasRemaining(4)) {
         uint32_t rewardCount = packet.readUInt32();
+        if (rewardCount > 4) rewardCount = 0; // misaligned stream guard
         for (uint32_t i = 0; i < rewardCount && packet.hasRemaining(12); ++i) {
             uint32_t itemId = packet.readUInt32();
             uint32_t count  = packet.readUInt32();
@@ -863,10 +869,12 @@ bool TbcPacketParsers::parseQuestDetails(network::Packet& packet, QuestDetailsDa
 
     if (packet.hasRemaining(4))
         data.rewardMoney = packet.readUInt32();
-    if (packet.hasRemaining(4))
-        data.rewardXp = packet.readUInt32();
+    // Remaining bytes are spell/honor/title trailing fields plus the emote
+    // block — no XP field exists pre-WotLK.
+    data.rewardXp = 0;
 
-    LOG_DEBUG("Quest details tbc/classic: id=", data.questId, " title='", data.title, "'");
+    LOG_DEBUG("Quest details tbc/classic: id=", data.questId, " title='", data.title,
+              "' choices=", data.rewardChoiceItems.size(), " fixed=", data.rewardItems.size());
     return true;
 }
 

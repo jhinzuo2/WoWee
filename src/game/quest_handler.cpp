@@ -272,41 +272,8 @@ static QuestQueryObjectives extractQuestQueryObjectives(const std::vector<uint8_
     return tryParseQuestObjectivesAt(data, base + 37u * 4u, 4, false);     // Classic/Turtle
 }
 
-struct QuestQueryRewards {
-    int32_t  rewardMoney = 0;
-    std::array<uint32_t, 4> itemId{};
-    std::array<uint32_t, 4> itemCount{};
-    std::array<uint32_t, 6> choiceItemId{};
-    std::array<uint32_t, 6> choiceItemCount{};
-    bool valid = false;
-};
-
-static QuestQueryRewards tryParseQuestRewards(const std::vector<uint8_t>& data,
-                                               bool classicLayout) {
-    const size_t base = 8;
-    const size_t fieldCount = classicLayout ? 40u : 55u;
-    const size_t headerEnd = base + fieldCount * 4u;
-    if (data.size() < headerEnd) return {};
-
-    const size_t moneyField     = classicLayout ? 14u : 17u;
-    const size_t itemIdField    = classicLayout ? 20u : 30u;
-    const size_t itemCountField = classicLayout ? 24u : 34u;
-    const size_t choiceIdField  = classicLayout ? 28u : 38u;
-    const size_t choiceCntField = classicLayout ? 34u : 44u;
-
-    QuestQueryRewards out;
-    out.rewardMoney = static_cast<int32_t>(readU32At(data, base + moneyField * 4u));
-    for (size_t i = 0; i < 4; ++i) {
-        out.itemId[i]    = readU32At(data, base + (itemIdField    + i) * 4u);
-        out.itemCount[i] = readU32At(data, base + (itemCountField + i) * 4u);
-    }
-    for (size_t i = 0; i < 6; ++i) {
-        out.choiceItemId[i]    = readU32At(data, base + (choiceIdField  + i) * 4u);
-        out.choiceItemCount[i] = readU32At(data, base + (choiceCntField + i) * 4u);
-    }
-    out.valid = true;
-    return out;
-}
+// Quest log reward extraction lives in QuestQueryRewardsParser
+// (world_packets_world.cpp) so the per-expansion offsets are unit-testable.
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -807,7 +774,7 @@ void QuestHandler::registerOpcodes(DispatchTable& table) {
         const bool isClassicLayout = questLogStride <= 4;
         const QuestQueryTextCandidate parsed = pickBestQuestQueryTexts(packet.getData(), isClassicLayout);
         const QuestQueryObjectives objs = extractQuestQueryObjectives(packet.getData(), questLogStride);
-        const QuestQueryRewards rwds = tryParseQuestRewards(packet.getData(), isClassicLayout);
+        const QuestQueryRewardsData rwds = QuestQueryRewardsParser::parse(packet.getData(), questLogStride);
 
         for (auto& q : questLog_) {
             if (q.questId != questId) continue;

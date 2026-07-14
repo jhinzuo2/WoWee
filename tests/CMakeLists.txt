@@ -537,6 +537,37 @@ target_link_libraries(test_expansion_profile PRIVATE catch2_main)
 add_test(NAME expansion_profile COMMAND test_expansion_profile)
 register_test_target(test_expansion_profile)
 
+# ── test_quest_rewards ──────────────────────────────────────
+add_executable(test_quest_rewards
+    test_quest_rewards.cpp
+    ${TEST_COMMON_SOURCES}
+    ${CMAKE_SOURCE_DIR}/src/network/packet.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/opcode_table.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/expansion_profile.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/character.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/spline_packet.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets_world.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets_entity.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets_social.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/world_packets_economy.cpp
+    ${CMAKE_SOURCE_DIR}/src/auth/crypto.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/packet_parsers_classic.cpp
+    ${CMAKE_SOURCE_DIR}/src/game/packet_parsers_tbc.cpp
+)
+target_include_directories(test_quest_rewards PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_quest_rewards SYSTEM PRIVATE ${TEST_SYSTEM_INCLUDE_DIRS})
+target_link_libraries(test_quest_rewards PRIVATE catch2_main SDL2::SDL2 ZLIB::ZLIB
+                                                 OpenSSL::SSL OpenSSL::Crypto)
+if(TARGET glm::glm)
+    target_link_libraries(test_quest_rewards PRIVATE glm::glm)
+endif()
+if(TARGET Vulkan::Vulkan)
+    target_link_libraries(test_quest_rewards PRIVATE Vulkan::Vulkan)
+endif()
+add_test(NAME quest_rewards COMMAND test_quest_rewards)
+register_test_target(test_quest_rewards)
+
 # ── test_inventory_sort ─────────────────────────────────────
 add_executable(test_inventory_sort
     test_inventory_sort.cpp
