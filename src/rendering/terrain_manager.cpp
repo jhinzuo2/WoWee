@@ -1473,7 +1473,7 @@ void TerrainManager::processPendingUnloads() {
     }
 
     if (unloaded > 0) {
-        LOG_INFO("Unloaded ", unloaded, " distant tiles (", pendingUnloadQueue_.size(),
+        LOG_DEBUG("Unloaded ", unloaded, " distant tiles (", pendingUnloadQueue_.size(),
                  " queued), ", loadedTiles.size(), " remain (models kept in VRAM)");
     }
 }
@@ -2557,7 +2557,7 @@ void TerrainManager::streamTiles() {
     }
 
     if (queuedNow > 0) {
-        LOG_INFO("Queued ", queuedNow, " distant tiles for unload (",
+        LOG_DEBUG("Queued ", queuedNow, " distant tiles for unload (",
                  pendingUnloadQueue_.size(), " total pending)");
     }
 }

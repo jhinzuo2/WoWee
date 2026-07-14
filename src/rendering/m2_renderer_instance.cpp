@@ -559,7 +559,7 @@ void M2Renderer::cleanupUnusedModels() {
         vkDeviceWaitIdle(vkCtx_->getDevice());
         const float waitMs = std::chrono::duration<float, std::milli>(
             std::chrono::steady_clock::now() - waitStart).count();
-        LOG_INFO("M2 cleanup: vkDeviceWaitIdle took ", waitMs, "ms (", toRemove.size(), " models to remove)");
+        LOG_DEBUG("M2 cleanup: vkDeviceWaitIdle took ", waitMs, "ms (", toRemove.size(), " models to remove)");
     }
     for (uint32_t id : toRemove) {
         auto it = models.find(id);

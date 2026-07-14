@@ -658,7 +658,12 @@ void AuthScreen::attemptAuth(auth::AuthHandler& authHandler) {
             info.os = profile->os;
             info.locale = profile->locale;
             info.timezone = profile->timezone;
-            info.legacyVanillaRealmList = (profile->id == "classic");
+            // Vanilla-family servers send the legacy realm-list layout even
+            // when the auth handshake itself uses protocol v8 (vmangos).
+            // Turtle keeps protocol 3, so cover both by id AND by version.
+            info.legacyVanillaRealmList = (profile->id == "classic" ||
+                                           profile->id == "turtle" ||
+                                           profile->protocolVersion <= 3);
             authHandler.setClientInfo(info);
         }
     }
