@@ -446,6 +446,11 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
 
     // Warrior Charge (ranks 1-3): client-side range check + charge callback
     if (spellId == 100 || spellId == 6178 || spellId == 11578) {
+        // Charge is an opener: it cannot be used once the fight has started.
+        if (owner_.isInCombat()) {
+            owner_.addSystemChatMessage("You can't do that while in combat.");
+            return;
+        }
         if (target == 0) {
             owner_.addSystemChatMessage("You have no target.");
             return;
@@ -455,9 +460,17 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
             owner_.addSystemChatMessage("You have no target.");
             return;
         }
-        // Corpses cannot be charged.
         if (auto unit = std::dynamic_pointer_cast<Unit>(entity)) {
+            // Corpses cannot be charged.
             if (unit->getHealth() == 0) {
+                owner_.addSystemChatMessage("You cannot attack that target.");
+                return;
+            }
+            // Friendly creatures cannot be charged. Only creatures are filtered:
+            // players stay chargeable so duels and PvP still work, since a duel
+            // opponent shares the player's faction and so is not flagged hostile.
+            if (entity->getType() == ObjectType::UNIT &&
+                !unit->isHostile() && !owner_.isAggressiveTowardPlayer(target)) {
                 owner_.addSystemChatMessage("You cannot attack that target.");
                 return;
             }
