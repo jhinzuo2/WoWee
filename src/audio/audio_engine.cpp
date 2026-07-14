@@ -494,7 +494,7 @@ bool AudioEngine::playSound3D(const std::string& mpqPath, const glm::vec3& posit
     return playSound3D(data, position, volume, pitch, maxDistance);
 }
 
-bool AudioEngine::playMusic(const std::vector<uint8_t>& musicData, float volume, bool loop) {
+bool AudioEngine::playMusic(std::vector<uint8_t> musicData, float volume, bool loop) {
     if (!initialized_ || !engine_ || musicData.empty()) {
         return false;
     }
@@ -504,8 +504,9 @@ bool AudioEngine::playMusic(const std::vector<uint8_t>& musicData, float volume,
     // Stop any currently playing music
     stopMusic();
 
-    // Keep the music data alive
-    musicData_ = musicData;
+    // Keep the music data alive. Move rather than copy: the decoder streams from this
+    // buffer, and a track is several MB.
+    musicData_ = std::move(musicData);
     musicVolume_ = volume;
 
     // Create decoder from memory (for streaming MP3/OGG)

@@ -258,7 +258,7 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
                 loginMusicVolumeAdjusted_ = true;
             }
             music->update(ImGui::GetIO().DeltaTime);
-            if (!music->isPlaying()) {
+            if (!music->isPlaying() && !music->isLoading()) {
                 static std::mt19937 rng(std::random_device{}());
                 if (!introTracksScanned_) {
                     introTracksScanned_ = true;
@@ -308,7 +308,9 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
                     const size_t idx = pick(rng);
                     const std::string path = introTracks_[idx];
                     music->playFilePath(path, true, 1800.0f);
-                    musicPlaying = music->isPlaying();
+                    // The read runs on a worker, so the track is not playing yet.
+                    // Treat a load in flight as success or the track gets dropped below.
+                    musicPlaying = music->isPlaying() || music->isLoading();
                     if (musicPlaying) {
                         LOG_INFO("AuthScreen: Playing login intro track: ", path);
                     } else {

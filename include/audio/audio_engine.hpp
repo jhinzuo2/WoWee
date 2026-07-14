@@ -57,7 +57,8 @@ public:
                      float volume = 1.0f, float pitch = 1.0f, float maxDistance = 100.0f);
 
     // Music streaming (for background music)
-    bool playMusic(const std::vector<uint8_t>& musicData, float volume = 1.0f, bool loop = true);
+    // Takes ownership: music tracks run to several MB and were being copied twice.
+    bool playMusic(std::vector<uint8_t> musicData, float volume = 1.0f, bool loop = true);
     void stopMusic();
     bool isMusicPlaying() const;
     void setMusicVolume(float volume);

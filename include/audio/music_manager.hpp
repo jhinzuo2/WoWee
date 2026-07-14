@@ -2,6 +2,8 @@
 
 #include <string>
 #include <cstdint>
+#include <future>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -30,11 +32,28 @@ public:
     void preloadMusic(const std::string& mpqPath);
 
     bool isPlaying() const { return playing; }
+    /// True while a track is being read on the worker but has not started yet.
+    /// Callers must treat this as "in progress", not as failure.
+    bool isLoading() const { return pendingFileLoad_.has_value(); }
     bool isInitialized() const { return assetManager != nullptr; }
     const std::string& getCurrentTrack() const { return currentTrack; }
 
 private:
     float effectiveMusicVolume() const;
+
+    // Tracks run to several MB, so reading one on the calling thread stalls whatever
+    // frame asked for it — starting the login music was costing ~200ms of render time.
+    // The read happens on a worker; update() hands the bytes to the AudioEngine once
+    // they land, keeping every miniaudio call on the main thread.
+    struct PendingFileLoad {
+        std::future<std::vector<uint8_t>> future;
+        std::string path;
+        bool loop = true;
+        float fadeInMs = 0.0f;
+    };
+    std::optional<PendingFileLoad> pendingFileLoad_;
+    void pollPendingFileLoad();
+
     pipeline::AssetManager* assetManager = nullptr;
     std::string currentTrack;
     bool currentTrackIsFile = false;

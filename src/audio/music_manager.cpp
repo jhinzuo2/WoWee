@@ -1,4 +1,6 @@
 #include "audio/music_manager.hpp"
+
+#include <chrono>
 #include "audio/audio_engine.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "core/logger.hpp"
@@ -106,18 +108,42 @@ void MusicManager::playFilePath(const std::string& filePath, bool loop, float fa
         return;
     }
 
-    // Read file into memory
-    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
-    if (!file) {
-        LOG_ERROR("Music: Could not open file: ", filePath);
-        return;
-    }
+    // Already reading this exact track: nothing to do. A request for a *different*
+    // track replaces the in-flight one (newest wins) rather than being dropped, which
+    // matters for the zone-change crossfade. Replacing blocks briefly in the old
+    // future's destructor, but only in the rare case where two requests collide.
+    if (pendingFileLoad_ && pendingFileLoad_->path == filePath) return;
 
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
+    // Read the track on a worker. A login track is ~6MB, and reading it here stalled
+    // the render frame that asked for it. pollPendingFileLoad() picks it up from
+    // update(), so every AudioEngine call still happens on the main thread.
+    pendingFileLoad_ = PendingFileLoad{
+        std::async(std::launch::async, [filePath]() -> std::vector<uint8_t> {
+            std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+            if (!file) return {};
+            std::streamsize size = file.tellg();
+            file.seekg(0, std::ios::beg);
+            std::vector<uint8_t> bytes(static_cast<size_t>(size));
+            if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) return {};
+            return bytes;
+        }),
+        filePath, loop, fadeInMs
+    };
+}
 
-    std::vector<uint8_t> data(static_cast<size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(data.data()), size)) {
+void MusicManager::pollPendingFileLoad() {
+    if (!pendingFileLoad_) return;
+    auto& pending = *pendingFileLoad_;
+    if (!pending.future.valid()) { pendingFileLoad_.reset(); return; }
+    if (pending.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+
+    std::vector<uint8_t> data = pending.future.get();
+    const std::string filePath = pending.path;
+    const bool loop = pending.loop;
+    const float fadeInMs = pending.fadeInMs;
+    pendingFileLoad_.reset();
+
+    if (data.empty()) {
         LOG_ERROR("Music: Could not read file: ", filePath);
         return;
     }
@@ -125,7 +151,7 @@ void MusicManager::playFilePath(const std::string& filePath, bool loop, float fa
     // Play with AudioEngine
     float targetVolume = effectiveMusicVolume();
     float startVolume = (fadeInMs > 0.0f) ? 0.0f : targetVolume;
-    if (AudioEngine::instance().playMusic(data, startVolume, loop)) {
+    if (AudioEngine::instance().playMusic(std::move(data), startVolume, loop)) {
         playing = true;
         fadingIn = false;
         if (fadeInMs > 0.0f) {
@@ -228,6 +254,9 @@ void MusicManager::crossfadeToFile(const std::string& filePath, float fadeMs) {
 }
 
 void MusicManager::update(float deltaTime) {
+    // Hand off any background-loaded track before touching playback state.
+    pollPendingFileLoad();
+
     // Check if music is still playing
     if (playing && !AudioEngine::instance().isMusicPlaying()) {
         playing = false;
