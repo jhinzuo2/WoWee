@@ -212,7 +212,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
         uint32_t lootSlot = packet.readUInt32();
         uint32_t itemId   = packet.readUInt32();
         /*uint32_t randSuffix =*/ packet.readUInt32();
-        /*int32_t  randProp   =*/ static_cast<int32_t>(packet.readUInt32());
+        (void)packet.readUInt32(); // random property
         uint32_t countdown = packet.readUInt32();
         uint8_t  voteMask  = packet.readUInt8();
 
@@ -245,7 +245,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
         /*uint32_t lootSlot   =*/ packet.readUInt32();
         uint32_t itemId     = packet.readUInt32();
         /*uint32_t randSuffix =*/ packet.readUInt32();
-        /*int32_t  randProp   =*/ static_cast<int32_t>(packet.readUInt32());
+        (void)packet.readUInt32(); // random property
         owner_.ensureItemInfo(itemId);
         auto* allPassInfo = owner_.getItemInfo(itemId);
         std::string allPassName = (allPassInfo && !allPassInfo->name.empty())
@@ -284,7 +284,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
         }
     };
 
-    table[Opcode::SMSG_LOOT_SLOT_CHANGED] = [this](network::Packet& packet) {
+    table[Opcode::SMSG_LOOT_SLOT_CHANGED] = [](network::Packet& packet) {
         if (packet.hasRemaining(1)) {
             uint8_t slotIdx = packet.readUInt8();
             LOG_DEBUG("SMSG_LOOT_SLOT_CHANGED: slot=", (int)slotIdx);
@@ -340,7 +340,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
     };
 
     // ---- Open container ----
-    table[Opcode::SMSG_OPEN_CONTAINER] = [this](network::Packet& packet) {
+    table[Opcode::SMSG_OPEN_CONTAINER] = [](network::Packet& packet) {
         if (packet.hasRemaining(8)) {
             uint64_t containerGuid = packet.readUInt64();
             LOG_DEBUG("SMSG_OPEN_CONTAINER: guid=0x", std::hex, containerGuid, std::dec);
@@ -585,7 +585,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
         if (packet.hasRemaining(20)) {
             /*uint64_t vendorGuid =*/ packet.readUInt64();
             /*uint32_t vendorSlot =*/ packet.readUInt32();
-            /*int32_t  newCount   =*/ static_cast<int32_t>(packet.readUInt32());
+            (void)packet.readUInt32(); // new count
             uint32_t itemCount  = packet.readUInt32();
             // Successful buyback: remove the entry from the local buyback list.
             // Without this the pending slot lingered and a later unrelated
@@ -978,7 +978,7 @@ void InventoryHandler::handleLootRoll(network::Packet& packet) {
     uint64_t playerGuid = packet.readUInt64();
     /*uint32_t itemId     =*/ packet.readUInt32();
     /*uint32_t randSuffix =*/ packet.readUInt32();
-    /*int32_t  randProp   =*/ static_cast<int32_t>(packet.readUInt32());
+    (void)packet.readUInt32(); // random property
     uint8_t rollNumber  = packet.readUInt8();
     uint8_t rollType    = packet.readUInt8();
     /*uint8_t autoPass   =*/ packet.readUInt8();

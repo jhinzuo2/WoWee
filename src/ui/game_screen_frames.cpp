@@ -58,18 +58,9 @@ namespace {
     constexpr auto& kColorRed        = kRed;
     constexpr auto& kColorGreen      = kGreen;
     constexpr auto& kColorBrightGreen= kBrightGreen;
-    constexpr auto& kColorYellow     = kYellow;
     constexpr auto& kColorGray       = kGray;
     constexpr auto& kColorDarkGray   = kDarkGray;
 
-    // Abbreviated month names (indexed 0-11)
-    constexpr const char* kMonthAbbrev[12] = {
-        "Jan","Feb","Mar","Apr","May","Jun",
-        "Jul","Aug","Sep","Oct","Nov","Dec"
-    };
-
-    // Common ImGui window flags for popup dialogs
-    const ImGuiWindowFlags kDialogFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
 
     bool raySphereIntersect(const wowee::rendering::Ray& ray, const glm::vec3& center, float radius, float& tOut) {
         glm::vec3 oc = ray.origin - center;

@@ -19,8 +19,7 @@ namespace {
 
 bool seedDeeprunTramStationPhase(ActiveTransport& transport,
                                  const PathEntry& pathEntry,
-                                 const glm::vec3& serverPosition,
-                                 float orientation) {
+                                 const glm::vec3& serverPosition) {
     const auto& spline = pathEntry.spline;
     const auto& keys = spline.keys();
     if (!pathEntry.fromDBC || spline.durationMs() == 0 || keys.empty()) {
@@ -495,7 +494,7 @@ void TransportManager::updateServerTransport(uint64_t guid, const glm::vec3& pos
         const glm::vec3 baseDelta = position - transport->basePosition;
         const bool stationEcho = glm::dot(baseDelta, baseDelta) < 4.0f;
         if (firstUpdate || stationEcho) {
-            if (!seedDeeprunTramStationPhase(*transport, *pathEntry, position, orientation)) {
+            if (!seedDeeprunTramStationPhase(*transport, *pathEntry, position)) {
                 transport->basePosition = position;
                 transport->position = position;
                 transport->localClockMs = 0;

@@ -84,7 +84,7 @@ void MovementHandler::registerOpcodes(DispatchTable& table) {
                      Opcode::SMSG_SPLINE_MOVE_NORMAL_FALL,
                      Opcode::SMSG_SPLINE_MOVE_ROOT,
                      Opcode::SMSG_SPLINE_MOVE_SET_HOVER }) {
-        table[op] = [this](network::Packet& packet) {
+        table[op] = [](network::Packet& packet) {
             if (packet.hasRemaining(1))
                 (void)packet.readPackedGuid();
         };
@@ -231,7 +231,7 @@ void MovementHandler::registerOpcodes(DispatchTable& table) {
     for (auto op : {Opcode::SMSG_SPLINE_MOVE_UNROOT,
                     Opcode::SMSG_SPLINE_MOVE_UNSET_HOVER,
                     Opcode::SMSG_SPLINE_MOVE_WATER_WALK}) {
-        table[op] = [this](network::Packet& packet) {
+        table[op] = [](network::Packet& packet) {
             // Minimal parse: PackedGuid only — no animation-relevant state change.
             if (packet.hasRemaining(1)) {
                 (void)packet.readPackedGuid();

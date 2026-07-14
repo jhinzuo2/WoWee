@@ -883,7 +883,6 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
     const float ICON_SPACING = layout.iconSpacing;
     const int enchantShown = layout.enchantShown;
     const int auraShown = layout.auraShown;
-    const int iconCount = layout.iconCount;
 
     ImGui::SetNextWindowPos(ImVec2(layout.barX, layout.barY), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(layout.barWidth, 0), ImGuiCond_Always);

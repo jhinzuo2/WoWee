@@ -243,7 +243,7 @@ void GameHandler::registerOpcodeHandlers() {
         LOG_DEBUG("SMSG_UPDATE_WORLD_STATE: field=", field, " value=", value);
         fireAddonEvent("UPDATE_WORLD_STATES", {});
     };
-    dispatchTable_[Opcode::SMSG_WORLD_STATE_UI_TIMER_UPDATE] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_WORLD_STATE_UI_TIMER_UPDATE] = [](network::Packet& packet) {
         if (packet.hasRemaining(4)) {
             uint32_t serverTime = packet.readUInt32();
             LOG_DEBUG("SMSG_WORLD_STATE_UI_TIMER_UPDATE: serverTime=", serverTime);
@@ -358,7 +358,7 @@ void GameHandler::registerOpcodeHandlers() {
         addSystemChatMessage(msg);
         LOG_INFO("SMSG_TITLE_EARNED: bit=", titleBit, " lost=", isLost, " title='", titleStr, "'");
     };
-    dispatchTable_[Opcode::SMSG_LEARNED_DANCE_MOVES] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_LEARNED_DANCE_MOVES] = [](network::Packet& packet) {
         LOG_DEBUG("SMSG_LEARNED_DANCE_MOVES: ignored (size=", packet.getSize(), ")");
     };
     dispatchTable_[Opcode::SMSG_CHAR_RENAME] = [this](network::Packet& packet) {
@@ -443,7 +443,7 @@ void GameHandler::registerOpcodeHandlers() {
             LOG_DEBUG("SMSG_CROSSED_INEBRIATION_THRESHOLD: guid=0x", std::hex, guid, std::dec, " threshold=", threshold);
         }
     };
-    dispatchTable_[Opcode::SMSG_CLEAR_FAR_SIGHT_IMMEDIATE] = [this](network::Packet& /*packet*/) {
+    dispatchTable_[Opcode::SMSG_CLEAR_FAR_SIGHT_IMMEDIATE] = [](network::Packet& /*packet*/) {
         LOG_DEBUG("SMSG_CLEAR_FAR_SIGHT_IMMEDIATE");
     };
     registerSkipHandler(Opcode::SMSG_COMBAT_EVENT_FAILED);
@@ -501,7 +501,7 @@ void GameHandler::registerOpcodeHandlers() {
             LOG_INFO("SMSG_CORPSE_RECLAIM_DELAY: ", delayMs, "ms");
         }
     };
-    dispatchTable_[Opcode::SMSG_DEATH_RELEASE_LOC] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_DEATH_RELEASE_LOC] = [](network::Packet& packet) {
         if (packet.hasRemaining(16)) {
             uint32_t relMapId = packet.readUInt32();
             float relX = packet.readFloat(), relY = packet.readFloat(), relZ = packet.readFloat();
@@ -538,7 +538,7 @@ void GameHandler::registerOpcodeHandlers() {
         addUIError("Your Feign Death was resisted.");
         addSystemChatMessage("Your Feign Death attempt was resisted.");
     };
-    dispatchTable_[Opcode::SMSG_CHANNEL_MEMBER_COUNT] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_CHANNEL_MEMBER_COUNT] = [](network::Packet& packet) {
         std::string chanName = packet.readString();
         if (packet.hasRemaining(5)) {
             /*uint8_t flags =*/ packet.readUInt8();
@@ -564,7 +564,7 @@ void GameHandler::registerOpcodeHandlers() {
         }
         packet.skipAll();
     };
-    dispatchTable_[Opcode::SMSG_GAMETIMEBIAS_SET] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_GAMETIMEBIAS_SET] = [](network::Packet& packet) {
         packet.skipAll();
     };
     dispatchTable_[Opcode::SMSG_ACHIEVEMENT_DELETED] = [this](network::Packet& packet) {
@@ -815,7 +815,7 @@ void GameHandler::registerOpcodeHandlers() {
 
     // (SMSG_INITIALIZE_FACTIONS, SMSG_SET_FACTION_STANDING,
     //  SMSG_SET_FACTION_ATWAR, SMSG_SET_FACTION_VISIBLE → moved to SocialHandler)
-    dispatchTable_[Opcode::SMSG_FEATURE_SYSTEM_STATUS] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_FEATURE_SYSTEM_STATUS] = [](network::Packet& packet) {
         packet.skipAll();
     };
 
@@ -855,7 +855,7 @@ void GameHandler::registerOpcodeHandlers() {
     // ---- Batch 5: Teleport, taxi, BG, LFG, arena, movement relay, mail, bank, auction, quests ----
 
     // Teleport
-    dispatchTable_[Opcode::SMSG_TRANSFER_PENDING] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_TRANSFER_PENDING] = [](network::Packet& packet) {
         uint32_t pendingMapId = packet.readUInt32();
         if (packet.hasRemaining(8)) {
             packet.readUInt32(); // transportEntry
@@ -962,7 +962,7 @@ void GameHandler::registerOpcodeHandlers() {
             else addSystemChatMessage("Failed to socket gems.");
         }
     };
-    dispatchTable_[Opcode::SMSG_ITEM_TIME_UPDATE] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_ITEM_TIME_UPDATE] = [](network::Packet& packet) {
         if (packet.hasRemaining(12)) {
             packet.readUInt64(); // itemGuid
             packet.readUInt32(); // durationMs
@@ -986,7 +986,7 @@ void GameHandler::registerOpcodeHandlers() {
     };
 
     // ---- Auto-repeat / auras / dispel / totem ----
-    dispatchTable_[Opcode::SMSG_CANCEL_AUTO_REPEAT] = [this](network::Packet& /*packet*/) {
+    dispatchTable_[Opcode::SMSG_CANCEL_AUTO_REPEAT] = [](network::Packet& /*packet*/) {
         // Server signals to stop a repeating spell (wand/shoot); no client action needed
     };
 
@@ -1453,7 +1453,7 @@ void GameHandler::registerOpcodeHandlers() {
         }
         packet.skipAll();
     };
-    dispatchTable_[Opcode::SMSG_MOUNTSPECIAL_ANIM] = [this](network::Packet& packet) { (void)packet.readPackedGuid(); };
+    dispatchTable_[Opcode::SMSG_MOUNTSPECIAL_ANIM] = [](network::Packet& packet) { (void)packet.readPackedGuid(); };
     dispatchTable_[Opcode::SMSG_CHAR_CUSTOMIZE] = [this](network::Packet& packet) {
         if (packet.hasRemaining(1)) {
             uint8_t result = packet.readUInt8();

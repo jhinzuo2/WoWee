@@ -43,7 +43,6 @@ ADTTerrain ADTLoader::load(const std::vector<uint8_t>& adtData) {
     int chunkIndex = 0;
 
     // Parse chunks
-    int totalChunks = 0;
     while (offset < adtData.size()) {
         ChunkHeader header;
         if (!readChunkHeader(adtData.data(), offset, adtData.size(), header)) {
@@ -52,8 +51,6 @@ ADTTerrain ADTLoader::load(const std::vector<uint8_t>& adtData) {
 
         const uint8_t* chunkData = adtData.data() + offset + 8;
         size_t chunkSize = header.size;
-
-        totalChunks++;
 
         // Parse based on chunk type
         if (header.magic == MVER) {

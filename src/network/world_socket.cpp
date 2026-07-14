@@ -31,7 +31,6 @@ constexpr size_t kMaxQueuedPacketCallbacks = 4096;
 constexpr int kAsyncPumpSleepMs = 2;
 constexpr size_t kRecentPacketHistoryLimit = 96;
 constexpr auto kRecentPacketHistoryWindow = std::chrono::seconds(15);
-constexpr const char* kCloseTraceEnv = "WOWEE_NET_CLOSE_TRACE";
 
 inline int parsedPacketsBudgetPerUpdate() {
     static int budget = []() {

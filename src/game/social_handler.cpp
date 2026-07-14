@@ -587,7 +587,7 @@ void SocialHandler::registerOpcodes(DispatchTable& table) {
         owner_.addUIError("You are out of the duel area!");
         owner_.addSystemChatMessage("You are out of the duel area!");
     };
-    table[Opcode::SMSG_DUEL_INBOUNDS] = [this](network::Packet& /*packet*/) {};
+    table[Opcode::SMSG_DUEL_INBOUNDS] = [](network::Packet& /*packet*/) {};
     table[Opcode::SMSG_DUEL_COUNTDOWN] = [this](network::Packet& packet) {
         if (packet.hasRemaining(4)) {
             uint32_t ms = packet.readUInt32();

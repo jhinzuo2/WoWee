@@ -31,9 +31,6 @@ namespace {
     using namespace wowee::ui::colors;
     using namespace wowee::ui::helpers;
     constexpr auto& kColorRed         = kRed;
-    constexpr auto& kColorGreen       = kGreen;
-    constexpr auto& kColorBrightGreen = kBrightGreen;
-    constexpr auto& kColorYellow      = kYellow;
     constexpr auto& kColorGray        = kGray;
     constexpr auto& kColorDarkGray    = kDarkGray;
 } // anonymous namespace

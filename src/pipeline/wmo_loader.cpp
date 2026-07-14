@@ -22,11 +22,9 @@ constexpr uint32_t MODS = 0x4D4F4453;  // Doodad sets
 constexpr uint32_t MOPV = 0x4D4F5056;  // Portal vertices
 constexpr uint32_t MOPT = 0x4D4F5054;  // Portal info
 constexpr uint32_t MOPR = 0x4D4F5052;  // Portal references
-constexpr uint32_t MFOG = 0x4D464F47;  // Fog
 
 // WMO group chunk identifiers
 constexpr uint32_t MOGP = 0x4D4F4750;  // Group header
-constexpr uint32_t MOVV = 0x4D4F5656;  // Vertices
 constexpr uint32_t MOVI = 0x4D4F5649;  // Indices
 constexpr uint32_t MOBA = 0x4D4F4241;  // Batches
 constexpr uint32_t MOCV = 0x4D4F4356;  // Vertex colors
@@ -517,7 +515,7 @@ bool WMOLoader::loadGroup(const std::vector<uint8_t>& groupData,
                         group.vertices.push_back(vertex);
                     }
                 }
-                else if (subChunkId == 0x4D4F5649) { // MOVI - Indices
+                else if (subChunkId == MOVI) { // Indices
                     uint32_t indexCount = subChunkSize / 2; // uint16_t per index
                     for (uint32_t i = 0; i < indexCount; i++) {
                         group.indices.push_back(read<uint16_t>(groupData, mogpOffset));
@@ -533,7 +531,7 @@ bool WMOLoader::loadGroup(const std::vector<uint8_t>& groupData,
                         read<uint8_t>(groupData, mogpOffset); // materialId (skip)
                     }
                 }
-                else if (subChunkId == 0x4D4F4E52) { // MONR - Normals
+                else if (subChunkId == MONR) { // Normals
                     uint32_t normalCount = subChunkSize / 12;
                     core::Logger::getInstance().debug("  MONR: ", normalCount, " normals for ", group.vertices.size(), " vertices");
                     for (uint32_t i = 0; i < normalCount && i < group.vertices.size(); i++) {
@@ -546,7 +544,7 @@ bool WMOLoader::loadGroup(const std::vector<uint8_t>& groupData,
                         core::Logger::getInstance().debug("    First normal: (", n.x, ", ", n.y, ", ", n.z, ")");
                     }
                 }
-                else if (subChunkId == 0x4D4F5456) { // MOTV - Texture coords
+                else if (subChunkId == MOTV) { // Texture coords
                     // Update texture coords for existing vertices
                     uint32_t texCoordCount = subChunkSize / 8;
                     core::Logger::getInstance().debug("  MOTV: ", texCoordCount, " tex coords for ", group.vertices.size(), " vertices");
@@ -558,7 +556,7 @@ bool WMOLoader::loadGroup(const std::vector<uint8_t>& groupData,
                         core::Logger::getInstance().debug("    First UV: (", group.vertices[0].texCoord.x, ", ", group.vertices[0].texCoord.y, ")");
                     }
                 }
-                else if (subChunkId == 0x4D4F4356) { // MOCV - Vertex colors
+                else if (subChunkId == MOCV) { // Vertex colors
                     // Update vertex colors
                     uint32_t colorCount = subChunkSize / 4;
                     core::Logger::getInstance().debug("  MOCV: ", colorCount, " vertex colors for ", group.vertices.size(), " vertices");
@@ -574,7 +572,7 @@ bool WMOLoader::loadGroup(const std::vector<uint8_t>& groupData,
                         core::Logger::getInstance().debug("    First color: (", c.r, ", ", c.g, ", ", c.b, ", ", c.a, ")");
                     }
                 }
-                else if (subChunkId == 0x4D4F4241) { // MOBA - Batches
+                else if (subChunkId == MOBA) { // Batches
                     // SMOBatch structure (24 bytes):
                     // - 6 x int16 bounding box (12 bytes)
                     // - uint32 startIndex (4 bytes)

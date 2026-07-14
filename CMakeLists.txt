@@ -20,7 +20,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 if(WIN32)
     # Needed for Vulkan Win32 external memory/semaphore handle types used by FSR3 interop.
-    add_compile_definitions(VK_USE_PLATFORM_WIN32_KHR)
+    add_compile_definitions(VK_USE_PLATFORM_WIN32_KHR WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
 # Options
@@ -77,6 +77,7 @@ if(WOWEE_ENABLE_AMD_FSR2 AND EXISTS ${WOWEE_AMD_FSR2_HEADER} AND EXISTS ${WOWEE_
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(wowee_fsr2_amd_vk PRIVATE
             "-include${WOWEE_FFX_COMPAT_HEADER}"
+            -Wno-deprecated-declarations
         )
     elseif(MSVC)
         target_compile_options(wowee_fsr2_amd_vk PRIVATE
@@ -390,7 +391,7 @@ endif()
 # GLM GTX extensions (quaternion, norm, etc.) require this flag on newer GLM versions
 add_compile_definitions(GLM_ENABLE_EXPERIMENTAL GLM_FORCE_DEPTH_ZERO_TO_ONE)
 if(WIN32)
-    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
 # SPIR-V shader compilation via glslc

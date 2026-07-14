@@ -388,7 +388,7 @@ void WorldEntryCallbackHandler::setupCallbacks() {
     }
 
     // Bind point update (innkeeper) — position stored in gameHandler->getHomeBind()
-    gameHandler_.setBindPointCallback([this](uint32_t mapId, float x, float y, float z) {
+    gameHandler_.setBindPointCallback([](uint32_t mapId, float x, float y, float z) {
         LOG_INFO("Bindpoint set: mapId=", mapId, " pos=(", x, ", ", y, ", ", z, ")");
     });
 

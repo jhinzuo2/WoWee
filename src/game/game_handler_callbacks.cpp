@@ -2038,8 +2038,6 @@ void GameHandler::queryGuildInfo(uint32_t guildId) {
     if (socialHandler_) socialHandler_->queryGuildInfo(guildId);
 }
 
-static const std::string kEmptyString;
-
 const std::string& GameHandler::lookupGuildName(uint32_t guildId) {
     static const std::string kEmpty;
     if (socialHandler_) return socialHandler_->lookupGuildName(guildId);

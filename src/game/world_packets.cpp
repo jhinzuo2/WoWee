@@ -15,14 +15,6 @@
 #include <zlib.h>
 
 namespace {
-    inline uint32_t bswap32(uint32_t v) {
-        return ((v & 0xFF000000u) >> 24) | ((v & 0x00FF0000u) >> 8)
-             | ((v & 0x0000FF00u) << 8)  | ((v & 0x000000FFu) << 24);
-    }
-    inline uint16_t bswap16(uint16_t v) {
-        return static_cast<uint16_t>(((v & 0xFF00u) >> 8) | ((v & 0x00FFu) << 8));
-    }
-
     const char* updateTypeName(wowee::game::UpdateType type) {
         using wowee::game::UpdateType;
         switch (type) {

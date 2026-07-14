@@ -20,7 +20,6 @@ namespace {
     // Volume settings
     constexpr float FIRE_VOLUME = 0.7f;
     constexpr float WATER_VOLUME = 0.5f;
-    constexpr float WIND_VOLUME = 0.35f;
     constexpr float BIRD_VOLUME = 0.6f;
     constexpr float CRICKET_VOLUME = 0.5f;
 

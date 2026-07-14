@@ -30,11 +30,6 @@
 namespace {
     using namespace wowee::ui::colors;
     constexpr auto& kColorRed         = kRed;
-    constexpr auto& kColorGreen       = kGreen;
-    constexpr auto& kColorBrightGreen = kBrightGreen;
-    constexpr auto& kColorYellow      = kYellow;
-    constexpr auto& kColorGray        = kGray;
-    constexpr auto& kColorDarkGray    = kDarkGray;
 
     // Collect all non-comment, non-empty lines from a macro body.
     std::vector<std::string> allMacroCommands(const std::string& macroText) {

@@ -564,7 +564,7 @@ int handleStripDataTree(int& i, int argc, char** argv) {
             if (ec) sz = 0;
             if (dryRun) {
                 std::printf("  would remove: %s (%llu bytes)\n",
-                            e.path().c_str(),
+                            e.path().string().c_str(),
                             static_cast<unsigned long long>(sz));
                 removed++;
                 perExtRemoved[propExt]++;
@@ -572,7 +572,7 @@ int handleStripDataTree(int& i, int argc, char** argv) {
             } else {
                 if (fs::remove(e.path(), ec)) {
                     std::printf("  removed: %s (%llu bytes)\n",
-                                e.path().c_str(),
+                                e.path().string().c_str(),
                                 static_cast<unsigned long long>(sz));
                     removed++;
                     perExtRemoved[propExt]++;
@@ -580,7 +580,7 @@ int handleStripDataTree(int& i, int argc, char** argv) {
                 } else {
                     std::fprintf(stderr,
                         "  WARN: failed to remove %s (%s)\n",
-                        e.path().c_str(), ec.message().c_str());
+                        e.path().string().c_str(), ec.message().c_str());
                     failed++;
                 }
             }

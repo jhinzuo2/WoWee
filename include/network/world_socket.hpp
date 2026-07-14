@@ -53,7 +53,7 @@ public:
      * Update socket - receive data and parse packets
      * Should be called regularly (e.g., each frame)
      */
-    void update();
+    void update() override;
 
     /**
      * Set callback for complete packets

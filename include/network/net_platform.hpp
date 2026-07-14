@@ -8,7 +8,9 @@
   #endif
   #include <winsock2.h>
   #include <ws2tcpip.h>
-  #pragma comment(lib, "ws2_32.lib")
+  #ifdef _MSC_VER
+    #pragma comment(lib, "ws2_32.lib")
+  #endif
 
   using socket_t  = SOCKET;
 #ifndef __MINGW32__

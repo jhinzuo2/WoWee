@@ -12,7 +12,6 @@ namespace TbcMoveFlags {
     constexpr uint32_t ON_TRANSPORT     = 0x00000200;  // Gates transport data (same as WotLK)
     constexpr uint32_t JUMPING          = 0x00002000;  // Gates jump data (WotLK: FALLING=0x1000)
     constexpr uint32_t SWIMMING         = 0x00200000;  // Same as WotLK
-    constexpr uint32_t FLYING           = 0x01000000;  // WotLK: 0x02000000
     constexpr uint32_t ONTRANSPORT      = 0x02000000;  // Secondary pitch check
     constexpr uint32_t SPLINE_ELEVATION = 0x04000000;  // Same as WotLK
     constexpr uint32_t SPLINE_ENABLED   = 0x08000000;  // Same as WotLK

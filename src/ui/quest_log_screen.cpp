@@ -59,15 +59,11 @@ std::string cleanQuestTitleForUi(const std::string& raw, uint32_t questId) {
     while (!s.empty() && s.front() == ' ') s.erase(s.begin());
     while (!s.empty() && s.back() == ' ') s.pop_back();
 
-    int alphaCount = 0;
-    int spaceCount = 0;
     int shortWordCount = 0;
     int wordCount = 0;
     int currentWordLen = 0;
     for (char c : s) {
-        if (std::isalpha(static_cast<unsigned char>(c))) alphaCount++;
         if (c == ' ') {
-            spaceCount++;
             if (currentWordLen > 0) {
                 wordCount++;
                 if (currentWordLen <= 1) shortWordCount++;

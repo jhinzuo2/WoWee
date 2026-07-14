@@ -44,14 +44,8 @@ namespace {
     // Common ImGui colors (aliases)
     using namespace wowee::ui::colors;
     constexpr auto& kColorRed        = kRed;
-    constexpr auto& kColorGreen      = kGreen;
     constexpr auto& kColorBrightGreen= kBrightGreen;
-    constexpr auto& kColorYellow     = kYellow;
-    constexpr auto& kColorGray       = kGray;
     constexpr auto& kColorDarkGray   = kDarkGray;
-
-    // Common ImGui window flags for popup dialogs
-    const ImGuiWindowFlags kDialogFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
 
     // ---------------------------------------------------------------------------
     // formatChatMessage — build the display string for a single chat message.
@@ -715,7 +709,7 @@ void ChatPanel::render(game::GameHandler& gameHandler,
     char inputHint[128];
     if (selectedChatType_ == 4) {
         if (whisperTargetBuffer_[0] != '\0')
-            std::snprintf(inputHint, sizeof(inputHint), "Whisper %s...", whisperTargetBuffer_);
+            std::snprintf(inputHint, sizeof(inputHint), "Whisper %.100s...", whisperTargetBuffer_);
         else
             std::snprintf(inputHint, sizeof(inputHint), "Whisper: enter a name in To: first");
     } else if (selectedChatType_ == 10) {
