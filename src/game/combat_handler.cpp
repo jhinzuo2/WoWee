@@ -1169,18 +1169,39 @@ void CombatHandler::targetLastTarget() {
 }
 
 void CombatHandler::targetEnemy(bool reverse) {
-    // Get list of hostile entities
-    std::vector<uint64_t> hostiles;
-    auto& entities = owner_.getEntityManager().getEntities();
+    constexpr float kRangeSq = 40.0f * 40.0f;
 
-    for (const auto& [guid, entity] : entities) {
-        if (entity->getType() == ObjectType::UNIT) {
-            auto unit = std::dynamic_pointer_cast<Unit>(entity);
-            if (unit && guid != owner_.getPlayerGuid() && unit->isHostile()) {
-                hostiles.push_back(guid);
-            }
-        }
+    // Player position for the range gate and nearest-first ordering
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    if (auto self = owner_.getEntityManager().getEntity(owner_.getPlayerGuid())) {
+        px = self->getX(); py = self->getY(); pz = self->getZ();
     }
+
+    // Living hostiles within range, nearest first. Corpses are never
+    // /targetenemy candidates — that's what mouse looting is for.
+    struct Cand { uint64_t guid; float distSq; };
+    std::vector<Cand> cands;
+    auto& entities = owner_.getEntityManager().getEntities();
+    for (const auto& [guid, entity] : entities) {
+        auto t = entity->getType();
+        if (t != ObjectType::UNIT && t != ObjectType::PLAYER) continue;
+        if (guid == owner_.getPlayerGuid()) continue;
+        auto* unit = dynamic_cast<Unit*>(entity.get());
+        if (!unit || unit->getHealth() == 0) continue;
+        if (!unit->isHostile() && !isAggressiveTowardPlayer(guid)) continue;
+        float dx = entity->getX() - px;
+        float dy = entity->getY() - py;
+        float dz = entity->getZ() - pz;
+        float distSq = dx*dx + dy*dy + dz*dz;
+        if (distSq > kRangeSq) continue;
+        cands.push_back({guid, distSq});
+    }
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.distSq < b.distSq; });
+
+    std::vector<uint64_t> hostiles;
+    hostiles.reserve(cands.size());
+    for (const auto& c : cands) hostiles.push_back(c.guid);
 
     if (hostiles.empty()) {
         owner_.addSystemChatMessage("No enemies in range.");
@@ -1213,15 +1234,33 @@ void CombatHandler::targetEnemy(bool reverse) {
 }
 
 void CombatHandler::targetFriend(bool reverse) {
-    // Get list of friendly entities (players)
-    std::vector<uint64_t> friendlies;
-    auto& entities = owner_.getEntityManager().getEntities();
+    constexpr float kRangeSq = 40.0f * 40.0f;
 
-    for (const auto& [guid, entity] : entities) {
-        if (entity->getType() == ObjectType::PLAYER && guid != owner_.getPlayerGuid()) {
-            friendlies.push_back(guid);
-        }
+    float px = 0.0f, py = 0.0f, pz = 0.0f;
+    if (auto self = owner_.getEntityManager().getEntity(owner_.getPlayerGuid())) {
+        px = self->getX(); py = self->getY(); pz = self->getZ();
     }
+
+    // Friendly players within range, nearest first. Dead friends stay
+    // targetable — you need to select them to resurrect them.
+    struct Cand { uint64_t guid; float distSq; };
+    std::vector<Cand> cands;
+    auto& entities = owner_.getEntityManager().getEntities();
+    for (const auto& [guid, entity] : entities) {
+        if (entity->getType() != ObjectType::PLAYER || guid == owner_.getPlayerGuid()) continue;
+        float dx = entity->getX() - px;
+        float dy = entity->getY() - py;
+        float dz = entity->getZ() - pz;
+        float distSq = dx*dx + dy*dy + dz*dz;
+        if (distSq > kRangeSq) continue;
+        cands.push_back({guid, distSq});
+    }
+    std::sort(cands.begin(), cands.end(),
+              [](const Cand& a, const Cand& b) { return a.distSq < b.distSq; });
+
+    std::vector<uint64_t> friendlies;
+    friendlies.reserve(cands.size());
+    for (const auto& c : cands) friendlies.push_back(c.guid);
 
     if (friendlies.empty()) {
         owner_.addSystemChatMessage("No friendly targets in range.");
@@ -1254,13 +1293,25 @@ void CombatHandler::targetFriend(bool reverse) {
 }
 
 void CombatHandler::tabTarget(float playerX, float playerY, float playerZ) {
-    // Helper: returns true if the entity is a living hostile that can be tab-targeted.
+    // Maximum tab-target range in yards (matches the WoW client).
+    constexpr float kTabRange   = 40.0f;
+    constexpr float kTabRangeSq = kTabRange * kTabRange;
+    // A pause this long between tab presses restarts the cycle from the
+    // nearest enemy instead of continuing a stale rotation.
+    constexpr uint64_t kCycleResetMs = 4000;
+
+    const bool playerInCombat = owner_.isInCombat();
+
+    // Helper: returns true if the entity is a hostile that can be tab-targeted.
+    // Corpses are never tab targets while fighting; out of combat they only
+    // qualify when they still hold loot.
     auto isValidTabTarget = [&](const std::shared_ptr<Entity>& e) -> bool {
         if (!e) return false;
         const uint64_t guid = e->getGuid();
         auto* unit = dynamic_cast<Unit*>(e.get());
         if (!unit) return false;
         if (unit->getHealth() == 0) {
+            if (playerInCombat) return false;
             auto lootIt = owner_.localLootStateRef().find(guid);
             if (lootIt == owner_.localLootStateRef().end() || lootIt->second.data.items.empty()) {
                 return false;
@@ -1273,12 +1324,21 @@ void CombatHandler::tabTarget(float playerX, float playerY, float playerZ) {
         return true;
     };
 
+    // Restart the cycle after a pause — the player has moved on; the next tab
+    // should grab the nearest enemy, not resume an old rotation.
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (nowMs - lastTabTargetMs_ > kCycleResetMs)
+        owner_.tabCycleStaleRef() = true;
+    lastTabTargetMs_ = nowMs;
+
     // Rebuild cycle list if stale (entity added/removed since last tab press).
     if (owner_.tabCycleStaleRef()) {
         owner_.tabCycleListRef().clear();
         owner_.tabCycleIndexRef() = -1;
 
-        struct EntityDist { uint64_t guid; float distSq; };
+        struct EntityDist { uint64_t guid; float distSq; bool dead; };
         std::vector<EntityDist> sortable;
         const auto& entities = owner_.getEntityManager().getEntities();
         sortable.reserve(entities.size());
@@ -1292,11 +1352,18 @@ void CombatHandler::tabTarget(float playerX, float playerY, float playerZ) {
             float dy = entity->getY() - playerY;
             float dz = entity->getZ() - playerZ;
             // Sort by squared distance — monotonic with distance, skips sqrt per entity.
-            sortable.push_back({guid, dx*dx + dy*dy + dz*dz});
+            float distSq = dx*dx + dy*dy + dz*dz;
+            if (distSq > kTabRangeSq) continue;
+            auto* unit = static_cast<Unit*>(entity.get());
+            sortable.push_back({guid, distSq, unit->getHealth() == 0});
         }
 
+        // Live enemies cycle first (nearest to farthest); lootable corpses last.
         std::sort(sortable.begin(), sortable.end(),
-                  [](const EntityDist& a, const EntityDist& b) { return a.distSq < b.distSq; });
+                  [](const EntityDist& a, const EntityDist& b) {
+                      if (a.dead != b.dead) return b.dead;
+                      return a.distSq < b.distSq;
+                  });
 
         owner_.tabCycleListRef().reserve(sortable.size());
         for (const auto& ed : sortable) {
@@ -1308,6 +1375,22 @@ void CombatHandler::tabTarget(float playerX, float playerY, float playerZ) {
     if (owner_.tabCycleListRef().empty()) {
         clearTarget();
         return;
+    }
+
+    // If the current target was picked by other means (click, assist), resume
+    // the cycle from its position so tab advances to the NEXT enemy instead of
+    // jumping back to wherever the old rotation left off.
+    {
+        const uint64_t curTarget = owner_.getTargetGuid();
+        if (curTarget != 0) {
+            const auto& list = owner_.tabCycleListRef();
+            for (size_t i = 0; i < list.size(); ++i) {
+                if (list[i] == curTarget) {
+                    owner_.tabCycleIndexRef() = static_cast<int>(i);
+                    break;
+                }
+            }
+        }
     }
 
     // Advance through the cycle, skipping any entry that has since died or

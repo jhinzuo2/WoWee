@@ -125,6 +125,10 @@ public:
     void removeCombatTextForGuid(uint64_t guid);
 
 private:
+    // Last tab-target press (steady-clock ms); a pause restarts the cycle
+    // from the nearest enemy instead of resuming a stale rotation.
+    uint64_t lastTabTargetMs_ = 0;
+
     // --- Packet handlers ---
     void handleAttackStart(network::Packet& packet);
     void handleAttackStop(network::Packet& packet);

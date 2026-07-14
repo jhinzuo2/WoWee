@@ -1005,9 +1005,11 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
         bool isPlayer = (entityPtr->getType() == game::ObjectType::PLAYER);
         bool isTarget = (guid == targetGuid);
 
-        // Player nameplates use Shift+V toggle; NPC/enemy nameplates use V toggle
-        if (isPlayer && !settingsPanel_.showFriendlyNameplates_) continue;
-        if (!isPlayer && !showNameplates_) continue;
+        // Player nameplates use Shift+V toggle; NPC/enemy nameplates use V toggle.
+        // The current target ALWAYS gets a nameplate so it's clear what is
+        // selected even with nameplates toggled off.
+        if (isPlayer && !settingsPanel_.showFriendlyNameplates_ && !isTarget) continue;
+        if (!isPlayer && !showNameplates_ && !isTarget) continue;
 
         // For corpses (dead units), only show a minimal grey nameplate if selected
         bool isCorpse = (unit->getHealth() == 0);
@@ -1022,10 +1024,11 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
         }
         renderPos.z += 2.3f;
 
-        // Cull distance: target or other players up to 40 units; NPC others up to 20 units
+        // Cull distance: the current target stays visible to 60 units so its
+        // bar doesn't vanish at combat range; players 40; other NPCs 20.
         glm::vec3 nameDelta = renderPos - camPos;
         float distSq = glm::dot(nameDelta, nameDelta);
-        float cullDist = (isTarget || isPlayer) ? 40.0f : 20.0f;
+        float cullDist = isTarget ? 60.0f : (isPlayer ? 40.0f : 20.0f);
         if (distSq > cullDist * cullDist) continue;
 
         // Project to clip space
@@ -1396,6 +1399,21 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
 
         drawList->AddText(ImVec2(nameX + 1.0f, nameY + 1.0f), IM_COL32(0, 0, 0, A(160)), labelBuf);
         drawList->AddText(ImVec2(nameX,         nameY),         nameColor, labelBuf);
+
+        // Gold chevron above the current target's plate — a gently bobbing
+        // down-arrow so the selected enemy is unmistakable at a glance.
+        if (isTarget) {
+            float bob = 2.0f * std::sin(static_cast<float>(ImGui::GetTime()) * 5.0f);
+            float tipY  = nameY - 5.0f + bob;
+            float baseY = tipY - 8.0f;
+            float halfW = 6.0f;
+            drawList->AddTriangleFilled(
+                ImVec2(sx - halfW + 1.0f, baseY + 1.0f), ImVec2(sx + halfW + 1.0f, baseY + 1.0f),
+                ImVec2(sx + 1.0f, tipY + 1.0f), IM_COL32(0, 0, 0, A(140)));
+            drawList->AddTriangleFilled(
+                ImVec2(sx - halfW, baseY), ImVec2(sx + halfW, baseY),
+                ImVec2(sx, tipY), IM_COL32(255, 215, 0, A(240)));
+        }
 
         // Sub-label below the name (WoW-style <Guild Name> or <NPC Title> in lighter color)
         if (!subLabel.empty()) {
