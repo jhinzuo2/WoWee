@@ -1491,6 +1491,21 @@ void Application::update(float deltaTime) {
                               (gameHandler->isOnTaxiFlight() ||
                                gameHandler->isTaxiMountActive() ||
                                gameHandler->isTaxiActivationPending());
+                // Deliberately narrower than onTaxi: only true once the flight is
+                // actually happening (mounted/flying), not merely pending a reply.
+                // A rejected CMSG_ACTIVATETAXI sets isTaxiActivationPending() true
+                // for one or two frames and then clears it - if that alone counted
+                // as "was taxiing", the landing clamp below would arm on every
+                // rejected activation and snap the player onto whatever floor
+                // candidate is closest to their current (never-actually-flown-from)
+                // position, exactly as if a real flight had just landed. Live-hit
+                // this at Booty Bay (multi-level WMO): a rejected activation while
+                // standing on the upper platform snapped the character down to the
+                // level below, with a "Cannot take that flight path" chat message
+                // and zero actual movement in between.
+                bool actuallyFlying = gameHandler &&
+                                      (gameHandler->isOnTaxiFlight() ||
+                                       gameHandler->isTaxiMountActive());
                 bool onTransportNow = gameHandler && gameHandler->isOnTransport();
                 // Clear stale client-side transport state when the tracked transport no longer exists.
                 if (onTransportNow && gameHandler->getTransportManager()) {
@@ -1644,7 +1659,7 @@ void Application::update(float deltaTime) {
                 renderer->getTerrainManager()->setUnloadRadius(onTaxi ? 12 : 7);
                 renderer->getTerrainManager()->setTaxiStreamingMode(onTaxi);
                 }
-                if (worldEntryCallbacks_) worldEntryCallbacks_->setLastTaxiFlight(onTaxi);
+                if (worldEntryCallbacks_) worldEntryCallbacks_->setLastTaxiFlight(actuallyFlying);
 
                 // Sync character render position ↔ canonical WoW coords each frame
                 if (renderer && gameHandler) {

@@ -111,6 +111,20 @@ void TransportCallbackHandler::setupCallbacks() {
         }
     });
 
+    // Taxi landing position correction callback - see its declaration comment in
+    // game_handler.hpp for why this exists (Application's own per-frame render
+    // sync stops as soon as onTaxi goes false, which happens before this fires).
+    gameHandler_.setTaxiLandingPositionCallback([this](float x, float y, float z) {
+        glm::vec3 renderPos = core::coords::canonicalToRender(glm::vec3(x, y, z));
+        renderer_.getCharacterPosition() = renderPos;
+        if (renderer_.getCameraController()) {
+            glm::vec3* followTarget = renderer_.getCameraController()->getFollowTargetMutable();
+            if (followTarget) {
+                *followTarget = renderPos;
+            }
+        }
+    });
+
     // Taxi flight start callback - keep non-blocking to avoid hitching at takeoff.
     gameHandler_.setTaxiFlightStartCallback([this]() {
         if (renderer_.getTerrainManager() && renderer_.getM2Renderer()) {

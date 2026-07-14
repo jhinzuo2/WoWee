@@ -1919,6 +1919,22 @@ public:
     using TaxiOrientationCallback = std::function<void(float yaw, float pitch, float roll)>;
     void setTaxiOrientationCallback(TaxiOrientationCallback cb) { taxiOrientationCallback_ = std::move(cb); }
 
+    // Taxi landing position correction callback (canonical x, y, z). Application's
+    // per-frame render-position sync only pulls from game state while onTaxi (see
+    // its "Sync character render position" block) - once finishClientTaxiFlight()
+    // clears onTaxiFlight_/taxiMountActive_, that sync stops, so a position
+    // correction applied only to movementInfo/the entity (e.g. snapping to the
+    // known-correct TaxiNodes.dbc position instead of a short-landed spline) never
+    // reaches the renderer, which then stays authoritative at its last (wrong)
+    // value. Live-confirmed: the landing clamp reads renderer->getCharacterPosition()
+    // directly and kept computing from the pre-correction position even after
+    // finishClientTaxiFlight() had already fixed movementInfo/the entity. This
+    // callback lets MovementHandler push the corrected position straight to the
+    // renderer at the same moment, without MovementHandler needing direct access
+    // to rendering types.
+    using TaxiLandingPositionCallback = std::function<void(float x, float y, float z)>;
+    void setTaxiLandingPositionCallback(TaxiLandingPositionCallback cb) { taxiLandingPositionCallback_ = std::move(cb); }
+
     // Callback for when taxi flight is about to start (after mounting delay, before movement begins)
     using TaxiFlightStartCallback = std::function<void()>;
     void setTaxiFlightStartCallback(TaxiFlightStartCallback cb) { taxiFlightStartCallback_ = std::move(cb); }
@@ -2497,6 +2513,7 @@ public:
     auto& stunStateCallbackRef() { return stunStateCallback_; }
     auto& taxiFlightStartCallbackRef() { return taxiFlightStartCallback_; }
     auto& taxiOrientationCallbackRef() { return taxiOrientationCallback_; }
+    auto& taxiLandingPositionCallbackRef() { return taxiLandingPositionCallback_; }
     auto& taxiPrecacheCallbackRef() { return taxiPrecacheCallback_; }
     auto& transportMoveCallbackRef() { return transportMoveCallback_; }
     auto& unitAnimHintCallbackRef() { return unitAnimHintCallback_; }
@@ -3551,6 +3568,7 @@ private:
     MountCallback mountCallback_;
     TaxiPrecacheCallback taxiPrecacheCallback_;
     TaxiOrientationCallback taxiOrientationCallback_;
+    TaxiLandingPositionCallback taxiLandingPositionCallback_;
     TaxiFlightStartCallback taxiFlightStartCallback_;
     OpenLfgCallback openLfgCallback_;
     uint32_t currentMountDisplayId_ = 0;
