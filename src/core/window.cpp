@@ -5,10 +5,35 @@
 #include <cstdlib>
 #ifdef __APPLE__
 #include <filesystem>
+#include <mach-o/dyld.h>
+#include <vector>
 #endif
 
 namespace wowee {
 namespace core {
+
+#ifdef __APPLE__
+namespace {
+
+std::string bundledMoltenVkManifest() {
+    uint32_t pathSize = 0;
+    _NSGetExecutablePath(nullptr, &pathSize);
+    if (pathSize == 0) return {};
+
+    std::vector<char> executablePath(pathSize + 1, '\0');
+    if (_NSGetExecutablePath(executablePath.data(), &pathSize) != 0) return {};
+
+    std::error_code ec;
+    auto executable = std::filesystem::weakly_canonical(executablePath.data(), ec);
+    if (ec) return {};
+
+    auto candidate = executable.parent_path().parent_path()
+        / "Resources" / "vulkan" / "icd.d" / "MoltenVK_icd.json";
+    return std::filesystem::exists(candidate) ? candidate.string() : std::string{};
+}
+
+} // namespace
+#endif
 
 Window::Window(const WindowConfig& config)
     : config(config)
@@ -53,10 +78,14 @@ bool Window::initialize() {
     // LunarG SDK without sourcing setup-env.sh first.  Check $VULKAN_SDK
     // (LunarG SDK) before falling back to the two common Homebrew prefixes.
     if (!std::getenv("VK_ICD_FILENAMES")) {
-        std::string foundIcd;
+        // Prefer the app-bundled driver so a redistributed build never depends
+        // on a developer's Homebrew or LunarG SDK installation.
+        std::string foundIcd = bundledMoltenVkManifest();
         if (const char* sdk = std::getenv("VULKAN_SDK"); sdk && *sdk) {
-            std::string candidate = std::string(sdk) + "/share/vulkan/icd.d/MoltenVK_icd.json";
-            if (std::filesystem::exists(candidate)) foundIcd = candidate;
+            if (foundIcd.empty()) {
+                std::string candidate = std::string(sdk) + "/share/vulkan/icd.d/MoltenVK_icd.json";
+                if (std::filesystem::exists(candidate)) foundIcd = candidate;
+            }
         }
         if (foundIcd.empty()) {
             for (const char* p : {
@@ -87,7 +116,7 @@ bool Window::initialize() {
     if (!vulkanLoaded) {
         LOG_ERROR("Failed to load Vulkan library: ", SDL_GetError());
 #ifdef __APPLE__
-        LOG_ERROR("On macOS, install the Vulkan loader via Homebrew:  brew install vulkan-loader");
+        LOG_ERROR("On macOS, install Vulkan via Homebrew:  brew install vulkan-loader molten-vk");
         LOG_ERROR("Or source the LunarG SDK setup script before running:  source $VULKAN_SDK/setup-env.sh");
 #else
         LOG_ERROR("Ensure the Vulkan runtime (vulkan-1.dll) is installed. "

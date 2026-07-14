@@ -117,8 +117,7 @@ jobs:
     - name: Install dependencies
       run: |
         brew install cmake pkg-config sdl2 glm openssl@3 zlib ffmpeg unicorn \
-          stormlib vulkan-loader vulkan-headers shaderc dylibbundler || true
-        brew install dylibbundler 2>/dev/null || true
+          stormlib vulkan-loader vulkan-headers molten-vk shaderc dylibbundler
 
     - name: Configure
       run: |
@@ -126,6 +125,7 @@ jobs:
         export PKG_CONFIG_PATH="$BREW/lib/pkgconfig:$(brew --prefix ffmpeg)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix vulkan-loader)/lib/pkgconfig:$(brew --prefix shaderc)/lib/pkgconfig"
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
           -DCMAKE_PREFIX_PATH="$BREW" \
           -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
 
@@ -139,6 +139,8 @@ jobs:
     - name: Create .app bundle
       run: |
         TAG="${GITHUB_REF_NAME}"
+        VERSION="${TAG#v}"
+        VERSION="${VERSION%%-*}"
         mkdir -p Wowee.app/Contents/{MacOS,Frameworks,Resources}
 
         # Wrapper launch script
@@ -186,37 +188,67 @@ jobs:
         # Copy all vulkan-loader dylib names so wowee_bin can resolve whichever
         # install_name it was linked against (e.g. libvulkan.1.4.341.dylib).
         VULKAN_LIB_DIR="$(brew --prefix vulkan-loader)/lib"
-        for lib in "${VULKAN_LIB_DIR}"/libvulkan*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
+        if ! ls Wowee.app/Contents/Frameworks/libvulkan*.dylib >/dev/null 2>&1; then
+          for lib in "${VULKAN_LIB_DIR}"/libvulkan*.dylib; do
+            [ -e "${lib}" ] || continue
+            cp -L -n "${lib}" Wowee.app/Contents/Frameworks/
+          done
+        fi
 
         if ! ls Wowee.app/Contents/Frameworks/libvulkan*.dylib >/dev/null 2>&1; then
           echo "Missing Vulkan loader dylib(s) in app bundle Frameworks/" >&2
           exit 1
         fi
 
+        # The Vulkan loader is not a graphics driver. Bundle MoltenVK and its
+        # ICD manifest so the app works on a clean Mac without Homebrew or the
+        # LunarG SDK installed.
+        MOLTENVK_PREFIX="$(brew --prefix molten-vk)"
+        cp -L "${MOLTENVK_PREFIX}/lib/libMoltenVK.dylib" \
+          Wowee.app/Contents/Frameworks/libMoltenVK.dylib
+        install_name_tool -id @rpath/libMoltenVK.dylib \
+          Wowee.app/Contents/Frameworks/libMoltenVK.dylib
+        mkdir -p Wowee.app/Contents/Resources/vulkan/icd.d
+        python3 - \
+          "${MOLTENVK_PREFIX}/etc/vulkan/icd.d/MoltenVK_icd.json" \
+          Wowee.app/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        source, destination = map(pathlib.Path, sys.argv[1:])
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+        manifest["ICD"]["library_path"] = "../../../Frameworks/libMoltenVK.dylib"
+        manifest["ICD"]["is_portability_driver"] = True
+        destination.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        PY
+
         # Homebrew GLM can provide a compiled libglm target. dylibbundler may
         # rewrite its install name without copying the actual dylib.
         GLM_LIB_DIR="$(brew --prefix glm)/lib"
-        for lib in "${GLM_LIB_DIR}"/libglm*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
-
-        if otool -L Wowee.app/Contents/MacOS/wowee_bin | grep -q 'libglm.*\.dylib' && \
-           ! ls Wowee.app/Contents/Frameworks/libglm*.dylib >/dev/null 2>&1; then
-          echo "wowee_bin links libglm, but no GLM dylib was bundled" >&2
-          exit 1
+        if otool -L Wowee.app/Contents/MacOS/wowee_bin | grep -q 'libglm.*\.dylib'; then
+          if ! ls Wowee.app/Contents/Frameworks/libglm*.dylib >/dev/null 2>&1; then
+            for lib in "${GLM_LIB_DIR}"/libglm*.dylib; do
+              [ -e "${lib}" ] || continue
+              cp -L -n "${lib}" Wowee.app/Contents/Frameworks/
+            done
+          fi
+          if ! ls Wowee.app/Contents/Frameworks/libglm*.dylib >/dev/null 2>&1; then
+            echo "wowee_bin links libglm, but no GLM dylib was bundled" >&2
+            exit 1
+          fi
         fi
 
         # dylibbundler may miss Homebrew's OpenSSL on some runner images.
         # Copy libssl and libcrypto so wowee_bin can resolve them at runtime.
         OPENSSL_LIB_DIR="$(brew --prefix openssl@3)/lib"
-        for lib in "${OPENSSL_LIB_DIR}"/libssl*.dylib "${OPENSSL_LIB_DIR}"/libcrypto*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
+        if ! ls Wowee.app/Contents/Frameworks/libssl*.dylib >/dev/null 2>&1 || \
+           ! ls Wowee.app/Contents/Frameworks/libcrypto*.dylib >/dev/null 2>&1; then
+          for lib in "${OPENSSL_LIB_DIR}"/libssl*.dylib "${OPENSSL_LIB_DIR}"/libcrypto*.dylib; do
+            [ -e "${lib}" ] || continue
+            cp -L -n "${lib}" Wowee.app/Contents/Frameworks/
+          done
+        fi
 
         if ! ls Wowee.app/Contents/Frameworks/libssl*.dylib >/dev/null 2>&1; then
           echo "Missing OpenSSL libssl dylib(s) in app bundle Frameworks/" >&2
@@ -226,14 +258,16 @@ jobs:
         # dylibbundler may miss Homebrew's FFmpeg libraries.
         # Copy libavformat, libavcodec, libavutil, and libswscale.
         FFMPEG_LIB_DIR="$(brew --prefix ffmpeg)/lib"
-        for lib in "${FFMPEG_LIB_DIR}"/libavformat*.dylib \
-                   "${FFMPEG_LIB_DIR}"/libavcodec*.dylib \
-                   "${FFMPEG_LIB_DIR}"/libavutil*.dylib \
-                   "${FFMPEG_LIB_DIR}"/libswscale*.dylib \
-                   "${FFMPEG_LIB_DIR}"/libswresample*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
+        if ! ls Wowee.app/Contents/Frameworks/libavformat*.dylib >/dev/null 2>&1; then
+          for lib in "${FFMPEG_LIB_DIR}"/libavformat*.dylib \
+                     "${FFMPEG_LIB_DIR}"/libavcodec*.dylib \
+                     "${FFMPEG_LIB_DIR}"/libavutil*.dylib \
+                     "${FFMPEG_LIB_DIR}"/libswscale*.dylib \
+                     "${FFMPEG_LIB_DIR}"/libswresample*.dylib; do
+            [ -e "${lib}" ] || continue
+            cp -L -n "${lib}" Wowee.app/Contents/Frameworks/
+          done
+        fi
 
         if ! ls Wowee.app/Contents/Frameworks/libavformat*.dylib >/dev/null 2>&1; then
           echo "Missing FFmpeg libavformat dylib(s) in app bundle Frameworks/" >&2
@@ -243,10 +277,12 @@ jobs:
         # dylibbundler may miss Homebrew's Unicorn engine library.
         # Copy libunicorn so wowee_bin can resolve it at runtime.
         UNICORN_LIB_DIR="$(brew --prefix unicorn)/lib"
-        for lib in "${UNICORN_LIB_DIR}"/libunicorn*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
+        if ! ls Wowee.app/Contents/Frameworks/libunicorn*.dylib >/dev/null 2>&1; then
+          for lib in "${UNICORN_LIB_DIR}"/libunicorn*.dylib; do
+            [ -e "${lib}" ] || continue
+            cp -L -n "${lib}" Wowee.app/Contents/Frameworks/
+          done
+        fi
 
         if ! ls Wowee.app/Contents/Frameworks/libunicorn*.dylib >/dev/null 2>&1; then
           echo "Missing Unicorn dylib(s) in app bundle Frameworks/" >&2
@@ -262,9 +298,10 @@ jobs:
           <key>CFBundleExecutable</key><string>wowee</string>
           <key>CFBundleIdentifier</key><string>com.wowee.app</string>
           <key>CFBundleName</key><string>Wowee</string>
-          <key>CFBundleVersion</key><string>${TAG}</string>
-          <key>CFBundleShortVersionString</key><string>${TAG}</string>
+          <key>CFBundleVersion</key><string>${GITHUB_RUN_NUMBER}</string>
+          <key>CFBundleShortVersionString</key><string>${VERSION}</string>
           <key>CFBundlePackageType</key><string>APPL</string>
+          <key>LSMinimumSystemVersion</key><string>13.0</string>
         </dict></plist>
         EOF
 
@@ -273,41 +310,7 @@ jobs:
 
     - name: Verify bundled dylibs
       run: |
-        set -euo pipefail
-        echo "=== dylib references for wowee_bin ==="
-        otool -L Wowee.app/Contents/MacOS/wowee_bin
-
-        missing=0
-        while IFS= read -r dep; do
-          path=$(echo "$dep" | sed 's/^[[:space:]]*//;s/ (compat.*//')
-          case "$path" in
-            /usr/lib/*|/System/*) continue ;;
-            @executable_path/*)
-              resolved="Wowee.app/Contents/MacOS/${path#@executable_path/}"
-              ;;
-            @loader_path/*)
-              resolved="Wowee.app/Contents/MacOS/${path#@loader_path/}"
-              ;;
-            @rpath/*)
-              resolved="Wowee.app/Contents/Frameworks/${path#@rpath/}"
-              ;;
-            *) resolved="$path" ;;
-          esac
-          if [ ! -f "$resolved" ]; then
-            basename=$(basename "$path")
-            if [ ! -f "Wowee.app/Contents/Frameworks/$basename" ]; then
-              echo "ERROR: unbundled dylib: $path" >&2
-              missing=$((missing + 1))
-            fi
-          fi
-        done < <(otool -L Wowee.app/Contents/MacOS/wowee_bin | tail -n +2)
-
-        if [ "$missing" -gt 0 ]; then
-          ls -la Wowee.app/Contents/Frameworks/
-          echo "FAIL: $missing dylib(s) missing from app bundle" >&2
-          exit 1
-        fi
-        echo "All non-system dylibs are bundled."
+        bash tools/macos/verify_bundle.sh Wowee.app arm64
 
     - name: Create DMG
       run: |
