@@ -962,6 +962,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     std::sort(sortedVisible_.begin(), sortedVisible_.end(),
               [](const VisibleEntry& a, const VisibleEntry& b) { return a.modelId < b.modelId; });
 
+
     uint32_t currentModelId = UINT32_MAX;
     const M2ModelGPU* currentModel = nullptr;
     bool currentModelValid = false;
@@ -1228,7 +1229,8 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                             }
                         }
                         for (size_t j = lodIdx; j < lodEnd; j++) {
-                            auto& inst = instances[pending[j].instanceIdx];
+                            const auto& p = pending[j];
+                            auto& inst = instances[p.instanceIdx];
                             glm::vec2 uvOffset(0.0f);
                             if (tt) {
                                 glm::vec3 trans = interpVec3(tt->translation,
@@ -1240,9 +1242,17 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                                 uvOffset = glm::vec2(lavaAnimSeconds * 0.03f,
                                                      -lavaAnimSeconds * 0.08f);
                             }
-                            // Copy base entry and override uvOffset
-                            instSSBO[instanceDataCount_] = instSSBO[groupSSBOOffset + (j - lodIdx)];
-                            instSSBO[instanceDataCount_].uvOffset = uvOffset;
+                            // Rebuild the entry from CPU-side data rather than copying it
+                            // out of the base entry. instSSBO lives in write-combined
+                            // upload memory: writing it is cheap, but reading it back is
+                            // uncached and costs microseconds per instance.
+                            auto& e = instSSBO[instanceDataCount_];
+                            e.model = inst.modelMatrix;
+                            e.uvOffset = uvOffset;
+                            e.fadeAlpha = p.fadeAlpha;
+                            e.useBones = p.useBones ? 1 : 0;
+                            e.boneBase = p.useBones ? static_cast<int32_t>(inst.megaBoneOffset) : 0;
+                            std::memset(e._pad, 0, sizeof(e._pad));
                             instanceDataCount_++;
                         }
                     }
