@@ -816,6 +816,7 @@ EntityController::UnitFieldUpdateResult EntityController::applyUnitFieldsOnUpdat
     result.oldDisplayId = unit->getDisplayId();
     uint32_t oldHealth = unit->getHealth();
     constexpr uint32_t UNIT_DYNFLAG_DEAD = 0x0008;
+    constexpr uint32_t UNIT_DYNFLAG_LOOTABLE = 0x0001;
 
     for (const auto& [key, val] : block.fields) {
         if (key == ufi.health) {
@@ -933,6 +934,11 @@ EntityController::UnitFieldUpdateResult EntityController::applyUnitFieldsOnUpdat
                         owner_.npcRespawnCallbackRef()(block.guid);
                         result.npcRespawnNotified = true;
                     }
+                }
+                if (entity->getType() == ObjectType::UNIT &&
+                    (oldDyn & UNIT_DYNFLAG_LOOTABLE) != 0 &&
+                    (val & UNIT_DYNFLAG_LOOTABLE) == 0) {
+                    result.lootableCleared = true;
                 }
             }
         } else if (key == ufi.level) {
@@ -1707,6 +1713,15 @@ void EntityController::onValuesUpdateUnit(const UpdateBlock& block, std::shared_
     UnitFieldIndices ufi = UnitFieldIndices::resolve();
     UnitFieldUpdateResult result = applyUnitFieldsOnUpdate(block, entity, unit, ufi);
     handleDisplayIdChange(block, entity, unit, result);
+
+    // A corpse that has been looted empty has nothing left to offer, so drop it.
+    // Skinnable corpses stay until they have been skinned. Done here rather than
+    // inside the field loop so the entity is not removed while it is being read.
+    constexpr uint32_t UNIT_FLAG_SKINNABLE = 0x04000000;
+    if (result.lootableCleared && unit->getHealth() == 0 &&
+        (unit->getUnitFlags() & UNIT_FLAG_SKINNABLE) == 0) {
+        owner_.despawnCreatureLocally(block.guid);
+    }
 }
 
 void EntityController::onValuesUpdatePlayer(const UpdateBlock& block, std::shared_ptr<Entity>& entity) {

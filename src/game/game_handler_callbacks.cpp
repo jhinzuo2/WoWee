@@ -2132,6 +2132,23 @@ bool GameHandler::isGatherGameObject(uint64_t guid) const {
     return gatherSpellForGameObject(goInfo, go->getName()) != 0;
 }
 
+void GameHandler::despawnCreatureLocally(uint64_t guid) {
+    if (guid == 0 || !entityController_) return;
+
+    auto& entityManager = entityController_->getEntityManager();
+    auto entity = entityManager.getEntity(guid);
+    if (!entity || entity->getType() != ObjectType::UNIT) return;
+
+    if (creatureDespawnCallback_) creatureDespawnCallback_(guid);
+    entityManager.removeEntity(guid);
+
+    if (combatHandler_ && guid == combatHandler_->getAutoAttackTargetGuid()) stopAutoAttack();
+    if (getTargetGuid() == guid) setTargetGuidRaw(0);
+    tabCycleStale = true;
+
+    LOG_INFO("Locally despawned looted corpse: 0x", std::hex, guid, std::dec);
+}
+
 void GameHandler::despawnGameObjectLocally(uint64_t guid) {
     if (guid == 0 || !entityController_) return;
 

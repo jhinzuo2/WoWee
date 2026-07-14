@@ -196,6 +196,9 @@ private:
         bool displayIdChanged = false;
         bool npcDeathNotified = false;
         bool npcRespawnNotified = false;
+        // Set when UNIT_DYNFLAG_LOOTABLE went away this update — the corpse has
+        // been looted empty. Acted on after the field loop, never inside it.
+        bool lootableCleared = false;
         uint32_t oldDisplayId = 0;
     };
 

@@ -1067,8 +1067,29 @@ void CombatHandler::handleResurrectFailed(network::Packet& packet) {
 // Targeting
 // ============================================================
 
+bool CombatHandler::isSelectableUnit(uint64_t guid) const {
+    if (guid == 0) return true; // clearing the target
+    auto entity = owner_.getEntityManager().getEntity(guid);
+    if (!entity) return true; // unknown entity — let the server arbitrate
+    // Only creature corpses are filtered. Players keep ObjectType::PLAYER even when
+    // dead, so their corpses stay targetable for resurrection.
+    if (entity->getType() != ObjectType::UNIT) return true;
+    auto unit = std::dynamic_pointer_cast<Unit>(entity);
+    if (!unit) return true;
+    if (unit->getHealth() > 0) return true; // alive
+
+    // A corpse is only worth selecting while it still has something to take.
+    constexpr uint32_t UNIT_DYNFLAG_LOOTABLE = 0x0001;
+    constexpr uint32_t UNIT_FLAG_SKINNABLE   = 0x04000000;
+    if (unit->getDynamicFlags() & UNIT_DYNFLAG_LOOTABLE) return true;
+    if (unit->getUnitFlags() & UNIT_FLAG_SKINNABLE) return true;
+    return false;
+}
+
 void CombatHandler::setTarget(uint64_t guid) {
     if (guid == owner_.getTargetGuid()) return;
+    // Looted-out, unskinnable corpses cannot be selected.
+    if (!isSelectableUnit(guid)) return;
 
     // Save previous target
     if (owner_.getTargetGuid() != 0) {
