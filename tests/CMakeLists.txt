@@ -549,7 +549,8 @@ add_executable(test_realm_list
 )
 target_include_directories(test_realm_list PRIVATE ${TEST_INCLUDE_DIRS})
 target_include_directories(test_realm_list SYSTEM PRIVATE ${TEST_SYSTEM_INCLUDE_DIRS})
-target_link_libraries(test_realm_list PRIVATE catch2_main OpenSSL::SSL OpenSSL::Crypto)
+target_link_libraries(test_realm_list PRIVATE catch2_main OpenSSL::SSL OpenSSL::Crypto
+    $<$<BOOL:${WIN32}>:ws2_32>)
 add_test(NAME realm_list COMMAND test_realm_list)
 register_test_target(test_realm_list)
 
