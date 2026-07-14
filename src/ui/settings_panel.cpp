@@ -48,6 +48,16 @@ void SettingsPanel::renderSettingsInterfaceTab(std::function<void()> saveCallbac
 ImGui::Spacing();
 ImGui::BeginChild("InterfaceSettings", ImVec2(0, 360), true);
 
+ImGui::SeparatorText("Scale");
+ImGui::Spacing();
+ImGui::SetNextItemWidth(200.0f);
+if (ImGui::SliderFloat("UI Scale", &pendingUiScale, 0.75f, 1.5f, "%.2fx")) {
+    saveCallback();
+}
+ImGui::SameLine();
+ImGui::TextDisabled("(on top of automatic resolution scaling)");
+ImGui::Spacing();
+
 ImGui::SeparatorText("Action Bars");
 ImGui::Spacing();
 ImGui::SetNextItemWidth(200.0f);

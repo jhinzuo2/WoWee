@@ -845,6 +845,7 @@ void CombatUI::renderDPSMeter(game::GameHandler& gameHandler,
 void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
                              SpellbookScreen& spellbookScreen,
                              InventoryScreen& inventoryScreen,
+                             const SettingsPanel& settings,
                              SpellIconFn getSpellIcon) {
     const auto& auras = gameHandler.getPlayerAuras();
 
@@ -857,23 +858,49 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
 
     auto* assetMgr = services_.assetManager;
 
-    // Position below the minimap (minimap: 200x200 at top-right, bottom edge at Y≈210)
-    // Anchored to the right side to stay away from party frames on the left
-    constexpr float ICON_SIZE = 32.0f;
-    constexpr int ICONS_PER_ROW = 8;
-    float barW = ICONS_PER_ROW * (ICON_SIZE + 4.0f) + 8.0f;
+    // Single row along the top of the screen, right of centre. The row is right-aligned
+    // so it ends just left of the minimap (200x200 at 10px margin, so its left edge sits
+    // at screenW-210) and grows leftwards towards the centre as auras are gained.
     ImVec2 displaySize = ImGui::GetIO().DisplaySize;
     float screenW = displaySize.x > 0.0f ? displaySize.x : 1280.0f;
-    // Y=215 puts us just below the minimap's bottom edge (minimap bottom ≈ 210)
-    ImGui::SetNextWindowPos(ImVec2(screenW - barW - 10.0f, 215.0f), ImGuiCond_Always);
+    float screenH = displaySize.y > 0.0f ? displaySize.y : 720.0f;
+
+    // Icons track the window size so the bar keeps its proportions at any resolution,
+    // with the UI Scale setting layered on top. 1080p is the reference height.
+    const float autoScale = std::clamp(screenH / 1080.0f, 0.75f, 2.0f);
+    const float uiScale = autoScale * settings.pendingUiScale;
+
+    const float ICON_SIZE = 40.0f * uiScale;  // 25% larger than the old 32px icons
+    const float ICON_SPACING = 2.0f * uiScale;
+    const float WINDOW_PADDING = 16.0f;       // 8px each side
+    constexpr int ICONS_PER_ROW = 8;          // still used for the temp-enchant icons below
+
+    // Keep the row on-screen: it may not run past the minimap on the right, nor off the
+    // left edge. Anything that does not fit is dropped rather than wrapped to a new row.
+    constexpr float MINIMAP_LEFT_EDGE = 210.0f;  // from the right edge of the screen
+    constexpr float RIGHT_GAP = 10.0f;
+    const float availableW = screenW - MINIMAP_LEFT_EDGE - RIGHT_GAP - 10.0f;
+    const int maxIcons = std::max(1, static_cast<int>(
+        (availableW - WINDOW_PADDING + ICON_SPACING) / (ICON_SIZE + ICON_SPACING)));
+    const int iconCount = std::min(activeCount, maxIcons);
+
+    float barW = WINDOW_PADDING;
+    if (iconCount > 0) {
+        barW += iconCount * ICON_SIZE + (iconCount - 1) * ICON_SPACING;
+    }
+    barW = std::max(barW, 140.0f * uiScale);  // floor: the Dismiss Pet button needs room
+
+    const float barX = std::max(10.0f, screenW - MINIMAP_LEFT_EDGE - RIGHT_GAP - barW);
+    ImGui::SetNextWindowPos(ImVec2(barX, 10.0f), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(barW, 0), ImGuiCond_Always);
 
+    // No AlwaysAutoResize: the width is computed above so the row can be right-aligned.
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                              ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar |
-                             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoScrollbar;
+                             ImGuiWindowFlags_NoScrollbar;
 
     ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2.0f, 2.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(ICON_SPACING, ICON_SPACING));
 
     if (ImGui::Begin("##BuffBar", nullptr, flags)) {
         // Pre-sort auras: buffs first, then debuffs; within each group, shorter remaining first
@@ -897,11 +924,12 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
             return ra < rb;
         });
 
-        // Render one pass for buffs, one for debuffs
+        // Render one pass for buffs, one for debuffs — both on a single continuous row.
+        int shown = 0;
         for (int pass = 0; pass < 2; ++pass) {
             bool wantBuff = (pass == 0);
-            int shown = 0;
-        for (size_t si = 0; si < buffSortedIdx.size() && shown < 40; ++si) {
+            bool firstOfPass = true;
+        for (size_t si = 0; si < buffSortedIdx.size() && shown < iconCount; ++si) {
             size_t i = buffSortedIdx[si];
             const auto& aura = auras[i];
             if (aura.isEmpty()) continue;
@@ -909,7 +937,11 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
             bool isBuff = (aura.flags & 0x80) == 0;  // 0x80 = negative/debuff flag
             if (isBuff != wantBuff) continue;  // only render matching pass
 
-            if (shown > 0 && shown % ICONS_PER_ROW != 0) ImGui::SameLine();
+            // Stay on one row; widen the gap where the debuff group begins.
+            if (shown > 0) {
+                ImGui::SameLine(0.0f, (pass == 1 && firstOfPass) ? 10.0f * uiScale : ICON_SPACING);
+            }
+            firstOfPass = false;
 
             ImGui::PushID(static_cast<int>(i) + (pass * 256));
 
@@ -1062,9 +1094,9 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
             ImGui::PopID();
             shown++;
         }  // end aura loop
-        // Add visual gap between buffs and debuffs
-        if (pass == 0 && shown > 0) ImGui::Spacing();
         }  // end pass loop
+        // The buff/debuff gap is horizontal now (see SameLine above) — a vertical
+        // Spacing() here would push debuffs onto a second row.
 
         // Dismiss Pet button
         if (gameHandler.hasPet()) {

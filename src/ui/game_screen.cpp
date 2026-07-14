@@ -447,7 +447,7 @@ void GameScreen::render(game::GameHandler& gameHandler) {
     dialogManager_.renderDialogs(gameHandler, inventoryScreen, chatPanel_);
     socialPanel_.renderGuildRoster(gameHandler, chatPanel_);
     socialPanel_.renderSocialFrame(gameHandler, chatPanel_);
-    combatUI_.renderBuffBar(gameHandler, spellbookScreen, inventoryScreen, spellIconFn);
+    combatUI_.renderBuffBar(gameHandler, spellbookScreen, inventoryScreen, settingsPanel_, spellIconFn);
     windowManager_.renderLootWindow(gameHandler, inventoryScreen, chatPanel_);
     windowManager_.renderGossipWindow(gameHandler, chatPanel_);
     windowManager_.renderQuestDetailsWindow(gameHandler, chatPanel_, inventoryScreen);

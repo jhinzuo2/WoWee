@@ -1483,6 +1483,7 @@ void GameScreen::saveSettings() {
     out << "show_keyring=" << (settingsPanel_.pendingShowKeyring ? 1 : 0) << "\n";
     out << "show_micro_menu=" << (settingsPanel_.pendingShowMicroMenu ? 1 : 0) << "\n";
     out << "idle_camera_orbit=" << (settingsPanel_.pendingIdleCameraOrbit ? 1 : 0) << "\n";
+    out << "ui_scale=" << settingsPanel_.pendingUiScale << "\n";
     out << "action_bar_scale=" << settingsPanel_.pendingActionBarScale << "\n";
     out << "nameplate_scale=" << settingsPanel_.nameplateScale_ << "\n";
     out << "show_friendly_nameplates=" << (settingsPanel_.showFriendlyNameplates_ ? 1 : 0) << "\n";
@@ -1624,6 +1625,8 @@ void GameScreen::loadSettings() {
                 settingsPanel_.pendingShowMicroMenu = (std::stoi(val) != 0);
             } else if (key == "idle_camera_orbit") {
                 settingsPanel_.pendingIdleCameraOrbit = (std::stoi(val) != 0);
+            } else if (key == "ui_scale") {
+                settingsPanel_.pendingUiScale = std::clamp(std::stof(val), 0.75f, 1.5f);
             } else if (key == "action_bar_scale") {
                 settingsPanel_.pendingActionBarScale = std::clamp(std::stof(val), 0.5f, 1.5f);
             } else if (key == "nameplate_scale") {

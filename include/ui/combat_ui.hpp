@@ -68,6 +68,7 @@ public:
     void renderBuffBar(game::GameHandler& gameHandler,
                        SpellbookScreen& spellbookScreen,
                        InventoryScreen& inventoryScreen,
+                       const SettingsPanel& settings,
                        SpellIconFn getSpellIcon);
     void renderBattlegroundScore(game::GameHandler& gameHandler);
     void renderCombatLog(game::GameHandler& gameHandler,
