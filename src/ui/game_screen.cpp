@@ -402,6 +402,8 @@ void GameScreen::render(game::GameHandler& gameHandler) {
         chatPanel_.getSpellIcon = [this](uint32_t id, pipeline::AssetManager* am) {
             return getSpellIcon(id, am);
         };
+        if (!chatPanel_.saveSettingsFn)
+            chatPanel_.saveSettingsFn = [this]() { saveSettings(); };
         chatPanel_.render(gameHandler, inventoryScreen, spellbookScreen, questLogScreen);
         // Process slash commands that affect GameScreen state
         auto cmds = chatPanel_.consumeSlashCommands();

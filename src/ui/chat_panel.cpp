@@ -109,6 +109,44 @@ namespace {
             return tsPrefix + "[" + std::string(wowee::ui::ChatTabManager::getChatTypeName(msg.type)) + "] " + processedMessage;
         return tsPrefix + processedMessage;
     }
+
+    // ---------------------------------------------------------------------------
+    // Input chat-type helpers. Indices match the selectedChatType_ dropdown:
+    // 0=Say 1=Yell 2=Party 3=Guild 4=Whisper 5=Raid 6=Officer 7=BG 8=RW
+    // 9=Instance 10=Channel
+    // ---------------------------------------------------------------------------
+    ImVec4 chatTypeIndexColor(int typeIdx) {
+        switch (typeIdx) {
+            case 1:  return kColorRed;                          // Yell
+            case 2:  return wowee::ui::colors::kLightBlue;      // Party
+            case 3:  return kColorBrightGreen;                  // Guild
+            case 4:  return ImVec4(1.0f, 0.5f, 1.0f, 1.0f);     // Whisper
+            case 5:  return ImVec4(1.0f, 0.5f, 0.0f, 1.0f);     // Raid
+            case 6:  return kColorBrightGreen;                  // Officer
+            case 7:  return ImVec4(1.0f, 0.5f, 0.0f, 1.0f);     // BG
+            case 8:  return ImVec4(1.0f, 0.3f, 0.0f, 1.0f);     // Raid Warning
+            case 9:  return wowee::ui::colors::kLightBlue;      // Instance
+            case 10: return ImVec4(0.3f, 0.9f, 0.9f, 1.0f);     // Channel
+            default: return wowee::ui::colors::kWhite;          // Say
+        }
+    }
+
+    // Whether a chat type can currently be used, and why not when it can't.
+    // Returned reason is shown grayed-out in the type picker.
+    const char* chatTypeUnavailableReason(int typeIdx, wowee::game::GameHandler& gh) {
+        switch (typeIdx) {
+            case 2: case 9:                       // Party, Instance
+                return gh.isInGroup() ? nullptr : "not in a group";
+            case 5: case 7: case 8:               // Raid, BG, Raid Warning
+                return gh.isInGroup() ? nullptr : "not in a raid";
+            case 3: case 6:                       // Guild, Officer
+                return gh.isInGuild() ? nullptr : "not in a guild";
+            case 10:                              // Channel
+                return gh.getJoinedChannels().empty() ? "no channels joined" : nullptr;
+            default:
+                return nullptr;                   // Say, Yell, Whisper
+        }
+    }
 }
 
 namespace wowee { namespace ui {
@@ -164,8 +202,18 @@ void ChatPanel::render(game::GameHandler& gameHandler,
     // Update unread counts via ChatTabManager (Phase 1.3)
     tabManager_.updateUnread(gameHandler.getChatHistory(), activeChatTab);
 
+    // Ctrl + mouse wheel anywhere over the chat window cycles tabs.
+    if (ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && ImGui::GetIO().KeyCtrl) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel != 0.0f) {
+            int n = tabManager_.getTabCount();
+            int dir = wheel > 0.0f ? -1 : 1;
+            pendingChatTab_ = ((activeChatTab + dir) % n + n) % n;
+        }
+    }
+
     // Chat tabs (rendered via ChatTabManager)
-    if (ImGui::BeginTabBar("ChatTabs")) {
+    if (ImGui::BeginTabBar("ChatTabs", ImGuiTabBarFlags_FittingPolicyScroll)) {
         for (int i = 0; i < tabManager_.getTabCount(); ++i) {
             int unread = tabManager_.getUnreadCount(i);
             // Format directly into a stack buffer when an unread count is present;
@@ -174,11 +222,13 @@ void ChatPanel::render(game::GameHandler& gameHandler,
             char tabLabelBuf[96];
             const char* tabLabel;
             if (i > 0 && unread > 0) {
-                std::snprintf(tabLabelBuf, sizeof(tabLabelBuf), "%s (%d)",
-                              baseName.c_str(), unread);
+                std::snprintf(tabLabelBuf, sizeof(tabLabelBuf), "%s (%d)###%s",
+                              baseName.c_str(), unread, baseName.c_str());
                 tabLabel = tabLabelBuf;
             } else {
-                tabLabel = baseName.c_str();
+                std::snprintf(tabLabelBuf, sizeof(tabLabelBuf), "%s###%s",
+                              baseName.c_str(), baseName.c_str());
+                tabLabel = tabLabelBuf;
             }
             // Flash tab text color when unread messages exist
             bool hasUnread = (i > 0 && unread > 0);
@@ -186,17 +236,90 @@ void ChatPanel::render(game::GameHandler& gameHandler,
                 float pulse = 0.6f + 0.4f * std::sin(static_cast<float>(ImGui::GetTime()) * 4.0f);
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.85f * pulse, 0.2f * pulse, 1.0f));
             }
-            if (ImGui::BeginTabItem(tabLabel)) {
+            ImGuiTabItemFlags tabFlags = (pendingChatTab_ == i) ? ImGuiTabItemFlags_SetSelected : 0;
+            if (ImGui::BeginTabItem(tabLabel, nullptr, tabFlags)) {
                 if (activeChatTab != i) {
                     activeChatTab = i;
                     // Clear unread count when tab becomes active
                     tabManager_.clearUnread(i);
+                    // Point the input at this tab's natural destination
+                    onTabActivated(i, gameHandler);
                 }
                 ImGui::EndTabItem();
             }
             if (hasUnread) ImGui::PopStyleColor();
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal)) {
+                ImGui::SetTooltip("%s%s", ChatTabManager::getTabTooltip(i),
+                                  "\n(Ctrl+wheel cycles tabs, right-click for options)");
+            }
+            if (ImGui::BeginPopupContextItem()) {
+                if (unread > 0 && ImGui::MenuItem("Mark as read"))
+                    tabManager_.clearUnread(i);
+                if (ImGui::MenuItem("Mark all tabs as read"))
+                    tabManager_.markAllRead();
+                ImGui::EndPopup();
+            }
         }
+        pendingChatTab_ = -1;
+
+        // Trailing "Find" toggle — search box over the visible history
+        if (ImGui::TabItemButton(chatFilterActive_ ? "Find*" : "Find",
+                                 ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip)) {
+            chatFilterActive_ = !chatFilterActive_;
+            if (chatFilterActive_) refocusFilterInput_ = true;
+            else chatFilterBuffer_[0] = '\0';
+        }
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Search the chat history");
+
+        // Trailing quick-settings menu
+        if (ImGui::TabItemButton("...", ImGuiTabItemFlags_Trailing | ImGuiTabItemFlags_NoTooltip))
+            ImGui::OpenPopup("ChatQuickMenu");
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayNormal))
+            ImGui::SetTooltip("Chat options");
+        if (ImGui::BeginPopup("ChatQuickMenu")) {
+            bool changed = false;
+            changed |= ImGui::Checkbox("Timestamps", &settings.showTimestamps);
+            ImGui::SetNextItemWidth(120);
+            changed |= ImGui::Combo("Text size", &settings.fontSize, "Small\0Medium\0Large\0");
+            ImGui::SetNextItemWidth(120);
+            changed |= ImGui::SliderFloat("Background", &settings.backgroundAlpha, 0.0f, 1.0f, "%.2f");
+            changed |= ImGui::Checkbox("Fade old messages", &settings.fadeMessages);
+            if (settings.fadeMessages) {
+                ImGui::SetNextItemWidth(120);
+                changed |= ImGui::SliderFloat("Fade after", &settings.messageFadeTime, 5.0f, 120.0f, "%.0fs");
+            }
+            changed |= ImGui::Checkbox("Lock window", &settings.windowLocked);
+            ImGui::Separator();
+            if (ImGui::MenuItem("Mark all tabs as read"))
+                tabManager_.markAllRead();
+            ImGui::TextDisabled("More in Settings > Chat");
+            if (changed && saveSettingsFn) saveSettingsFn();
+            ImGui::EndPopup();
+        }
+
         ImGui::EndTabBar();
+    }
+
+    // Search filter row (toggled by the Find button)
+    if (chatFilterActive_) {
+        if (refocusFilterInput_) {
+            ImGui::SetKeyboardFocusHere();
+            refocusFilterInput_ = false;
+        }
+        ImGui::SetNextItemWidth(-130);
+        ImGui::InputTextWithHint("##ChatFilter", "Find in chat...",
+                                 chatFilterBuffer_, sizeof(chatFilterBuffer_));
+        ImGui::SameLine();
+        if (chatFilterBuffer_[0] != '\0')
+            ImGui::Text("%d match%s", chatFilterMatches_, chatFilterMatches_ == 1 ? "" : "es");
+        else
+            ImGui::TextDisabled("type to search");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("X##CloseFilter")) {
+            chatFilterActive_ = false;
+            chatFilterBuffer_[0] = '\0';
+        }
     }
 
     // Chat history
@@ -273,13 +396,21 @@ void ChatPanel::render(game::GameHandler& gameHandler,
         }
     }
 
+    // Case-folded needle for the history search filter
+    std::string filterLower;
+    if (chatFilterActive_ && chatFilterBuffer_[0] != '\0') {
+        filterLower = chatFilterBuffer_;
+        for (auto& c : filterLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    int filterMatches = 0;
+
     int chatMsgIdx = 0;
     for (const auto& msg : chatHistory) {
         if (!tabManager_.shouldShowMessage(msg, activeChatTab)) continue;
 
-        // Compute message age for fade-out
+        // Compute message age for fade-out (suspended while searching)
         float msgAlpha = 1.0f;
-        if (settings.fadeMessages && !chatHistoryHovered && !chatInputActive_) {
+        if (settings.fadeMessages && filterLower.empty() && !chatHistoryHovered && !chatInputActive_) {
             auto elapsed = std::chrono::duration<float>(nowTime - msg.timestamp).count();
             float fadeStart = settings.messageFadeTime;
             float fadeDuration = 5.0f;
@@ -356,6 +487,14 @@ void ChatPanel::render(game::GameHandler& gameHandler,
         }
         const bool isMention = line->isMention;
 
+        // History search: show only lines containing the needle
+        if (!filterLower.empty()) {
+            std::string lineLower = line->fullMsg;
+            for (auto& c : lineLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (lineLower.find(filterLower) == std::string::npos) continue;
+            ++filterMatches;
+        }
+
         // Alternate row tinting for readability
         if (chatMsgIdx % 2 == 1) {
             ImVec2 rowStart = ImGui::GetCursorScreenPos();
@@ -394,6 +533,21 @@ void ChatPanel::render(game::GameHandler& gameHandler,
             msg.type != game::ChatType::RAID_BOSS_EMOTE;
 
         if (ImGui::BeginPopupContextItem("ChatMsgCtx")) {
+            // When/where header: exact time + chat type (channel name if any)
+            {
+                auto tt = std::chrono::system_clock::to_time_t(msg.timestamp);
+                std::tm tm{};
+#ifdef _WIN32
+                localtime_s(&tm, &tt);
+#else
+                localtime_r(&tt, &tm);
+#endif
+                const char* typeName = (msg.type == game::ChatType::CHANNEL && !msg.channelName.empty())
+                    ? msg.channelName.c_str()
+                    : ChatTabManager::getChatTypeName(msg.type);
+                ImGui::TextDisabled("%02d:%02d:%02d - %s", tm.tm_hour, tm.tm_min, tm.tm_sec, typeName);
+                ImGui::Separator();
+            }
             if (isPlayerMsg) {
                 ImGui::TextDisabled("%s", resolvedSenderName.c_str());
                 ImGui::Separator();
@@ -422,6 +576,8 @@ void ChatPanel::render(game::GameHandler& gameHandler,
 
         ImGui::PopID();
     }
+
+    chatFilterMatches_ = filterMatches;
 
     // Auto-scroll to bottom; track whether user has scrolled up
     {
@@ -453,35 +609,35 @@ void ChatPanel::render(game::GameHandler& gameHandler,
     }
 
     // Chat input row — compact WoW-style: [Type] input
-    const char* chatTypes[] = { "SAY", "YELL", "PARTY", "GUILD", "WHISPER", "RAID", "OFFICER", "BATTLEGROUND", "RAID WARNING", "INSTANCE", "CHANNEL" };
+    const char* chatTypes[] = { "Say", "Yell", "Party", "Guild", "Whisper", "Raid", "Officer", "Battleground", "Raid Warning", "Instance", "Channel" };
     const char* chatTypeLabels[] = { "[Say]", "[Yell]", "[Party]", "[Guild]", "[Whisper]", "[Raid]", "[Officer]", "[BG]", "[RW]", "[Instance]", "[Channel]" };
 
-    // Color the type label to match the chat type
-    ImVec4 inputColor;
-    switch (selectedChatType_) {
-        case 1: inputColor = kColorRed; break;
-        case 2: inputColor = colors::kLightBlue; break;
-        case 3: inputColor = kColorBrightGreen; break;
-        case 4: inputColor = ImVec4(1.0f, 0.5f, 1.0f, 1.0f); break;
-        case 5: inputColor = ImVec4(1.0f, 0.5f, 0.0f, 1.0f); break;
-        case 6: inputColor = kColorBrightGreen; break;
-        case 7: inputColor = ImVec4(1.0f, 0.5f, 0.0f, 1.0f); break;
-        case 8: inputColor = ImVec4(1.0f, 0.3f, 0.0f, 1.0f); break;
-        case 9: inputColor = colors::kLightBlue; break;
-        case 10: inputColor = ImVec4(0.3f, 0.9f, 0.9f, 1.0f); break;
-        default: inputColor = ui::colors::kWhite; break;
-    }
+    ImVec4 inputColor = chatTypeIndexColor(selectedChatType_);
 
-    // Clickable type label that opens a popup to change type
+    // Type selector: colored button that opens an availability-aware picker
     ImGui::PushStyleColor(ImGuiCol_Text, inputColor);
-    ImGui::Text("%s", chatTypeLabels[selectedChatType_]);
-    ImGui::PopStyleColor();
-    if (ImGui::IsItemClicked()) ImGui::OpenPopup("ChatTypePopup");
-    ImGui::SetItemTooltip("Click to change chat type");
+    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(1.0f, 1.0f, 1.0f, 0.06f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 1.0f, 1.0f, 0.15f));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 1.0f, 1.0f, 0.25f));
+    if (ImGui::SmallButton(chatTypeLabels[selectedChatType_]))
+        ImGui::OpenPopup("ChatTypePopup");
+    ImGui::PopStyleColor(4);
+    ImGui::SetItemTooltip("Where your message goes.\nClick to change - or press Tab in the empty input.");
     if (ImGui::BeginPopup("ChatTypePopup")) {
         for (int i = 0; i < 11; ++i) {
-            if (ImGui::Selectable(chatTypes[i], selectedChatType_ == i))
-                selectedChatType_ = i;
+            const char* reason = chatTypeUnavailableReason(i, gameHandler);
+            if (reason) {
+                char label[64];
+                std::snprintf(label, sizeof(label), "%s  (%s)", chatTypes[i], reason);
+                ImGui::PushStyleColor(ImGuiCol_Text, kColorDarkGray);
+                ImGui::Selectable(label, false, ImGuiSelectableFlags_Disabled);
+                ImGui::PopStyleColor();
+            } else {
+                ImGui::PushStyleColor(ImGuiCol_Text, chatTypeIndexColor(i));
+                if (ImGui::Selectable(chatTypes[i], selectedChatType_ == i))
+                    selectedChatType_ = i;
+                ImGui::PopStyleColor();
+            }
         }
         ImGui::EndPopup();
     }
@@ -514,7 +670,7 @@ void ChatPanel::render(game::GameHandler& gameHandler,
         ImGui::SameLine();
     }
 
-    // Show channel picker inline
+    // Show channel picker inline — numbered like the /1../9 shortcuts
     if (selectedChatType_ == 10) {
         const auto& channels = gameHandler.getJoinedChannels();
         if (channels.empty()) {
@@ -522,15 +678,20 @@ void ChatPanel::render(game::GameHandler& gameHandler,
             ImGui::SameLine();
         } else {
             if (selectedChannelIdx_ >= static_cast<int>(channels.size())) selectedChannelIdx_ = 0;
-            ImGui::SetNextItemWidth(100);
-            if (ImGui::BeginCombo("##ChannelPicker", channels[selectedChannelIdx_].c_str())) {
+            char chLabel[96];
+            std::snprintf(chLabel, sizeof(chLabel), "%d. %s",
+                          selectedChannelIdx_ + 1, channels[selectedChannelIdx_].c_str());
+            ImGui::SetNextItemWidth(130);
+            if (ImGui::BeginCombo("##ChannelPicker", chLabel)) {
                 for (int ci = 0; ci < static_cast<int>(channels.size()); ++ci) {
                     bool selected = (ci == selectedChannelIdx_);
-                    if (ImGui::Selectable(channels[ci].c_str(), selected)) selectedChannelIdx_ = ci;
+                    std::snprintf(chLabel, sizeof(chLabel), "%d. %s", ci + 1, channels[ci].c_str());
+                    if (ImGui::Selectable(chLabel, selected)) selectedChannelIdx_ = ci;
                     if (selected) ImGui::SetItemDefaultFocus();
                 }
                 ImGui::EndCombo();
             }
+            ImGui::SetItemTooltip("Joined channels - type /1../9 to switch quickly");
             ImGui::SameLine();
         }
     }
@@ -549,7 +710,22 @@ void ChatPanel::render(game::GameHandler& gameHandler,
                                      ImGuiInputTextFlags_CallbackAlways |
                                      ImGuiInputTextFlags_CallbackHistory |
                                      ImGuiInputTextFlags_CallbackCompletion;
-    if (ImGui::InputText("##ChatInput", chatInputBuffer_, sizeof(chatInputBuffer_), inputFlags, &ChatPanel::inputTextCallback, this)) {
+
+    // Contextual placeholder: says where the message will go and how to switch
+    char inputHint[128];
+    if (selectedChatType_ == 4) {
+        if (whisperTargetBuffer_[0] != '\0')
+            std::snprintf(inputHint, sizeof(inputHint), "Whisper %s...", whisperTargetBuffer_);
+        else
+            std::snprintf(inputHint, sizeof(inputHint), "Whisper: enter a name in To: first");
+    } else if (selectedChatType_ == 10) {
+        std::snprintf(inputHint, sizeof(inputHint), "Message the channel... (Tab switches, /help lists commands)");
+    } else {
+        std::snprintf(inputHint, sizeof(inputHint), "%s... (Tab switches, / for commands)",
+                      chatTypes[selectedChatType_]);
+    }
+
+    if (ImGui::InputTextWithHint("##ChatInput", inputHint, chatInputBuffer_, sizeof(chatInputBuffer_), inputFlags, &ChatPanel::inputTextCallback, this)) {
         sendChatMessage(gameHandler);
         // Close chat input on send so movement keys work immediately.
         refocusChatInput_ = false;
@@ -658,8 +834,13 @@ int ChatPanel::inputTextCallback(ImGuiInputTextCallbackData* data) {
         self->chatInputMoveCursorToEnd_ = false;
     }
 
-    // Tab: slash-command autocomplete (Phase 5)
+    // Tab: slash-command autocomplete (Phase 5); with an empty input it
+    // cycles the chat type instead (Shift+Tab cycles backwards).
     if (data->EventFlag == ImGuiInputTextFlags_CallbackCompletion) {
+        if (data->BufTextLen == 0) {
+            self->cycleChatType(ImGui::GetIO().KeyShift);
+            return 0;
+        }
         if (data->BufTextLen > 0 && data->Buf[0] == '/') {
             std::string fullBuf(data->Buf, data->BufTextLen);
             size_t spacePos = fullBuf.find(' ');
@@ -840,6 +1021,80 @@ int ChatPanel::inputTextCallback(ImGuiInputTextCallbackData* data) {
         }
     }
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// cycleChatType — Tab key with an empty input walks the chat types that are
+// actually available right now: Say → Party → Guild → Whisper → Channel.
+// ---------------------------------------------------------------------------
+void ChatPanel::cycleChatType(bool backwards) {
+    auto* gh = cachedGameHandler_;
+    if (!gh) return;
+
+    // Candidate ring in cycle order (indices into selectedChatType_)
+    static constexpr int kCycleOrder[] = {0 /*Say*/, 2 /*Party*/, 3 /*Guild*/, 4 /*Whisper*/, 10 /*Channel*/};
+    std::vector<int> ring;
+    for (int t : kCycleOrder)
+        if (!chatTypeUnavailableReason(t, *gh)) ring.push_back(t);
+    if (ring.empty()) return;
+
+    int cur = -1;
+    for (size_t i = 0; i < ring.size(); ++i)
+        if (ring[i] == selectedChatType_) { cur = static_cast<int>(i); break; }
+
+    int n = static_cast<int>(ring.size());
+    int next = (cur < 0) ? 0 : ((cur + (backwards ? -1 : 1)) % n + n) % n;
+    selectedChatType_ = ring[next];
+
+    // Entering whisper mode with no target: reuse the last whisper partner
+    if (selectedChatType_ == 4 && whisperTargetBuffer_[0] == '\0') {
+        const std::string& last = gh->getLastWhisperSender();
+        if (!last.empty()) {
+            strncpy(whisperTargetBuffer_, last.c_str(), sizeof(whisperTargetBuffer_) - 1);
+            whisperTargetBuffer_[sizeof(whisperTargetBuffer_) - 1] = '\0';
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// onTabActivated — switching to a tab points the input at that tab's natural
+// destination, so Whispers/Guild/Trade tabs are ready to type into.
+// ---------------------------------------------------------------------------
+void ChatPanel::onTabActivated(int tab, game::GameHandler& gameHandler) {
+    switch (tab) {
+        case 2: { // Whispers
+            selectedChatType_ = 4;
+            if (whisperTargetBuffer_[0] == '\0') {
+                const std::string& last = gameHandler.getLastWhisperSender();
+                if (!last.empty()) {
+                    strncpy(whisperTargetBuffer_, last.c_str(), sizeof(whisperTargetBuffer_) - 1);
+                    whisperTargetBuffer_[sizeof(whisperTargetBuffer_) - 1] = '\0';
+                }
+            }
+            break;
+        }
+        case 3: // Guild
+            if (gameHandler.isInGuild()) selectedChatType_ = 3;
+            break;
+        case 4: { // Trade/LFG — pick the first city channel if one is joined
+            const auto& chans = gameHandler.getJoinedChannels();
+            if (!chans.empty()) {
+                selectedChatType_ = 10;
+                for (int ci = 0; ci < static_cast<int>(chans.size()); ++ci) {
+                    const std::string& ch = chans[ci];
+                    if (ch.find("Trade") != std::string::npos ||
+                        ch.find("General") != std::string::npos ||
+                        ch.find("LookingForGroup") != std::string::npos) {
+                        selectedChannelIdx_ = ci;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        default: // General / Combat keep whatever the player was using
+            break;
+    }
 }
 
 // --- Command registration (calls into each command group file) ---

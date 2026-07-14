@@ -115,6 +115,10 @@ public:
     /** Spell icon lookup callback — set by GameScreen each frame before render(). */
     std::function<VkDescriptorSet(uint32_t, pipeline::AssetManager*)> getSpellIcon;
 
+    /** Persist-settings callback — set once by GameScreen so the in-window
+     *  quick menu can save appearance changes immediately. */
+    std::function<void()> saveSettingsFn;
+
     /** Render the "Chat" tab inside the Settings window (delegates to settings). */
     void renderSettingsTab(std::function<void()> saveSettingsFn) {
         settings.renderSettingsTab(std::move(saveSettingsFn));
@@ -163,6 +167,24 @@ private:
     // Sent-message history (Up/Down arrow recall)
     std::vector<std::string> chatSentHistory_;
     int chatHistoryIdx_ = -1;
+
+    // ---- History search filter ----
+    bool chatFilterActive_ = false;
+    char chatFilterBuffer_[128] = "";
+    int  chatFilterMatches_ = 0;   // result count from the previous frame
+    bool refocusFilterInput_ = false;
+
+    // Programmatic tab switch (Ctrl+wheel / quick menu); applied next frame
+    // via ImGuiTabItemFlags_SetSelected, -1 = none pending.
+    int pendingChatTab_ = -1;
+
+    /** Sync the input chat type to a newly activated tab (Guild tab → guild
+     *  chat, Whispers tab → whisper with last sender, Trade/LFG → channel). */
+    void onTabActivated(int tab, game::GameHandler& gameHandler);
+
+    /** Tab key with an empty input: cycle Say → Party → Guild → Whisper →
+     *  Channel through the types currently available to the player. */
+    void cycleChatType(bool backwards);
 
     // Macro stop flag
     bool macroStopped_ = false;
