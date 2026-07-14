@@ -418,7 +418,7 @@ void AuthHandler::handleRealmListResponse(network::Packet& packet) {
     LOG_DEBUG("Handling REALM_LIST response");
 
     RealmListResponse response;
-    if (!RealmListResponseParser::parse(packet, response, clientInfo.protocolVersion)) {
+    if (!RealmListResponseParser::parse(packet, response, clientInfo.legacyVanillaRealmList)) {
         LOG_ERROR("Failed to parse REALM_LIST response");
         return;
     }
