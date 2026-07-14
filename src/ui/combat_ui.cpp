@@ -854,7 +854,19 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
     for (const auto& a : auras) {
         if (!a.isEmpty()) activeCount++;
     }
-    if (activeCount == 0 && !gameHandler.hasPet()) return;
+
+    // Temporary weapon enchants (sharpening stones, poisons, imbues) share the row with
+    // the auras, so they have to be counted before the row is sized and positioned.
+    const uint64_t nowMsForWidth = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    int enchantCount = 0;
+    for (const auto& t : gameHandler.getTempEnchantTimers()) {
+        if (t.slot > 2) continue;
+        if (t.expireMs > nowMsForWidth) enchantCount++;
+    }
+
+    if (activeCount == 0 && enchantCount == 0 && !gameHandler.hasPet()) return;
 
     auto* assetMgr = services_.assetManager;
 
@@ -873,7 +885,6 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
     const float ICON_SIZE = 40.0f * uiScale;  // 25% larger than the old 32px icons
     const float ICON_SPACING = 2.0f * uiScale;
     const float WINDOW_PADDING = 16.0f;       // 8px each side
-    constexpr int ICONS_PER_ROW = 8;          // still used for the temp-enchant icons below
 
     // Keep the row on-screen: it may not run past the minimap on the right, nor off the
     // left edge. Anything that does not fit is dropped rather than wrapped to a new row.
@@ -882,7 +893,10 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
     const float availableW = screenW - MINIMAP_LEFT_EDGE - RIGHT_GAP - 10.0f;
     const int maxIcons = std::max(1, static_cast<int>(
         (availableW - WINDOW_PADDING + ICON_SPACING) / (ICON_SIZE + ICON_SPACING)));
-    const int iconCount = std::min(activeCount, maxIcons);
+    // Enchants get first claim on the row so a wall of buffs cannot push them off it.
+    const int enchantShown = std::min(enchantCount, maxIcons);
+    const int auraShown = std::min(activeCount, maxIcons - enchantShown);
+    const int iconCount = auraShown + enchantShown;
 
     float barW = WINDOW_PADDING;
     if (iconCount > 0) {
@@ -929,7 +943,7 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
         for (int pass = 0; pass < 2; ++pass) {
             bool wantBuff = (pass == 0);
             bool firstOfPass = true;
-        for (size_t si = 0; si < buffSortedIdx.size() && shown < iconCount; ++si) {
+        for (size_t si = 0; si < buffSortedIdx.size() && shown < auraShown; ++si) {
             size_t i = buffSortedIdx[si];
             const auto& aura = auras[i];
             if (aura.isEmpty()) continue;
@@ -1098,25 +1112,14 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
         // The buff/debuff gap is horizontal now (see SameLine above) — a vertical
         // Spacing() here would push debuffs onto a second row.
 
-        // Dismiss Pet button
-        if (gameHandler.hasPet()) {
-            ImGui::Spacing();
-            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.2f, 0.2f, 0.9f));
-            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.3f, 0.3f, 1.0f));
-            if (ImGui::Button("Dismiss Pet", ImVec2(-1, 0))) {
-                gameHandler.dismissPet();
-            }
-            ImGui::PopStyleColor(2);
-        }
-
         // Temporary weapon enchant timers (Shaman imbues, Rogue poisons, sharpening
         // stones, oils). Shown as the enchanted weapon's icon with its remaining time
         // beneath, the way the retail client does — not as a labelled bar.
         {
             const auto& timers = gameHandler.getTempEnchantTimers();
             if (!timers.empty()) {
-                ImGui::Spacing();
-                ImGui::Separator();
+                // Continue the aura row rather than starting a second one — a Spacing()
+                // or Separator() here is what used to push these onto their own line.
                 static constexpr game::EquipSlot kWeaponEquipSlots[] = {
                     game::EquipSlot::MAIN_HAND, game::EquipSlot::OFF_HAND, game::EquipSlot::RANGED
                 };
@@ -1158,7 +1161,11 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
                     const game::EquipSlot equipSlot = kWeaponEquipSlots[t.slot];
                     const auto& weapon = inventory.getEquipSlot(equipSlot);
 
-                    if (enchantsShown > 0 && enchantsShown % ICONS_PER_ROW != 0) ImGui::SameLine();
+                    if (enchantsShown >= enchantShown) break;
+                    // Stay on the shared row; widen the gap where the enchants begin.
+                    if (shown > 0) {
+                        ImGui::SameLine(0.0f, (enchantsShown == 0) ? 10.0f * uiScale : ICON_SPACING);
+                    }
                     ImGui::PushID(static_cast<int>(t.slot) + 5000);
 
                     ImVec2 iconPos = ImGui::GetCursorScreenPos();
@@ -1211,9 +1218,21 @@ void CombatUI::renderBuffBar(game::GameHandler& gameHandler,
                     }
                     ImGui::PopID();
                     ++enchantsShown;
+                    ++shown;  // shared row counter — drives the SameLine above
                 }
             }
         }
+        // Dismiss Pet button
+        if (gameHandler.hasPet()) {
+            ImGui::Spacing();
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.2f, 0.2f, 0.9f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.8f, 0.3f, 0.3f, 1.0f));
+            if (ImGui::Button("Dismiss Pet", ImVec2(-1, 0))) {
+                gameHandler.dismissPet();
+            }
+            ImGui::PopStyleColor(2);
+        }
+
     }
     ImGui::End();
 
