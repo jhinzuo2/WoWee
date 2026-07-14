@@ -1176,8 +1176,11 @@ if(HAVE_UNICORN)
     target_compile_definitions(wowee PRIVATE HAVE_UNICORN)
 endif()
 
-# Link GLM if found
-if(TARGET glm::glm)
+# Prefer GLM's explicit header-only target. GLM 1.0 may build glm::glm as a
+# shared library, which creates an unnecessary runtime dependency in app bundles.
+if(TARGET glm::glm-header-only)
+    target_link_libraries(wowee PRIVATE glm::glm-header-only)
+elseif(TARGET glm::glm)
     target_link_libraries(wowee PRIVATE glm::glm)
 elseif(glm_FOUND)
     target_include_directories(wowee PRIVATE ${GLM_INCLUDE_DIRS})
@@ -1934,7 +1937,9 @@ target_link_libraries(wowee_editor PRIVATE
     imgui
     vk-bootstrap
 )
-if(TARGET glm::glm)
+if(TARGET glm::glm-header-only)
+    target_link_libraries(wowee_editor PRIVATE glm::glm-header-only)
+elseif(TARGET glm::glm)
     target_link_libraries(wowee_editor PRIVATE glm::glm)
 elseif(glm_FOUND)
     target_include_directories(wowee_editor PRIVATE ${GLM_INCLUDE_DIRS})

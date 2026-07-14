@@ -221,6 +221,20 @@ jobs:
           exit 1
         fi
 
+        # Homebrew GLM can provide a compiled libglm target. dylibbundler may
+        # rewrite its install name without copying the actual dylib.
+        GLM_LIB_DIR="$(brew --prefix glm)/lib"
+        for lib in "${GLM_LIB_DIR}"/libglm*.dylib; do
+          [ -e "${lib}" ] || continue
+          cp -f "${lib}" Wowee.app/Contents/Frameworks/
+        done
+
+        if otool -L Wowee.app/Contents/MacOS/wowee_bin | grep -q 'libglm.*\.dylib' && \
+           ! ls Wowee.app/Contents/Frameworks/libglm*.dylib >/dev/null 2>&1; then
+          echo "wowee_bin links libglm, but no GLM dylib was bundled" >&2
+          exit 1
+        fi
+
         # dylibbundler may miss Homebrew's OpenSSL on some runner images.
         # Copy libssl and libcrypto so wowee_bin can resolve them at runtime.
         OPENSSL_LIB_DIR="$(brew --prefix openssl@3)/lib"
@@ -283,10 +297,18 @@ jobs:
           # Strip leading whitespace and version info: "	/path/to/lib.dylib (compat ...)"
           path=$(echo "$dep" | sed 's/^[[:space:]]*//;s/ (compat.*//')
           case "$path" in
-            /usr/lib/*|/System/*|@executable_path/*|@rpath/*) continue ;;
+            /usr/lib/*|/System/*) continue ;;
+            @executable_path/*)
+              resolved="Wowee.app/Contents/MacOS/${path#@executable_path/}"
+              ;;
+            @loader_path/*)
+              resolved="Wowee.app/Contents/MacOS/${path#@loader_path/}"
+              ;;
+            @rpath/*)
+              resolved="Wowee.app/Contents/Frameworks/${path#@rpath/}"
+              ;;
+            *) resolved="$path" ;;
           esac
-          # Resolve @loader_path relative to the binary
-          resolved="${path/#@loader_path/Wowee.app/Contents/MacOS}"
           if [ ! -f "$resolved" ]; then
             basename=$(basename "$path")
             if [ ! -f "Wowee.app/Contents/Frameworks/$basename" ]; then
