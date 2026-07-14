@@ -77,6 +77,7 @@ public:
         uint32_t questId = 0;
         std::string title;
         std::string objectives;
+        int32_t level = 0;   // quest level from query response; 0 = unknown, -1 = player-scaling
         bool complete = false;
         std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> killCounts;
         std::unordered_map<uint32_t, uint32_t> itemCounts;

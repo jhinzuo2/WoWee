@@ -49,6 +49,7 @@
 #include <cctype>
 #include <chrono>
 #include <ctime>
+#include <limits>
 
 #include <unordered_set>
 
@@ -753,9 +754,10 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
     constexpr float RIGHT_MARGIN = 10.0f;
     // Build display list: tracked quests only, or all quests if none tracked
     const auto& trackedIds = gameHandler.getTrackedQuestIds();
+    const bool anyTracked = !trackedIds.empty();
     std::vector<const game::GameHandler::QuestLogEntry*> toShow;
     toShow.reserve(questLog.size());
-    if (!trackedIds.empty()) {
+    if (anyTracked) {
         for (const auto& q : questLog) {
             if (q.questId == 0) continue;
             if (trackedIds.count(q.questId)) toShow.push_back(&q);
@@ -769,6 +771,25 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
         }
     }
     if (toShow.empty()) return;
+
+    // Apply completion filter (0=All, 1=Active, 2=Done). Keep the window open
+    // even when the filter hides everything so the user can cycle it back.
+    if (questTrackerFilter_ != 0) {
+        std::erase_if(toShow, [this](const game::GameHandler::QuestLogEntry* q) {
+            return questTrackerFilter_ == 1 ? q->complete : !q->complete;
+        });
+    }
+
+    // Sort lowest level first so stale quests surface at the top;
+    // unknown level (0) and player-scaling (-1) sort last
+    std::stable_sort(toShow.begin(), toShow.end(),
+                     [](const game::GameHandler::QuestLogEntry* a,
+                        const game::GameHandler::QuestLogEntry* b) {
+        const int la = a->level > 0 ? a->level : std::numeric_limits<int>::max();
+        const int lb = b->level > 0 ? b->level : std::numeric_limits<int>::max();
+        if (la != lb) return la < lb;
+        return a->title < b->title;
+    });
 
     float screenH = ImGui::GetIO().DisplaySize.y > 0.0f ? ImGui::GetIO().DisplaySize.y : 720.0f;
 
@@ -796,16 +817,44 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 2.0f));
 
     if (ImGui::Begin("##QuestTracker", nullptr, flags)) {
+        // Header row: quest count + completion filter (click to cycle)
+        static const char* kFilterNames[] = {"All", "Active", "Done"};
+        ImGui::TextDisabled("Quests (%d)", static_cast<int>(toShow.size()));
+        {
+            float btnW = ImGui::CalcTextSize("Active").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+            ImGui::SameLine();
+            float off = ImGui::GetContentRegionAvail().x - btnW;
+            if (off > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + off);
+            if (ImGui::SmallButton(kFilterNames[questTrackerFilter_])) {
+                questTrackerFilter_ = (questTrackerFilter_ + 1) % 3;
+                saveSettings();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Filter: All / Active / Done (click to cycle)");
+            }
+        }
+        ImGui::Separator();
+        if (toShow.empty()) {
+            ImGui::TextDisabled("%s", questTrackerFilter_ == 1 ? "No active quests"
+                                                               : "No completed quests");
+        }
+
         for (int i = 0; i < static_cast<int>(toShow.size()); ++i) {
             const auto& q = *toShow[i];
 
-            // Clickable quest title — opens quest log
+            // Clickable quest title — opens quest log; small [x] button untracks
             ImGui::PushID(q.questId);
+            float untrackW = ImGui::CalcTextSize("x").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+            float titleW = ImGui::GetContentRegionAvail().x - untrackW -
+                           ImGui::GetStyle().ItemSpacing.x;
             ImVec4 titleCol = q.complete ? colors::kWarmGold
                                          : ImVec4(1.0f, 1.0f, 0.85f, 1.0f);
+            std::string titleLabel = q.level > 0
+                ? "[" + std::to_string(q.level) + "] " + q.title
+                : q.title;
             ImGui::PushStyleColor(ImGuiCol_Text, titleCol);
-            if (ImGui::Selectable(q.title.c_str(), false,
-                                   ImGuiSelectableFlags_DontClosePopups, ImVec2(ImGui::GetContentRegionAvail().x, 0))) {
+            if (ImGui::Selectable(titleLabel.c_str(), false,
+                                   ImGuiSelectableFlags_DontClosePopups, ImVec2(titleW, 0))) {
                 questLogScreen.openAndSelectQuest(q.questId);
             }
             if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("##QTCtx")) {
@@ -813,7 +862,8 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
             }
             ImGui::PopStyleColor();
 
-            // Right-click context menu for quest tracker entry
+            // Right-click context menu for quest tracker entry (attaches to the
+            // title Selectable — must come before the untrack button below)
             if (ImGui::BeginPopupContextItem("##QTCtx")) {
                 ImGui::TextDisabled("%s", q.title.c_str());
                 ImGui::Separator();
@@ -844,43 +894,75 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
                 }
                 ImGui::EndPopup();
             }
+
+            // Untrack button at the end of the title row
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) {
+                if (anyTracked) {
+                    gameHandler.setQuestTracked(q.questId, false);
+                } else {
+                    // Nothing explicitly tracked (tracker shows all quests):
+                    // hide this one by tracking every other quest instead
+                    for (const auto& other : questLog) {
+                        if (other.questId != 0 && other.questId != q.questId) {
+                            gameHandler.setQuestTracked(other.questId, true);
+                        }
+                    }
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Untrack (remove from tracker)");
+            }
             ImGui::PopID();
 
-            // Objectives line (condensed)
+            // Objectives — every required objective with progress, done ones marked
             if (q.complete) {
-                ImGui::TextColored(colors::kActiveGreen, "  (Complete)");
+                ImGui::TextColored(colors::kActiveGreen, "  Ready to turn in");
             } else {
-                // Kill counts — green when complete, gray when in progress
-                for (const auto& [entry, progress] : q.killCounts) {
-                    bool objDone = (progress.first >= progress.second && progress.second > 0);
-                    ImVec4 objColor = objDone ? kColorGreen
-                                              : ImVec4(0.75f, 0.75f, 0.75f, 1.0f);
+                constexpr ImVec4 kPendingGray(0.75f, 0.75f, 0.75f, 1.0f);
+
+                // Kill/interact objective line — green + "(done)" when finished
+                auto renderKillLine = [&](uint32_t entry, uint32_t count, uint32_t required) {
+                    bool objDone = (required > 0 && count >= required);
+                    ImVec4 objColor = objDone ? kColorGreen : kPendingGray;
                     std::string name = gameHandler.getCachedCreatureName(entry);
                     if (name.empty()) {
                         const auto* goInfo = gameHandler.getCachedGameObjectInfo(entry);
                         if (goInfo && !goInfo->name.empty()) name = goInfo->name;
                     }
                     if (!name.empty()) {
-                        ImGui::TextColored(objColor,
-                                           "  %s: %u/%u", name.c_str(),
-                                           progress.first, progress.second);
+                        ImGui::TextColored(objColor, "  - %s: %u/%u%s", name.c_str(),
+                                           count, required, objDone ? " (done)" : "");
                     } else {
-                        ImGui::TextColored(objColor,
-                                           "  %u/%u", progress.first, progress.second);
+                        ImGui::TextColored(objColor, "  - %u/%u%s",
+                                           count, required, objDone ? " (done)" : "");
                     }
+                };
+                // Quest query data first (covers objectives with no progress yet),
+                // then any progress entries the query didn't know about
+                std::unordered_set<uint32_t> shownKills;
+                for (const auto& obj : q.killObjectives) {
+                    if (obj.npcOrGoId == 0 || obj.required == 0) continue;
+                    uint32_t entry = static_cast<uint32_t>(
+                        obj.npcOrGoId > 0 ? obj.npcOrGoId : -obj.npcOrGoId);
+                    uint32_t count = 0;
+                    auto it = q.killCounts.find(entry);
+                    if (it != q.killCounts.end()) count = it->second.first;
+                    renderKillLine(entry, count, obj.required);
+                    shownKills.insert(entry);
                 }
-                // Item counts — green when complete, gray when in progress
-                for (const auto& [itemId, count] : q.itemCounts) {
-                    uint32_t required = 1;
-                    auto reqIt = q.requiredItemCounts.find(itemId);
-                    if (reqIt != q.requiredItemCounts.end()) required = reqIt->second;
-                    bool objDone = (count >= required);
-                    ImVec4 objColor = objDone ? kColorGreen
-                                              : ImVec4(0.75f, 0.75f, 0.75f, 1.0f);
+                for (const auto& [entry, progress] : q.killCounts) {
+                    if (shownKills.count(entry)) continue;
+                    renderKillLine(entry, progress.first, progress.second);
+                }
+
+                // Item objective line — small icon + name, green + "(done)" when finished
+                auto renderItemLine = [&](uint32_t itemId, uint32_t count, uint32_t required) {
+                    bool objDone = (required > 0 && count >= required);
+                    ImVec4 objColor = objDone ? kColorGreen : kPendingGray;
                     const auto* info = gameHandler.getItemInfo(itemId);
                     const char* itemName = (info && !info->name.empty()) ? info->name.c_str() : nullptr;
 
-                    // Show small icon if available
                     uint32_t dispId = (info && info->displayInfoId) ? info->displayInfoId : 0;
                     VkDescriptorSet iconTex = dispId ? inventoryScreen.getItemIcon(dispId) : VK_NULL_HANDLE;
                     if (iconTex) {
@@ -891,27 +973,52 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
                             ImGui::EndTooltip();
                         }
                         ImGui::SameLine(0, 3);
-                        ImGui::TextColored(objColor,
-                                           "%s: %u/%u", itemName ? itemName : "Item", count, required);
-                        if (info && info->valid && ImGui::IsItemHovered()) {
-                            ImGui::BeginTooltip();
-                            inventoryScreen.renderItemTooltip(*info);
-                            ImGui::EndTooltip();
-                        }
-                    } else if (itemName) {
-                        ImGui::TextColored(objColor,
-                                           "  %s: %u/%u", itemName, count, required);
+                        ImGui::TextColored(objColor, "%s: %u/%u%s",
+                                           itemName ? itemName : "Item",
+                                           count, required, objDone ? " (done)" : "");
                         if (info && info->valid && ImGui::IsItemHovered()) {
                             ImGui::BeginTooltip();
                             inventoryScreen.renderItemTooltip(*info);
                             ImGui::EndTooltip();
                         }
                     } else {
-                        ImGui::TextColored(objColor,
-                                           "  Item: %u/%u", count, required);
+                        ImGui::TextColored(objColor, "  - %s: %u/%u%s",
+                                           itemName ? itemName : "Item",
+                                           count, required, objDone ? " (done)" : "");
+                        if (info && info->valid && ImGui::IsItemHovered()) {
+                            ImGui::BeginTooltip();
+                            inventoryScreen.renderItemTooltip(*info);
+                            ImGui::EndTooltip();
+                        }
                     }
+                };
+                // requiredItemCounts is the authoritative required list (includes
+                // 0-progress items); then show stray progress entries not in it
+                std::unordered_set<uint32_t> shownItems;
+                for (const auto& obj : q.itemObjectives) {
+                    if (obj.itemId == 0 || obj.required == 0) continue;
+                    uint32_t count = 0;
+                    auto it = q.itemCounts.find(obj.itemId);
+                    if (it != q.itemCounts.end()) count = it->second;
+                    renderItemLine(obj.itemId, count, obj.required);
+                    shownItems.insert(obj.itemId);
                 }
-                if (q.killCounts.empty() && q.itemCounts.empty() && !q.objectives.empty()) {
+                for (const auto& [itemId, required] : q.requiredItemCounts) {
+                    if (shownItems.count(itemId)) continue;
+                    uint32_t count = 0;
+                    auto it = q.itemCounts.find(itemId);
+                    if (it != q.itemCounts.end()) count = it->second;
+                    renderItemLine(itemId, count, required);
+                    shownItems.insert(itemId);
+                }
+                for (const auto& [itemId, count] : q.itemCounts) {
+                    if (shownItems.count(itemId)) continue;
+                    renderItemLine(itemId, count, 1);
+                }
+
+                bool hasCounted = !shownKills.empty() || !shownItems.empty() ||
+                                  !q.killCounts.empty() || !q.itemCounts.empty();
+                if (!hasCounted && !q.objectives.empty()) {
                     const std::string& obj = q.objectives;
                     if (obj.size() > 40) {
                         ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.75f, 1.0f),

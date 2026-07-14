@@ -124,6 +124,29 @@ struct QuestQueryTextCandidate {
     int score = -1000;
 };
 
+// Expand WoW text tokens ($b line breaks etc.) in quest strings; titles are
+// single-line so their line breaks collapse to spaces instead
+static std::string normalizeQuestText(std::string s, bool singleLine) {
+    s = normalizeWowTextTokens(std::move(s));
+    if (singleLine) {
+        std::string out;
+        out.reserve(s.size());
+        bool lastSpace = false;
+        for (char ch : s) {
+            if (ch == '\n' || ch == '\r' || ch == ' ') {
+                if (!lastSpace && !out.empty()) out.push_back(' ');
+                lastSpace = true;
+            } else {
+                out.push_back(ch);
+                lastSpace = false;
+            }
+        }
+        while (!out.empty() && out.back() == ' ') out.pop_back();
+        s = std::move(out);
+    }
+    return s;
+}
+
 static QuestQueryTextCandidate pickBestQuestQueryTexts(const std::vector<uint8_t>& data, bool classicHint) {
     QuestQueryTextCandidate best;
     if (data.size() <= 9) return best;
@@ -145,13 +168,13 @@ static QuestQueryTextCandidate pickBestQuestQueryTexts(const std::vector<uint8_t
             size_t next = off;
             if (readCStringAt(data, off, title, next)) {
                 QuestQueryTextCandidate c;
-                c.title = title;
-                c.score = scoreQuestTitle(title) + 20; // Prefer expected struct offsets
+                c.title = normalizeQuestText(title, true);
+                c.score = scoreQuestTitle(c.title) + 20; // Prefer expected struct offsets
 
                 std::string s2;
                 size_t n2 = next;
                 if (readCStringAt(data, next, s2, n2) && isReadableQuestText(s2, 8, 600)) {
-                    c.objectives = s2;
+                    c.objectives = normalizeQuestText(s2, false);
                 }
                 if (c.score > best.score) best = c;
             }
@@ -165,15 +188,15 @@ static QuestQueryTextCandidate pickBestQuestQueryTexts(const std::vector<uint8_t
         if (!readCStringAt(data, start, title, next)) continue;
 
         QuestQueryTextCandidate c;
-        c.title = title;
-        c.score = scoreQuestTitle(title);
+        c.title = normalizeQuestText(title, true);
+        c.score = scoreQuestTitle(c.title);
         if (c.score < 0) continue;
 
         std::string s2, s3;
         size_t n2 = next, n3 = next;
         if (readCStringAt(data, next, s2, n2)) {
-            if (isReadableQuestText(s2, 8, 600)) c.objectives = s2;
-            else if (readCStringAt(data, n2, s3, n3) && isReadableQuestText(s3, 8, 600)) c.objectives = s3;
+            if (isReadableQuestText(s2, 8, 600)) c.objectives = normalizeQuestText(s2, false);
+            else if (readCStringAt(data, n2, s3, n3) && isReadableQuestText(s3, 8, 600)) c.objectives = normalizeQuestText(s3, false);
         }
         if (c.score > best.score) best = c;
     }
@@ -772,12 +795,23 @@ void QuestHandler::registerOpcodes(DispatchTable& table) {
         const uint8_t questLogStride = owner_.getPacketParsers()
                                            ? owner_.getPacketParsers()->questLogStride() : 5;
         const bool isClassicLayout = questLogStride <= 4;
+
+        // questLevel is the third field (after questId + questMethod) in every
+        // expansion's SMSG_QUEST_QUERY_RESPONSE; -1 = player-scaling (WotLK)
+        int32_t questLevel = 0;
+        if (packet.getData().size() >= 12) {
+            questLevel = static_cast<int32_t>(readU32At(packet.getData(), 8));
+            if (questLevel < -1 || questLevel > 255) questLevel = 0; // sanity: wrong layout
+        }
+
         const QuestQueryTextCandidate parsed = pickBestQuestQueryTexts(packet.getData(), isClassicLayout);
         const QuestQueryObjectives objs = extractQuestQueryObjectives(packet.getData(), questLogStride);
         const QuestQueryRewardsData rwds = QuestQueryRewardsParser::parse(packet.getData(), questLogStride);
 
         for (auto& q : questLog_) {
             if (q.questId != questId) continue;
+
+            if (questLevel != 0) q.level = questLevel;
 
             const int existingScore = scoreQuestTitle(q.title);
             const bool parsedStrong = isStrongQuestTitle(parsed.title);
@@ -1353,8 +1387,9 @@ void QuestHandler::addQuestToLocalLogIfMissing(uint32_t questId, const std::stri
     if (questId == 0 || hasQuestInLog(questId)) return;
     QuestLogEntry entry;
     entry.questId = questId;
-    entry.title = title.empty() ? ("Quest #" + std::to_string(questId)) : title;
-    entry.objectives = objectives;
+    entry.title = title.empty() ? ("Quest #" + std::to_string(questId))
+                                : normalizeQuestText(title, true);
+    entry.objectives = normalizeQuestText(objectives, false);
     questLog_.push_back(std::move(entry));
     if (owner_.addonEventCallbackRef()) {
         owner_.addonEventCallbackRef()("QUEST_ACCEPTED", {std::to_string(questId)});
@@ -1680,7 +1715,8 @@ void QuestHandler::classifyGossipQuests(bool updateQuestLog) {
             for (auto& entry : questLog_) {
                 if (entry.questId == q.questId) {
                     entry.complete = completable;
-                    entry.title = q.title;
+                    entry.title = normalizeQuestText(q.title, true);
+                    if (q.questLevel > 0 && entry.level <= 0) entry.level = q.questLevel;
                     break;
                 }
             }
@@ -1831,10 +1867,10 @@ void QuestHandler::handleQuestDetails(network::Packet& packet) {
     for (auto& q : questLog_) {
         if (q.questId != data.questId) continue;
         if (!data.title.empty() && (isPlaceholderQuestTitle(q.title) || data.title.size() >= q.title.size())) {
-            q.title = data.title;
+            q.title = normalizeQuestText(data.title, true);
         }
         if (!data.objectives.empty() && (q.objectives.empty() || data.objectives.size() > q.objectives.size())) {
-            q.objectives = data.objectives;
+            q.objectives = normalizeQuestText(data.objectives, false);
         }
         break;
     }
