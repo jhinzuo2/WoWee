@@ -294,6 +294,9 @@ public:
     /** Process a bounded batch of ready tiles with async GPU upload (no sync wait) */
     void processReadyTiles();
 
+    /** Unload a bounded batch of distant tiles queued by streamTiles() (no frame-spike) */
+    void processPendingUnloads();
+
 private:
     /**
      * Get tile coordinates from GL world position
@@ -430,6 +433,28 @@ private:
     // (prevents re-parsing thousands of doodads when same WMO spans multiple tiles)
     std::unordered_set<uint32_t> preparedWmoUniqueIds_;
     std::mutex preparedWmoUniqueIdsMutex_;
+
+    // MAIN-THREAD-ONLY: tiles beyond unloadRadius, queued by streamTiles() and drained a
+    // time-budgeted batch at a time by processPendingUnloads() each frame. Unloading them
+    // all synchronously in one call (e.g. ~100 tiles right after a taxi landing snaps the
+    // radius down) caused multi-second main-thread stalls — live-confirmed via "SLOW
+    // terrainManager->update: 1943.71ms" immediately after "Unloaded 103 distant tiles" in
+    // a real flight-landing log.
+    //
+    // This was originally a fixed per-frame *count* cap (8 tiles/frame) rather than a time
+    // budget. That prevented the single-frame catastrophic stall but doesn't scale with
+    // actual frame cost: streamTiles() discovers newly-out-of-range tiles at a roughly
+    // constant real-world rate during a long, fast (taxi) flight, but a count-based drain
+    // processes fewer tiles per *second* whenever frame rate drops for any reason — and once
+    // the backlog (and therefore loadedTiles_/streamTiles()'s own per-call scan cost) starts
+    // growing, frame rate drops further, which throttles the count-based drain further still.
+    // Live-reproduced: a long cross-continent taxi flight (the first sustained-large-radius
+    // tile churn any test had done) snowballed from ~50ms terrain-update frames early on to
+    // 600ms+ later in the same flight. A time budget (matching processReadyTiles()/
+    // advanceFinalization()'s existing pattern) scales unload throughput with whatever time
+    // is actually available each frame instead of a fixed count, so it can't fall behind
+    // real-world churn the way the count cap could.
+    std::deque<TileCoord> pendingUnloadQueue_;
 
     // MAIN-THREAD-ONLY: checked and modified in processReadyTiles() and unloadDistantTiles(),
     // both of which run exclusively on the main thread.

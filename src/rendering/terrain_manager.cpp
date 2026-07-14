@@ -203,6 +203,10 @@ void TerrainManager::update(const Camera& camera, float deltaTime) {
     // Time-budgeted internally to prevent frame spikes.
     processReadyTiles();
 
+    // Always drain a bounded batch of pending unloads each frame — same
+    // frame-spike rationale as processReadyTiles() above.
+    processPendingUnloads();
+
     timeSinceLastUpdate += deltaTime;
 
     // Only update streaming periodically (not every frame)
@@ -1436,6 +1440,44 @@ void TerrainManager::processReadyTiles() {
     if (vkCtx) vkCtx->endUploadBatch();  // Async — submits but doesn't wait
 }
 
+void TerrainManager::processPendingUnloads() {
+    ZoneScopedN("TerrainManager::processPendingUnloads");
+    if (pendingUnloadQueue_.empty()) return;
+
+    // Time-budgeted rather than count-capped (see pendingUnloadQueue_'s comment) so
+    // throughput scales with whatever time is actually available this frame instead
+    // of a fixed tile count that can't keep pace when frame rate drops or the queue
+    // is unusually large (e.g. after a long, fast taxi flight). Taxi mode gets a
+    // larger budget, matching processReadyTiles()'s existing taxi-aware budget.
+    const auto budgetStart = std::chrono::steady_clock::now();
+    const float budgetMs = taxiStreamingMode_ ? 16.0f : 8.0f;
+
+    size_t unloaded = 0;
+    while (!pendingUnloadQueue_.empty()) {
+        TileCoord coord = pendingUnloadQueue_.front();
+        pendingUnloadQueue_.pop_front();
+
+        // Skip stale entries: the player may have reversed course since this
+        // tile was queued, bringing it back within range. Unloading it now
+        // would pop visible terrain out from under them.
+        int dx = coord.x - currentTile.x;
+        int dy = coord.y - currentTile.y;
+        if (dx*dx + dy*dy <= unloadRadius*unloadRadius) continue;
+
+        unloadTile(coord.x, coord.y);
+        unloaded++;
+
+        const float elapsed = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - budgetStart).count();
+        if (elapsed >= budgetMs) break;
+    }
+
+    if (unloaded > 0) {
+        LOG_INFO("Unloaded ", unloaded, " distant tiles (", pendingUnloadQueue_.size(),
+                 " queued), ", loadedTiles.size(), " remain (models kept in VRAM)");
+    }
+}
+
 void TerrainManager::processAllReadyTiles() {
     // Move all ready tiles into finalizing deque
     // Keep in pendingTiles until committed (same as processReadyTiles)
@@ -2494,8 +2536,12 @@ void TerrainManager::streamTiles() {
     // Notify workers that there's work
     queueCV.notify_all();
 
-    // Unload tiles beyond unload radius (well past the camera far clip)
-    std::vector<TileCoord> tilesToUnload;
+    // Unload tiles beyond unload radius (well past the camera far clip).
+    // Queue them rather than unloading synchronously here — processPendingUnloads()
+    // drains a time-budgeted batch per frame instead (see pendingUnloadQueue_'s comment).
+    std::unordered_set<TileCoord, TileCoord::Hash> alreadyQueued(
+        pendingUnloadQueue_.begin(), pendingUnloadQueue_.end());
+    size_t queuedNow = 0;
 
     for (const auto& pair : loadedTiles) {
         const TileCoord& coord = pair.first;
@@ -2504,18 +2550,15 @@ void TerrainManager::streamTiles() {
         int dy = coord.y - currentTile.y;
 
         // Circular pattern: unload beyond radius (Euclidean distance)
-        if (dx*dx + dy*dy > unloadRadius*unloadRadius) {
-            tilesToUnload.push_back(coord);
+        if (dx*dx + dy*dy > unloadRadius*unloadRadius && !alreadyQueued.count(coord)) {
+            pendingUnloadQueue_.push_back(coord);
+            queuedNow++;
         }
     }
 
-    for (const auto& coord : tilesToUnload) {
-        unloadTile(coord.x, coord.y);
-    }
-
-    if (!tilesToUnload.empty()) {
-        LOG_INFO("Unloaded ", tilesToUnload.size(), " distant tiles, ",
-                 loadedTiles.size(), " remain (models kept in VRAM)");
+    if (queuedNow > 0) {
+        LOG_INFO("Queued ", queuedNow, " distant tiles for unload (",
+                 pendingUnloadQueue_.size(), " total pending)");
     }
 }
 
