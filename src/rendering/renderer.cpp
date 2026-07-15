@@ -701,6 +701,12 @@ void Renderer::shutdown() {
         m2Renderer->shutdown();
         m2Renderer.reset();
     }
+    if (outlandSkyRenderer_) {
+        outlandSkyRenderer_->shutdown();
+        outlandSkyRenderer_.reset();
+        outlandSkyInstanceId_ = 0;
+        outlandSkyPath_.clear();
+    }
 
     // Audio shutdown is handled by AudioCoordinator (owned by Application).
     audioCoordinator_ = nullptr;
@@ -804,6 +810,7 @@ void Renderer::applyMsaaChange() {
     }
     if (wmoRenderer) wmoRenderer->recreatePipelines();
     if (m2Renderer) m2Renderer->recreatePipelines();
+    if (outlandSkyRenderer_) outlandSkyRenderer_->recreatePipelines();
     if (characterRenderer) characterRenderer->recreatePipelines();
     if (questMarkerRenderer) questMarkerRenderer->recreatePipelines();
     if (weather) weather->recreatePipelines();
@@ -1161,6 +1168,74 @@ const std::string& Renderer::getCurrentZoneName() const {
     return audioCoordinator_ ? audioCoordinator_->getCurrentZoneName() : empty;
 }
 
+bool Renderer::ensureOutlandSkybox() {
+    const auto* gh = core::Application::getInstance().getGameHandler();
+    if (!gh || gh->getCurrentMapId() != 530 || !outlandSkyRenderer_ ||
+        !lightingManager || !cachedAssetManager || !camera) {
+        return false;
+    }
+
+    std::string path = lightingManager->getActiveSkyboxPath();
+    if (path.empty()) return false;
+    std::replace(path.begin(), path.end(), '/', '\\');
+    if (path == outlandSkyPath_) return outlandSkyInstanceId_ != 0;
+
+    outlandSkyRenderer_->clear();
+    outlandSkyPath_ = path;
+    outlandSkyInstanceId_ = 0;
+
+    std::vector<std::string> candidates{path};
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos) {
+        candidates.push_back(path + ".m2");
+    } else {
+        std::string ext = path.substr(dot);
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".mdx" || ext == ".mdl") candidates.push_back(path.substr(0, dot) + ".m2");
+    }
+
+    std::vector<uint8_t> modelData;
+    std::string resolvedPath;
+    for (const auto& candidate : candidates) {
+        modelData = cachedAssetManager->readFileOptional(candidate);
+        if (!modelData.empty()) {
+            resolvedPath = candidate;
+            break;
+        }
+    }
+    if (modelData.empty()) {
+        LOG_WARNING("Outland original skybox unavailable: ", path);
+        return false;
+    }
+
+    pipeline::M2Model model = pipeline::M2Loader::load(modelData);
+    model.name = resolvedPath + "#original-sky";
+    const size_t resolvedDot = resolvedPath.find_last_of('.');
+    const std::string skinPath = (resolvedDot == std::string::npos
+        ? resolvedPath : resolvedPath.substr(0, resolvedDot)) + "00.skin";
+    auto skinData = cachedAssetManager->readFileOptional(skinPath);
+    if (!skinData.empty() && model.version >= 264) {
+        pipeline::M2Loader::loadSkin(skinData, model);
+    }
+    if (!model.isValid()) {
+        LOG_WARNING("Outland original skybox model is invalid: ", resolvedPath);
+        return false;
+    }
+
+    const uint32_t modelId = static_cast<uint32_t>(std::hash<std::string>{}(model.name));
+    if (!outlandSkyRenderer_->loadModel(model, modelId)) {
+        LOG_WARNING("Failed to upload Outland original skybox: ", resolvedPath);
+        return false;
+    }
+    outlandSkyInstanceId_ = outlandSkyRenderer_->createInstance(
+        modelId, camera->getPosition(), glm::vec3(0.0f), 1.0f);
+    if (!outlandSkyInstanceId_) return false;
+    outlandSkyRenderer_->setSkipCollision(outlandSkyInstanceId_, true);
+    LOG_INFO("Outland original skybox active: ", resolvedPath);
+    return true;
+}
+
 uint32_t Renderer::getCurrentZoneId() const {
     uint32_t tileZoneId = 0;
     if (zoneManager && terrainManager) {
@@ -1338,6 +1413,11 @@ void Renderer::update(float deltaTime) {
     // Update sky system (skybox time, star twinkle, clouds, celestial moon phases)
     if (skySystem) {
         skySystem->update(deltaTime);
+    }
+    if (ensureOutlandSkybox() && outlandSkyRenderer_ && camera) {
+        outlandSkyRenderer_->setInstancePosition(outlandSkyInstanceId_, camera->getPosition());
+        outlandSkyRenderer_->update(deltaTime, camera->getPosition(),
+            camera->getProjectionMatrix() * camera->getViewMatrix());
     }
 
     // Update weather particles
@@ -1596,6 +1676,8 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
     float timeOfDay = lightingManager
         ? lightingManager->getVisualTimeOfDayHours()
         : (skybox ? skybox->getTimeOfDay() : 12.0f);
+    const bool useOutlandOriginalSky = gameHandler && gameHandler->getCurrentMapId() == 530 &&
+        outlandSkyRenderer_ && outlandSkyInstanceId_ != 0;
 
     // ── Multithreaded secondary command buffer recording ──
     // Terrain, WMO, and M2 record on worker threads while main thread handles
@@ -1613,6 +1695,8 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
         if (wmoRenderer) wmoRenderer->prepareRender();
         auto prepWmoEnd = std::chrono::steady_clock::now();
         if (m2Renderer && camera) m2Renderer->prepareRender(frameIdx, *camera);
+        if (useOutlandOriginalSky && camera)
+            outlandSkyRenderer_->prepareRender(frameIdx, *camera);
         auto prepM2End = std::chrono::steady_clock::now();
         if (characterRenderer) characterRenderer->prepareRender(frameIdx);
         auto prepEnd = std::chrono::steady_clock::now();
@@ -1684,8 +1768,12 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                 }
                 if (gameHandler) skyParams.weatherIntensity = gameHandler->getWeatherIntensity();
                 skyParams.skyboxModelId = 0;
-                skyParams.skyboxHasStars = false;
+                skyParams.skyboxHasStars = useOutlandOriginalSky;
+                skyParams.useOriginalSkybox = useOutlandOriginalSky;
                 skySystem->render(cmd, perFrameSet, *camera, skyParams);
+                if (useOutlandOriginalSky) {
+                    outlandSkyRenderer_->render(cmd, perFrameSet, *camera);
+                }
             }
             vkEndCommandBuffer(cmd);
         }
@@ -1849,8 +1937,13 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             }
             if (gameHandler) skyParams.weatherIntensity = gameHandler->getWeatherIntensity();
             skyParams.skyboxModelId = 0;
-            skyParams.skyboxHasStars = false;
+            skyParams.skyboxHasStars = useOutlandOriginalSky;
+            skyParams.useOriginalSkybox = useOutlandOriginalSky;
             skySystem->render(currentCmd, perFrameSet, *camera, skyParams);
+            if (useOutlandOriginalSky) {
+                outlandSkyRenderer_->prepareRender(frameIdx, *camera);
+                outlandSkyRenderer_->render(currentCmd, perFrameSet, *camera);
+            }
         }
 
         if (terrainRenderer && camera && terrainEnabled && !skipTerrain) {
@@ -2049,6 +2142,18 @@ bool Renderer::initializeRenderers(pipeline::AssetManager* assetManager, const s
         if (!spellVisualSystem_) {
             spellVisualSystem_ = std::make_unique<SpellVisualSystem>();
             spellVisualSystem_->initialize(m2Renderer.get(), this);
+        }
+    }
+
+    // Outland's original client skies are camera-centered M2 models selected
+    // through LightParams/LightSkybox. Keep them in a dedicated no-depth
+    // renderer so they draw behind terrain and never enter world collision.
+    if (mapName == "Outland" && !outlandSkyRenderer_) {
+        outlandSkyRenderer_ = std::make_unique<M2Renderer>();
+        outlandSkyRenderer_->setSkyMode(true);
+        if (!outlandSkyRenderer_->initialize(vkCtx, perFrameSetLayout, assetManager)) {
+            LOG_WARNING("Outland sky M2 renderer initialization failed");
+            outlandSkyRenderer_.reset();
         }
     }
 

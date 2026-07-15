@@ -217,6 +217,9 @@ private:
     std::unique_ptr<CharacterRenderer> characterRenderer;
     std::unique_ptr<WMORenderer> wmoRenderer;
     std::unique_ptr<M2Renderer> m2Renderer;
+    std::unique_ptr<M2Renderer> outlandSkyRenderer_;
+    std::string outlandSkyPath_;
+    uint32_t outlandSkyInstanceId_ = 0;
     std::unique_ptr<Minimap> minimap;
     std::unique_ptr<WorldMap> worldMap;
     std::unique_ptr<QuestMarkerRenderer> questMarkerRenderer;
@@ -272,6 +275,7 @@ public:
 
 private:
     void applyMsaaChange();
+    bool ensureOutlandSkybox();
     VkSampleCountFlagBits pendingMsaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
     bool msaaChangePending_ = false;
     void renderShadowPass();

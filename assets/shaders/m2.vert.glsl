@@ -49,6 +49,7 @@ layout(location = 2) out vec2 TexCoord;
 layout(location = 3) flat out vec3 InstanceOrigin;
 layout(location = 4) out float ModelHeight;
 layout(location = 5) out float vFadeAlpha;
+layout(location = 6) flat out int vSkyMode;
 
 void main() {
     // Fetch per-instance data from SSBO
@@ -73,7 +74,7 @@ void main() {
     }
 
     // Wind animation for foliage
-    if (push.isFoliage != 0) {
+    if (push.isFoliage > 0) {
         float windTime = fogParams.z;
         vec3 worldRef = model[3].xyz;
         float heightFactor = clamp(pos.z / 20.0, 0.0, 1.0);
@@ -107,6 +108,7 @@ void main() {
     InstanceOrigin = model[3].xyz;
     ModelHeight = pos.z;
     vFadeAlpha = fade;
+    vSkyMode = push.isFoliage < 0 ? 1 : 0;
 
     gl_Position = projection * view * worldPos;
 }

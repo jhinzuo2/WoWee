@@ -675,7 +675,8 @@ bool M2Renderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFrameLayout
             .setVertexInput({m2Binding}, m2Attrs)
             .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
             .setRasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
-            .setDepthTest(true, depthWrite, VK_COMPARE_OP_LESS_OR_EQUAL)
+            .setDepthTest(!skyMode_, skyMode_ ? false : depthWrite,
+                          skyMode_ ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL)
             .setColorBlendAttachment(blendState)
             .setMultisample(vkCtx_->getMsaaSamples())
             .setLayout(pipelineLayout_)

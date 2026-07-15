@@ -3,6 +3,7 @@
 #include <vector>
 #include <map>
 #include <memory>
+#include <string>
 #include <glm/glm.hpp>
 
 namespace wowee {
@@ -100,6 +101,7 @@ struct FloatBand {
  */
 struct LightParamsProfile {
     uint32_t lightParamsId = 0;
+    uint32_t lightSkyboxId = 0;
 
     // 18 color channels (IntBand)
     enum ColorChannel {
@@ -181,6 +183,9 @@ public:
     /** Time used by the visible sky, including persistent zone ambience. */
     float getVisualTimeOfDayHours() const { return visualTimeOfDayHours_; }
 
+    /** Original client M2 sky selected by the dominant LightParams volume. */
+    const std::string& getActiveSkyboxPath() const { return activeSkyboxPath_; }
+
     /**
      * Manually set time of day for testing
      */
@@ -201,6 +206,8 @@ private:
      * Load LightParams.dbc for zone→light mapping
      */
     bool loadLightParamsDbc(pipeline::AssetManager* assetManager);
+
+    bool loadLightSkyboxDbc(pipeline::AssetManager* assetManager);
 
     /**
      * Load LightIntBand.dbc and LightFloatBand.dbc for time curves
@@ -252,6 +259,7 @@ private:
 
     // LightParams profiles by ID
     std::map<uint32_t, LightParamsProfile> lightParamsProfiles_;
+    std::map<uint32_t, std::string> lightSkyboxPaths_;
 
     // Current state
     LightingParams currentParams_;
@@ -261,6 +269,7 @@ private:
     uint32_t currentMapId_ = 0;
     float timeOfDay_ = 0.5f;  // Start at noon
     float visualTimeOfDayHours_ = 12.0f;
+    std::string activeSkyboxPath_;
     bool isIndoors_ = false;
     bool manualTime_ = false;
     bool initialized_ = false;

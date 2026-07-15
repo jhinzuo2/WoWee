@@ -38,6 +38,7 @@ layout(location = 2) in vec2 TexCoord;
 layout(location = 3) flat in vec3 InstanceOrigin;
 layout(location = 4) in float ModelHeight;
 layout(location = 5) in float vFadeAlpha;
+layout(location = 6) flat in int vSkyMode;
 
 layout(location = 0) out vec4 outColor;
 
@@ -113,6 +114,13 @@ void main() {
         if (lum < colorKeyThreshold) discard;
     }
     if (blendMode == 1 && texColor.a < 0.004) discard;
+
+    // Original client sky M2s carry their authored color and alpha. They are
+    // camera-centered, unlit, and must not be swallowed by world-distance fog.
+    if (vSkyMode != 0) {
+        outColor = vec4(texColor.rgb, texColor.a * vFadeAlpha);
+        return;
+    }
 
     // Per-instance color variation (foliage only)
     if (isFoliage) {
