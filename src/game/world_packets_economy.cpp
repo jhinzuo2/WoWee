@@ -107,8 +107,13 @@ network::Packet SendMailPacket::build(uint64_t mailboxGuid, const std::string& r
         packet.writeUInt8(i);            // attachment slot index
         packet.writeUInt64(itemGuids[i]);
     }
-    packet.writeUInt64(money);
-    packet.writeUInt64(cod);
+    // WotLK represents both values as uint32, followed by the legacy
+    // uint64/uint8 zero fields.  Writing the values as uint64 shifts COD into
+    // the unknown fields and leaves the server one byte short.
+    packet.writeUInt32(static_cast<uint32_t>(money));
+    packet.writeUInt32(static_cast<uint32_t>(cod));
+    packet.writeUInt64(0);
+    packet.writeUInt8(0);
     return packet;
 }
 
@@ -167,10 +172,14 @@ bool PacketParsers::parseMailList(network::Packet& packet, std::vector<MailMessa
         size_t startPos = packet.getReadPos();
 
         MailMessage msg;
-        if (remaining < static_cast<size_t>(msgSize) + 2) {
-            LOG_WARNING("Mail entry ", i, " truncated");
+        // The WotLK wire value includes its own uint16 size field, so only
+        // msgSize - 2 bytes remain after reading it.
+        if (msgSize < 2 || remaining < static_cast<size_t>(msgSize)) {
+            LOG_WARNING("Mail entry ", static_cast<int>(i), " truncated");
             break;
         }
+        const size_t payloadSize = static_cast<size_t>(msgSize) - 2;
+        const size_t entryEnd = startPos + payloadSize;
 
         msg.messageId = packet.readUInt32();
         msg.messageType = packet.readUInt8();
@@ -182,11 +191,10 @@ bool PacketParsers::parseMailList(network::Packet& packet, std::vector<MailMessa
             default: msg.senderEntry = packet.readUInt32(); break;
         }
 
-        msg.cod = packet.readUInt64();
-        packet.readUInt32(); // item text id
-        packet.readUInt32(); // unknown
+        msg.cod = packet.readUInt32();
+        packet.readUInt32(); // unknown (was item text id before 3.3.3)
         msg.stationeryId = packet.readUInt32();
-        msg.money = packet.readUInt64();
+        msg.money = packet.readUInt32();
         msg.flags = packet.readUInt32();
         msg.expirationTime = packet.readFloat();
         msg.mailTemplateId = packet.readUInt32();
@@ -222,11 +230,11 @@ bool PacketParsers::parseMailList(network::Packet& packet, std::vector<MailMessa
         inbox.push_back(std::move(msg));
 
         // Skip unread bytes
-        size_t consumed = packet.getReadPos() - startPos;
-        if (consumed < msgSize) {
-            size_t skip = msgSize - consumed;
-            for (size_t s = 0; s < skip && packet.hasData(); ++s)
-                packet.readUInt8();
+        if (packet.getReadPos() < entryEnd) {
+            packet.setReadPos(entryEnd);
+        } else if (packet.getReadPos() > entryEnd) {
+            LOG_WARNING("Mail entry ", static_cast<int>(i),
+                        " exceeded declared size by ", packet.getReadPos() - entryEnd, " bytes");
         }
     }
 

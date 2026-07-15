@@ -1165,11 +1165,10 @@ bool TbcPacketParsers::parseItemQueryResponse(network::Packet& packet, ItemQuery
 //
 // Differences from WotLK 3.3.5a (base implementation):
 //   - Header: uint8 count only (WotLK: uint32 totalCount + uint8 shownCount)
-//   - No body field — subject IS the full text (WotLK added body when mailTemplateId==0)
-//   - Attachment item GUID: full uint64 (WotLK: uint32 low GUID)
-//   - Attachment enchants: 7 × uint32 id only (WotLK: 7 × {id+duration+charges} = 84 bytes)
-//   - Header fields: cod + itemTextId + stationery (WotLK has extra unknown uint32 between
-//     itemTextId and stationery)
+//   - No body field; the body is fetched separately through itemTextId
+//   - Header includes itemTextId + package before stationery
+//   - Attachment enchants are 6 × {charges, duration, id}
+//   - Attachment stack count is uint8 rather than uint32
 // ============================================================================
 bool TbcPacketParsers::parseMailList(network::Packet& packet, std::vector<MailMessage>& inbox) {
     size_t remaining = packet.getRemainingSize();
@@ -1189,13 +1188,26 @@ bool TbcPacketParsers::parseMailList(network::Packet& packet, std::vector<MailMe
         size_t startPos = packet.getReadPos();
 
         MailMessage msg;
-        if (remaining < static_cast<size_t>(msgSize) + 2) {
-            LOG_WARNING("[TBC] Mail entry ", i, " truncated");
+        if (msgSize < 7 || remaining < 7) {
+            LOG_WARNING("[TBC] Mail entry ", static_cast<int>(i), " truncated");
             break;
         }
 
         msg.messageId = packet.readUInt32();
         msg.messageType = packet.readUInt8();
+
+        // CMaNGOS includes the uint16 size field in msgSize.  Its 2.4.3 size
+        // calculation always budgets an 8-byte sender even though non-player
+        // mail emits a uint32 sender, so those entries overstate their size by
+        // four bytes.
+        const size_t senderSizeAdjustment = msg.messageType == 0 ? 0 : 4;
+        if (msgSize < 2 + senderSizeAdjustment ||
+            remaining < static_cast<size_t>(msgSize) - senderSizeAdjustment) {
+            LOG_WARNING("[TBC] Mail entry ", static_cast<int>(i), " truncated");
+            break;
+        }
+        const size_t payloadSize = static_cast<size_t>(msgSize) - 2 - senderSizeAdjustment;
+        const size_t entryEnd = startPos + payloadSize;
 
         switch (msg.messageType) {
             case 0: msg.senderGuid = packet.readUInt64(); break;
@@ -1203,8 +1215,8 @@ bool TbcPacketParsers::parseMailList(network::Packet& packet, std::vector<MailMe
         }
 
         msg.cod          = packet.readUInt32();
-        packet.readUInt32();         // itemTextId
-        // NOTE: TBC has NO extra unknown uint32 here (WotLK added one between itemTextId and stationery)
+        packet.readUInt32();         // itemTextId (body fetched separately)
+        packet.readUInt32();         // package (Package.dbc)
         msg.stationeryId = packet.readUInt32();
         msg.money        = packet.readUInt32();
         msg.flags        = packet.readUInt32();
@@ -1218,17 +1230,17 @@ bool TbcPacketParsers::parseMailList(network::Packet& packet, std::vector<MailMe
         for (uint8_t j = 0; j < attachCount; ++j) {
             MailAttachment att;
             att.slot         = packet.readUInt8();
-            uint64_t itemGuid = packet.readUInt64();   // full 64-bit GUID (TBC)
-            att.itemGuidLow  = static_cast<uint32_t>(itemGuid & 0xFFFFFFFF);
+            att.itemGuidLow  = packet.readUInt32();
             att.itemId       = packet.readUInt32();
-            // TBC: 7 × uint32 enchant ID only (no duration/charges per slot)
-            for (int e = 0; e < 7; ++e) {
+            for (int e = 0; e < 6; ++e) {
+                packet.readUInt32(); // charges
+                packet.readUInt32(); // duration
                 uint32_t enchId = packet.readUInt32();
                 if (e == 0) att.enchantId = enchId;
             }
             att.randomPropertyId     = packet.readUInt32();
             att.randomSuffix         = packet.readUInt32();
-            att.stackCount           = packet.readUInt32();
+            att.stackCount           = packet.readUInt8();
             att.chargesOrDurability  = packet.readUInt32();
             att.maxDurability        = packet.readUInt32();
             packet.readUInt32();  // current durability (separate from chargesOrDurability)
@@ -1238,10 +1250,11 @@ bool TbcPacketParsers::parseMailList(network::Packet& packet, std::vector<MailMe
         msg.read = (msg.flags & 0x01) != 0;
         inbox.push_back(std::move(msg));
 
-        // Skip any unread bytes within this mail entry
-        size_t consumed = packet.getReadPos() - startPos;
-        if (consumed < static_cast<size_t>(msgSize)) {
-            packet.setReadPos(startPos + msgSize);
+        if (packet.getReadPos() < entryEnd) {
+            packet.setReadPos(entryEnd);
+        } else if (packet.getReadPos() > entryEnd) {
+            LOG_WARNING("[TBC] Mail entry ", static_cast<int>(i),
+                        " exceeded declared size by ", packet.getReadPos() - entryEnd, " bytes");
         }
     }
 

@@ -2023,8 +2023,18 @@ void InventoryHandler::handleSendMailResult(network::Packet& packet) {
     uint32_t mailId = packet.readUInt32();
     uint32_t action = packet.readUInt32();
     uint32_t error  = packet.readUInt32();
-    (void)mailId;
-    if (action == 0) { // SEND
+    // WotLK MailResponseType values from SharedDefines.h.
+    constexpr uint32_t MAIL_SEND = 0;
+    constexpr uint32_t MAIL_MONEY_TAKEN = 1;
+    constexpr uint32_t MAIL_ITEM_TAKEN = 2;
+    constexpr uint32_t MAIL_RETURNED_TO_SENDER = 3;
+    constexpr uint32_t MAIL_DELETED = 4;
+    constexpr uint32_t MAIL_MADE_PERMANENT = 5;
+
+    auto mailIt = std::find_if(mailInbox_.begin(), mailInbox_.end(),
+        [mailId](const MailMessage& mail) { return mail.messageId == mailId; });
+
+    if (action == MAIL_SEND) {
         if (error == 0) {
             owner_.addSystemChatMessage("Mail sent.");
             clearMailAttachments();
@@ -2032,22 +2042,37 @@ void InventoryHandler::handleSendMailResult(network::Packet& packet) {
         } else {
             owner_.addSystemChatMessage("Failed to send mail (error " + std::to_string(error) + ").");
         }
-    } else if (action == 4) { // TAKE_ITEM
+    } else if (action == MAIL_ITEM_TAKEN) {
         if (error == 0) {
             owner_.addSystemChatMessage("Item taken from mail.");
             if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("BAG_UPDATE", {});
         } else {
             owner_.addSystemChatMessage("Failed to take item (error " + std::to_string(error) + ").");
         }
-    } else if (action == 5) { // TAKE_MONEY
+    } else if (action == MAIL_MONEY_TAKEN) {
         if (error == 0) {
+            if (mailIt != mailInbox_.end()) mailIt->money = 0;
             owner_.addSystemChatMessage("Money taken from mail.");
-            if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("PLAYER_MONEY", {});
+            if (owner_.addonEventCallbackRef()) {
+                owner_.addonEventCallbackRef()("PLAYER_MONEY", {});
+                owner_.addonEventCallbackRef()("MAIL_INBOX_UPDATE", {});
+            }
+        } else {
+            owner_.addSystemChatMessage("Failed to take money (error " + std::to_string(error) + ").");
         }
-    } else if (action == 2) { // DELETE
+    } else if (action == MAIL_DELETED || action == MAIL_RETURNED_TO_SENDER) {
         if (error == 0) {
-            owner_.addSystemChatMessage("Mail deleted.");
+            owner_.addSystemChatMessage(action == MAIL_DELETED ? "Mail deleted." : "Mail returned.");
+            if (mailIt != mailInbox_.end()) {
+                const int erasedIndex = static_cast<int>(std::distance(mailInbox_.begin(), mailIt));
+                mailInbox_.erase(mailIt);
+                if (selectedMailIndex_ == erasedIndex) selectedMailIndex_ = -1;
+                else if (selectedMailIndex_ > erasedIndex) --selectedMailIndex_;
+            }
+            if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("MAIL_INBOX_UPDATE", {});
         }
+    } else if (action == MAIL_MADE_PERMANENT && error == 0) {
+        owner_.addSystemChatMessage("Mail text copied.");
     }
     refreshMailList();
 }
