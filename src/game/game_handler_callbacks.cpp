@@ -2437,9 +2437,9 @@ void GameHandler::applyQuestStateFromFields(const FlatFieldMap& fields) {
     if (questHandler_) questHandler_->applyQuestStateFromFields(fields);
 }
 
-// Extract packed 6-bit kill/objective counts from WotLK/TBC/Classic quest-log update fields
-// and populate quest.killCounts + quest.itemCounts using the structured objectives obtained
-// from a prior SMSG_QUEST_QUERY_RESPONSE.  Silently does nothing if objectives are absent.
+// Extract expansion-specific kill/objective counters from quest-log update fields
+// and populate quest.killCounts using the structured objectives obtained from a prior
+// SMSG_QUEST_QUERY_RESPONSE. Silently does nothing if objectives are absent.
 void GameHandler::applyPackedKillCountsFromFields(QuestLogEntry& quest) {
     if (questHandler_) questHandler_->applyPackedKillCountsFromFields(quest);
 }

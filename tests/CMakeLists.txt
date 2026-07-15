@@ -640,6 +640,16 @@ target_link_libraries(test_inventory_sort PRIVATE catch2_main)
 add_test(NAME inventory_sort COMMAND test_inventory_sort)
 register_test_target(test_inventory_sort)
 
+# ── test_quest_progress ─────────────────────────────────────
+add_executable(test_quest_progress
+    test_quest_progress.cpp
+)
+target_include_directories(test_quest_progress PRIVATE ${TEST_INCLUDE_DIRS})
+target_include_directories(test_quest_progress SYSTEM PRIVATE ${TEST_SYSTEM_INCLUDE_DIRS})
+target_link_libraries(test_quest_progress PRIVATE catch2_main)
+add_test(NAME quest_progress COMMAND test_quest_progress)
+register_test_target(test_quest_progress)
+
 # ── ASAN / UBSan for test targets ────────────────────────────
 if(WOWEE_ENABLE_ASAN AND NOT MSVC)
     foreach(_t IN LISTS ALL_TEST_TARGETS)
