@@ -9,7 +9,9 @@
 #include "audio/audio_coordinator.hpp"
 #include "audio/combat_sound_manager.hpp"
 #include "audio/activity_sound_manager.hpp"
+#include "audio/npc_voice_manager.hpp"
 #include "core/application.hpp"
+#include "core/coordinates.hpp"
 #include "core/logger.hpp"
 #include "network/world_socket.hpp"
 #include <algorithm>
@@ -461,6 +463,17 @@ void CombatHandler::handleAttackerStateUpdate(network::Packet& packet) {
     }
     if (!isPlayerAttacker && owner_.npcSwingCallbackRef()) {
         owner_.npcSwingCallbackRef()(data.attackerGuid);
+    }
+    if (!isPlayerAttacker) {
+        auto entity = owner_.getEntityManager().getEntity(data.attackerGuid);
+        auto* audioCoordinator = owner_.services().audioCoordinator;
+        auto* voiceManager = audioCoordinator ? audioCoordinator->getNpcVoiceManager() : nullptr;
+        if (entity && entity->getType() == ObjectType::UNIT && voiceManager) {
+            auto unit = std::static_pointer_cast<Unit>(entity);
+            const glm::vec3 canonical(unit->getLatestX(), unit->getLatestY(), unit->getLatestZ());
+            voiceManager->playCombatAttack(
+                data.attackerGuid, unit->getDisplayId(), core::coords::canonicalToRender(canonical));
+        }
     }
 
     if (isPlayerTarget && data.attackerGuid != 0) {
