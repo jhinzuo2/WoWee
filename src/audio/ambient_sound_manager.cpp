@@ -437,7 +437,7 @@ void AmbientSoundManager::updatePeriodicSounds(float deltaTime, bool isIndoor, b
     if (isIndoor || isSwimming) return;
 
     // Bird sounds during daytime
-    if (isDaytime()) {
+    if (isDaytime() && currentZoneId_ != 10) {
         birdTimer_ += deltaTime;
         if (birdTimer_ >= randomFloat(BIRD_MIN_INTERVAL, BIRD_MAX_INTERVAL)) {
             birdTimer_ = 0.0f;
@@ -525,6 +525,12 @@ void AmbientSoundManager::updateWindAmbience(float deltaTime, bool isIndoor) {
     }
     // Outdoor wind ambience
     else {
+        // This generic loop is ForestNormalDay.wav and contains prominent
+        // birdsong. Duskwood already has its authored night forest ambience.
+        if (currentZoneId_ == 10) {
+            windLoopTime_ = 0.0f;
+            return;
+        }
         if (!windSounds_.empty() && windSounds_[0].loaded) {
             windLoopTime_ += deltaTime;
             if (windLoopTime_ >= 30.0f) {
@@ -590,6 +596,8 @@ void AmbientSoundManager::setZoneType(ZoneType type) {
 }
 
 void AmbientSoundManager::setZoneId(uint32_t zoneId) {
+    currentZoneId_ = zoneId;
+
     // Map WoW zone ID to ZoneType + CityType.
     // City zones: set CityType and clear ZoneType.
     // Outdoor zones: set ZoneType and clear CityType.

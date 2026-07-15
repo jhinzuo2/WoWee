@@ -10,12 +10,12 @@ using wowee::rendering::resolveZoneVisualTimeHours;
 TEST_CASE("Duskwood ADT coverage follows client map bounds", "[zone_ambience]") {
     using wowee::game::isDuskwoodAdtTile;
 
-    REQUIRE(isDuskwoodAdtTile(50, 30));
-    REQUIRE(isDuskwoodAdtTile(51, 34)); // Darkshire
-    REQUIRE(isDuskwoodAdtTile(53, 35));
-    REQUIRE_FALSE(isDuskwoodAdtTile(49, 32)); // Elwynn/Redridge side
-    REQUIRE_FALSE(isDuskwoodAdtTile(54, 34)); // Stranglethorn side
-    REQUIRE_FALSE(isDuskwoodAdtTile(52, 29));
+    REQUIRE(isDuskwoodAdtTile(33, 52));
+    REQUIRE(isDuskwoodAdtTile(35, 53));
+    REQUIRE(isDuskwoodAdtTile(52, 33)); // Transposed extracted-map convention
+    REQUIRE_FALSE(isDuskwoodAdtTile(34, 51)); // Shared Elwynn/Duskwood bank ADT
+    REQUIRE_FALSE(isDuskwoodAdtTile(32, 52));
+    REQUIRE_FALSE(isDuskwoodAdtTile(36, 52));
 }
 
 TEST_CASE("Duskwood uses a permanent late-night sky clock", "[zone_ambience]") {

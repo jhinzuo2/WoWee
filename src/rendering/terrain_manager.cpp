@@ -2377,6 +2377,25 @@ std::optional<float> TerrainManager::getHeightAt(float glX, float glY) const {
     return std::nullopt;
 }
 
+std::optional<uint32_t> TerrainManager::getAreaIdAt(float glX, float glY) const {
+    const TileCoord tc = worldToTile(glX, glY);
+    auto it = loadedTiles.find(tc);
+    if (it == loadedTiles.end() || !it->second || !it->second->loaded) {
+        return std::nullopt;
+    }
+
+    const TerrainTile& tile = *it->second;
+    // tileX advances along renderY while tileY advances along renderX.
+    const float tileMaxRenderX = (32.0f - static_cast<float>(tc.y)) * TILE_SIZE;
+    const float tileMaxRenderY = (32.0f - static_cast<float>(tc.x)) * TILE_SIZE;
+    const int chunkY = glm::clamp(
+        static_cast<int>(std::floor((tileMaxRenderX - glX) / CHUNK_SIZE)), 0, 15);
+    const int chunkX = glm::clamp(
+        static_cast<int>(std::floor((tileMaxRenderY - glY) / CHUNK_SIZE)), 0, 15);
+    const uint32_t areaId = tile.terrain.getChunk(chunkX, chunkY).areaId;
+    return areaId != 0 ? std::optional<uint32_t>(areaId) : std::nullopt;
+}
+
 std::optional<std::string> TerrainManager::getDominantTextureAt(float glX, float glY) const {
     const float unitSize = CHUNK_SIZE / 8.0f;
     std::vector<uint8_t> alphaScratch;

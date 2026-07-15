@@ -290,6 +290,7 @@ void ADTLoader::parseMCNK(const uint8_t* data, size_t size, int chunkIndex, ADTT
     chunk.flags = readUInt32(data, 0);
     chunk.indexX = readUInt32(data, 4);
     chunk.indexY = readUInt32(data, 8);
+    chunk.areaId = readUInt32(data, 52);
 
     // Read holes mask (at offset 0x3C = 60 in MCNK header)
     // Each bit represents a 2x2 block of the 8x8 quad grid

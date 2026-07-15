@@ -1164,16 +1164,19 @@ const std::string& Renderer::getCurrentZoneName() const {
 uint32_t Renderer::getCurrentZoneId() const {
     uint32_t tileZoneId = 0;
     if (zoneManager && terrainManager) {
+        if (const auto areaId = terrainManager->getAreaIdAt(
+                characterPosition.x, characterPosition.y)) {
+            return zoneManager->resolveAreaZoneId(*areaId);
+        }
         const auto tile = terrainManager->getCurrentTile();
         tileZoneId = zoneManager->getZoneId(tile.x, tile.y);
     }
 
-    // Prefer the corrected spatial classification for Duskwood. World-state
-    // zone IDs can lag behind movement across a zone boundary.
-    if (tileZoneId == 10) return tileZoneId;
-
     const auto* gh = core::Application::getInstance().getGameHandler();
-    if (gh && gh->getWorldStateZoneId() != 0) return gh->getWorldStateZoneId();
+    if (gh && gh->getWorldStateZoneId() != 0) {
+        const uint32_t areaId = gh->getWorldStateZoneId();
+        return zoneManager ? zoneManager->resolveAreaZoneId(areaId) : areaId;
+    }
     if (audioCoordinator_ && audioCoordinator_->getCurrentZoneId() != 0)
         return audioCoordinator_->getCurrentZoneId();
     return tileZoneId;
@@ -1243,7 +1246,13 @@ void Renderer::update(float deltaTime) {
         if (weather && gh) {
             uint32_t wType = gh->getWeatherType();
             float wInt = gh->getWeatherIntensity();
-            if (wType != 0) {
+            if (resolvedZoneId == 10) {
+                // Duskwood's defining effect is persistent ground fog. Some
+                // realms continuously report rain here; suppress those streak
+                // particles so they cannot replace the authored fog ambience.
+                weather->setWeatherType(Weather::Type::NONE);
+                weather->setIntensity(0.0f);
+            } else if (wType != 0) {
                 // Server-driven weather (SMSG_WEATHER) — authoritative
                 if (wType == 1)      weather->setWeatherType(Weather::Type::RAIN);
                 else if (wType == 2) weather->setWeatherType(Weather::Type::SNOW);
@@ -1440,8 +1449,9 @@ void Renderer::update(float deltaTime) {
             zctx.tileY = tile.y;
             zctx.hasTile = true;
         }
-        const auto* gh2 = core::Application::getInstance().getGameHandler();
-        zctx.serverZoneId = gh2 ? gh2->getWorldStateZoneId() : 0;
+        // Use the precise MCNK area classification when available; this avoids
+        // stale server world-state zones and whole-ADT ambiguity at river banks.
+        zctx.serverZoneId = getCurrentZoneId();
         zctx.zoneManager = zoneManager.get();
         audioCoordinator_->updateZoneAudio(zctx);
     }

@@ -112,9 +112,10 @@ void AudioCoordinator::updateZoneAudio(const ZoneAudioContext& ctx) {
     const uint32_t tileZoneId = (zm && ctx.hasTile)
         ? zm->getZoneId(ctx.tileX, ctx.tileY)
         : 0;
-    uint32_t zoneId = (tileZoneId == 10)
-        ? tileZoneId
-        : (ctx.serverZoneId != 0 ? ctx.serverZoneId : tileZoneId);
+    const uint32_t serverZoneId = (zm && ctx.serverZoneId != 0)
+        ? zm->resolveAreaZoneId(ctx.serverZoneId)
+        : ctx.serverZoneId;
+    uint32_t zoneId = serverZoneId != 0 ? serverZoneId : tileZoneId;
 
     // ── Ambient weather audio sync ──
     if (ambientSoundManager_) {

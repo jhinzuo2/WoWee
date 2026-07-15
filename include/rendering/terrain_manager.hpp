@@ -265,6 +265,9 @@ public:
      */
     std::optional<float> getHeightAt(float glX, float glY) const;
 
+    /** Get the precise MCNK AreaTable ID at a world position. */
+    std::optional<uint32_t> getAreaIdAt(float glX, float glY) const;
+
     // Collision queries using WOC data (custom zones)
     bool isPositionWalkable(float glX, float glY) const;
     uint8_t getCollisionFlags(float glX, float glY) const;

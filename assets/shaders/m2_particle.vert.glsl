@@ -20,6 +20,7 @@ layout(location = 3) in float aTile;
 
 layout(location = 0) out vec4 vColor;
 layout(location = 1) out float vTile;
+layout(location = 2) out float vFogVisibility;
 
 void main() {
     vec4 viewPos4 = view * vec4(aPos, 1.0);
@@ -27,5 +28,8 @@ void main() {
     gl_PointSize = clamp(aSize * 500.0 / max(dist, 1.0), 1.0, 128.0);
     vColor = aColor;
     vTile = aTile;
+    float worldDist = length(viewPos.xyz - aPos);
+    float fogRange = max(fogParams.y - fogParams.x, 0.001);
+    vFogVisibility = clamp((fogParams.y - worldDist) / fogRange, 0.0, 1.0);
     gl_Position = projection * viewPos4;
 }

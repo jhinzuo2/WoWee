@@ -188,6 +188,7 @@ private:
     bool wasSwimming_ = false;
     bool initialized_ = false;
     WeatherType currentWeather_ = WeatherType::NONE;
+    uint32_t currentZoneId_ = 0;
     ZoneType currentZone_ = ZoneType::NONE;
     CityType currentCity_ = CityType::NONE;
 
