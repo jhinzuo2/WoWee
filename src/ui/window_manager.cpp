@@ -1312,6 +1312,18 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
             };
             uint32_t playerLevel = gameHandler.getPlayerLevel();
 
+            // A recipe/spell may require a minimum skill value (e.g. Cooking 50).
+            // The server encodes this in reqSkill/reqSkillValue and reports the
+            // spell as unavailable (state=1) until the value is reached. Check it
+            // against the player's own skills so we don't promote a skill-gated
+            // recipe to a green "Train" button the server will reject.
+            auto skillMet = [&](const game::TrainerSpell& spell) {
+                if (spell.reqSkill == 0 || spell.reqSkillValue == 0) return true;
+                const auto& skills = gameHandler.getPlayerSkills();
+                auto it = skills.find(spell.reqSkill);
+                return it != skills.end() && it->second.effectiveValue() >= spell.reqSkillValue;
+            };
+
             // Renders spell rows into the current table
             auto renderSpellRows = [&](const std::vector<const game::TrainerSpell*>& spells) {
                 for (const auto* spell : spells) {
@@ -1325,8 +1337,9 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
 
                     // Dynamically determine effective state based on current prerequisites
                     // Server sends state, but we override if prerequisites are now met
+                    bool reqSkillMet = skillMet(*spell);
                     uint8_t effectiveState = spell->state;
-                    if (spell->state == 1 && prereqsMet && levelMet) {
+                    if (spell->state == 1 && prereqsMet && levelMet && reqSkillMet) {
                         // Server said unavailable, but we now meet all requirements
                         effectiveState = 0;  // Treat as available
                     }
@@ -1427,7 +1440,19 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
                             ImVec4 lvlColor = levelMet ? ui::colors::kLightGray : kColorRed;
                             ImGui::TextColored(lvlColor, "Required Level: %u", spell->reqLevel);
                         }
-                        if (spell->reqSkill > 0) ImGui::Text("Required Skill: %u (value %u)", spell->reqSkill, spell->reqSkillValue);
+                        if (spell->reqSkill > 0 && spell->reqSkillValue > 0) {
+                            const auto& skills = gameHandler.getPlayerSkills();
+                            auto skIt = skills.find(spell->reqSkill);
+                            uint16_t curSkill = (skIt != skills.end()) ? skIt->second.effectiveValue() : 0;
+                            const std::string& skName = gameHandler.getSkillName(spell->reqSkill);
+                            ImVec4 skColor = reqSkillMet ? ui::colors::kLightGray : kColorRed;
+                            if (!skName.empty())
+                                ImGui::TextColored(skColor, "Requires %s %u (you have %u)",
+                                    skName.c_str(), spell->reqSkillValue, curSkill);
+                            else
+                                ImGui::TextColored(skColor, "Required Skill: %u (need %u, have %u)",
+                                    spell->reqSkill, spell->reqSkillValue, curSkill);
+                        }
                         auto showPrereq = [&](uint32_t node) {
                             if (node == 0) return;
                             bool met = isKnown(node);
@@ -1576,7 +1601,7 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
                 bool levelMet = (spell.reqLevel == 0 || playerLevel >= spell.reqLevel);
                 bool alreadyKnown = isKnown(spell.spellId);
                 uint8_t effectiveState = spell.state;
-                if (spell.state == 1 && prereqsMet && levelMet) effectiveState = 0;
+                if (spell.state == 1 && prereqsMet && levelMet && skillMet(spell)) effectiveState = 0;
                 bool canTrain = !alreadyKnown && effectiveState == 0
                                && prereqsMet && levelMet
                                && (money >= spell.spellCost);
@@ -1611,7 +1636,7 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
                     bool levelMet = (spell.reqLevel == 0 || playerLevel >= spell.reqLevel);
                     bool alreadyKnown = isKnown(spell.spellId);
                     uint8_t effectiveState = spell.state;
-                    if (spell.state == 1 && prereqsMet && levelMet) effectiveState = 0;
+                    if (spell.state == 1 && prereqsMet && levelMet && skillMet(spell)) effectiveState = 0;
                     bool canTrain = !alreadyKnown && effectiveState == 0
                                    && prereqsMet && levelMet
                                    && (money >= spell.spellCost);

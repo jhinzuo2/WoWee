@@ -3852,15 +3852,18 @@ void InventoryHandler::handleTrainerBuyFailed(network::Packet& packet) {
     std::string msg = "Cannot learn ";
     if (!spellName.empty()) msg += spellName;
     else msg += "spell #" + std::to_string(spellId);
-    if (errorCode == 0) msg += " (not enough money)";
-    else if (errorCode == 1) msg += " (not enough skill)";
-    else if (errorCode == 2) msg += " (already known)";
-    else if (errorCode != 0) msg += " (error " + std::to_string(errorCode) + ")";
+    // SMSG_TRAINER_BUY_FAILED reason codes (WoW 3.3.5a):
+    //   0 = trainer service unavailable / cannot learn (requirements unmet, e.g. skill too low)
+    //   1 = not enough money
+    //   2 = does not meet requirements (class/race/level/skill)
+    if (errorCode == 1) msg += " (not enough money)";
+    else if (errorCode == 2) msg += " (requirements not met)";
+    else msg += " (requirements not met)";
     owner_.addUIError(msg);
     owner_.addSystemChatMessage(msg);
     if (auto* ac = owner_.services().audioCoordinator)
         if (auto* sfx = ac->getUiSoundManager()) sfx->playError();
-    if (errorCode == 0)
+    if (errorCode == 1)
         owner_.playErrorSpeech(audio::PlayerErrorSpeech::NOT_ENOUGH_MONEY);
     else
         owner_.playErrorSpeech(audio::PlayerErrorSpeech::CANT_LEARN_SPELL);
