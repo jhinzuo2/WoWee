@@ -475,6 +475,18 @@ void Renderer::updatePerFrameUBO() {
     float shadowBias = glm::clamp(0.8f * (shadowDistance_ / 300.0f), 0.0f, 1.0f);
     currentFrameData.shadowParams = glm::vec4(shadowsEnabled ? 1.0f : 0.0f, shadowBias, 0.0f, 0.0f);
 
+    for (uint32_t i = 0; i < MAX_LOCAL_LIGHTS; ++i) {
+        currentFrameData.localLightPosRadius[i] = glm::vec4(0.0f);
+        currentFrameData.localLightColorIntensity[i] = glm::vec4(0.0f);
+    }
+    const uint32_t localLightCount = m2Renderer
+        ? m2Renderer->gatherLocalLights(camera->getPosition(),
+              currentFrameData.localLightPosRadius,
+              currentFrameData.localLightColorIntensity,
+              MAX_LOCAL_LIGHTS)
+        : 0;
+    currentFrameData.localLightMeta = glm::ivec4(static_cast<int32_t>(localLightCount), 0, 0, 0);
+
     // Player water ripple data: pack player XY into shadowParams.zw, ripple strength into fogParams.w
     if (cameraController) {
         currentFrameData.shadowParams.z = characterPosition.x;

@@ -325,6 +325,12 @@ public:
     void dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, const Camera& camera);
     void render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const Camera& camera);
 
+    /** Gather the nearest authored glow cards as inexpensive scene point lights. */
+    uint32_t gatherLocalLights(const glm::vec3& cameraPos,
+                               glm::vec4* outPosRadius,
+                               glm::vec4* outColorIntensity,
+                               uint32_t maxLights) const;
+
     /** Set the HiZ system for occlusion culling (Phase 6.3). nullptr disables HiZ. */
     void setHiZSystem(HiZSystem* hiz) { hizSystem_ = hiz; }
     void setForceNoCull(bool v) { forceNoCull_ = v; }
@@ -571,7 +577,7 @@ private:
     VmaAllocation m2ParticleVBAlloc_ = VK_NULL_HANDLE;
     void* m2ParticleVBMapped_ = nullptr;
     // Dedicated glow sprite vertex buffer (separate from particle VB to avoid data race)
-    static constexpr size_t MAX_GLOW_SPRITES = 2000;
+    static constexpr size_t MAX_GLOW_SPRITES = 8000;
     ::VkBuffer glowVB_ = VK_NULL_HANDLE;
     VmaAllocation glowVBAlloc_ = VK_NULL_HANDLE;
     void* glowVBMapped_ = nullptr;

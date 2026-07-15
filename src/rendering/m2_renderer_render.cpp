@@ -1158,13 +1158,6 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     if (!model.isGroundDetail && batch.submeshLevel != lod) continue;
                     if (batch.batchOpacity < 0.01f) continue;
 
-                    // Opaque gate — skip transparent batches
-                    const bool rawTransparent = (batch.blendMode >= 2) || model.isSpellEffect;
-                    if (rawTransparent) continue;
-
-                    // Particle-dominant effects: emission geometry — skip opaque
-                    if (particleDominantEffect && batch.blendMode <= 1) continue;
-
                     // Glow sprite check (per model+batch, sprites generated per instance)
                     const bool koboldFlameCard = batch.colorKeyBlack && model.isKoboldFlame;
                     const bool smallCardLikeBatch =
@@ -1173,7 +1166,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     const bool batchUnlit = (batch.materialFlags & 0x01) != 0;
                     const bool shouldUseGlowSprite =
                         !koboldFlameCard &&
-                        (model.isElvenLike || (model.isLanternLike && batch.lanternGlowHint)) &&
+                        (model.isElvenLike || ((model.isLanternLike || model.isTorch) && batch.lanternGlowHint)) &&
                         !model.isSpellEffect &&
                         smallCardLikeBatch &&
                         (batch.lanternGlowHint ||
@@ -1183,33 +1176,41 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                         // Generate glow sprites for each instance in the group
                         for (size_t j = lodIdx; j < lodEnd; j++) {
                             auto& inst = instances[pending[j].instanceIdx];
-                            float distSq = sortedVisible_[visStart].distSq; // approximate with group
-                            if (distSq < 180.0f * 180.0f) {
-                                glm::vec3 worldPos = glm::vec3(inst.modelMatrix * glm::vec4(batch.center, 1.0f));
-                                GlowSprite gs;
-                                gs.worldPos = worldPos;
-                                if (batch.glowTint == 1 || model.isElvenLike)
-                                    gs.color = glm::vec4(0.48f, 0.72f, 1.0f, 1.05f);
-                                else if (batch.glowTint == 2)
-                                    gs.color = glm::vec4(1.0f, 0.28f, 0.22f, 1.10f);
-                                else
-                                    gs.color = glm::vec4(1.0f, 0.82f, 0.46f, 1.15f);
-                                gs.size = batch.glowSize * inst.scale * 1.45f;
-                                glowSprites_.push_back(gs);
-                                GlowSprite halo = gs;
-                                halo.color.a *= 0.42f;
-                                halo.size *= 1.8f;
-                                glowSprites_.push_back(halo);
-                            }
+                            glm::vec3 worldPos = glm::vec3(inst.modelMatrix * glm::vec4(batch.center, 1.0f));
+                            GlowSprite gs;
+                            gs.worldPos = worldPos;
+                            if (batch.glowTint == 1 || model.isElvenLike)
+                                gs.color = glm::vec4(0.48f, 0.72f, 1.0f, 1.05f);
+                            else if (batch.glowTint == 2)
+                                gs.color = glm::vec4(1.0f, 0.28f, 0.22f, 1.10f);
+                            else
+                                gs.color = glm::vec4(1.0f, 0.82f, 0.46f, 1.15f);
+                            // Match the parent M2's distance fade instead of a separate
+                            // hard 180-unit cutoff, which made tunnel lights pop on.
+                            gs.color.a *= pending[j].fadeAlpha;
+                            gs.size = batch.glowSize * inst.scale * 1.45f;
+                            glowSprites_.push_back(gs);
+                            GlowSprite halo = gs;
+                            halo.color.a *= 0.42f;
+                            halo.size *= 1.8f;
+                            glowSprites_.push_back(halo);
                         }
                         const bool cardLikeSkipMesh =
-                            (batch.blendMode >= 3) || batch.colorKeyBlack || batchUnlit;
+                            batch.glowCardLike || (batch.blendMode >= 3) || batch.colorKeyBlack || batchUnlit;
                         const bool lanternGlowCardSkip =
-                            model.isLanternLike && batch.lanternGlowHint &&
+                            (model.isLanternLike || model.isTorch) && batch.lanternGlowHint &&
                             smallCardLikeBatch && cardLikeSkipMesh;
                         if (lanternGlowCardSkip || (cardLikeSkipMesh && !model.isLanternLike))
                             continue;
                     }
+
+                    // Opaque gate — transparent glow cards were handled above so their
+                    // sprites are generated before the mesh moves to pass 2.
+                    const bool rawTransparent = (batch.blendMode >= 2) || model.isSpellEffect;
+                    if (rawTransparent) continue;
+
+                    // Particle-dominant effects: emission geometry — skip opaque
+                    if (particleDominantEffect && batch.blendMode <= 1) continue;
 
                     // Handle texture animation: if this batch has per-instance uvOffset,
                     // write a separate SSBO range with the correct offsets.
@@ -1417,15 +1418,15 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                 (batch.lanternGlowHint && batch.glowSize <= 6.0f);
             const bool shouldUseGlowSprite =
                 !koboldFlameCard &&
-                (model.isElvenLike || model.isLanternLike) &&
+                (model.isElvenLike || model.isLanternLike || model.isTorch) &&
                 !model.isSpellEffect &&
                 smallCardLikeBatch &&
                 (batch.lanternGlowHint || (batch.blendMode >= 3) ||
                  (batch.colorKeyBlack && batchUnlit && batch.blendMode >= 1));
             if (shouldUseGlowSprite) {
-                const bool cardLikeSkipMesh = (batch.blendMode >= 3) || batch.colorKeyBlack || batchUnlit;
+                const bool cardLikeSkipMesh = batch.glowCardLike || (batch.blendMode >= 3) || batch.colorKeyBlack || batchUnlit;
                 const bool lanternGlowCardSkip =
-                    model.isLanternLike &&
+                    (model.isLanternLike || model.isTorch) &&
                     batch.lanternGlowHint &&
                     smallCardLikeBatch &&
                     cardLikeSkipMesh;

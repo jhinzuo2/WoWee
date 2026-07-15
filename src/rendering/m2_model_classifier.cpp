@@ -69,7 +69,8 @@ M2ClassificationResult classifyM2Model(
     r.isWaterfall       = has(n, "waterfall");
 
     r.isElvenLike   = has(n, "elf")     || has(n, "elven") || has(n, "quel");
-    r.isLanternLike = has(n, "lantern") || has(n, "lamp")  || has(n, "light");
+    r.isLanternLike = has(n, "lantern") || has(n, "lamp")  || has(n, "light")
+                    || has(n, "sconce");
     r.isKoboldFlame = has(n, "kobold")
                     && (has(n, "candle") || has(n, "torch") || has(n, "mine"));
 
@@ -307,6 +308,7 @@ M2BatchTexClassification classifyBatchTexture(const std::string& lowerTexKey)
     r.hasGlowToken     = hasAny(lowerTexKey, kGlowTokens);
     r.hasFlameToken    = hasAny(lowerTexKey, kFlameTokens);
     r.hasGlowCardToken = hasAny(lowerTexKey, kGlowCardTokens);
+    if (r.exactLanternGlowTex) r.hasGlowCardToken = true;
     r.likelyFlame      = hasAny(lowerTexKey, kLikelyFlameTokens);
     r.lanternFamily    = hasAny(lowerTexKey, kLanternFamilyTokens);
     r.glowTint         = hasAny(lowerTexKey, kCoolTintTokens) ? 1
