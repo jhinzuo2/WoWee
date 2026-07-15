@@ -4,6 +4,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <cctype>
+#include <filesystem>
 #include <string>
 #include <SDL2/SDL.h>
 #ifdef __APPLE__
@@ -81,6 +82,34 @@ static wowee::core::LogLevel readLogLevelFromEnv() {
     return wowee::core::LogLevel::WARNING;
 }
 
+#ifdef __APPLE__
+static void selectMacUserDataPath() {
+    if (std::getenv("WOW_DATA_PATH")) return;
+
+    const char* home = std::getenv("HOME");
+    if (!home || !*home) return;
+
+    namespace fs = std::filesystem;
+    const fs::path dataRoot = fs::path(home) / "Library/Application Support/Wowee/Data";
+    std::error_code ec;
+    bool hasManifest = fs::is_regular_file(dataRoot / "manifest.json", ec);
+
+    const fs::path expansions = dataRoot / "expansions";
+    if (!hasManifest && fs::is_directory(expansions, ec)) {
+        for (fs::directory_iterator it(expansions, ec), end; it != end && !ec; it.increment(ec)) {
+            if (fs::is_regular_file(it->path() / "manifest.json", ec)) {
+                hasManifest = true;
+                break;
+            }
+        }
+    }
+
+    if (hasManifest) {
+        setenv("WOW_DATA_PATH", dataRoot.c_str(), 0);
+    }
+}
+#endif
+
 int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
 #ifdef __linux__
     g_emergencyDisplay = XOpenDisplay(nullptr);
@@ -113,6 +142,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char* argv[]) {
         _NSGetExecutablePath(exePath.data(), &bufSize);
         if (chdir(dirname(exePath.data())) != 0) {}
     }
+    selectMacUserDataPath();
 #elif defined(__linux__)
     {
         char buf[4096];

@@ -136,16 +136,42 @@ jobs:
     - name: Build
       run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
 
+    - name: Configure Developer ID signing
+      env:
+        APPLE_CERT_P12: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+        APPLE_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+        APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY }}
+      run: |
+        if [ -z "${APPLE_CERT_P12}" ] || [ -z "${APPLE_CERT_PASSWORD}" ] || \
+           [ -z "${APPLE_SIGNING_IDENTITY}" ]; then
+          echo "MACOS_SIGNING_ENABLED=false" >> "${GITHUB_ENV}"
+          echo "::warning::Apple Developer ID secrets are absent; using ad-hoc signing."
+          exit 0
+        fi
+
+        KEYCHAIN_PATH="${RUNNER_TEMP}/wowee-signing.keychain-db"
+        KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+        printf '%s' "${APPLE_CERT_P12}" | base64 -D \
+          > "${RUNNER_TEMP}/developer-id.p12"
+        security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+        security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security import "${RUNNER_TEMP}/developer-id.p12" \
+          -k "${KEYCHAIN_PATH}" -P "${APPLE_CERT_PASSWORD}" -A -t cert -f pkcs12
+        security set-key-partition-list -S apple-tool:,apple: -s \
+          -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security list-keychain -d user -s "${KEYCHAIN_PATH}"
+        echo "MACOS_SIGNING_ENABLED=true" >> "${GITHUB_ENV}"
+        echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY}" >> "${GITHUB_ENV}"
+
     - name: Create .app bundle
       run: |
         TAG="${GITHUB_REF_NAME}"
         VERSION="${TAG#v}"
         VERSION="${VERSION%%-*}"
         mkdir -p Wowee.app/Contents/{MacOS,Frameworks,Resources}
-
-        # Wrapper launch script selects the user's writable extraction when present.
-        cp tools/macos/wowee_launcher.sh Wowee.app/Contents/MacOS/wowee
-        chmod +x Wowee.app/Contents/MacOS/wowee
+        bash tools/macos/create_icns.sh assets/Wowee.png \
+          Wowee.app/Contents/Resources/Wowee.icns
 
         # Actual binary
         cp build/bin/wowee Wowee.app/Contents/MacOS/wowee_bin
@@ -213,9 +239,10 @@ jobs:
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0"><dict>
-          <key>CFBundleExecutable</key><string>wowee</string>
+          <key>CFBundleExecutable</key><string>wowee_bin</string>
           <key>CFBundleIdentifier</key><string>com.wowee.app</string>
           <key>CFBundleName</key><string>Wowee</string>
+          <key>CFBundleIconFile</key><string>Wowee</string>
           <key>CFBundleVersion</key><string>${GITHUB_RUN_NUMBER}</string>
           <key>CFBundleShortVersionString</key><string>${VERSION}</string>
           <key>CFBundlePackageType</key><string>APPL</string>
@@ -223,12 +250,22 @@ jobs:
         </dict></plist>
         EOF
 
-        # Ad-hoc codesign
-        codesign --force --deep --sign - Wowee.app
+        # Build a visible, independently signed extraction launcher.
+        bash tools/macos/create_asset_extractor_app.sh \
+          "Wowee Asset Extractor.app" "${VERSION}" \
+          Wowee.app/Contents/Resources/Wowee.icns
+
+        IDENTITY="-"
+        if [ "${MACOS_SIGNING_ENABLED}" = "true" ]; then
+          IDENTITY="${APPLE_SIGNING_IDENTITY}"
+        fi
+        bash tools/macos/sign_app.sh Wowee.app "${IDENTITY}"
+        bash tools/macos/sign_app.sh "Wowee Asset Extractor.app" "${IDENTITY}"
 
     - name: Verify bundled dylibs
       run: |
         bash tools/macos/verify_bundle.sh Wowee.app arm64
+        codesign --verify --deep --strict --verbose=2 "Wowee Asset Extractor.app"
 
     - name: Create DMG
       run: |
@@ -236,13 +273,36 @@ jobs:
         rm -rf dmg-root
         mkdir dmg-root
         mv Wowee.app dmg-root/
-        cp tools/macos/extract_assets.command "dmg-root/Extract Assets.command"
+        mv "Wowee Asset Extractor.app" dmg-root/
         cp tools/macos/ASSET_EXTRACTION_README.txt \
           "dmg-root/README - Asset Extraction.txt"
-        chmod +x "dmg-root/Extract Assets.command"
         ln -s /Applications dmg-root/Applications
         hdiutil create -volname Wowee -srcfolder dmg-root -ov -format UDZO \
           "wowee-${TAG}-macos-arm64.dmg"
+
+    - name: Notarize and staple DMG
+      env:
+        APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+        APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      run: |
+        if [ "${MACOS_SIGNING_ENABLED}" != "true" ] || \
+           [ -z "${APPLE_NOTARY_KEY}" ] || [ -z "${APPLE_NOTARY_KEY_ID}" ] || \
+           [ -z "${APPLE_NOTARY_ISSUER_ID}" ]; then
+          echo "::warning::Notarization credentials are absent; DMG cannot be stapled."
+          exit 0
+        fi
+
+        DMG="wowee-${GITHUB_REF_NAME}-macos-arm64.dmg"
+        printf '%s' "${APPLE_NOTARY_KEY}" | base64 -D \
+          > "${RUNNER_TEMP}/AuthKey.p8"
+        xcrun notarytool submit "${DMG}" \
+          --key "${RUNNER_TEMP}/AuthKey.p8" \
+          --key-id "${APPLE_NOTARY_KEY_ID}" \
+          --issuer "${APPLE_NOTARY_ISSUER_ID}" \
+          --wait --timeout 30m
+        xcrun stapler staple "${DMG}"
+        xcrun stapler validate "${DMG}"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -282,13 +342,29 @@ jobs:
         # whose signatures the older cached keyring rejects ("unknown trust"),
         # breaking setup after MSYS2 rotates signing keys.
         cache: false
-        install: >-
-          ${{ matrix.prefix }}-cmake ${{ matrix.arch == 'x86-64' && format('{0}-gcc', matrix.prefix) || format('{0}-clang', matrix.prefix) }} ${{ matrix.prefix }}-ninja ${{ matrix.prefix }}-pkgconf ${{ matrix.prefix }}-SDL2 ${{ matrix.prefix }}-glm ${{ matrix.prefix }}-openssl ${{ matrix.prefix }}-zlib ${{ matrix.prefix }}-ffmpeg ${{ matrix.prefix }}-unicorn ${{ matrix.prefix }}-vulkan-loader ${{ matrix.prefix }}-vulkan-headers ${{ matrix.prefix }}-shaderc ${{ matrix.prefix }}-libtommath ${{ matrix.prefix }}-libtomcrypt git
 
-    - name: Install optional packages
+    - name: Install dependencies with mirror retry
       shell: msys2 {0}
+      env:
+        PREFIX: ${{ matrix.prefix }}
+        COMPILER_PACKAGE: ${{ matrix.arch == 'x86-64' && format('{0}-gcc', matrix.prefix) || format('{0}-clang', matrix.prefix) }}
       run: |
-        pacman -S --noconfirm --needed zip
+        packages=(
+          "${PREFIX}-cmake" "${COMPILER_PACKAGE}" "${PREFIX}-ninja"
+          "${PREFIX}-pkgconf" "${PREFIX}-SDL2" "${PREFIX}-glm"
+          "${PREFIX}-openssl" "${PREFIX}-zlib" "${PREFIX}-ffmpeg"
+          "${PREFIX}-unicorn" "${PREFIX}-vulkan-loader"
+          "${PREFIX}-vulkan-headers" "${PREFIX}-shaderc"
+          "${PREFIX}-libtommath" "${PREFIX}-libtomcrypt" git zip
+        )
+        for attempt in 1 2 3; do
+          if pacman -S --noconfirm --needed "${packages[@]}"; then
+            exit 0
+          fi
+          echo "MSYS2 package download failed on attempt ${attempt}; retrying..."
+          sleep $((attempt * 10))
+        done
+        exit 1
 
     - name: Build StormLib from source
       shell: msys2 {0}

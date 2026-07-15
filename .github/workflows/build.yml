@@ -182,13 +182,39 @@ jobs:
     - name: Run tests
       run: cd build && ctest --output-on-failure
 
+    - name: Configure Developer ID signing
+      env:
+        APPLE_CERT_P12: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+        APPLE_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+        APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY }}
+      run: |
+        if [ -z "${APPLE_CERT_P12}" ] || [ -z "${APPLE_CERT_PASSWORD}" ] || \
+           [ -z "${APPLE_SIGNING_IDENTITY}" ]; then
+          echo "MACOS_SIGNING_ENABLED=false" >> "${GITHUB_ENV}"
+          echo "::warning::Apple Developer ID secrets are absent; using ad-hoc signing."
+          exit 0
+        fi
+
+        KEYCHAIN_PATH="${RUNNER_TEMP}/wowee-signing.keychain-db"
+        KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+        printf '%s' "${APPLE_CERT_P12}" | base64 -D \
+          > "${RUNNER_TEMP}/developer-id.p12"
+        security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+        security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security import "${RUNNER_TEMP}/developer-id.p12" \
+          -k "${KEYCHAIN_PATH}" -P "${APPLE_CERT_PASSWORD}" -A -t cert -f pkcs12
+        security set-key-partition-list -S apple-tool:,apple: -s \
+          -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security list-keychain -d user -s "${KEYCHAIN_PATH}"
+        echo "MACOS_SIGNING_ENABLED=true" >> "${GITHUB_ENV}"
+        echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY}" >> "${GITHUB_ENV}"
+
     - name: Create .app bundle
       run: |
         mkdir -p Wowee.app/Contents/{MacOS,Frameworks,Resources}
-
-        # Wrapper launch script selects the user's writable extraction when present.
-        cp tools/macos/wowee_launcher.sh Wowee.app/Contents/MacOS/wowee
-        chmod +x Wowee.app/Contents/MacOS/wowee
+        bash tools/macos/create_icns.sh assets/Wowee.png \
+          Wowee.app/Contents/Resources/Wowee.icns
 
         # Actual binary
         cp build/bin/wowee Wowee.app/Contents/MacOS/wowee_bin
@@ -253,9 +279,10 @@ jobs:
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0"><dict>
-          <key>CFBundleExecutable</key><string>wowee</string>
+          <key>CFBundleExecutable</key><string>wowee_bin</string>
           <key>CFBundleIdentifier</key><string>com.wowee.app</string>
           <key>CFBundleName</key><string>Wowee</string>
+          <key>CFBundleIconFile</key><string>Wowee</string>
           <key>CFBundleVersion</key><string>1.0.0</string>
           <key>CFBundleShortVersionString</key><string>1.0.0</string>
           <key>CFBundlePackageType</key><string>APPL</string>
@@ -263,12 +290,22 @@ jobs:
         </dict></plist>
         EOF
 
-        # Ad-hoc codesign (allows running on the local machine)
-        codesign --force --deep --sign - Wowee.app
+        # Build a visible, independently signed extraction launcher.
+        bash tools/macos/create_asset_extractor_app.sh \
+          "Wowee Asset Extractor.app" "1.0.0" \
+          Wowee.app/Contents/Resources/Wowee.icns
+
+        IDENTITY="-"
+        if [ "${MACOS_SIGNING_ENABLED}" = "true" ]; then
+          IDENTITY="${APPLE_SIGNING_IDENTITY}"
+        fi
+        bash tools/macos/sign_app.sh Wowee.app "${IDENTITY}"
+        bash tools/macos/sign_app.sh "Wowee Asset Extractor.app" "${IDENTITY}"
 
     - name: Verify bundled dylibs
       run: |
         bash tools/macos/verify_bundle.sh Wowee.app arm64
+        codesign --verify --deep --strict --verbose=2 "Wowee Asset Extractor.app"
 
     - name: Create DMG
       run: |
@@ -277,10 +314,9 @@ jobs:
         rm -rf dmg-root
         mkdir dmg-root
         mv Wowee.app dmg-root/
-        cp tools/macos/extract_assets.command "dmg-root/Extract Assets.command"
+        mv "Wowee Asset Extractor.app" dmg-root/
         cp tools/macos/ASSET_EXTRACTION_README.txt \
           "dmg-root/README - Asset Extraction.txt"
-        chmod +x "dmg-root/Extract Assets.command"
         ln -s /Applications dmg-root/Applications
         # CI runners can occasionally leave a mounted volume around; detach if present.
         if [ -d "/Volumes/Wowee" ]; then
@@ -305,6 +341,29 @@ jobs:
           echo "Failed to create Wowee.dmg after retries."
           exit 1
         fi
+
+    - name: Notarize and staple DMG
+      env:
+        APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+        APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      run: |
+        if [ "${MACOS_SIGNING_ENABLED}" != "true" ] || \
+           [ -z "${APPLE_NOTARY_KEY}" ] || [ -z "${APPLE_NOTARY_KEY_ID}" ] || \
+           [ -z "${APPLE_NOTARY_ISSUER_ID}" ]; then
+          echo "::warning::Notarization credentials are absent; DMG cannot be stapled."
+          exit 0
+        fi
+
+        printf '%s' "${APPLE_NOTARY_KEY}" | base64 -D \
+          > "${RUNNER_TEMP}/AuthKey.p8"
+        xcrun notarytool submit Wowee.dmg \
+          --key "${RUNNER_TEMP}/AuthKey.p8" \
+          --key-id "${APPLE_NOTARY_KEY_ID}" \
+          --issuer "${APPLE_NOTARY_ISSUER_ID}" \
+          --wait --timeout 30m
+        xcrun stapler staple Wowee.dmg
+        xcrun stapler validate Wowee.dmg
 
     - name: Upload DMG
       uses: actions/upload-artifact@v4

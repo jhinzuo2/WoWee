@@ -16,15 +16,19 @@ finish() {
 }
 trap finish EXIT
 
-LAUNCHER_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_PATH="${LAUNCHER_DIR}/Wowee.app"
+DIST_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+APP_PATH="${DIST_ROOT}/Wowee.app"
+if [ ! -d "${APP_PATH}" ] && [ -d "/Applications/Wowee.app" ]; then
+    APP_PATH="/Applications/Wowee.app"
+fi
+
 EXTRACTOR="${APP_PATH}/Contents/MacOS/asset_extract"
 BUNDLED_DATA="${APP_PATH}/Contents/MacOS/Data"
 OUTPUT_ROOT="${HOME}/Library/Application Support/Wowee/Data"
 
 if [ ! -x "${EXTRACTOR}" ]; then
     echo "Could not find the bundled asset extractor."
-    echo "Keep Extract Assets.command beside Wowee.app and try again."
+    echo "Keep Wowee Asset Extractor.app beside Wowee.app, or install Wowee.app in /Applications."
     exit 1
 fi
 

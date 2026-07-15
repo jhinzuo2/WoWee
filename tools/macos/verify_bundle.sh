@@ -89,7 +89,42 @@ while IFS= read -r -d '' owner; do
                 resolved="$(dirname "${owner}")/${dep#@loader_path/}"
                 ;;
             @rpath/*)
-                resolved="${FRAMEWORKS_DIR}/${dep#@rpath/}"
+                suffix="${dep#@rpath/}"
+                resolved=""
+                while IFS= read -r rpath; do
+                    case "${rpath}" in
+                        @executable_path)
+                            candidate="${MACOS_DIR}/${suffix}"
+                            ;;
+                        @executable_path/*)
+                            candidate="${MACOS_DIR}/${rpath#@executable_path/}/${suffix}"
+                            ;;
+                        @loader_path)
+                            candidate="$(dirname "${owner}")/${suffix}"
+                            ;;
+                        @loader_path/*)
+                            candidate="$(dirname "${owner}")/${rpath#@loader_path/}/${suffix}"
+                            ;;
+                        /*)
+                            candidate="${rpath}/${suffix}"
+                            ;;
+                        *)
+                            continue
+                            ;;
+                    esac
+                    if [ -e "${candidate}" ]; then
+                        resolved="${candidate}"
+                        break
+                    fi
+                done < <(otool -l "${owner}" | awk '
+                    $1 == "cmd" && $2 == "LC_RPATH" { in_rpath=1; next }
+                    in_rpath && $1 == "path" { print $2; in_rpath=0 }
+                ')
+                if [ -z "${resolved}" ]; then
+                    echo "ERROR: ${owner} has no LC_RPATH resolving dependency: ${dep}" >&2
+                    missing=$((missing + 1))
+                    continue
+                fi
                 ;;
             /*)
                 echo "ERROR: ${owner} retains non-system absolute dependency: ${dep}" >&2

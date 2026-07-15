@@ -48,6 +48,12 @@ def rpaths(binary: pathlib.Path) -> list[str]:
     return found
 
 
+def ensure_rpath(binary: pathlib.Path, wanted: str) -> None:
+    if wanted not in rpaths(binary):
+        run("install_name_tool", "-add_rpath", wanted, str(binary))
+        print(f"Added LC_RPATH {wanted} to {binary.name}")
+
+
 class Bundler:
     def __init__(
         self, app: pathlib.Path, search_dirs: list[pathlib.Path]
@@ -133,6 +139,14 @@ class Bundler:
             if not owner.is_file():
                 raise RuntimeError(f"bundle root does not exist: {owner}")
             visited.add(owner)
+
+            # Every executable root needs a real path to the app Frameworks
+            # directory. Framework dylibs also get a loader-relative fallback
+            # so their own @rpath dependencies resolve when loaded indirectly.
+            if owner.parent == self.macos:
+                ensure_rpath(owner, "@executable_path/../Frameworks")
+            elif owner.parent == self.frameworks:
+                ensure_rpath(owner, "@loader_path")
 
             own_id = dylib_id(owner)
             if owner.parent == self.frameworks and own_id:
