@@ -658,8 +658,12 @@ void EntitySpawner::buildCreatureDisplayLookups() {
             uint32_t sexId = chg->getUInt32(i, chgL ? (*chgL)["SexID"] : 2);
             uint32_t variation = chg->getUInt32(i, chgL ? (*chgL)["Variation"] : 3);
             uint32_t geosetId = chg->getUInt32(i, chgL ? (*chgL)["GeosetID"] : 4);
+            // Showscalp/Bald means this style uses the default scalp instead
+            // of the extra hair-cap mesh. Ignoring it makes the cap physically
+            // poke through hair authored to expose the normal scalp.
+            const bool useDefaultScalp = chg->getFieldCount() > 5 && chg->getUInt32(i, 5) != 0;
             uint32_t key = (raceId << 16) | (sexId << 8) | variation;
-            hairGeosetMap_[key] = static_cast<uint16_t>(geosetId);
+            hairGeosetMap_[key] = static_cast<uint16_t>(useDefaultScalp ? 1 : geosetId);
         }
         LOG_INFO("Loaded ", hairGeosetMap_.size(), " hair geoset mappings from CharHairGeosets.dbc");
     }
@@ -1982,9 +1986,7 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
             uint16_t selectedFacial200 = 200;
             uint16_t selectedFacial300 = 300;
             uint16_t selectedFacial300Alt = 300;
-            bool wantsFacialHair = false;
             uint32_t equipChestGG = 0, equipLegsGG = 0, equipFeetGG = 0;
-            std::unordered_set<uint16_t> hairScalpGeosetsForRaceSex;
             if (itDisplayData != displayDataMap_.end() &&
                 itDisplayData->second.extraDisplayId != 0) {
                 auto itExtra = humanoidExtraMap_.find(itDisplayData->second.extraDisplayId);
@@ -2003,19 +2005,11 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                     uint32_t facialKey = (static_cast<uint32_t>(extraRaceId) << 16) |
                                          (static_cast<uint32_t>(extraSexId) << 8) |
                                          static_cast<uint32_t>(itExtra->second.facialHairId);
-                    wantsFacialHair = (itExtra->second.facialHairId != 0);
                     auto itFacial = facialHairGeosetMap_.find(facialKey);
                     if (itFacial != facialHairGeosetMap_.end()) {
                         selectedFacial200 = static_cast<uint16_t>(200 + itFacial->second.geoset200);
                         selectedFacial300 = static_cast<uint16_t>(300 + itFacial->second.geoset300);
                         selectedFacial300Alt = static_cast<uint16_t>(300 + itFacial->second.geoset200);
-                    }
-                    for (const auto& [k, v] : hairGeosetMap_) {
-                        uint8_t race = static_cast<uint8_t>((k >> 16) & 0xFF);
-                        uint8_t sex = static_cast<uint8_t>((k >> 8) & 0xFF);
-                        if (race == extraRaceId && sex == extraSexId && v > 0 && v < 100) {
-                            hairScalpGeosetsForRaceSex.insert(v);
-                        }
                     }
                     auto itemDisplayDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
                     const auto* idiL = pipeline::getActiveDBCLayout()
@@ -2118,7 +2112,7 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                 if (!hasRenderableCape && group == 16) continue;
                 // Group 0 can contain multiple scalp/hair meshes. Keep only the selected
                 // race/sex/style scalp to avoid overlapping broken hair.
-                if (hasHumanoidExtra && sid < 100 && hairScalpGeosetsForRaceSex.count(sid) > 0 && sid != selectedHairScalp) {
+                if (hasHumanoidExtra && sid < 100 && sid != 0 && sid != selectedHairScalp) {
                     continue;
                 }
                 // Group 1 contains connector variants that mirror scalp style.
@@ -2133,17 +2127,16 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                 }
                 // Group 2 facial variants: keep selected variant; fallback only if missing.
                 if (hasHumanoidExtra && group == 2) {
-                    if (!wantsFacialHair) {
-                        continue;
-                    }
-                    if (sid != selectedFacial200) {
-                        if (sid != 200 && sid != 201) {
-                            continue;
-                        }
-                        if (allGeosets.count(selectedFacial200) > 0) {
-                            continue;
+                    uint16_t resolvedFacial200 = selectedFacial200;
+                    if (allGeosets.count(resolvedFacial200) == 0) {
+                        if (allGeosets.count(201) > 0) resolvedFacial200 = 201;
+                        else if (allGeosets.count(200) > 0) resolvedFacial200 = 200;
+                        else {
+                            auto itFirst = firstByGroup.find(2);
+                            resolvedFacial200 = (itFirst != firstByGroup.end()) ? itFirst->second : 0;
                         }
                     }
+                    if (sid != resolvedFacial200) continue;
                 }
                 normalizedGeosets.insert(sid);
             }
@@ -2206,7 +2199,7 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
 
             // Some mustache/goatee variants are authored in facial group 3xx.
             // Re-add selected facial 3xx plus low-index facial fallbacks.
-            if (hasHumanoidExtra && wantsFacialHair) {
+            if (hasHumanoidExtra) {
                 // Prefer alt channel first (often chin-beard), then primary.
                 uint16_t facial300Sid = pickFromGroup(selectedFacial300Alt, 3);
                 if (facial300Sid == 0) facial300Sid = pickFromGroup(selectedFacial300, 3);
@@ -2215,6 +2208,14 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                     if (allGeosets.count(300) > 0) normalizedGeosets.insert(300);
                     else if (allGeosets.count(301) > 0) normalizedGeosets.insert(301);
                 }
+            }
+
+            // Night Elf NPC eyes require the model's eye overlay. Continue to
+            // strip it from other humanoids, but restore exactly one variant
+            // for the race that actually uses it.
+            if (hasHumanoidExtra && extraRaceId == 4) {
+                uint16_t eyeGlowSid = pickFromGroup(1701, 17);
+                if (eyeGlowSid != 0) normalizedGeosets.insert(eyeGlowSid);
             }
 
             // Prefer trousers geoset; use covered variant when legs armor exists.

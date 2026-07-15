@@ -61,7 +61,35 @@ void M2Instance::updateModelMatrix() {
 }
 
 void M2Instance::recomputeCachedCullFactors() {
-    float worldRadius = cachedBoundRadius * scale;
+    // Matrix instances (notably ADT tree doodads) can have an offset pivot and
+    // arbitrary scale. A sphere centered at the placement origin with the M2
+    // header radius can therefore exclude much of the visible canopy. Derive
+    // the render-cull sphere from transformed vertex bounds instead. The
+    // separate worldBounds fields intentionally remain collision bounds.
+    if (cachedModel) {
+        glm::vec3 visualMin(std::numeric_limits<float>::max());
+        glm::vec3 visualMax(std::numeric_limits<float>::lowest());
+        for (int x = 0; x < 2; ++x) {
+            for (int y = 0; y < 2; ++y) {
+                for (int z = 0; z < 2; ++z) {
+                    const glm::vec3 local(
+                        x ? cachedModel->boundMax.x : cachedModel->boundMin.x,
+                        y ? cachedModel->boundMax.y : cachedModel->boundMin.y,
+                        z ? cachedModel->boundMax.z : cachedModel->boundMin.z);
+                    const glm::vec3 world = glm::vec3(modelMatrix * glm::vec4(local, 1.0f));
+                    visualMin = glm::min(visualMin, world);
+                    visualMax = glm::max(visualMax, world);
+                }
+            }
+        }
+        cachedCullCenter = (visualMin + visualMax) * 0.5f;
+        cachedVisualRadius = glm::length(visualMax - visualMin) * 0.5f;
+    } else {
+        cachedCullCenter = position;
+        cachedVisualRadius = cachedBoundRadius * scale;
+    }
+
+    float worldRadius = cachedVisualRadius;
     float cullRadius = worldRadius;
     if (cachedDisableAnimation) cullRadius = std::max(cullRadius, 3.0f);
     float factor = std::max(1.0f, cullRadius / rendering::M2_CULL_RADIUS_SCALE_DIVISOR);

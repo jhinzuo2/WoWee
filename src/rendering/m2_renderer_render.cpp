@@ -470,7 +470,7 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
         }
         if (distSq > effectiveMaxDistSq) continue;
         float paddedRadius = instance.cachedPaddedRadius;
-        if (paddedRadius > 0.0f && !updateFrustum.intersectsSphere(instance.position, paddedRadius)) continue;
+        if (paddedRadius > 0.0f && !updateFrustum.intersectsSphere(instance.cachedCullCenter, paddedRadius)) continue;
 
         // LOD 3 skip: models beyond 150 units use the lowest LOD mesh which has
         // no visible skeletal animation.  Keep their last-computed bone matrices
@@ -728,7 +728,7 @@ void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, c
             if (i < prevFrameVisible_.size() && prevFrameVisible_[i] < 2)
                 flags |= 8u;
 
-            input[i].sphere = glm::vec4(inst.position, inst.cachedPaddedRadius);
+            input[i].sphere = glm::vec4(inst.cachedCullCenter, inst.cachedPaddedRadius);
             input[i].effectiveMaxDistSq = effectiveMaxDistSq;
             input[i].flags = flags;
         }
@@ -915,7 +915,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                 effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
                 if (distSq > effectiveMaxDistSq) continue;
                 float paddedRadius = instance.cachedPaddedRadius;
-                if (paddedRadius > 0.0f && !frustum.intersectsSphere(instance.position, paddedRadius)) continue;
+                if (paddedRadius > 0.0f && !frustum.intersectsSphere(instance.cachedCullCenter, paddedRadius)) continue;
             }
 
             if (instance.cachedIsSkyBird && instance.cachedHasAnimation && !instance.cachedDisableAnimation) {

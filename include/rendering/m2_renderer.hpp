@@ -221,6 +221,8 @@ struct M2Instance {
     bool cachedIsValid = false;
     bool skipCollision = false;    // WMO interior doodads — skip player wall collision
     float cachedBoundRadius = 0.0f;
+    glm::vec3 cachedCullCenter{0.0f};              // transformed visual-bounds center
+    float cachedVisualRadius = 0.0f;               // transformed visual-bounds half diagonal
     // Pre-computed per-instance cull factors (depend only on static flags + scale +
     // bound radius), populated by recomputeCachedCullFactors(). The per-frame SSBO
     // upload just multiplies by the smoothed render distance and packs the rest.

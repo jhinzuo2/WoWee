@@ -51,6 +51,7 @@ void M2Renderer::setInstancePosition(uint32_t instanceId, const glm::vec3& posit
         glm::vec3 localMin, localMax;
         getTightCollisionBounds(*inst.cachedModel, localMin, localMax);
         transformAABB(inst.modelMatrix, localMin, localMax, inst.worldBoundsMin, inst.worldBoundsMax);
+        inst.recomputeCachedCullFactors();
     }
 
     // Incrementally update spatial grid
@@ -159,6 +160,7 @@ void M2Renderer::setInstanceTransform(uint32_t instanceId, const glm::mat4& tran
         glm::vec3 localMin, localMax;
         getTightCollisionBounds(*inst.cachedModel, localMin, localMax);
         transformAABB(inst.modelMatrix, localMin, localMax, inst.worldBoundsMin, inst.worldBoundsMax);
+        inst.recomputeCachedCullFactors();
     }
 
     // Incrementally update spatial grid (remove old cells, add new cells)

@@ -90,8 +90,9 @@ void CharacterPreview::ensureAppearanceGeosetsLoaded() {
             uint32_t sexId = chg->getUInt32(i, chgL ? (*chgL)["SexID"] : 2);
             uint32_t variation = chg->getUInt32(i, chgL ? (*chgL)["Variation"] : 3);
             uint32_t geosetId = chg->getUInt32(i, chgL ? (*chgL)["GeosetID"] : 4);
+            const bool useDefaultScalp = chg->getFieldCount() > 5 && chg->getUInt32(i, 5) != 0;
             uint32_t key = (raceId << 16) | (sexId << 8) | variation;
-            hairGeosetMap_[key] = static_cast<uint16_t>(geosetId);
+            hairGeosetMap_[key] = static_cast<uint16_t>(useDefaultScalp ? 1 : geosetId);
         }
         LOG_INFO("CharacterPreview: loaded ", hairGeosetMap_.size(), " hair geoset mappings");
     }
