@@ -315,10 +315,8 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
     activeGeosets.insert(0);  // body base
     activeGeosets.insert(selectedHairScalp);
 
-    // Hair connector: group 1 = 100 + geoset
-    activeGeosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(selectedHairScalp, 1)));
-
-    // Facial hair geosets from CharacterFacialHairStyles.dbc
+    // Groups 1xx, 2xx and 3xx are independent facial-feature channels from
+    // CharacterFacialHairStyles. They must not be derived from the hairstyle.
     if (entitySpawner_) {
         const auto& facialMap = entitySpawner_->getFacialHairGeosetMap();
         uint32_t facialKey = (static_cast<uint32_t>(raceId) << 16) |
@@ -326,13 +324,16 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
                              static_cast<uint32_t>(facialId);
         auto it = facialMap.find(facialKey);
         if (it != facialMap.end()) {
+            activeGeosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(it->second.geoset100, 1)));
             activeGeosets.insert(static_cast<uint16_t>(200 + std::max<uint16_t>(it->second.geoset200, 1)));
             activeGeosets.insert(static_cast<uint16_t>(300 + std::max<uint16_t>(it->second.geoset300, 1)));
         } else {
+            activeGeosets.insert(101);
             activeGeosets.insert(201);
             activeGeosets.insert(301);
         }
     } else {
+        activeGeosets.insert(101);
         activeGeosets.insert(201);
         activeGeosets.insert(301);
     }

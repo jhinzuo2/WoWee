@@ -1983,9 +1983,9 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
             uint8_t extraRaceId = 0;
             uint8_t extraSexId = 0;
             uint16_t selectedHairScalp = 1;
+            uint16_t selectedFacial100 = 100;
             uint16_t selectedFacial200 = 200;
             uint16_t selectedFacial300 = 300;
-            uint16_t selectedFacial300Alt = 300;
             uint32_t equipChestGG = 0, equipLegsGG = 0, equipFeetGG = 0;
             if (itDisplayData != displayDataMap_.end() &&
                 itDisplayData->second.extraDisplayId != 0) {
@@ -2007,9 +2007,9 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                                          static_cast<uint32_t>(itExtra->second.facialHairId);
                     auto itFacial = facialHairGeosetMap_.find(facialKey);
                     if (itFacial != facialHairGeosetMap_.end()) {
-                        selectedFacial200 = static_cast<uint16_t>(200 + itFacial->second.geoset200);
-                        selectedFacial300 = static_cast<uint16_t>(300 + itFacial->second.geoset300);
-                        selectedFacial300Alt = static_cast<uint16_t>(300 + itFacial->second.geoset200);
+                        selectedFacial100 = static_cast<uint16_t>(100 + std::max<uint16_t>(itFacial->second.geoset100, 1));
+                        selectedFacial200 = static_cast<uint16_t>(200 + std::max<uint16_t>(itFacial->second.geoset200, 1));
+                        selectedFacial300 = static_cast<uint16_t>(300 + std::max<uint16_t>(itFacial->second.geoset300, 1));
                     }
                     auto itemDisplayDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
                     const auto* idiL = pipeline::getActiveDBCLayout()
@@ -2115,15 +2115,12 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                 if (hasHumanoidExtra && sid < 100 && sid != 0 && sid != selectedHairScalp) {
                     continue;
                 }
-                // Group 1 contains connector variants that mirror scalp style.
+                // Group 1 is the first CharacterFacialHairStyles channel.
                 if (hasHumanoidExtra && group == 1) {
-                    const uint16_t selectedConnector = static_cast<uint16_t>(100 + std::max<uint16_t>(selectedHairScalp, 1));
-                    if (sid != selectedConnector) {
-                        // Keep fallback connector only when selected one does not exist on this model.
-                        if (sid != 101 || allGeosets.count(selectedConnector) > 0) {
-                            continue;
-                        }
-                    }
+                    uint16_t resolvedFacial100 = selectedFacial100;
+                    if (allGeosets.count(resolvedFacial100) == 0)
+                        resolvedFacial100 = allGeosets.count(101) > 0 ? 101 : firstByGroup[1];
+                    if (sid != resolvedFacial100) continue;
                 }
                 // Group 2 facial variants: keep selected variant; fallback only if missing.
                 if (hasHumanoidExtra && group == 2) {
@@ -2200,9 +2197,7 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
             // Some mustache/goatee variants are authored in facial group 3xx.
             // Re-add selected facial 3xx plus low-index facial fallbacks.
             if (hasHumanoidExtra) {
-                // Prefer alt channel first (often chin-beard), then primary.
-                uint16_t facial300Sid = pickFromGroup(selectedFacial300Alt, 3);
-                if (facial300Sid == 0) facial300Sid = pickFromGroup(selectedFacial300, 3);
+                uint16_t facial300Sid = pickFromGroup(selectedFacial300, 3);
                 if (facial300Sid != 0) normalizedGeosets.insert(facial300Sid);
                 if (facial300Sid == 0) {
                     if (allGeosets.count(300) > 0) normalizedGeosets.insert(300);

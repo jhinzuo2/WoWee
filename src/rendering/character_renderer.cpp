@@ -2659,7 +2659,7 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
 
                 const uint16_t submeshGroup = static_cast<uint16_t>(batch.submeshId / 100);
                 const bool hairTexture = batchUsesTextureType(gpuModel, batch, 6);
-                const bool hairGeoset = (submeshGroup == 1) ||
+                const bool hairGeoset = (submeshGroup >= 1 && submeshGroup <= 3) ||
                                         (submeshGroup == 0 && batch.submeshId > 0 && batch.submeshId <= 99);
                 // Scene models have no hair, and their submesh ids are all 0, which
                 // would otherwise satisfy the hair-geoset guess for every batch.
@@ -2810,12 +2810,43 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 matData.emissiveTintB = emissiveTint.b;
                 matData.specularIntensity = 0.5f;
                 matData.enableNormalMap = (useAdvancedMaterials && normalMappingEnabled_) ? 1 : 0;
-                matData.enablePOM = (useAdvancedMaterials && pomEnabled_) ? 1 : 0;
+                // Character textures are layered/mirrored atlases, not coherent
+                // height fields. Parallax offsets cross face seams and reveal
+                // underlying armor through tabards, so keep POM out of the
+                // character path even when it is enabled for the world.
+                matData.enablePOM = 0;
                 matData.pomScale = 0.06f;
                 matData.pomMaxSamples = pomSamples;
                 matData.heightMapVariance = useAdvancedMaterials ? batchHeightVariance : 0.0f;
                 matData.normalMapStrength = normalMapStrength_;
                 matData.hairMaterial = hairMaterial ? 1 : 0;
+
+                // The base humanoid mesh samples a mirrored character atlas,
+                // with the face sitting directly beside a UV seam. Parallax
+                // displacement moves each mirrored half in opposite screen
+                // directions, producing crossed eyes and a center-squashed
+                // mouth at oblique angles. Keep normal lighting, but never
+                // displace UVs on group 0 body/head surfaces.
+                if (batchGroup == 0) {
+                    normalMap = flatNormalTexture_.get();
+                    matData.specularIntensity = 0.20f;
+                    matData.enableNormalMap = 0;
+                    matData.enablePOM = 0;
+                    matData.heightMapVariance = 0.0f;
+                }
+
+                // Tabards are a thin cloth layer over the torso. Reusing the
+                // body composite's generated height/normal response makes the
+                // armor underneath appear embossed and reflective through the
+                // cloth as the camera moves. Keep the diffuse tabard artwork,
+                // but give group 12 a flat, low-specular cloth material.
+                if (batchGroup == 12) {
+                    normalMap = flatNormalTexture_.get();
+                    matData.specularIntensity = 0.08f;
+                    matData.enableNormalMap = 0;
+                    matData.enablePOM = 0;
+                    matData.heightMapVariance = 0.0f;
+                }
                 if (usePreviewSimpleShader) {
                     matData.enableNormalMap = 0;
                     matData.enablePOM = kPreviewSimpleTextureMode;
