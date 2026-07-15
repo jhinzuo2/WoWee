@@ -879,13 +879,42 @@ void GameScreen::renderMinimapMarkers(game::GameHandler& gameHandler) {
 
     // Zone name display — drawn inside the top edge of the minimap circle
     {
-        auto* zmRenderer = renderer ? renderer->getZoneManager() : nullptr;
-        uint32_t zoneId = gameHandler.getWorldStateZoneId();
-        const game::ZoneInfo* zi = (zmRenderer && zoneId != 0) ? zmRenderer->getZoneInfo(zoneId) : nullptr;
-        if (zi && !zi->name.empty()) {
+        std::string zoneName;
+        const uint32_t zoneId = gameHandler.getWorldStateZoneId();
+        if (zoneId != 0) {
+            zoneName = gameHandler.getWhoAreaName(zoneId);
+            if (zoneName.empty()) {
+                if (auto* zmRenderer = renderer ? renderer->getZoneManager() : nullptr) {
+                    if (const game::ZoneInfo* zi = zmRenderer->getZoneInfo(zoneId)) {
+                        zoneName = zi->name;
+                    }
+                }
+            }
+        }
+        if (zoneName.empty() && renderer) {
+            zoneName = renderer->getCurrentZoneName();
+        }
+        if (!zoneName.empty()) {
             ImFont* font = ImGui::GetFont();
             float fontSize = ImGui::GetFontSize();
-            ImVec2 ts = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, zi->name.c_str());
+
+            const char* weatherIcon = nullptr;
+            ImU32 weatherColor = IM_COL32(255, 255, 255, 200);
+            const uint32_t weatherType = gameHandler.getWeatherType();
+            const float weatherIntensity = gameHandler.getWeatherIntensity();
+            if (weatherType == 1 && weatherIntensity > 0.05f) {
+                weatherIcon = " \xe2\x9b\x86"; // Rain
+                weatherColor = IM_COL32(140, 180, 240, 220);
+            } else if (weatherType == 2 && weatherIntensity > 0.05f) {
+                weatherIcon = " \xe2\x9d\x84"; // Snow
+                weatherColor = IM_COL32(210, 230, 255, 220);
+            } else if (weatherType == 3 && weatherIntensity > 0.05f) {
+                weatherIcon = " \xe2\x98\x81"; // Storm/fog
+                weatherColor = IM_COL32(160, 160, 190, 220);
+            }
+
+            const std::string fullLabel = weatherIcon ? zoneName + weatherIcon : zoneName;
+            ImVec2 ts = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, fullLabel.c_str());
             float tx = centerX - ts.x * 0.5f;
             float ty = centerY - mapRadius + 4.0f;  // just inside top edge of the circle
             float pad = 2.0f;
@@ -894,9 +923,15 @@ void GameScreen::renderMinimapMarkers(game::GameHandler& gameHandler) {
                 ImVec2(tx + ts.x + pad, ty + ts.y + pad),
                 IM_COL32(0, 0, 0, 160), 2.0f);
             drawList->AddText(font, fontSize, ImVec2(tx + 1.0f, ty + 1.0f),
-                              IM_COL32(0, 0, 0, 180), zi->name.c_str());
+                              IM_COL32(0, 0, 0, 180), zoneName.c_str());
             drawList->AddText(font, fontSize, ImVec2(tx, ty),
-                              IM_COL32(255, 230, 150, 220), zi->name.c_str());
+                              IM_COL32(255, 230, 150, 220), zoneName.c_str());
+            if (weatherIcon) {
+                const ImVec2 nameSize = font->CalcTextSizeA(
+                    fontSize, FLT_MAX, 0.0f, zoneName.c_str());
+                drawList->AddText(font, fontSize, ImVec2(tx + nameSize.x, ty),
+                                  weatherColor, weatherIcon);
+            }
         }
     }
 
@@ -1029,57 +1064,6 @@ void GameScreen::renderMinimapMarkers(game::GameHandler& gameHandler) {
             activity->setVolumeScale(settingsPanel_.pendingActivityVolume / 100.0f);
         }
     };
-
-    // Zone name label above the minimap (centered, WoW-style)
-    // Prefer the server-reported zone/area name (from SMSG_INIT_WORLD_STATES) so sub-zones
-    // like Ironforge or Wailing Caverns display correctly; fall back to renderer zone name.
-    {
-        std::string wsZoneName;
-        uint32_t wsZoneId = gameHandler.getWorldStateZoneId();
-        if (wsZoneId != 0)
-            wsZoneName = gameHandler.getWhoAreaName(wsZoneId);
-        const std::string& rendererZoneName = renderer ? renderer->getCurrentZoneName() : std::string{};
-        const std::string& zoneName = !wsZoneName.empty() ? wsZoneName : rendererZoneName;
-        if (!zoneName.empty()) {
-            auto* fgDl = ImGui::GetForegroundDrawList();
-            float zoneTextY = centerY - mapRadius - 16.0f;
-            ImFont* font = ImGui::GetFont();
-
-            // Weather icon appended to zone name when active
-            uint32_t wType = gameHandler.getWeatherType();
-            float wIntensity = gameHandler.getWeatherIntensity();
-            const char* weatherIcon = nullptr;
-            ImU32 weatherColor = IM_COL32(255, 255, 255, 200);
-            if (wType == 1 && wIntensity > 0.05f) {           // Rain
-                weatherIcon = " \xe2\x9b\x86";               // U+26C6 ⛆
-                weatherColor = IM_COL32(140, 180, 240, 220);
-            } else if (wType == 2 && wIntensity > 0.05f) {    // Snow
-                weatherIcon = " \xe2\x9d\x84";               // U+2744 ❄
-                weatherColor = IM_COL32(210, 230, 255, 220);
-            } else if (wType == 3 && wIntensity > 0.05f) {    // Storm/Fog
-                weatherIcon = " \xe2\x98\x81";               // U+2601 ☁
-                weatherColor = IM_COL32(160, 160, 190, 220);
-            }
-
-            std::string displayName = zoneName;
-            // Build combined string if weather active
-            std::string fullLabel = weatherIcon ? (zoneName + weatherIcon) : zoneName;
-            ImVec2 tsz = font->CalcTextSizeA(12.0f, FLT_MAX, 0.0f, fullLabel.c_str());
-            float tzx = centerX - tsz.x * 0.5f;
-
-            // Shadow pass
-            fgDl->AddText(font, 12.0f, ImVec2(tzx + 1.0f, zoneTextY + 1.0f),
-                IM_COL32(0, 0, 0, 180), zoneName.c_str());
-            // Zone name in gold
-            fgDl->AddText(font, 12.0f, ImVec2(tzx, zoneTextY),
-                IM_COL32(255, 220, 120, 230), zoneName.c_str());
-            // Weather symbol in its own color appended after
-            if (weatherIcon) {
-                ImVec2 nameSz = font->CalcTextSizeA(12.0f, FLT_MAX, 0.0f, zoneName.c_str());
-                fgDl->AddText(font, 12.0f, ImVec2(tzx + nameSz.x, zoneTextY), weatherColor, weatherIcon);
-            }
-        }
-    }
 
     // Speaker mute button at the minimap top-right corner
     ImGui::SetNextWindowPos(ImVec2(centerX + mapRadius - 26.0f, centerY - mapRadius + 4.0f), ImGuiCond_Always);

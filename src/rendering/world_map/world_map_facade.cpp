@@ -132,6 +132,7 @@ struct WorldMapFacade::Impl {
     float lastFrameTime = 0.0f;
 
     void initOverlayLayers();
+    void closeMap();
     void switchToMap(const std::string& newMapName);
     void switchToWorldView();
     void renderImGuiOverlay(const glm::vec3& playerRenderPos,
@@ -139,6 +140,16 @@ struct WorldMapFacade::Impl {
                             float playerYawDeg,
                             bool rightClickConsumed);
 };
+
+void WorldMapFacade::Impl::closeMap() {
+    open = false;
+    userMapOverride = false;
+    // Apply any map name that was deferred while in world/cosmic view.
+    if (!pendingMapName.empty()) {
+        mapName = pendingMapName;
+        pendingMapName.clear();
+    }
+}
 
 void WorldMapFacade::Impl::switchToMap(const std::string& newMapName) {
     if (mapName == newMapName && !data.zones().empty()) return;
@@ -387,12 +398,7 @@ void WorldMapFacade::render(const glm::vec3& playerRenderPos,
 
     switch (inputResult.action) {
         case InputAction::CLOSE:
-            d.open = false;
-            d.userMapOverride = false;
-            if (!d.pendingMapName.empty()) {
-                d.mapName = d.pendingMapName;
-                d.pendingMapName.clear();
-            }
+            d.closeMap();
             return;
 
         case InputAction::ZOOM_IN: {
@@ -540,13 +546,7 @@ void WorldMapFacade::setCorpsePos(bool hasCorpse, glm::vec3 renderPos) {
 
 bool WorldMapFacade::isOpen() const { return impl_->open; }
 void WorldMapFacade::close() {
-    impl_->open = false;
-    impl_->userMapOverride = false;
-    // Apply any map name that was deferred while in world/cosmic view
-    if (!impl_->pendingMapName.empty()) {
-        impl_->mapName = impl_->pendingMapName;
-        impl_->pendingMapName.clear();
-    }
+    impl_->closeMap();
 }
 
 // ── ImGui Overlay ────────────────────────────────────────────
@@ -596,14 +596,14 @@ void WorldMapFacade::Impl::renderImGuiOverlay(const glm::vec3& playerRenderPos,
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(0, 0));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
 
-    // Bug fix: pass nullptr instead of &open so ImGui's X-button doesn't
-    // set open=false directly — that bypasses cleanup (userMapOverride,
-    // pendingMapName) and causes immediate re-open on next render() call.
-    // Close is handled by ESC / InputAction::CLOSE instead.
-    if (ImGui::Begin("World Map", nullptr, flags)) {
+    // Keep ImGui's close state separate so clicking the title-bar X can use
+    // the same cleanup path as Escape instead of mutating open directly.
+    bool windowOpen = open;
+    if (ImGui::Begin("World Map", &windowOpen, flags)) {
         ImDrawList* drawList = ImGui::GetWindowDrawList();
 
         // imgMin/imgMax = the content area (after title bar)
+        const float contentLocalY = ImGui::GetCursorPosY();
         ImVec2 contentPos = ImGui::GetCursorScreenPos();
         ImVec2 contentSize = ImGui::GetContentRegionAvail();
         ImVec2 imgMin = contentPos;
@@ -821,7 +821,7 @@ void WorldMapFacade::Impl::renderImGuiOverlay(const glm::vec3& playerRenderPos,
                 }
             }
         } else if (vl == ViewLevel::CONTINENT && continentIndices.size() > 1) {
-            ImGui::SetCursorPos(ImVec2(8.0f, 8.0f));
+            ImGui::SetCursorPos(ImVec2(8.0f, contentLocalY + 8.0f));
             for (size_t i = 0; i < continentIndices.size(); i++) {
                 int ci = continentIndices[i];
                 if (i > 0) ImGui::SameLine();
@@ -845,7 +845,7 @@ void WorldMapFacade::Impl::renderImGuiOverlay(const glm::vec3& playerRenderPos,
 
         // Zone view: back to continent + zone name
         if (vl == ViewLevel::ZONE && viewState.continentIdx() >= 0) {
-            ImGui::SetCursorPos(ImVec2(8.0f, 8.0f));
+            ImGui::SetCursorPos(ImVec2(8.0f, contentLocalY + 8.0f));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 0.8f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.1f, 0.9f));
             ImGui::PushStyleColor(ImGuiCol_Text, ui::colors::kBrightGold);
@@ -861,17 +861,19 @@ void WorldMapFacade::Impl::renderImGuiOverlay(const glm::vec3& playerRenderPos,
             if (curIdx >= 0 && curIdx < static_cast<int>(data.zones().size())) {
                 const char* zoneName = data.zones()[curIdx].areaName.c_str();
                 ImVec2 nameSize = ImGui::CalcTextSize(zoneName);
-                float nameY = mapY - nameSize.y - 8.0f;
-                if (nameY > 0.0f) {
-                    ImGui::SetCursorPos(ImVec2((sw - nameSize.x) / 2.0f, nameY));
-                    ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.0f, 0.9f), "%s", zoneName);
-                }
+                float nameX = imgMin.x + (displayW - nameSize.x) * 0.5f;
+                float nameY = imgMin.y + 8.0f;
+                drawList->AddText(ImVec2(nameX + 1.0f, nameY + 1.0f),
+                                  IM_COL32(0, 0, 0, 220), zoneName);
+                drawList->AddText(ImVec2(nameX, nameY),
+                                  IM_COL32(255, 215, 0, 230), zoneName);
             }
         }
 
         // Continent view: back to world + hovered zone name
         if (vl == ViewLevel::CONTINENT) {
-            float localBtnY = (continentIndices.size() > 1 ? 40.0f : 8.0f);
+            float localBtnY = contentLocalY +
+                              (continentIndices.size() > 1 ? 40.0f : 8.0f);
             ImGui::SetCursorPos(ImVec2(8.0f, localBtnY));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 0.8f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.1f, 0.9f));
@@ -891,27 +893,25 @@ void WorldMapFacade::Impl::renderImGuiOverlay(const glm::vec3& playerRenderPos,
 
                     ImVec2 hoverSz = ImGui::CalcTextSize(hoverLabel.c_str());
                     float hx = imgMin.x + (displayW - hoverSz.x) * 0.5f;
-                    float hy = imgMin.y - hoverSz.y - 8.0f;
-                    if (hy > 0.0f) {
-                        drawList->AddText(ImVec2(hx + 1.0f, hy + 1.0f),
-                                          IM_COL32(0, 0, 0, 220), hoverLabel.c_str());
-                        ImU32 hoverColor = IM_COL32(255, 215, 0, 255);
-                        if (meta) {
-                            switch (meta->faction) {
-                                case ZoneFaction::Alliance: hoverColor = IM_COL32(100, 160, 255, 255); break;
-                                case ZoneFaction::Horde:    hoverColor = IM_COL32(255, 80, 80, 255); break;
-                                default: break;
-                            }
+                    float hy = imgMin.y + 8.0f;
+                    drawList->AddText(ImVec2(hx + 1.0f, hy + 1.0f),
+                                      IM_COL32(0, 0, 0, 220), hoverLabel.c_str());
+                    ImU32 hoverColor = IM_COL32(255, 215, 0, 255);
+                    if (meta) {
+                        switch (meta->faction) {
+                            case ZoneFaction::Alliance: hoverColor = IM_COL32(100, 160, 255, 255); break;
+                            case ZoneFaction::Horde:    hoverColor = IM_COL32(255, 80, 80, 255); break;
+                            default: break;
                         }
-                        drawList->AddText(ImVec2(hx, hy), hoverColor, hoverLabel.c_str());
                     }
+                    drawList->AddText(ImVec2(hx, hy), hoverColor, hoverLabel.c_str());
                 }
             }
         }
 
         // Cosmic view: title + clickable landmass regions
         if (vl == ViewLevel::COSMIC) {
-            ImGui::SetCursorPos(ImVec2(8.0f, 8.0f));
+            ImGui::SetCursorPos(ImVec2(8.0f, contentLocalY + 8.0f));
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 0.8f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.3f, 0.1f, 0.9f));
             ImGui::PushStyleColor(ImGuiCol_Text, ui::colors::kBrightGold);
@@ -922,13 +922,11 @@ void WorldMapFacade::Impl::renderImGuiOverlay(const glm::vec3& playerRenderPos,
 
             ImVec2 titleSz = ImGui::CalcTextSize("Cosmic");
             float titleX = imgMin.x + (displayW - titleSz.x) * 0.5f;
-            float titleY = imgMin.y - titleSz.y - 8.0f;
-            if (titleY > 0.0f) {
-                drawList->AddText(ImVec2(titleX + 1.0f, titleY + 1.0f),
-                                  IM_COL32(0, 0, 0, 220), "Cosmic");
-                drawList->AddText(ImVec2(titleX, titleY),
-                                  IM_COL32(255, 215, 0, 255), "Cosmic");
-            }
+            float titleY = imgMin.y + 8.0f;
+            drawList->AddText(ImVec2(titleX + 1.0f, titleY + 1.0f),
+                              IM_COL32(0, 0, 0, 220), "Cosmic");
+            drawList->AddText(ImVec2(titleX, titleY),
+                              IM_COL32(255, 215, 0, 255), "Cosmic");
 
             ImVec2 mp2 = ImGui::GetMousePos();
             auto& io = ImGui::GetIO();
@@ -1060,12 +1058,16 @@ void WorldMapFacade::Impl::renderImGuiOverlay(const glm::vec3& playerRenderPos,
             helpText = "Click zone to open | Right-click to zoom out | M or Escape to close";
 
         ImVec2 textSize = ImGui::CalcTextSize(helpText);
-        float textX = mapX + (displayW - textSize.x) / 2.0f;
-        float textY = mapY + displayH - textSize.y - 4.0f;
+        float textX = imgMin.x + (displayW - textSize.x) / 2.0f;
+        float textY = imgMax.y - textSize.y - 4.0f;
         ImGui::SetCursorScreenPos(ImVec2(textX, textY));
         ImGui::TextColored(ImVec4(0.7f, 0.7f, 0.7f, 0.8f), "%s", helpText);
     }
     ImGui::End();
+
+    if (!windowOpen) {
+        closeMap();
+    }
 
     ImGui::PopStyleVar(3);  // WindowPadding + ItemSpacing + WindowBorderSize
 }
