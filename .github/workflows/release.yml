@@ -143,18 +143,16 @@ jobs:
         VERSION="${VERSION%%-*}"
         mkdir -p Wowee.app/Contents/{MacOS,Frameworks,Resources}
 
-        # Wrapper launch script
-        printf '#!/bin/bash\ncd "$(dirname "$0")"\nexec ./wowee_bin "$@"\n' \
-          > Wowee.app/Contents/MacOS/wowee
+        # Wrapper launch script selects the user's writable extraction when present.
+        cp tools/macos/wowee_launcher.sh Wowee.app/Contents/MacOS/wowee
         chmod +x Wowee.app/Contents/MacOS/wowee
 
         # Actual binary
         cp build/bin/wowee Wowee.app/Contents/MacOS/wowee_bin
 
-        # Asset extraction tool (if built — requires StormLib)
-        if [ -f build/bin/asset_extract ]; then
-          cp build/bin/asset_extract Wowee.app/Contents/MacOS/
-        fi
+        # Asset extraction is a required part of the macOS distribution.
+        test -x build/bin/asset_extract
+        cp build/bin/asset_extract Wowee.app/Contents/MacOS/
 
         # Extraction scripts and GUI
         cp extract_assets.sh Wowee.app/Contents/MacOS/
@@ -235,7 +233,15 @@ jobs:
     - name: Create DMG
       run: |
         TAG="${GITHUB_REF_NAME}"
-        hdiutil create -volname Wowee -srcfolder Wowee.app -ov -format UDZO \
+        rm -rf dmg-root
+        mkdir dmg-root
+        mv Wowee.app dmg-root/
+        cp tools/macos/extract_assets.command "dmg-root/Extract Assets.command"
+        cp tools/macos/ASSET_EXTRACTION_README.txt \
+          "dmg-root/README - Asset Extraction.txt"
+        chmod +x "dmg-root/Extract Assets.command"
+        ln -s /Applications dmg-root/Applications
+        hdiutil create -volname Wowee -srcfolder dmg-root -ov -format UDZO \
           "wowee-${TAG}-macos-arm64.dmg"
 
     - name: Upload artifact

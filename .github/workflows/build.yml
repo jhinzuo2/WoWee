@@ -186,17 +186,30 @@ jobs:
       run: |
         mkdir -p Wowee.app/Contents/{MacOS,Frameworks,Resources}
 
-        # Wrapper launch script — cd to MacOS/ so ./assets/ resolves correctly
-        printf '#!/bin/bash\ncd "$(dirname "$0")"\nexec ./wowee_bin "$@"\n' \
-          > Wowee.app/Contents/MacOS/wowee
+        # Wrapper launch script selects the user's writable extraction when present.
+        cp tools/macos/wowee_launcher.sh Wowee.app/Contents/MacOS/wowee
         chmod +x Wowee.app/Contents/MacOS/wowee
 
         # Actual binary
         cp build/bin/wowee Wowee.app/Contents/MacOS/wowee_bin
 
+        # Asset extraction is a required part of the macOS distribution.
+        test -x build/bin/asset_extract
+        cp build/bin/asset_extract Wowee.app/Contents/MacOS/
+
+        # Extraction scripts and GUI remain available for advanced users.
+        cp extract_assets.sh Wowee.app/Contents/MacOS/
+        cp tools/asset_pipeline_gui.py Wowee.app/Contents/MacOS/
+
         # Assets (exclude proprietary music)
         rsync -a --exclude='Original Music' build/bin/assets/ \
           Wowee.app/Contents/MacOS/assets/
+
+        # Data directory (git-tracked redistributable files only)
+        git ls-files Data/ | while read -r f; do
+          mkdir -p "Wowee.app/Contents/MacOS/$(dirname "$f")"
+          cp "$f" "Wowee.app/Contents/MacOS/$f"
+        done
 
         # The Vulkan loader is not a graphics driver. Bundle MoltenVK and its
         # ICD manifest so the app works on a clean Mac without Homebrew or the
@@ -231,6 +244,7 @@ jobs:
           --search-dir "$(brew --prefix stormlib)/lib" \
           --search-dir "$(brew --prefix glm)/lib" \
           Wowee.app/Contents/MacOS/wowee_bin \
+          Wowee.app/Contents/MacOS/asset_extract \
           Wowee.app/Contents/Frameworks/libMoltenVK.dylib
 
         # Info.plist
@@ -260,6 +274,14 @@ jobs:
       run: |
         set -euo pipefail
         rm -f Wowee.dmg
+        rm -rf dmg-root
+        mkdir dmg-root
+        mv Wowee.app dmg-root/
+        cp tools/macos/extract_assets.command "dmg-root/Extract Assets.command"
+        cp tools/macos/ASSET_EXTRACTION_README.txt \
+          "dmg-root/README - Asset Extraction.txt"
+        chmod +x "dmg-root/Extract Assets.command"
+        ln -s /Applications dmg-root/Applications
         # CI runners can occasionally leave a mounted volume around; detach if present.
         if [ -d "/Volumes/Wowee" ]; then
           hdiutil detach "/Volumes/Wowee" -force || true
@@ -268,7 +290,7 @@ jobs:
 
         ok=0
         for attempt in 1 2 3 4 5; do
-          if hdiutil create -volname Wowee -srcfolder Wowee.app -ov -format UDZO Wowee.dmg; then
+          if hdiutil create -volname Wowee -srcfolder dmg-root -ov -format UDZO Wowee.dmg; then
             ok=1
             break
           fi
