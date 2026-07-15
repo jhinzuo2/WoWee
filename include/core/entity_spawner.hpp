@@ -244,6 +244,7 @@ private:
     std::unordered_map<uint64_t, bool> creatureWalkingState_;
     std::unordered_map<uint64_t, bool> creatureFlyingState_;
     std::unordered_map<uint64_t, bool> creatureWasStealthed_;
+    uint32_t stealthSyncFrameCounter_ = 0;  // throttles syncCreatureStealthVisuals()
     std::unordered_set<uint64_t> creatureWeaponsAttached_;
     std::unordered_map<uint64_t, uint8_t> creatureWeaponAttachAttempts_;
     std::unordered_map<uint32_t, bool> modelIdIsWolfLike_;

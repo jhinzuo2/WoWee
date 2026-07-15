@@ -85,13 +85,26 @@ void EntitySpawner::syncCreatureStealthVisuals() {
     auto* characterRenderer = renderer_->getCharacterRenderer();
     if (!characterRenderer) return;
 
+    // Stealth flags flip rarely, but this scan visits every spawned creature.
+    // Doing that each frame with the mutex-locked getEntity() plus a
+    // dynamic_pointer_cast per creature was a measurable main-thread cost in
+    // crowded areas — a few sweeps per second is visually indistinguishable.
+    if (++stealthSyncFrameCounter_ % 15 != 0) return;
+
+    // EntitySpawner::update() runs on the main thread, so the unlocked
+    // getEntities() reference is safe and avoids a mutex acquire per creature.
+    const auto& entities = gameHandler_->getEntityManager().getEntities();
+
     // Undetected stealth is culled by the server. Units that are sent with the
     // CREEP visibility flag use the translucent detected-stealth presentation.
     constexpr float kDetectedStealthOpacity = 0.35f;
     for (const auto& [guid, instanceId] : creatureInstances_) {
-        auto entity = gameHandler_->getEntityManager().getEntity(guid);
-        auto unit = std::dynamic_pointer_cast<game::Unit>(entity);
-        if (!unit) continue;
+        auto entIt = entities.find(guid);
+        if (entIt == entities.end() || !entIt->second) continue;
+        const game::Entity* entity = entIt->second.get();
+        if (entity->getType() != game::ObjectType::UNIT &&
+            entity->getType() != game::ObjectType::PLAYER) continue;
+        const auto* unit = static_cast<const game::Unit*>(entity);
 
         const bool stealthed = unit->hasCreepVisibility();
         auto [it, inserted] = creatureWasStealthed_.try_emplace(guid, stealthed);
