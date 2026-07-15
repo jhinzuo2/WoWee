@@ -574,7 +574,7 @@ bool Renderer::initialize(core::Window* win) {
 
     // LightingManager doesn't use GL — initialize for data-only use
     lightingManager = std::make_unique<LightingManager>();
-    [[maybe_unused]] auto* assetManager = core::Application::getInstance().getAssetManager();
+    auto* assetManager = core::Application::getInstance().getAssetManager();
 
     // Create zone manager; enrich music paths from DBC if available
     zoneManager = std::make_unique<game::ZoneManager>();
@@ -1234,8 +1234,9 @@ void Renderer::update(float deltaTime) {
         float gameTime    = gh ? gh->getGameTime() : -1.0f;
         bool isRaining    = gh ? gh->isRaining() : false;
         bool isUnderwater = cameraController ? cameraController->isSwimming() : false;
+        const uint32_t resolvedZoneId = getCurrentZoneId();
 
-        lightingManager->update(characterPosition, mapId, getCurrentZoneId(),
+        lightingManager->update(characterPosition, mapId, resolvedZoneId,
                                 gameTime, isRaining, isUnderwater);
 
         // Sync weather visual renderer with game state

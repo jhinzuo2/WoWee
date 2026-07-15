@@ -1,10 +1,22 @@
 #include <catch_amalgamated.hpp>
 
 #include "rendering/lighting_manager.hpp"
+#include "game/zone_manager.hpp"
 
 using wowee::rendering::LightingParams;
 using wowee::rendering::applyZoneAmbienceOverride;
 using wowee::rendering::resolveZoneVisualTimeHours;
+
+TEST_CASE("Duskwood ADT coverage follows client map bounds", "[zone_ambience]") {
+    using wowee::game::isDuskwoodAdtTile;
+
+    REQUIRE(isDuskwoodAdtTile(50, 30));
+    REQUIRE(isDuskwoodAdtTile(51, 34)); // Darkshire
+    REQUIRE(isDuskwoodAdtTile(53, 35));
+    REQUIRE_FALSE(isDuskwoodAdtTile(49, 32)); // Elwynn/Redridge side
+    REQUIRE_FALSE(isDuskwoodAdtTile(54, 34)); // Stranglethorn side
+    REQUIRE_FALSE(isDuskwoodAdtTile(52, 29));
+}
 
 TEST_CASE("Duskwood uses a permanent late-night sky clock", "[zone_ambience]") {
     REQUIRE(resolveZoneVisualTimeHours(10, false, 12.0f) == Catch::Approx(22.0f));

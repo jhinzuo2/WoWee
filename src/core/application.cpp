@@ -34,6 +34,7 @@
 #include "rendering/clouds.hpp"
 #include "rendering/lens_flare.hpp"
 #include "rendering/weather.hpp"
+#include "rendering/lighting_manager.hpp"
 #include "rendering/character_renderer.hpp"
 #include "rendering/wmo_renderer.hpp"
 #include "rendering/m2_renderer.hpp"
@@ -276,6 +277,14 @@ bool Application::initialize() {
     LOG_INFO("Attempting to load WoW assets from: ", assetPath);
     if (assetManager->initialize(assetPath)) {
         LOG_INFO("Asset manager initialized successfully");
+
+        // Renderer creation precedes AssetManager creation, so DBC-driven
+        // lighting must be initialized here rather than in Renderer::initialize.
+        if (renderer && renderer->getLightingManager() &&
+            !renderer->getLightingManager()->initialize(assetManager.get())) {
+            LOG_WARNING("Lighting manager initialization failed; using fallback lighting");
+        }
+
         // Eagerly load creature display DBC lookups so first spawn doesn't stall
         entitySpawner_ = std::make_unique<EntitySpawner>(
             renderer.get(), assetManager.get(), gameHandler.get(),

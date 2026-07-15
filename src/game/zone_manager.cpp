@@ -326,12 +326,15 @@ void ZoneManager::initialize() {
         tileToZone[tx * 100 + 53] = 1;
     }
 
-    // Duskwood tiles (south of Elwynn). These are canonical ADT indices:
-    // Darkshire at (-10573, -1182) resolves to tile (51, 34). The older table
-    // accidentally transposed the axes and could never classify the live zone.
-    for (int tx = 50; tx <= 52; tx++) {
-        for (int ty = 33; ty <= 36; ty++) {
-            tileToZone[tx * 100 + ty] = 10;
+    // Duskwood tiles (south of Elwynn). WorldMapArea.dbc bounds the zone at
+    // canonical X [-11516.67, -9716.67], Y [-1866.67, 833.33], which covers
+    // ADT tiles X 50..53 and Y 30..35. The older table accidentally transposed
+    // the axes and could never classify most live positions in the zone.
+    for (int tx = 0; tx < 64; tx++) {
+        for (int ty = 0; ty < 64; ty++) {
+            if (isDuskwoodAdtTile(tx, ty)) {
+                tileToZone[tx * 100 + ty] = 10;
+            }
         }
     }
 

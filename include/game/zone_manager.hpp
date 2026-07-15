@@ -9,6 +9,11 @@ namespace wowee {
 namespace pipeline { class AssetManager; }
 namespace game {
 
+// WorldMapArea.dbc bounds converted to canonical ADT tile indices.
+constexpr bool isDuskwoodAdtTile(int tileX, int tileY) {
+    return tileX >= 50 && tileX <= 53 && tileY >= 30 && tileY <= 35;
+}
+
 struct ZoneInfo {
     uint32_t id;
     std::string name;
