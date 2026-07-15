@@ -2,6 +2,7 @@
 #include <catch_amalgamated.hpp>
 #include "rendering/animation/combat_fsm.hpp"
 #include "rendering/animation/animation_ids.hpp"
+#include "game/inventory.hpp"
 
 using namespace wowee::rendering;
 namespace anim = wowee::rendering::anim;
@@ -122,4 +123,22 @@ TEST_CASE("CombatFSM: reset clears all state", "[combat]") {
     fsm.reset();
     CHECK(fsm.getState() == CombatFSM::State::INACTIVE);
     CHECK_FALSE(fsm.isStunned());
+}
+
+TEST_CASE("CombatFSM: equipped thrown weapon does not replace melee ready stance", "[combat]") {
+    CombatFSM fsm;
+    auto caps = makeCombatCaps();
+    caps.resolvedReady1H = anim::READY_1H;
+    caps.resolvedReadyThrown = anim::READY_THROWN;
+    WeaponLoadout loadout;
+    loadout.inventoryType = wowee::game::InvType::ONE_HAND;
+    loadout.rangedType = RangedWeaponType::THROWN;
+
+    fsm.setState(CombatFSM::State::COMBAT_IDLE);
+    auto in = combatInput();
+    in.rangedWeaponActive = false;
+    CHECK(fsm.resolve(in, caps, loadout).animId == anim::READY_1H);
+
+    in.rangedWeaponActive = true;
+    CHECK(fsm.resolve(in, caps, loadout).animId == anim::READY_THROWN);
 }

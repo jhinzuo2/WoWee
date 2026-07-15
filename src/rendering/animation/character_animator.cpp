@@ -58,6 +58,10 @@ void CharacterAnimator::setEquippedRangedType(RangedWeaponType type) {
     loadout_.rangedType = type;
 }
 
+void CharacterAnimator::setRangedWeaponActive(bool active) {
+    rangedWeaponActive_ = active;
+}
+
 void CharacterAnimator::playEmote(uint32_t animId, bool loop) {
     activity_.startEmote(animId, loop);
 }
@@ -134,6 +138,7 @@ AnimOutput CharacterAnimator::resolveAnimation() {
     combatIn.moving = fi.moving;
     combatIn.sprinting = fi.sprinting;
     combatIn.lowHealth = lowHealth_;
+    combatIn.rangedWeaponActive = rangedWeaponActive_;
     combatIn.meleeSwingTimer = fi.meleeSwingTimer;
     combatIn.rangedShootTimer = fi.rangedShootTimer;
     combatIn.specialAttackAnimId = fi.specialAttackAnimId;

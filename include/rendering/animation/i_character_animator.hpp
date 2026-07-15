@@ -24,6 +24,7 @@ public:
     virtual void triggerSpecialAttack(uint32_t spellId) = 0;
     virtual void setEquippedWeaponType(const WeaponLoadout& loadout) = 0;
     virtual void setEquippedRangedType(RangedWeaponType type) = 0;
+    virtual void setRangedWeaponActive(bool active) = 0;
     virtual void playEmote(uint32_t animId, bool loop) = 0;
     virtual void cancelEmote() = 0;
     virtual void startLooting() = 0;

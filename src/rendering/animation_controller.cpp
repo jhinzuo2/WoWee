@@ -235,6 +235,8 @@ void AnimationController::resetCombatVisualState() {
     specialAttackAnimId_ = 0;
     rangedShootTimer_ = 0.0f;
     rangedAnimId_ = 0;
+    restoreWeaponAfterRangedShot_ = false;
+    characterAnimator_.setRangedWeaponActive(false);
     stunned_ = false;
     charging_ = false;
 
@@ -350,6 +352,10 @@ void AnimationController::setEquippedRangedType(RangedWeaponType type) {
     characterAnimator_.setEquippedRangedType(type);
 }
 
+void AnimationController::setRangedWeaponActive(bool active) {
+    characterAnimator_.setRangedWeaponActive(active);
+}
+
 void AnimationController::setCharging(bool c) {
     charging_ = c;
     characterAnimator_.setCharging(c);
@@ -401,6 +407,8 @@ void AnimationController::triggerRangedShot() {
     if (dur < 0.25f) dur = 0.25f;
     if (dur > 1.5f) dur = 1.5f;
     rangedShootTimer_ = dur;
+    restoreWeaponAfterRangedShot_ =
+        (weaponLoadout_.rangedType == RangedWeaponType::THROWN);
 }
 
 uint32_t AnimationController::resolveMeleeAnimId() {
@@ -870,6 +878,10 @@ void AnimationController::updateMeleeTimers(float deltaTime) {
     // Ranged shot timer (same pattern as melee)
     if (rangedShootTimer_ > 0.0f) {
         rangedShootTimer_ = std::max(0.0f, rangedShootTimer_ - deltaTime);
+        if (rangedShootTimer_ <= 0.0f && restoreWeaponAfterRangedShot_) {
+            restoreWeaponAfterRangedShot_ = false;
+            if (rangedShotCompleteCallback_) rangedShotCompleteCallback_();
+        }
     }
 }
 

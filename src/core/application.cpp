@@ -1026,6 +1026,11 @@ void Application::setState(AppState newState) {
                 gameHandler->setRangedWeaponSwapCallback([this](bool show) {
                     if (appearanceComposer_) appearanceComposer_->showRangedWeapon(show);
                 });
+                if (renderer && renderer->getAnimationController()) {
+                    renderer->getAnimationController()->setRangedShotCompleteCallback([this]() {
+                        if (appearanceComposer_) appearanceComposer_->showRangedWeapon(false);
+                    });
+                }
                 // The logout countdown finishing is not the end of it: the server
                 // confirms with SMSG_LOGOUT_COMPLETE, and only then does the client
                 // leave. Without this the countdown ran out and nothing happened.

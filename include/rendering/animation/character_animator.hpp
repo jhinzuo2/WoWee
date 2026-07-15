@@ -42,6 +42,7 @@ public:
     void triggerSpecialAttack(uint32_t spellId) override;
     void setEquippedWeaponType(const WeaponLoadout& loadout) override;
     void setEquippedRangedType(RangedWeaponType type) override;
+    void setRangedWeaponActive(bool active) override;
     void playEmote(uint32_t animId, bool loop) override;
     void cancelEmote() override;
     void startLooting() override;
@@ -129,6 +130,7 @@ private:
     bool sprintAura_ = false;
     bool lowHealth_ = false;
     bool inCombat_ = false;
+    bool rangedWeaponActive_ = false;
 
     float lastDt_ = 0.0f;
     FrameInput frameInput_;

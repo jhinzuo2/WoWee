@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include <string>
 #include <vector>
 #include <glm/glm.hpp>
@@ -96,6 +98,10 @@ public:
 
     // ── Ranged combat ──────────────────────────────────────────────────────
     void setEquippedRangedType(RangedWeaponType type);
+    void setRangedWeaponActive(bool active);
+    void setRangedShotCompleteCallback(std::function<void()> callback) {
+        rangedShotCompleteCallback_ = std::move(callback);
+    }
     /// Trigger a ranged shot animation (Auto Shot, Shoot, Throw)
     void triggerRangedShot();
     RangedWeaponType getEquippedRangedType() const { return weaponLoadout_.rangedType; }
@@ -217,6 +223,8 @@ private:
     // ── Ranged weapon state ──────────────────────────────────────────────
     float rangedShootTimer_ = 0.0f;
     uint32_t rangedAnimId_ = 0;
+    bool restoreWeaponAfterRangedShot_ = false;
+    std::function<void()> rangedShotCompleteCallback_;
 
     // ── Mount state (discovery + positioning need renderer) ──────────────
     uint32_t mountInstanceId_ = 0;

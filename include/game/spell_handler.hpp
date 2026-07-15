@@ -322,6 +322,7 @@ private:
     void triggerCastVisual(uint32_t spellId, uint64_t casterGuid, uint32_t castTimeMs = 0);
     // Play the impact visual effect at the target's position.
     void triggerImpactVisual(uint32_t spellId, uint64_t targetGuid);
+    void launchRangedWeaponProjectile(uint32_t spellId, uint64_t targetGuid);
 
     // --- handleSpellLogExecute per-effect parsers (extracted to reduce nesting) ---
     void parseEffectPowerDrain(network::Packet& packet, uint32_t effectLogCount,

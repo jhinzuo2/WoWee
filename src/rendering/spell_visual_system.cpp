@@ -9,6 +9,8 @@
 #include "core/application.hpp"
 #include "core/logger.hpp"
 #include <algorithm>
+#include <cmath>
+#include <glm/gtc/constants.hpp>
 
 namespace wowee {
 namespace rendering {
@@ -501,8 +503,63 @@ void SpellVisualSystem::playSpellVisual(uint32_t visualId, const glm::vec3& worl
     }
 }
 
+void SpellVisualSystem::playPhysicalProjectile(const std::string& modelPath,
+                                                const std::string& texturePath,
+                                                const glm::vec3& start,
+                                                const glm::vec3& end,
+                                                float duration,
+                                                bool spin) {
+    if (!renderer_ || modelPath.empty()) return;
+    auto* characterRenderer = renderer_->getCharacterRenderer();
+    if (!characterRenderer) return;
+    if (!cachedAssetManager_)
+        cachedAssetManager_ = core::Application::getInstance().getAssetManager();
+    if (!cachedAssetManager_) return;
+
+    const std::string cacheKey = modelPath + "|" + texturePath;
+    uint32_t modelId = 0;
+    auto cached = projectileModelIds_.find(cacheKey);
+    if (cached != projectileModelIds_.end()) {
+        modelId = cached->second;
+    } else {
+        if (nextProjectileModelId_ >= 999000) return;
+        modelId = nextProjectileModelId_++;
+        projectileModelIds_[cacheKey] = modelId;
+    }
+
+    if (!characterRenderer->getModelData(modelId)) {
+        auto bytes = cachedAssetManager_->readFile(modelPath);
+        if (bytes.empty()) return;
+        pipeline::M2Model model = pipeline::M2Loader::load(bytes);
+        if (model.name.empty()) model.name = modelPath;
+        if (model.version >= 264) {
+            const size_t dot = modelPath.rfind('.');
+            const std::string skinPath =
+                (dot == std::string::npos ? modelPath : modelPath.substr(0, dot)) + "00.skin";
+            auto skin = cachedAssetManager_->readFile(skinPath);
+            if (!skin.empty()) pipeline::M2Loader::loadSkin(skin, model);
+        }
+        if (model.vertices.empty() || !characterRenderer->loadModel(model, modelId)) return;
+        if (!texturePath.empty()) {
+            if (auto* texture = characterRenderer->loadTexture(texturePath))
+                characterRenderer->setModelTexture(modelId, 0, texture);
+        }
+    }
+
+    const glm::vec3 delta = end - start;
+    const float horizontal = std::sqrt(delta.x * delta.x + delta.y * delta.y);
+    glm::vec3 rotation(0.0f);
+    rotation.z = std::atan2(delta.y, delta.x);
+    rotation.y = -std::atan2(delta.z, std::max(horizontal, 0.001f));
+
+    const uint32_t instanceId = characterRenderer->createInstance(modelId, start, rotation, 1.0f);
+    if (instanceId == 0) return;
+    physicalProjectiles_.push_back({instanceId, start, end, rotation, 0.0f,
+                                    std::max(duration, 0.05f), spin});
+}
+
 void SpellVisualSystem::update(float deltaTime) {
-    if (activeSpellVisuals_.empty() || !m2Renderer_) return;
+    if (activeSpellVisuals_.empty() && physicalProjectiles_.empty()) return;
 
     // Get character bone tracking context (once per frame)
     CharacterRenderer* charRenderer = renderer_ ? renderer_->getCharacterRenderer() : nullptr;
@@ -523,6 +580,27 @@ void SpellVisualSystem::update(float deltaTime) {
                 }
             }
             ++it;
+        }
+    }
+
+
+    if (charRenderer) {
+        for (auto it = physicalProjectiles_.begin(); it != physicalProjectiles_.end(); ) {
+            it->elapsed += deltaTime;
+            const float t = std::min(it->elapsed / it->duration, 1.0f);
+            charRenderer->setInstancePosition(
+                it->instanceId, glm::mix(it->start, it->end, t));
+            if (it->spin) {
+                glm::vec3 rotation = it->rotation;
+                rotation.x += t * glm::two_pi<float>() * 2.0f;
+                charRenderer->setInstanceRotation(it->instanceId, rotation);
+            }
+            if (t >= 1.0f) {
+                charRenderer->removeInstance(it->instanceId);
+                it = physicalProjectiles_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 }
@@ -546,6 +624,11 @@ void SpellVisualSystem::reset() {
         if (m2Renderer_) m2Renderer_->removeInstance(sv.instanceId);
     }
     activeSpellVisuals_.clear();
+    if (renderer_ && renderer_->getCharacterRenderer()) {
+        for (const auto& projectile : physicalProjectiles_)
+            renderer_->getCharacterRenderer()->removeInstance(projectile.instanceId);
+    }
+    physicalProjectiles_.clear();
     // Reset the negative cache so models that failed during asset loading can retry.
     spellVisualFailedModels_.clear();
 }

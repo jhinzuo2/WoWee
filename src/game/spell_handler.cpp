@@ -5,6 +5,7 @@
 #include "game/packet_parsers.hpp"
 #include "game/entity.hpp"
 #include "rendering/renderer.hpp"
+#include "rendering/character_renderer.hpp"
 #include "rendering/spell_visual_system.hpp"
 #include "audio/audio_coordinator.hpp"
 #include "audio/spell_sound_manager.hpp"
@@ -14,6 +15,7 @@
 #include "core/logger.hpp"
 #include "network/world_socket.hpp"
 #include "pipeline/asset_manager.hpp"
+#include "pipeline/dbc_loader.hpp"
 #include "pipeline/dbc_layout.hpp"
 #include "audio/ui_sound_manager.hpp"
 #include "audio/player_voice_manager.hpp"
@@ -288,6 +290,67 @@ void SpellHandler::triggerImpactVisual(uint32_t spellId, uint64_t targetGuid) {
     if (!resolveUnitPosition(targetGuid, targetPos)) return;
     LOG_INFO("SpellVisual: triggerImpactVisual visualId=", visualId, " pos=(", targetPos.x, ",", targetPos.y, ",", targetPos.z, ")");
     svs->playSpellVisual(visualId, targetPos, /*useImpactKit=*/true);
+}
+
+void SpellHandler::launchRangedWeaponProjectile(uint32_t spellId, uint64_t targetGuid) {
+    if (targetGuid == 0) targetGuid = owner_.getTargetGuid();
+    auto* renderer = owner_.services().renderer;
+    auto* assets = owner_.services().assetManager;
+    if (!renderer || !assets || targetGuid == 0) return;
+    auto* visuals = renderer->getSpellVisualSystem();
+    auto* characters = renderer->getCharacterRenderer();
+    if (!visuals || !characters) return;
+
+    glm::vec3 start = renderer->getCharacterPosition() + glm::vec3(0.0f, 0.0f, 1.0f);
+    glm::mat4 handTransform(1.0f);
+    if (characters->getAttachmentTransform(renderer->getCharacterInstanceId(), 1, handTransform))
+        start = glm::vec3(handTransform[3]);
+
+    glm::vec3 end;
+    if (!resolveUnitPosition(targetGuid, end)) return;
+    end.z += 1.0f;
+
+    const auto& ranged = owner_.getInventory().getEquipSlot(EquipSlot::RANGED);
+    std::string modelPath;
+    std::string texturePath;
+    bool spin = false;
+
+    if (spellId == 2764 || (!ranged.empty() && ranged.item.inventoryType == InvType::THROWN)) {
+        spin = true;
+        if (!ranged.empty() && ranged.item.displayInfoId != 0) {
+            auto displayDbc = assets->loadDBC("ItemDisplayInfo.dbc");
+            if (displayDbc && displayDbc->isLoaded()) {
+                const int32_t row = displayDbc->findRecordById(ranged.item.displayInfoId);
+                if (row >= 0) {
+                    const auto* layout = pipeline::getActiveDBCLayout()
+                        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+                    std::string model = displayDbc->getString(
+                        static_cast<uint32_t>(row), layout ? (*layout)["LeftModel"] : 1);
+                    std::string texture = displayDbc->getString(
+                        static_cast<uint32_t>(row), layout ? (*layout)["LeftModelTexture"] : 3);
+                    if (!model.empty()) {
+                        const size_t dot = model.rfind('.');
+                        if (dot != std::string::npos) model = model.substr(0, dot);
+                        modelPath = "Item\\ObjectComponents\\Weapon\\" + model + ".m2";
+                    }
+                    if (!texture.empty())
+                        texturePath = "Item\\ObjectComponents\\Weapon\\" + texture + ".blp";
+                }
+            }
+        }
+        if (modelPath.empty())
+            modelPath = "Item\\ObjectComponents\\Weapon\\Thrown_1H_Dagger_A_01.m2";
+    } else if (spellId == 75 || (!ranged.empty() &&
+               (ranged.item.inventoryType == InvType::RANGED_BOW ||
+                ranged.item.subclassName == "Bow" || ranged.item.subclassName == "Crossbow"))) {
+        modelPath = "Item\\ObjectComponents\\Ammo\\ArrowFlight_01.m2";
+    } else {
+        modelPath = "Item\\ObjectComponents\\Ammo\\BulletFlight_01.m2";
+    }
+
+    const float distance = glm::length(end - start);
+    const float duration = std::clamp(distance / 35.0f, 0.12f, 0.8f);
+    visuals->playPhysicalProjectile(modelPath, texturePath, start, end, duration, spin);
 }
 
 
@@ -1286,9 +1349,10 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
         return SpellCastType::DIRECTED;
     };
     const SpellCastType castType = classifyCast(data.targetGuid, data.casterUnit);
+    const bool rangedWeaponAttack = spellclass::isRangedWeaponAutoAttack(data.spellId);
 
     // Track cast bar for any non-player caster
-    if (data.casterUnit != owner_.getPlayerGuid() && data.castTime > 0) {
+    if (data.casterUnit != owner_.getPlayerGuid() && data.castTime > 0 && !rangedWeaponAttack) {
         auto& s = unitCastStates_[data.casterUnit];
         s.casting        = true;
         s.isChannel      = false;
@@ -1303,7 +1367,7 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
     }
 
     // Player's own cast
-    if (data.casterUnit == owner_.getPlayerGuid() && data.castTime > 0) {
+    if (data.casterUnit == owner_.getPlayerGuid() && data.castTime > 0 && !rangedWeaponAttack) {
         // Cancel pending GO retries
         owner_.pendingGameObjectLootRetriesRef().erase(
             std::remove_if(owner_.pendingGameObjectLootRetriesRef().begin(), owner_.pendingGameObjectLootRetriesRef().end(),
@@ -1343,7 +1407,7 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
     }
 
     // Fire UNIT_SPELLCAST_START
-    if (owner_.addonEventCallbackRef()) {
+    if (owner_.addonEventCallbackRef() && !rangedWeaponAttack) {
         std::string unitId = owner_.guidToUnitId(data.casterUnit);
         if (!unitId.empty())
             owner_.addonEventCallbackRef()("UNIT_SPELLCAST_START", {unitId, std::to_string(data.spellId)});
@@ -1351,7 +1415,7 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
 
     // Trigger cast visual effect (precast/cast kit M2) at the caster's position.
     // Skip profession spells (crafting has no flashy cast effects).
-    if (!owner_.isProfessionSpell(data.spellId)) {
+    if (!owner_.isProfessionSpell(data.spellId) && !rangedWeaponAttack) {
         triggerCastVisual(data.spellId, data.casterUnit, data.castTime);
     }
 }
@@ -1359,10 +1423,11 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
 void SpellHandler::handleSpellGo(network::Packet& packet) {
     SpellGoData data;
     if (!owner_.getPacketParsers()->parseSpellGo(packet, data)) return;
+    const bool rangedWeaponAttack = spellclass::isRangedWeaponAutoAttack(data.spellId);
 
     if (data.casterUnit == owner_.getPlayerGuid()) {
         // Play cast-complete sound
-        if (!owner_.isProfessionSpell(data.spellId))
+        if (!owner_.isProfessionSpell(data.spellId) && !rangedWeaponAttack)
             playSpellCastSound(data.spellId);
 
         // Ranged auto-attack spells (Auto Shot, Shoot, Throw) complete as timed
@@ -1372,6 +1437,12 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
         if (spellclass::isRangedWeaponAutoAttack(sid)) {
             if (owner_.meleeSwingCallbackRef()) owner_.meleeSwingCallbackRef()(sid);
             owner_.suppressNextMeleeSwingAnim();
+            uint64_t projectileTarget = data.targetGuid;
+            if (projectileTarget == 0 && !data.hitTargets.empty())
+                projectileTarget = data.hitTargets.front();
+            if (projectileTarget == 0 && !data.missTargets.empty())
+                projectileTarget = data.missTargets.front().targetGuid;
+            launchRangedWeaponProjectile(sid, projectileTarget);
         }
 
         // Instant melee abilities → trigger attack animation. Range decides this, not
@@ -1398,7 +1469,8 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
 
         // Instant spell cast animation — if this wasn't a timed cast and isn't a
         // melee ability, play a brief spell cast animation (one-shot)
-        if (!wasInTimedCast && !isMeleeAbility && !owner_.isProfessionSpell(data.spellId)) {
+        if (!wasInTimedCast && !isMeleeAbility && !rangedWeaponAttack &&
+            !owner_.isProfessionSpell(data.spellId)) {
             // Classify instant spell from SPELL_GO packet target info
             SpellCastType goType = SpellCastType::OMNI;
             if (data.targetGuid != 0 && data.targetGuid != data.casterUnit)
@@ -1432,11 +1504,11 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
         // and suppresses CMSG_CANCEL_CAST for ALL subsequent spell casts.
         owner_.pendingGameObjectInteractGuidRef() = 0;
 
-        if (owner_.spellCastAnimCallbackRef()) {
+        if (owner_.spellCastAnimCallbackRef() && !rangedWeaponAttack) {
             owner_.spellCastAnimCallbackRef()(owner_.getPlayerGuid(), false, false, SpellCastType::OMNI);
         }
 
-        if (owner_.addonEventCallbackRef())
+        if (owner_.addonEventCallbackRef() && !rangedWeaponAttack)
             owner_.addonEventCallbackRef()("UNIT_SPELLCAST_STOP", {"player", std::to_string(data.spellId)});
 
         // Craft queue: re-cast if more crafts remaining
@@ -1470,17 +1542,17 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
             npcGoType = SpellCastType::DIRECTED;
         else if (data.targetGuid == 0 && data.hitCount > 1)
             npcGoType = SpellCastType::AREA;
-        if (!wasTrackedCast && owner_.spellCastAnimCallbackRef()) {
+        if (!wasTrackedCast && !rangedWeaponAttack && owner_.spellCastAnimCallbackRef()) {
             owner_.spellCastAnimCallbackRef()(data.casterUnit, true, false, npcGoType);
         }
-        if (owner_.spellCastAnimCallbackRef()) {
+        if (!rangedWeaponAttack && owner_.spellCastAnimCallbackRef()) {
             owner_.spellCastAnimCallbackRef()(data.casterUnit, false, false, SpellCastType::OMNI);
         }
         bool targetsPlayer = false;
         for (const auto& tgt : data.hitTargets) {
             if (tgt == owner_.getPlayerGuid()) { targetsPlayer = true; break; }
         }
-        if (targetsPlayer)
+        if (targetsPlayer && !rangedWeaponAttack)
             playSpellCastSound(data.spellId);
     }
 
@@ -1516,12 +1588,12 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
             owner_.addonEventCallbackRef()("UNIT_SPELLCAST_SUCCEEDED", {unitId, std::to_string(data.spellId)});
     }
 
-    if (playerIsHit || playerHitEnemy)
+    if ((playerIsHit || playerHitEnemy) && !rangedWeaponAttack)
         playSpellImpactSound(data.spellId);
 
     // Trigger spell visual effects: cast kit at caster + impact kit at each hit target.
     // Skip profession spells and melee (schoolMask == 1) abilities.
-    if (!owner_.isProfessionSpell(data.spellId)) {
+    if (!owner_.isProfessionSpell(data.spellId) && !rangedWeaponAttack) {
         uint32_t visualId = resolveSpellVisualId(data.spellId);
         if (visualId != 0) {
             // Cast-complete visual at caster (for instant spells that skip SPELL_START)

@@ -330,13 +330,13 @@ AnimOutput CombatFSM::resolve(const Input& in, const AnimCapabilitySet& caps,
         case State::COMBAT_IDLE:
             if (in.lowHealth && caps.resolvedStandWound) {
                 animId = caps.resolvedStandWound;
-            } else if (loadout.rangedType == RangedWeaponType::BOW) {
+            } else if (in.rangedWeaponActive && loadout.rangedType == RangedWeaponType::BOW) {
                 animId = caps.resolvedReadyBow;
-            } else if (loadout.rangedType == RangedWeaponType::GUN) {
+            } else if (in.rangedWeaponActive && loadout.rangedType == RangedWeaponType::GUN) {
                 animId = caps.resolvedReadyRifle;
-            } else if (loadout.rangedType == RangedWeaponType::CROSSBOW) {
+            } else if (in.rangedWeaponActive && loadout.rangedType == RangedWeaponType::CROSSBOW) {
                 animId = caps.resolvedReadyCrossbow;
-            } else if (loadout.rangedType == RangedWeaponType::THROWN) {
+            } else if (in.rangedWeaponActive && loadout.rangedType == RangedWeaponType::THROWN) {
                 animId = caps.resolvedReadyThrown;
             } else if (loadout.is2HLoose) {
                 animId = caps.resolvedReady2HLoose;
