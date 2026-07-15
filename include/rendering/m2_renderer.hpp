@@ -17,6 +17,7 @@
 #include <random>
 #include <chrono>
 #include <future>
+#include <algorithm>
 
 namespace wowee {
 
@@ -404,6 +405,9 @@ public:
 
     void setInsideInterior(bool inside) { insideInterior = inside; }
     void setOnTaxi(bool onTaxi) { onTaxi_ = onTaxi; }
+    void setViewDistance(float distance) {
+        viewDistanceScale_ = std::clamp(distance, 400.0f, 2400.0f) / 1200.0f;
+    }
 
     std::vector<glm::vec3> getWaterVegetationPositions(const glm::vec3& camPos, float maxDist) const;
 
@@ -749,6 +753,7 @@ private:
     glm::vec3 cachedCamPos_ = glm::vec3(0.0f);
     float cachedMaxRenderDistSq_ = 0.0f;
     float smoothedRenderDist_ = 1000.0f;  // Smoothed render distance to prevent flickering
+    float viewDistanceScale_ = 1.0f;
     bool forceNoCull_ = false;
 
     // Thread count for parallel bone animation

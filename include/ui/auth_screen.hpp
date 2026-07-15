@@ -159,6 +159,7 @@ private:
         int  preset          = 2;   // 0=Custom 1=Low 2=Medium 3=High 4=Ultra
         bool shadows         = true;
         float shadowDistance = 300.0f;
+        float viewDistance   = 1200.0f;
         int  antiAliasing    = 0;   // 0=Off 1=2x 2=4x 3=8x
         bool fxaa            = false;
         bool normalMapping   = true;

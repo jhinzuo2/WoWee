@@ -37,6 +37,7 @@ public:
     bool displaySettingsLoaded_ = false;
     bool pendingShadows = true;
     float pendingShadowDistance = 300.0f;
+    float pendingViewDistance = 1200.0f;
     bool pendingWaterRefraction = true;
     int pendingBrightness = 50; // 0-100, maps to 0.0-2.0 (50 = 1.0 default)
 

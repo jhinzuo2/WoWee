@@ -1461,13 +1461,14 @@ void WMORenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const
             if (gi < instance.worldGroupBounds.size()) {
                 const auto& [gMin, gMax] = instance.worldGroupBounds[gi];
 
-                if (doDistanceCull) {
-                    glm::vec3 closestPoint = glm::clamp(camPos, gMin, gMax);
-                    float distSq = glm::dot(closestPoint - camPos, closestPoint - camPos);
-                    if (distSq > 1440000.0f) { // 1200 units — matches terrain view distance
-                        result.distanceCulled++;
-                        continue;
-                    }
+                glm::vec3 closestPoint = glm::clamp(camPos, gMin, gMax);
+                float distSq = glm::dot(closestPoint - camPos, closestPoint - camPos);
+                const float groupViewDistance = doDistanceCull
+                    ? std::min(viewDistance_, maxGroupDistance)
+                    : viewDistance_;
+                if (distSq > groupViewDistance * groupViewDistance) {
+                    result.distanceCulled++;
+                    continue;
                 }
             }
 

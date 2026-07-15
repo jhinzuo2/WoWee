@@ -1109,25 +1109,25 @@ void AuthScreen::destroyBackgroundImage() {
 void AuthScreen::applyPresetToState(LoginGraphicsState& s, int preset) {
     switch (preset) {
     case 1: // Low
-        s.shadows = false; s.shadowDistance = 75.0f; s.antiAliasing = 0;
+        s.shadows = false; s.shadowDistance = 75.0f; s.viewDistance = 600.0f; s.antiAliasing = 0;
         s.fxaa = false; s.normalMapping = false; s.pom = false; s.pomQuality = 1;
         s.upscalingMode = 0; s.waterRefraction = false; s.groundClutter = 25;
         s.brightness = 50; s.vsync = true; s.fullscreen = false;
         break;
     case 2: // Medium
-        s.shadows = true; s.shadowDistance = 150.0f; s.antiAliasing = 0;
+        s.shadows = true; s.shadowDistance = 150.0f; s.viewDistance = 1000.0f; s.antiAliasing = 0;
         s.fxaa = false; s.normalMapping = true; s.pom = true; s.pomQuality = 1;
         s.upscalingMode = 0; s.waterRefraction = true; s.groundClutter = 100;
         s.brightness = 50; s.vsync = true; s.fullscreen = false;
         break;
     case 3: // High
-        s.shadows = true; s.shadowDistance = 250.0f; s.antiAliasing = 1;
+        s.shadows = true; s.shadowDistance = 250.0f; s.viewDistance = 1600.0f; s.antiAliasing = 1;
         s.fxaa = true; s.normalMapping = true; s.pom = true; s.pomQuality = 1;
         s.upscalingMode = 0; s.waterRefraction = true; s.groundClutter = 130;
         s.brightness = 50; s.vsync = true; s.fullscreen = false;
         break;
     case 4: // Ultra
-        s.shadows = true; s.shadowDistance = 400.0f; s.antiAliasing = 2;
+        s.shadows = true; s.shadowDistance = 400.0f; s.viewDistance = 2400.0f; s.antiAliasing = 2;
         s.fxaa = true; s.normalMapping = true; s.pom = true; s.pomQuality = 2;
         s.upscalingMode = 0; s.waterRefraction = true; s.groundClutter = 150;
         s.brightness = 50; s.vsync = true; s.fullscreen = false;
@@ -1154,6 +1154,7 @@ void AuthScreen::loadLoginGraphicsState() {
         if (key == "graphics_preset")       loginGfx_.preset        = std::stoi(val);
         else if (key == "shadows")          loginGfx_.shadows        = (val == "1");
         else if (key == "shadow_distance")  loginGfx_.shadowDistance = std::stof(val);
+        else if (key == "view_distance")    loginGfx_.viewDistance   = std::stof(val);
         else if (key == "antialiasing")     loginGfx_.antiAliasing   = std::stoi(val);
         else if (key == "fxaa")             loginGfx_.fxaa           = (val == "1");
         else if (key == "normal_mapping")   loginGfx_.normalMapping  = (val == "1");
@@ -1186,6 +1187,7 @@ void AuthScreen::saveLoginGraphicsState() {
     cfg["graphics_preset"]       = std::to_string(loginGfx_.preset);
     cfg["shadows"]               = loginGfx_.shadows        ? "1" : "0";
     cfg["shadow_distance"]       = std::to_string(static_cast<int>(loginGfx_.shadowDistance));
+    cfg["view_distance"]         = std::to_string(static_cast<int>(loginGfx_.viewDistance));
     cfg["antialiasing"]          = std::to_string(loginGfx_.antiAliasing);
     cfg["fxaa"]                  = loginGfx_.fxaa           ? "1" : "0";
     cfg["normal_mapping"]        = loginGfx_.normalMapping  ? "1" : "0";
@@ -1250,6 +1252,10 @@ void AuthScreen::renderLoginSettingsWindow() {
             if (ImGui::SliderFloat("Shadow Distance", &sd, 50.0f, 600.0f, "%.0f"))
                 loginGfx_.shadowDistance = sd;
         }
+
+        ImGui::SetNextItemWidth(240.0f);
+        ImGui::SliderFloat("View Distance", &loginGfx_.viewDistance,
+                           400.0f, 2400.0f, "%.0f");
 
         // Anti-aliasing
         const char* aaNames[] = {"Off", "2x MSAA", "4x MSAA"};

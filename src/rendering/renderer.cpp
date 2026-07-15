@@ -2023,6 +2023,10 @@ bool Renderer::initializeRenderers(pipeline::AssetManager* assetManager, const s
         }
     }
 
+    // Renderer components can be recreated during map transitions. Restore the
+    // configured view distance instead of falling back to their defaults.
+    setViewDistance(viewDistance_);
+
     // Initialize shadow pipelines for M2 if not yet done
     if (m2Renderer && shadowRenderPass != VK_NULL_HANDLE && !m2Renderer->hasShadowPipeline()) {
         if (!m2Renderer->initializeShadow(shadowRenderPass))
@@ -2244,6 +2248,23 @@ void Renderer::setWireframeMode(bool enabled) {
     if (terrainRenderer) {
         terrainRenderer->setWireframe(enabled);
     }
+}
+
+void Renderer::setViewDistance(float distance) {
+    viewDistance_ = glm::clamp(distance, 400.0f, 2400.0f);
+
+    if (terrainRenderer) terrainRenderer->setViewDistance(viewDistance_);
+    if (wmoRenderer) wmoRenderer->setViewDistance(viewDistance_);
+    if (m2Renderer) m2Renderer->setViewDistance(viewDistance_);
+    if (terrainManager) {
+        terrainManager->setLoadRadius(getTerrainLoadRadius());
+        terrainManager->setUnloadRadius(getTerrainUnloadRadius());
+    }
+}
+
+int Renderer::getTerrainLoadRadius() const {
+    constexpr float kAdtTileSize = 533.33333f;
+    return glm::clamp(static_cast<int>(std::ceil(viewDistance_ / kAdtTileSize)) + 1, 2, 6);
 }
 
 bool Renderer::loadTerrainArea(const std::string& mapName, int centerX, int centerY, int radius) {

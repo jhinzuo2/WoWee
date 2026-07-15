@@ -12,6 +12,7 @@
 #include <string>
 #include <optional>
 #include <future>
+#include <algorithm>
 
 namespace wowee {
 namespace pipeline {
@@ -239,6 +240,7 @@ public:
     }
     bool isDistanceCullingEnabled() const { return distanceCulling; }
     float getMaxGroupDistance() const { return maxGroupDistance; }
+    void setViewDistance(float distance) { viewDistance_ = std::clamp(distance, 400.0f, 2400.0f); }
 
     /**
      * Get number of groups culled by portals last frame
@@ -723,6 +725,7 @@ private:
     bool distanceCulling = false;  // Disabled - causes ground to disappear
     float maxGroupDistance = 500.0f;
     float maxGroupDistanceSq = 250000.0f;  // maxGroupDistance^2
+    float viewDistance_ = 1200.0f;
     uint32_t lastDrawCalls = 0;
     mutable uint32_t lastPortalCulledGroups = 0;
     mutable uint32_t lastDistanceCulledGroups = 0;

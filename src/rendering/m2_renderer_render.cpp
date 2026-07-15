@@ -290,9 +290,10 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
 
     // Cache camera state for frustum-culling bone computation
     cachedCamPos_ = cameraPos;
-    const float maxRenderDistance = (instances.size() > rendering::M2_HIGH_DENSITY_INSTANCE_THRESHOLD)
-                                     ? rendering::M2_MAX_RENDER_DISTANCE_HIGH_DENSITY
-                                     : rendering::M2_MAX_RENDER_DISTANCE_LOW_DENSITY;
+    const float maxRenderDistance = viewDistanceScale_ *
+        ((instances.size() > rendering::M2_HIGH_DENSITY_INSTANCE_THRESHOLD)
+             ? rendering::M2_MAX_RENDER_DISTANCE_HIGH_DENSITY
+             : rendering::M2_MAX_RENDER_DISTANCE_LOW_DENSITY);
     cachedMaxRenderDistSq_ = maxRenderDistance * maxRenderDistance;
 
     // Build frustum for culling bones
@@ -626,9 +627,10 @@ void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, c
     const uint32_t numInstances = std::min(static_cast<uint32_t>(instances.size()), MAX_CULL_INSTANCES);
 
     // --- Compute per-instance adaptive distances (same formula as old CPU cull) ---
-    const float targetRenderDist = (instances.size() > 2000) ? 300.0f
-                                 : (instances.size() > 1000) ? 500.0f
-                                 : 1000.0f;
+    const float targetRenderDist = viewDistanceScale_ *
+        ((instances.size() > 2000) ? 300.0f
+         : (instances.size() > 1000) ? 500.0f
+                                     : 1000.0f);
     const float shrinkRate = 0.005f;
     const float growRate   = 0.05f;
     float blendRate = (targetRenderDist < smoothedRenderDist_) ? shrinkRate : growRate;
@@ -838,9 +840,10 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     // If GPU culling was not dispatched, fallback: compute distances on CPU
     float maxRenderDistanceSq;
     if (!gpuCullAvailable) {
-        const float targetRenderDist = (instances.size() > 2000) ? 300.0f
-                                     : (instances.size() > 1000) ? 500.0f
-                                     : 1000.0f;
+        const float targetRenderDist = viewDistanceScale_ *
+            ((instances.size() > 2000) ? 300.0f
+             : (instances.size() > 1000) ? 500.0f
+                                         : 1000.0f);
         const float shrinkRate = 0.005f;
         const float growRate = 0.05f;
         float blendRate = (targetRenderDist < smoothedRenderDist_) ? shrinkRate : growRate;

@@ -791,6 +791,16 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
                     updateGraphicsPresetFromCurrentSettings();
                     saveCallback();
                 }
+                ImGui::SetNextItemWidth(240.0f);
+                if (ImGui::SliderFloat("View Distance", &pendingViewDistance,
+                                       400.0f, 2400.0f, "%.0f")) {
+                    if (renderer) renderer->setViewDistance(pendingViewDistance);
+                    updateGraphicsPresetFromCurrentSettings();
+                    saveCallback();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Controls terrain, world-object, and doodad draw distance.");
+                }
                 if (ImGui::Checkbox("Shadows", &pendingShadows)) {
                     if (renderer) renderer->setShadowsEnabled(pendingShadows);
                     updateGraphicsPresetFromCurrentSettings();
@@ -1140,6 +1150,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
     // Define preset values based on quality level
     switch (preset) {
         case GraphicsPreset::LOW: {
+            pendingViewDistance = 600.0f;
             pendingShadows = false;
             pendingShadowDistance = 100.0f;
             pendingAntiAliasing = 0;  // Off
@@ -1147,6 +1158,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             pendingPOM = false;
             pendingGroundClutterDensity = 25;
             if (renderer) {
+                renderer->setViewDistance(pendingViewDistance);
                 renderer->setShadowsEnabled(false);
                 renderer->setMsaaSamples(VK_SAMPLE_COUNT_1_BIT);
                 if (auto* wr = renderer->getWMORenderer()) {
@@ -1164,6 +1176,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             break;
         }
         case GraphicsPreset::MEDIUM: {
+            pendingViewDistance = 1000.0f;
             pendingShadows = true;
             pendingShadowDistance = 200.0f;
             pendingAntiAliasing = 1;  // 2x MSAA
@@ -1173,6 +1186,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             pendingPOMQuality = 0;  // Low
             pendingGroundClutterDensity = 60;
             if (renderer) {
+                renderer->setViewDistance(pendingViewDistance);
                 renderer->setShadowsEnabled(true);
                 renderer->setShadowDistance(200.0f);
                 renderer->setMsaaSamples(VK_SAMPLE_COUNT_2_BIT);
@@ -1195,6 +1209,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             break;
         }
         case GraphicsPreset::HIGH: {
+            pendingViewDistance = 1600.0f;
             pendingShadows = true;
             pendingShadowDistance = 350.0f;
             pendingAntiAliasing = 2;  // 4x MSAA
@@ -1204,6 +1219,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             pendingPOMQuality = 1;  // Medium
             pendingGroundClutterDensity = 100;
             if (renderer) {
+                renderer->setViewDistance(pendingViewDistance);
                 renderer->setShadowsEnabled(true);
                 renderer->setShadowDistance(350.0f);
                 renderer->setMsaaSamples(VK_SAMPLE_COUNT_4_BIT);
@@ -1226,6 +1242,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             break;
         }
         case GraphicsPreset::ULTRA: {
+            pendingViewDistance = 2400.0f;
             pendingShadows = true;
             pendingShadowDistance = 500.0f;
             pendingAntiAliasing = 3;  // 8x MSAA
@@ -1236,6 +1253,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             pendingPOMQuality = 2;  // High
             pendingGroundClutterDensity = 150;
             if (renderer) {
+                renderer->setViewDistance(pendingViewDistance);
                 renderer->setShadowsEnabled(true);
                 renderer->setShadowDistance(500.0f);
                 renderer->setMsaaSamples(VK_SAMPLE_COUNT_8_BIT);
@@ -1273,18 +1291,22 @@ void SettingsPanel::updateGraphicsPresetFromCurrentSettings() {
     auto matchesPreset = [this](GraphicsPreset preset) -> bool {
         switch (preset) {
             case GraphicsPreset::LOW:
-                return !pendingShadows && pendingAntiAliasing == 0 && !pendingNormalMapping && !pendingPOM &&
+                return pendingViewDistance >= 580.0f && pendingViewDistance <= 620.0f &&
+                       !pendingShadows && pendingAntiAliasing == 0 && !pendingNormalMapping && !pendingPOM &&
                        pendingGroundClutterDensity <= 30;
             case GraphicsPreset::MEDIUM:
-                return pendingShadows && pendingShadowDistance >= 180 && pendingShadowDistance <= 220 &&
+                return pendingViewDistance >= 980.0f && pendingViewDistance <= 1020.0f &&
+                       pendingShadows && pendingShadowDistance >= 180 && pendingShadowDistance <= 220 &&
                        pendingAntiAliasing == 1 && pendingNormalMapping && pendingPOM &&
                        pendingGroundClutterDensity >= 50 && pendingGroundClutterDensity <= 70;
             case GraphicsPreset::HIGH:
-                return pendingShadows && pendingShadowDistance >= 330 && pendingShadowDistance <= 370 &&
+                return pendingViewDistance >= 1580.0f && pendingViewDistance <= 1620.0f &&
+                       pendingShadows && pendingShadowDistance >= 330 && pendingShadowDistance <= 370 &&
                        pendingAntiAliasing == 2 && pendingNormalMapping && pendingPOM &&
                        pendingGroundClutterDensity >= 90 && pendingGroundClutterDensity <= 110;
             case GraphicsPreset::ULTRA:
-                return pendingShadows && pendingShadowDistance >= 480 && pendingAntiAliasing == 3 &&
+                return pendingViewDistance >= 2380.0f && pendingShadows &&
+                       pendingShadowDistance >= 480 && pendingAntiAliasing == 3 &&
                        pendingFXAA && pendingNormalMapping && pendingPOM && pendingGroundClutterDensity >= 140;
             default:
                 return false;
