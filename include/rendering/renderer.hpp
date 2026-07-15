@@ -238,7 +238,9 @@ private:
     VkImageLayout shadowDepthLayout_[2] = {};
     glm::mat4 lightSpaceMatrix = glm::mat4(1.0f);
     glm::vec3 shadowCenter = glm::vec3(0.0f);
+    glm::vec3 shadowLightDirection_ = glm::vec3(0.0f);
     bool shadowCenterInitialized = false;
+    bool shadowLightDirectionInitialized_ = false;
     bool shadowsEnabled = true;
     float shadowDistance_ = 300.0f;  // Shadow frustum half-extent (default: 300 units)
     uint32_t shadowFrameCounter_ = 0;

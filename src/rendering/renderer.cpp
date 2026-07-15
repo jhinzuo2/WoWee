@@ -2413,8 +2413,21 @@ glm::mat4 Renderer::computeLightSpaceMatrix() {
         sunDir = glm::normalize(sunDir);
     }
 
-    // Shadow center follows the player directly; texel snapping below
-    // prevents shimmer without needing to freeze the projection.
+    // Lighting transitions are deliberately smoothed every frame. Feeding that
+    // continuously rotating direction straight into the shadow camera rotates
+    // the entire shadow texel grid and makes otherwise stationary shadows
+    // shimmer. Hold the projection direction until the lighting has moved by a
+    // visible amount; diffuse lighting can continue to transition smoothly.
+    constexpr float kShadowDirectionUpdateCos = 0.9999619f; // cos(0.5 degrees)
+    if (!shadowLightDirectionInitialized_ ||
+        glm::dot(shadowLightDirection_, sunDir) < kShadowDirectionUpdateCos) {
+        shadowLightDirection_ = sunDir;
+        shadowLightDirectionInitialized_ = true;
+    }
+    sunDir = shadowLightDirection_;
+
+    // Shadow center follows the player directly; texel snapping below keeps
+    // translation aligned with the now-stable projection axes.
     glm::vec3 desiredCenter = characterPosition;
     if (!shadowCenterInitialized) {
         if (glm::dot(desiredCenter, desiredCenter) < 1.0f) {
