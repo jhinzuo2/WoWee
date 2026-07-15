@@ -6,7 +6,9 @@
 #include "core/application.hpp"
 #include "core/input.hpp"
 #include <imgui.h>
+#include <algorithm>
 #include <cctype>
+#include <cstdio>
 
 namespace wowee { namespace ui {
 
@@ -146,10 +148,17 @@ void QuestLogScreen::render(game::GameHandler& gameHandler, InventoryScreen& inv
         ImGui::SameLine();
         if (ImGui::RadioButton("Ready", questFilterMode_ == 2))   questFilterMode_ = 2;
 
-        // Summary counts
+        // Summary counts + capacity (server caps the log at 20/25 slots)
         ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.35f, 1.0f), "Active: %d", activeCount);
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.45f, 0.95f, 0.45f, 1.0f), "Ready: %d", completeCount);
+        ImGui::SameLine();
+        const int maxSlots = gameHandler.getMaxQuestLogSlots();
+        const int totalCount = static_cast<int>(quests.size());
+        ImVec4 capColor = totalCount >= maxSlots
+            ? ImVec4(1.0f, 0.45f, 0.45f, 1.0f)
+            : ImVec4(0.6f, 0.6f, 0.65f, 1.0f);
+        ImGui::TextColored(capColor, "(%d/%d)", totalCount, maxSlots);
         ImGui::Separator();
 
         if (quests.empty()) {
@@ -183,6 +192,13 @@ void QuestLogScreen::render(game::GameHandler& gameHandler, InventoryScreen& inv
             for (size_t fi = 0; fi < sizeof(questSearchFilter_) && questSearchFilter_[fi]; ++fi)
                 filterLower[fi] = static_cast<char>(std::tolower(static_cast<unsigned char>(questSearchFilter_[fi])));
 
+            // Group visible quests by zone: ZoneOrSort > 0 = AreaTable zone,
+            // < 0 = QuestSort category (class/profession/seasonal).
+            struct ZoneGroup {
+                std::string name;
+                std::vector<size_t> indices;
+            };
+            std::vector<ZoneGroup> zoneGroups;
             int visibleQuestCount = 0;
             for (size_t i = 0; i < quests.size(); i++) {
                 const auto& q = quests[i];
@@ -199,6 +215,40 @@ void QuestLogScreen::render(game::GameHandler& gameHandler, InventoryScreen& inv
                 }
 
                 visibleQuestCount++;
+                std::string zoneName;
+                if (q.zoneOrSort > 0)
+                    zoneName = gameHandler.getAreaName(static_cast<uint32_t>(q.zoneOrSort));
+                else if (q.zoneOrSort < 0)
+                    zoneName = gameHandler.getQuestSortName(static_cast<uint32_t>(-q.zoneOrSort));
+                if (zoneName.empty()) zoneName = "Other";
+
+                auto grpIt = std::find_if(zoneGroups.begin(), zoneGroups.end(),
+                    [&](const ZoneGroup& g) { return g.name == zoneName; });
+                if (grpIt == zoneGroups.end()) {
+                    zoneGroups.push_back({std::move(zoneName), {}});
+                    grpIt = std::prev(zoneGroups.end());
+                }
+                grpIt->indices.push_back(i);
+            }
+            // Alphabetical zones, "Other" last
+            std::sort(zoneGroups.begin(), zoneGroups.end(),
+                [](const ZoneGroup& a, const ZoneGroup& b) {
+                    if ((a.name == "Other") != (b.name == "Other")) return b.name == "Other";
+                    return a.name < b.name;
+                });
+
+            for (const auto& zoneGroup : zoneGroups) {
+                // "###" keeps the header's collapse state stable as counts change
+                char zoneHdr[160];
+                snprintf(zoneHdr, sizeof(zoneHdr), "%s (%zu)###zg_%s",
+                         zoneGroup.name.c_str(), zoneGroup.indices.size(), zoneGroup.name.c_str());
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.78f, 0.55f, 1.0f));
+                bool zoneOpen = ImGui::CollapsingHeader(zoneHdr, ImGuiTreeNodeFlags_DefaultOpen);
+                ImGui::PopStyleColor();
+                if (!zoneOpen) continue;
+
+            for (size_t i : zoneGroup.indices) {
+                const auto& q = quests[i];
                 ImGui::PushID(static_cast<int>(i));
 
                 bool selected = (selectedIndex == static_cast<int>(i));
@@ -268,6 +318,7 @@ void QuestLogScreen::render(game::GameHandler& gameHandler, InventoryScreen& inv
 
                 ImGui::PopID();
             }
+            } // zone groups
             if (visibleQuestCount == 0) {
                 ImGui::Spacing();
                 if (filterLower[0] || questFilterMode_ != 0)

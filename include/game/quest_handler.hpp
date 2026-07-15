@@ -78,6 +78,9 @@ public:
         std::string title;
         std::string objectives;
         int32_t level = 0;   // quest level from query response; 0 = unknown, -1 = player-scaling
+        // ZoneOrSort from query response: >0 = AreaTable zone id, <0 = QuestSort.dbc
+        // category (negated), 0 = unknown
+        int32_t zoneOrSort = 0;
         bool complete = false;
         std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> killCounts;
         std::unordered_map<uint32_t, uint32_t> itemCounts;
@@ -97,6 +100,11 @@ public:
         std::array<QuestRewardItem, 6> rewardChoiceItems{};
     };
     const std::vector<QuestLogEntry>& getQuestLog() const { return questLog_; }
+    // Server-side quest log capacity: 20 slots in Vanilla/Turtle, 25 from TBC on
+    int maxQuestLogSlots() const;
+    // QuestSort.dbc name ("Seasonal", class/profession sorts, ...) for negative
+    // ZoneOrSort values; empty if unknown
+    const std::string& getQuestSortName(uint32_t sortId);
     int getSelectedQuestLogIndex() const { return selectedQuestLogIndex_; }
     void setSelectedQuestLogIndex(int idx) { selectedQuestLogIndex_ = idx; }
     void abandonQuest(uint32_t questId);
@@ -175,6 +183,10 @@ private:
     uint32_t pendingTurnInQuestId_ = 0;
     uint64_t pendingTurnInNpcGuid_ = 0;
     bool pendingTurnInRewardRequest_ = false;
+    // QuestSort.dbc names, loaded lazily
+    std::unordered_map<uint32_t, std::string> questSortNames_;
+    bool questSortDbcLoaded_ = false;
+
     std::unordered_map<uint32_t, float> pendingQuestAcceptTimeouts_;
     std::unordered_map<uint32_t, uint64_t> pendingQuestAcceptNpcGuids_;
     bool questOfferRewardOpen_ = false;

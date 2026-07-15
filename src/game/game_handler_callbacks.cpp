@@ -609,8 +609,10 @@ void GameHandler::selectCharacter(uint64_t characterGuid) {
     pendingQuestQueryIds_.clear();
     pendingLoginQuestResync_ = false;
     pendingLoginQuestResyncTimeout_ = 0.0f;
-    pendingQuestAcceptTimeouts_.clear();
-    pendingQuestAcceptNpcGuids_.clear();
+    if (questHandler_) {
+        questHandler_->pendingQuestAcceptTimeoutsRef().clear();
+        questHandler_->pendingQuestAcceptNpcGuidsRef().clear();
+    }
     npcQuestStatus_.clear();
     if (combatHandler_) combatHandler_->resetAllCombatState();
     // resetCastState() already called inside resetAllState() above
@@ -825,8 +827,10 @@ void GameHandler::handleLoginVerifyWorld(network::Packet& packet) {
             LOG_INFO("Auto-queried guild info (guildId=", activeChar->guildId, ")");
         }
 
-        pendingQuestAcceptTimeouts_.clear();
-        pendingQuestAcceptNpcGuids_.clear();
+        if (questHandler_) {
+            questHandler_->pendingQuestAcceptTimeoutsRef().clear();
+            questHandler_->pendingQuestAcceptNpcGuidsRef().clear();
+        }
         pendingQuestQueryIds_.clear();
         pendingLoginQuestResync_ = true;
         pendingLoginQuestResyncTimeout_ = 10.0f;

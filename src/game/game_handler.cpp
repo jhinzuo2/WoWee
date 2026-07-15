@@ -569,17 +569,24 @@ void GameHandler::updateTimers(float deltaTime) {
         if (auctionSearchDelayTimer_ < 0.0f) auctionSearchDelayTimer_ = 0.0f;
     }
 
-    for (auto it = pendingQuestAcceptTimeouts_.begin(); it != pendingQuestAcceptTimeouts_.end();) {
-        it->second -= deltaTime;
-        if (it->second <= 0.0f) {
-            const uint32_t questId = it->first;
-            const uint64_t npcGuid = pendingQuestAcceptNpcGuids_.count(questId) != 0
-                ? pendingQuestAcceptNpcGuids_[questId] : 0;
-            triggerQuestAcceptResync(questId, npcGuid, "timeout");
-            it = pendingQuestAcceptTimeouts_.erase(it);
-            pendingQuestAcceptNpcGuids_.erase(questId);
-        } else {
-            ++it;
+    // Tick QuestHandler's pending-accept timeouts (the authoritative maps —
+    // GameHandler previously ticked its own never-populated copies, so lost
+    // or rejected quest accepts were never resynced or unblocked).
+    if (questHandler_) {
+        auto& acceptTimeouts = questHandler_->pendingQuestAcceptTimeoutsRef();
+        auto& acceptNpcGuids = questHandler_->pendingQuestAcceptNpcGuidsRef();
+        for (auto it = acceptTimeouts.begin(); it != acceptTimeouts.end();) {
+            it->second -= deltaTime;
+            if (it->second <= 0.0f) {
+                const uint32_t questId = it->first;
+                auto guidIt = acceptNpcGuids.find(questId);
+                const uint64_t npcGuid = guidIt != acceptNpcGuids.end() ? guidIt->second : 0;
+                triggerQuestAcceptResync(questId, npcGuid, "timeout");
+                it = acceptTimeouts.erase(it);
+                acceptNpcGuids.erase(questId);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -2586,6 +2593,13 @@ const std::vector<GameHandler::QuestLogEntry>& GameHandler::getQuestLog() const 
     if (questHandler_) return questHandler_->getQuestLog();
     static const std::vector<QuestLogEntry> empty;
     return empty;
+}
+int GameHandler::getMaxQuestLogSlots() const {
+    return questHandler_ ? questHandler_->maxQuestLogSlots() : 25;
+}
+const std::string& GameHandler::getQuestSortName(uint32_t sortId) const {
+    static const std::string empty;
+    return questHandler_ ? questHandler_->getQuestSortName(sortId) : empty;
 }
 bool GameHandler::isQuestOfferRewardOpen() const {
     return questHandler_ ? questHandler_->isQuestOfferRewardOpen() : false;

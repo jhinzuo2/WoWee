@@ -9,6 +9,7 @@
 #include "rendering/renderer.hpp"
 #include "audio/audio_coordinator.hpp"
 #include "audio/ui_sound_manager.hpp"
+#include "pipeline/asset_manager.hpp"
 #include "core/application.hpp"
 #include "core/logger.hpp"
 #include <algorithm>
@@ -344,8 +345,25 @@ void QuestHandler::registerOpcodes(DispatchTable& table) {
 
     // ---- SMSG_QUESTLOG_FULL ----
     table[Opcode::SMSG_QUESTLOG_FULL] = [this](network::Packet& /*packet*/) {
-        owner_.addUIError("Your quest log is full.");
-        owner_.addSystemChatMessage("Your quest log is full.");
+        const std::string msg = "Your quest log is full (" +
+            std::to_string(maxQuestLogSlots()) + " quests). Abandon a quest to make room.";
+        owner_.addUIError(msg);
+        owner_.addSystemChatMessage(msg);
+        // Roll back the optimistic local entries the server refused; without
+        // this the local log drifts past the server cap with phantom quests.
+        bool removed = false;
+        for (const auto& [pendingQuestId, npcGuid] : pendingQuestAcceptNpcGuids_) {
+            (void)npcGuid;
+            if (findQuestLogSlotIndexFromServer(pendingQuestId) < 0) {
+                removed |= std::erase_if(questLog_, [&](const QuestLogEntry& q) {
+                    return q.questId == pendingQuestId;
+                }) > 0;
+            }
+        }
+        pendingQuestAcceptTimeouts_.clear();
+        pendingQuestAcceptNpcGuids_.clear();
+        if (removed && owner_.addonEventCallbackRef())
+            owner_.addonEventCallbackRef()("QUEST_LOG_UPDATE", {});
     };
 
     // ---- SMSG_QUESTGIVER_REQUEST_ITEMS ----
@@ -811,6 +829,18 @@ void QuestHandler::registerOpcodes(DispatchTable& table) {
             if (questLevel < -1 || questLevel > 255) questLevel = 0; // sanity: wrong layout
         }
 
+        // ZoneOrSort follows questLevel: offset 12 in Classic/TBC, 16 in WotLK
+        // (which inserted MinLevel before it). >0 = AreaTable zone id, <0 =
+        // QuestSort.dbc category. Used to group the quest log by zone.
+        int32_t zoneOrSort = 0;
+        {
+            const size_t zosOffset = (questLogStride >= 5) ? 16 : 12;
+            if (packet.getData().size() >= zosOffset + 4) {
+                zoneOrSort = static_cast<int32_t>(readU32At(packet.getData(), zosOffset));
+                if (zoneOrSort < -100000 || zoneOrSort > 100000) zoneOrSort = 0; // sanity
+            }
+        }
+
         const QuestQueryTextCandidate parsed = pickBestQuestQueryTexts(packet.getData(), isClassicLayout);
         const QuestQueryObjectives objs = extractQuestQueryObjectives(packet.getData(), questLogStride);
         const QuestQueryRewardsData rwds = QuestQueryRewardsParser::parse(packet.getData(), questLogStride);
@@ -819,6 +849,7 @@ void QuestHandler::registerOpcodes(DispatchTable& table) {
             if (q.questId != questId) continue;
 
             if (questLevel != 0) q.level = questLevel;
+            if (zoneOrSort != 0) q.zoneOrSort = zoneOrSort;
 
             const int existingScore = scoreQuestTitle(q.title);
             const bool parsedStrong = isStrongQuestTitle(parsed.title);
@@ -1167,6 +1198,20 @@ void QuestHandler::acceptQuest() {
         std::erase_if(questLog_, [&](const QuestLogEntry& q) { return q.questId == questId; });
     }
 
+    // The server caps the quest log (20 slots in Vanilla, 25 in TBC/WotLK).
+    // Accepting past the cap only earns SMSG_QUESTLOG_FULL, so stop it here
+    // with a clearer message and no optimistic local entry to roll back.
+    const int maxSlots = maxQuestLogSlots();
+    if (static_cast<int>(questLog_.size()) >= maxSlots) {
+        const std::string msg = "Your quest log is full (" + std::to_string(maxSlots) +
+                                " quests). Abandon a quest to make room.";
+        owner_.addUIError(msg);
+        owner_.addSystemChatMessage(msg);
+        if (auto* ac = owner_.services().audioCoordinator)
+            if (auto* sfx = ac->getUiSoundManager()) sfx->playError();
+        return;
+    }
+
     network::Packet packet = owner_.getPacketParsers()
         ? owner_.getPacketParsers()->buildAcceptQuestPacket(npcGuid, questId)
         : QuestgiverAcceptQuestPacket::build(npcGuid, questId);
@@ -1366,6 +1411,33 @@ void QuestHandler::declineSharedQuest() {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
+int QuestHandler::maxQuestLogSlots() const {
+    return isClassicLikeExpansion() ? 20 : 25;
+}
+
+const std::string& QuestHandler::getQuestSortName(uint32_t sortId) {
+    static const std::string kEmpty;
+    if (!questSortDbcLoaded_) {
+        questSortDbcLoaded_ = true;
+        auto* am = owner_.services().assetManager;
+        if (am && am->isInitialized()) {
+            auto dbc = am->loadDBC("QuestSort.dbc");
+            // ID(0) + Name locstring whose English text sits at field 1
+            if (dbc && dbc->isLoaded() && dbc->getFieldCount() >= 2) {
+                for (uint32_t i = 0; i < dbc->getRecordCount(); ++i) {
+                    uint32_t id = dbc->getUInt32(i, 0);
+                    std::string name = dbc->getString(i, 1);
+                    if (id != 0 && !name.empty())
+                        questSortNames_[id] = std::move(name);
+                }
+                LOG_INFO("Loaded ", questSortNames_.size(), " quest sort names");
+            }
+        }
+    }
+    auto it = questSortNames_.find(sortId);
+    return it != questSortNames_.end() ? it->second : kEmpty;
+}
+
 bool QuestHandler::hasQuestInLog(uint32_t questId) const {
     for (const auto& q : questLog_) {
         if (q.questId == questId) return true;
@@ -1377,7 +1449,8 @@ int QuestHandler::findQuestLogSlotIndexFromServer(uint32_t questId) const {
     if (questId == 0 || owner_.lastPlayerFieldsRef().empty()) return -1;
     const uint16_t ufQuestStart = fieldIndex(UF::PLAYER_QUEST_LOG_START);
     const uint8_t qStride = owner_.getPacketParsers() ? owner_.getPacketParsers()->questLogStride() : 5;
-    for (uint16_t slot = 0; slot < 25; ++slot) {
+    const uint16_t maxSlots = static_cast<uint16_t>(maxQuestLogSlots());
+    for (uint16_t slot = 0; slot < maxSlots; ++slot) {
         const uint16_t idField = ufQuestStart + slot * qStride;
         auto it = owner_.lastPlayerFieldsRef().find(idField);
         if (it != owner_.lastPlayerFieldsRef().end() && it->second == questId) {

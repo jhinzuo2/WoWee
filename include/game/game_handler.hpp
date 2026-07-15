@@ -1548,6 +1548,9 @@ public:
     // Quest log
     using QuestLogEntry = QuestHandler::QuestLogEntry;
     const std::vector<QuestLogEntry>& getQuestLog() const;
+    int getMaxQuestLogSlots() const;
+    // QuestSort.dbc name for negative ZoneOrSort values (class/profession/seasonal)
+    const std::string& getQuestSortName(uint32_t sortId) const;
     int getSelectedQuestLogIndex() const;
     void setSelectedQuestLogIndex(int idx) { selectedQuestLogIndex_ = idx; }
     void abandonQuest(uint32_t questId);
@@ -3309,8 +3312,7 @@ private:
     uint32_t pendingTurnInQuestId_ = 0;
     uint64_t pendingTurnInNpcGuid_ = 0;
     bool pendingTurnInRewardRequest_ = false;
-    std::unordered_map<uint32_t, float> pendingQuestAcceptTimeouts_;
-    std::unordered_map<uint32_t, uint64_t> pendingQuestAcceptNpcGuids_;
+    // (pending quest accept timeout state lives in QuestHandler)
     bool questOfferRewardOpen_ = false;
     QuestOfferRewardData currentQuestOfferReward_;
 
