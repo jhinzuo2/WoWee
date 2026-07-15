@@ -77,6 +77,16 @@ TEST_CASE("A spell is never both self-cast and melee", "[spell][range]") {
     }
 }
 
+TEST_CASE("Ranged weapon auto-attacks ignore placeholder DBC resource costs",
+          "[spell][ranged-auto]") {
+    REQUIRE(isRangedWeaponAutoAttack(75));    // Auto Shot
+    REQUIRE(isRangedWeaponAutoAttack(5019));  // Shoot
+    REQUIRE(isRangedWeaponAutoAttack(2764));  // Throw
+
+    REQUIRE_FALSE(isRangedWeaponAutoAttack(0));
+    REQUIRE_FALSE(isRangedWeaponAutoAttack(19434)); // Aimed Shot still uses real costs
+}
+
 // ---------------------------------------------------------------------------
 // Rank strings
 // ---------------------------------------------------------------------------

@@ -99,15 +99,6 @@ bool isGatherSpellId(uint32_t spellId) {
     return false;
 }
 
-// The three ranged weapon auto-attacks. Used only to pick the shot animation —
-// melee classification comes from the spell's range, not from this list.
-bool isRangedWeaponAttackSpell(uint32_t spellId) {
-    // Client spell IDs shared by the supported legacy expansions.
-    return spellId == 75 ||    // Auto Shot
-           spellId == 5019 ||  // Shoot (wand)
-           spellId == 2764;    // Throw
-}
-
 bool shouldDespawnGatherTarget(uint8_t result) {
     return result == kSpellFailedAlreadyOpen || result == kSpellFailedChestInUse;
 }
@@ -120,7 +111,8 @@ std::string gatherCastFailureMessage(uint8_t result, const std::string& fallback
 
 // Map a (WotLK-normalized) SpellCastResult to a character speech response.
 // Results without a matching voice line return nullopt.
-std::optional<audio::PlayerErrorSpeech> errorSpeechForCastResult(uint8_t result, int powerType) {
+std::optional<audio::PlayerErrorSpeech> errorSpeechForCastResult(
+        uint32_t spellId, uint8_t result, int powerType) {
     using audio::PlayerErrorSpeech;
     switch (result) {
         case 11:  // Bad implicit targets
@@ -138,7 +130,12 @@ std::optional<audio::PlayerErrorSpeech> errorSpeechForCastResult(uint8_t result,
         case 75:  // No ammo
             return PlayerErrorSpeech::NO_AMMO;
         case 67:  // Not ready
-            return PlayerErrorSpeech::SPELL_COOLDOWN;
+            // Ranged weapon attacks are abilities, not conventional spells. If the
+            // server rejects one (weapon/ammo/attack state), use the generic "I can't
+            // do that yet" response instead of "That spell isn't ready yet."
+            return spellclass::isRangedWeaponAutoAttack(spellId)
+                ? PlayerErrorSpeech::ABILITY_COOLDOWN
+                : PlayerErrorSpeech::SPELL_COOLDOWN;
         case 85:  // Not enough power
             switch (powerType) {
                 case 1:  return PlayerErrorSpeech::NO_RAGE;
@@ -1186,7 +1183,7 @@ void SpellHandler::handleCastFailed(network::Packet& packet) {
     // Character speech response ("Not enough mana", "I'm out of range", ...)
     // Suppressed for gather casts, whose failures are routine and already rephrased.
     if (!gatherCast) {
-        if (auto speech = errorSpeechForCastResult(data.result, powerType))
+        if (auto speech = errorSpeechForCastResult(data.spellId, data.result, powerType))
             owner_.playErrorSpeech(*speech);
     }
 
@@ -1300,7 +1297,7 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
         // casts and are NOT classified as instant melee abilities, so trigger the
         // ranged shot animation explicitly here.
         uint32_t sid = data.spellId;
-        if (isRangedWeaponAttackSpell(sid)) {
+        if (spellclass::isRangedWeaponAutoAttack(sid)) {
             if (owner_.meleeSwingCallbackRef()) owner_.meleeSwingCallbackRef()(sid);
             owner_.suppressNextMeleeSwingAnim();
         }
@@ -1309,7 +1306,7 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
         // school: physical abilities cast at range (Steady Shot, Taunt) would otherwise
         // play a melee swing.
         bool isMeleeAbility = false;
-        if (!owner_.isProfessionSpell(sid) && !isRangedWeaponAttackSpell(sid)) {
+        if (!owner_.isProfessionSpell(sid) && !spellclass::isRangedWeaponAutoAttack(sid)) {
             if (spellclass::isMeleeRange(getSpellMaxRange(sid))) {
                 isMeleeAbility = (currentCastSpellId_ != sid);
             }

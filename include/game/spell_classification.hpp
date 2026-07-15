@@ -34,6 +34,17 @@ inline bool isMeleeRange(float maxRange) {
     return maxRange > 0.0f && maxRange <= kCombatRangeYards;
 }
 
+/// Legacy client IDs for the three repeating ranged weapon attacks.
+///
+/// Their Spell.dbc rows carry a dummy one-point rage cost even for classes that do
+/// not use rage. The server drives their real weapon/ammunition readiness, so UI
+/// resource checks must not treat that placeholder as a cast cost.
+inline bool isRangedWeaponAutoAttack(uint32_t spellId) {
+    return spellId == 75 ||    // Auto Shot
+           spellId == 5019 ||  // Shoot (wand)
+           spellId == 2764;    // Throw
+}
+
 /// Spell.dbc stores the rank as a display string ("Rank 3"). Rankless spells sort as 0.
 inline int rankValue(const std::string& rank) {
     int value = 0;

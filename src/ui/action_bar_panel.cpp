@@ -17,6 +17,7 @@
 #include "rendering/vk_context.hpp"
 #include "core/window.hpp"
 #include "game/game_handler.hpp"
+#include "game/spell_classification.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/dbc_layout.hpp"
 #include "audio/ui_sound_manager.hpp"
@@ -378,7 +379,10 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             else if (slot.type == game::ActionBarSlot::MACRO && slot.id != 0)
                 powerCheckSpellId = resolveMacroPrimarySpellId(slot.id, gameHandler);
             uint32_t spellCost = 0, spellPowerType = 0;
-            if (powerCheckSpellId != 0 && !onCooldown)
+            // Auto Shot, Shoot and Throw have a dummy 1-rage/1-cost value in the
+            // legacy Spell.dbc. Their actual readiness is server/weapon driven.
+            if (powerCheckSpellId != 0 && !onCooldown &&
+                !game::spellclass::isRangedWeaponAutoAttack(powerCheckSpellId))
                 spellbookScreen.getSpellPowerInfo(powerCheckSpellId, assetMgr, spellCost, spellPowerType);
             if (spellCost > 0) {
                 auto playerEnt = gameHandler.getEntityManager().getEntity(gameHandler.getPlayerGuid());
