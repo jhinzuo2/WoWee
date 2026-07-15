@@ -813,6 +813,11 @@ public:
     int getCraftQueueRemaining() const;
     uint32_t getCraftQueueSpellId() const;
 
+    // Crafting window (opened client-side by casting a profession spell)
+    bool isCraftingWindowOpen() const { return spellHandler_ ? spellHandler_->isCraftingWindowOpen() : false; }
+    uint32_t getCraftingSkillLine() const { return spellHandler_ ? spellHandler_->getCraftingSkillLine() : 0; }
+    void closeCraftingWindow() { if (spellHandler_) spellHandler_->closeCraftingWindow(); }
+
     // 400ms spell-queue window: next spell to cast when current finishes
     uint32_t getQueuedSpellId() const;
     void cancelQueuedSpell() { if (spellHandler_) spellHandler_->cancelQueuedSpell(); }

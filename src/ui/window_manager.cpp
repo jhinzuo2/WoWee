@@ -1655,44 +1655,13 @@ void WindowManager::renderTrainerWindow(game::GameHandler& gameHandler,
 
                 gameHandler.loadSpellNameCache();
 
-                // Difficulty color from skill thresholds
-                // orange < (minSkill + trivialLow) / 2, yellow < trivialLow, green < trivialHigh, gray >= trivialHigh
+                // Difficulty color/label from skill thresholds — shared with
+                // the standalone crafting window (crafting_window.cpp)
                 auto getDifficultyColor = [&](uint32_t spellId) -> ImVec4 {
-                    auto cit = gameHandler.spellNameCacheRef().find(spellId);
-                    if (cit == gameHandler.spellNameCacheRef().end()) return ui::colors::kWhite;
-                    const auto& se = cit->second;
-                    if (se.trivialSkillHigh == 0 && se.trivialSkillLow == 0)
-                        return ImVec4(1.0f, 0.5f, 0.0f, 1.0f); // orange (no thresholds = always useful)
-                    auto slIt = gameHandler.spellToSkillLineRef().find(spellId);
-                    if (slIt == gameHandler.spellToSkillLineRef().end()) return ui::colors::kWhite;
-                    auto skIt = gameHandler.getPlayerSkills().find(slIt->second);
-                    if (skIt == gameHandler.getPlayerSkills().end()) return ui::colors::kWhite;
-                    uint32_t skill = skIt->second.effectiveValue();
-                    if (skill >= se.trivialSkillHigh)
-                        return ImVec4(0.5f, 0.5f, 0.5f, 1.0f); // gray
-                    if (skill >= se.trivialSkillLow)
-                        return ImVec4(0.3f, 0.8f, 0.3f, 1.0f); // green
-                    uint32_t yellowThresh = se.minSkillRank + (se.trivialSkillLow - se.minSkillRank) / 2;
-                    if (skill >= yellowThresh)
-                        return ImVec4(1.0f, 1.0f, 0.0f, 1.0f); // yellow
-                    return ImVec4(1.0f, 0.5f, 0.0f, 1.0f); // orange
+                    return recipeDifficultyColor(gameHandler, spellId);
                 };
-
                 auto getDifficultyLabel = [&](uint32_t spellId) -> const char* {
-                    auto cit = gameHandler.spellNameCacheRef().find(spellId);
-                    if (cit == gameHandler.spellNameCacheRef().end()) return "";
-                    const auto& se = cit->second;
-                    if (se.trivialSkillHigh == 0 && se.trivialSkillLow == 0) return "Orange";
-                    auto slIt = gameHandler.spellToSkillLineRef().find(spellId);
-                    if (slIt == gameHandler.spellToSkillLineRef().end()) return "";
-                    auto skIt = gameHandler.getPlayerSkills().find(slIt->second);
-                    if (skIt == gameHandler.getPlayerSkills().end()) return "";
-                    uint32_t skill = skIt->second.effectiveValue();
-                    if (skill >= se.trivialSkillHigh) return "Gray";
-                    if (skill >= se.trivialSkillLow) return "Green";
-                    uint32_t yellowThresh = se.minSkillRank + (se.trivialSkillLow - se.minSkillRank) / 2;
-                    if (skill >= yellowThresh) return "Yellow";
-                    return "Orange";
+                    return recipeDifficultyLabel(gameHandler, spellId);
                 };
 
                 std::vector<const game::TrainerSpell*> craftable;

@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 #include <functional>
+#include <imgui.h>
 #include <vulkan/vulkan.h>
 
 namespace wowee {
@@ -50,6 +51,16 @@ public:
     void renderTrainerWindow(game::GameHandler& gameHandler,
                              SpellIconFn getSpellIcon,
                              InventoryScreen& inventoryScreen);
+    // Standalone crafting window (crafting_window.cpp) — opened by casting a
+    // profession spell (Cooking, First Aid, ...); recipe list with difficulty
+    // colors, reagent counts, and multi-craft controls.
+    void renderCraftingWindow(game::GameHandler& gameHandler,
+                              SpellIconFn getSpellIcon,
+                              InventoryScreen& inventoryScreen);
+    // Recipe difficulty vs current skill (orange/yellow/green/gray), shared by
+    // the trainer panel and the crafting window.
+    static ImVec4 recipeDifficultyColor(game::GameHandler& gameHandler, uint32_t spellId);
+    static const char* recipeDifficultyLabel(game::GameHandler& gameHandler, uint32_t spellId);
     void renderBarberShopWindow(game::GameHandler& gameHandler);
     void renderStableWindow(game::GameHandler& gameHandler);
     void renderTaxiWindow(game::GameHandler& gameHandler);
@@ -146,6 +157,12 @@ public:
 
     // Trainer
     char trainerSearchFilter_[128] = "";
+
+    // Crafting window
+    char craftSearchFilter_[128] = "";
+    uint32_t craftSelectedRecipe_ = 0;
+    int craftQuantity_ = 1;
+    bool craftOnlyMakeable_ = false;
 
     // Auction house
     char auctionSearchName_[256] = "";

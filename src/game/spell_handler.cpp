@@ -408,6 +408,15 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
     // sending any error, so swap in the highest rank we actually know.
     spellId = resolveHighestKnownRank(spellId);
 
+    // Profession spells (Cooking, First Aid, Alchemy, ...) open the crafting
+    // window client-side instead of being sent as casts — matching the real
+    // client, where these spells just open the tradeskill UI.
+    if (uint32_t craftSkillLine = tradeskillOpenerSkillLine(spellId)) {
+        LOG_INFO("castSpell: spell ", spellId, " opens crafting window for skill line ", craftSkillLine);
+        openCraftingWindow(craftSkillLine);
+        return;
+    }
+
     // Casting any spell while mounted → dismount instead
     if (owner_.isMounted()) {
         owner_.dismount();
@@ -2342,6 +2351,57 @@ void SpellHandler::loadSkillLineAbilityDbc() {
         }
         LOG_INFO("Trainer: Loaded ", owner_.spellToSkillLineRef().size(), " skill line abilities");
     }
+}
+
+uint32_t SpellHandler::tradeskillOpenerSkillLine(uint32_t spellId) {
+    owner_.loadSpellNameCache();
+    owner_.loadSkillLineDbc();
+    owner_.loadSkillLineAbilityDbc();
+
+    // SkillLine.dbc categories that hold crafting recipes
+    static constexpr uint32_t CAT_SECONDARY  = 9;   // Cooking, First Aid, Fishing
+    static constexpr uint32_t CAT_PROFESSION = 11;  // Alchemy, Blacksmithing, ...
+    // Smelting shares the Mining skill line but isn't named after it
+    static constexpr uint32_t SPELL_SMELTING = 2656;
+
+    auto slIt = owner_.spellToSkillLineRef().find(spellId);
+    if (slIt == owner_.spellToSkillLineRef().end()) return 0;
+    const uint32_t skillLine = slIt->second;
+
+    auto catIt = owner_.skillLineCategoriesRef().find(skillLine);
+    if (catIt == owner_.skillLineCategoriesRef().end()) return 0;
+    if (catIt->second != CAT_SECONDARY && catIt->second != CAT_PROFESSION) return 0;
+
+    // Opener heuristic: the window-opening spell is named after its skill line
+    // ("Cooking" opens Cooking). Recipes, gathering casts (Disenchant, Fishing
+    // bobber cast is filtered below by the recipe requirement), and utility
+    // spells never share the skill line's name.
+    if (spellId != SPELL_SMELTING) {
+        const std::string& spellName = owner_.getSpellName(spellId);
+        auto nameIt = owner_.skillLineNamesRef().find(skillLine);
+        if (spellName.empty() || nameIt == owner_.skillLineNamesRef().end() ||
+            spellName != nameIt->second) {
+            return 0;
+        }
+    }
+
+    // Only open a window that will actually list something: require at least
+    // one known recipe (creates an item or consumes reagents) in this line.
+    // This keeps Fishing falling through to a normal bobber cast.
+    for (uint32_t known : knownSpells_) {
+        if (known == spellId) continue;
+        auto kslIt = owner_.spellToSkillLineRef().find(known);
+        if (kslIt == owner_.spellToSkillLineRef().end() || kslIt->second != skillLine) continue;
+        auto cacheIt = owner_.spellNameCacheRef().find(known);
+        if (cacheIt == owner_.spellNameCacheRef().end()) continue;
+        const auto& entry = cacheIt->second;
+        bool hasReagents = false;
+        for (const auto& reagent : entry.reagents) {
+            if (reagent.itemId != 0) { hasReagents = true; break; }
+        }
+        if (entry.createdItemId != 0 || hasReagents) return skillLine;
+    }
+    return 0;
 }
 
 void SpellHandler::categorizeTrainerSpells() {
