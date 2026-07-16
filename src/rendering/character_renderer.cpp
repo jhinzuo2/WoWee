@@ -2033,23 +2033,49 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
                 wa.localTransform;
 
             // Back-sheathed weapons: the swinging left arm passes through the
-            // canted blade while running. Track the elbow (M2 attachment 4)
-            // against the weapon model's own AABB and ease the blade outward,
-            // away from the spine, so the arm pushes it instead of clipping.
+            // canted blade while running. Sample the whole arm — shoulder,
+            // elbow, hand attachment points plus segment midpoints — against
+            // the weapon model's AABB and ease the blade outward, away from
+            // the spine, so the arm pushes it instead of clipping. A single
+            // sphere at the elbow joint missed forearm/upper-arm contact.
             constexpr uint32_t kAttachmentBack = 12;
-            constexpr uint32_t kAttachmentElbowLeft = 4;
             if (wa.attachmentId == kAttachmentBack && weapIt->second.cachedModel) {
-                float targetPush = 0.0f;
-                glm::mat4 elbowMat;
-                if (getAttachmentTransform(pair.first, kAttachmentElbowLeft, elbowMat)) {
-                    const glm::vec3 localElbow = glm::vec3(
-                        glm::inverse(weaponMat) * glm::vec4(glm::vec3(elbowMat[3]), 1.0f));
-                    const auto& wm = weapIt->second.cachedModel->data;
-                    const glm::vec3 closest = glm::clamp(localElbow, wm.boundMin, wm.boundMax);
-                    constexpr float kElbowRadius = 0.12f;   // approximate forearm thickness
-                    const float dist = glm::distance(localElbow, closest);
-                    if (dist < kElbowRadius) targetPush = kElbowRadius - dist;
+                constexpr uint32_t kAttachmentHandLeft = 2;
+                constexpr uint32_t kAttachmentElbowLeft = 4;
+                constexpr uint32_t kAttachmentShoulderLeft = 6;
+                constexpr float kArmRadius = 0.16f;      // arm mesh thickness around the joint chain
+                constexpr float kPushClearance = 0.03f;  // keep the blade slightly off the sleeve
+                constexpr float kMaxPush = 0.35f;
+
+                const glm::mat4 weaponInv = glm::inverse(weaponMat);
+                const auto& wm = weapIt->second.cachedModel->data;
+
+                glm::vec3 joints[3];
+                int jointCount = 0;
+                for (uint32_t attId : {kAttachmentShoulderLeft, kAttachmentElbowLeft, kAttachmentHandLeft}) {
+                    glm::mat4 m;
+                    if (getAttachmentTransform(pair.first, attId, m)) {
+                        joints[jointCount++] = glm::vec3(m[3]);
+                    }
                 }
+
+                float targetPush = 0.0f;
+                auto testPoint = [&](const glm::vec3& worldPt) {
+                    const glm::vec3 local = glm::vec3(weaponInv * glm::vec4(worldPt, 1.0f));
+                    const glm::vec3 closest = glm::clamp(local, wm.boundMin, wm.boundMax);
+                    const float pen = kArmRadius - glm::distance(local, closest);
+                    if (pen > 0.0f) targetPush = std::max(targetPush, pen + kPushClearance);
+                };
+                for (int j = 0; j < jointCount; ++j) {
+                    testPoint(joints[j]);
+                    if (j + 1 < jointCount) testPoint((joints[j] + joints[j + 1]) * 0.5f);
+                }
+                targetPush = std::min(targetPush, kMaxPush);
+                if (targetPush > 0.0f && wa.sheathPush < 0.01f) {
+                    core::Logger::getInstance().debug("Sheath push engaged: pen=", targetPush,
+                                                      " joints=", jointCount);
+                }
+
                 wa.sheathPush += (targetPush - wa.sheathPush) * std::min(1.0f, deltaTime * 14.0f);
                 if (wa.sheathPush > 0.001f) {
                     // Horizontal direction from the spine out through the weapon.
