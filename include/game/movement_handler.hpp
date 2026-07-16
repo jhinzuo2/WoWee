@@ -252,6 +252,12 @@ private:
     int heartbeatLogCount_ = 0;  // periodic position audit counter
     uint32_t lastAreaTriggerId_ = 0;
     uint32_t postTransferReturnAreaTriggerId_ = 0;
+    // Previous checkAreaTriggers() sample for swept-path testing (canonical
+    // coords). Mounted speed covers ~3 yd per 0.25s check, enough to straddle
+    // small portal boxes when only the instantaneous position is tested.
+    glm::vec3 lastAreaTriggerCheckPos_{0.0f};
+    uint32_t lastAreaTriggerCheckMapId_ = 0xFFFFFFFFu;
+    bool lastAreaTriggerCheckValid_ = false;
     bool postTransferReturnAreaTriggerSawNear_ = false;
     bool pendingAreaTriggerDestinationValid_ = false;
     uint32_t pendingAreaTriggerDestinationMapId_ = 0;

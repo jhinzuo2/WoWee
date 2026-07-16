@@ -1129,8 +1129,11 @@ void CameraController::update(float deltaTime) {
                     // the passage). WMO ramps that merely run beneath flat walkable
                     // streets must not steal the player from the terrain above them —
                     // that pulled players through the ground at the Stormwind gate
-                    // ramparts and down ramps into the void.
-                    if (atTunnelSeam && terrainManager) {
+                    // ramparts and down ramps into the void. Inside an interior WMO
+                    // group (tram entrance buildings) the heightfield under the city
+                    // is meaningless, so it gets no veto — otherwise entry becomes
+                    // dependent on approach angle.
+                    if (atTunnelSeam && !cachedInsideInteriorWMO && terrainManager) {
                         glm::vec3 moveDir = targetPos - lastCollisionCheckPos_;
                         moveDir.z = 0.0f;
                         const float moveLen = glm::length(moveDir);
