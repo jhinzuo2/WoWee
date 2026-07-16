@@ -70,6 +70,7 @@ private:
     bool authenticating = false;
     bool showPassword = false;
     bool pinAutoSubmitted_ = false;
+    bool securityPromptFocused_ = false;
 
     // Status
     std::string statusMessage;

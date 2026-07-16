@@ -9,6 +9,7 @@
 #include "auth/auth_packets.hpp"
 #include "network/packet.hpp"
 
+#include <array>
 #include <cstring>
 
 using namespace wowee::auth;
@@ -145,4 +146,27 @@ TEST_CASE("Realm list: empty realm list is not an error", "[realm_list]") {
     RealmListResponse resp;
     REQUIRE(RealmListResponseParser::parse(pkt, resp, /*legacyVanillaLayout=*/true));
     CHECK(resp.realms.empty());
+}
+
+TEST_CASE("Logon proof legacy format omits v8 security flags", "[auth_packets]") {
+    std::vector<uint8_t> A(32, 0xA5);
+    std::vector<uint8_t> M1(20, 0x5A);
+    std::array<uint8_t, 20> crc{};
+
+    auto legacy = LogonProofPacket::buildLegacy(A, M1, &crc);
+    CHECK(legacy.getSize() == 32 + 20 + 20 + 1);
+
+    auto v8 = LogonProofPacket::build(A, M1, 0, &crc, nullptr, nullptr);
+    CHECK(v8.getSize() == 32 + 20 + 20 + 1 + 1);
+}
+
+TEST_CASE("Logon proof PIN format includes security proof data", "[auth_packets]") {
+    std::vector<uint8_t> A(32, 0xA5);
+    std::vector<uint8_t> M1(20, 0x5A);
+    std::array<uint8_t, 20> crc{};
+    std::array<uint8_t, 16> pinSalt{};
+    std::array<uint8_t, 20> pinHash{};
+
+    auto v8 = LogonProofPacket::build(A, M1, 0x01, &crc, &pinSalt, &pinHash);
+    CHECK(v8.getSize() == 32 + 20 + 20 + 1 + 1 + 16 + 20);
 }

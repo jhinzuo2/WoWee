@@ -245,7 +245,6 @@ network::Packet LogonProofPacket::buildLegacy(const std::vector<uint8_t>& A,
         for (int i = 0; i < 20; ++i) packet.writeUInt8(0); // CRC hash
     }
     packet.writeUInt8(0); // number of keys
-    packet.writeUInt8(0); // security flags
     return packet;
 }
 

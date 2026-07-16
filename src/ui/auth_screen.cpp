@@ -466,14 +466,30 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
         // Checkbox state changed
     }
 
+    const auto authState = authHandler.getState();
+    const bool waitingForSecurityCode = (authState == auth::AuthState::PIN_REQUIRED ||
+                                         authState == auth::AuthState::AUTHENTICATOR_REQUIRED);
+
     // Optional 2FA / PIN field (some servers require this; e.g. Turtle WoW uses Google Authenticator).
     // Keep it visible pre-connect so we can send LOGON_PROOF immediately after the SRP challenge.
     {
         ImGuiInputTextFlags pinFlags = ImGuiInputTextFlags_Password;
-        if (authHandler.getState() == auth::AuthState::PIN_REQUIRED) {
+        if (waitingForSecurityCode) {
             pinFlags |= ImGuiInputTextFlags_EnterReturnsTrue;
+            if (!securityPromptFocused_) {
+                ImGui::SetKeyboardFocusHere();
+                securityPromptFocused_ = true;
+            }
         }
-        ImGui::InputText("2FA / PIN", pinCode, sizeof(pinCode), pinFlags);
+        const bool submitFromField = ImGui::InputText("2FA / PIN", pinCode, sizeof(pinCode), pinFlags);
+        if (waitingForSecurityCode && submitFromField) {
+            const std::string code = trimAscii(pinCode);
+            if (!code.empty()) {
+                authHandler.submitSecurityCode(code);
+                pinCode[0] = '\0';
+                pinAutoSubmitted_ = true;
+            }
+        }
         ImGui::SameLine();
         ImGui::TextDisabled("(optional)");
     }
@@ -499,6 +515,7 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
         auto state = authHandler.getState();
         if (state != auth::AuthState::PIN_REQUIRED && state != auth::AuthState::AUTHENTICATOR_REQUIRED) {
             pinAutoSubmitted_ = false;
+            securityPromptFocused_ = false;
             authTimer += ImGui::GetIO().DeltaTime;
 
             // Show progress with elapsed time
@@ -526,10 +543,13 @@ void AuthScreen::render(auth::AuthHandler& authHandler) {
 
             ImGui::SameLine();
             if (ImGui::Button("Submit 2FA/PIN")) {
-                authHandler.submitSecurityCode(pinCode);
-                // Don't keep the code around longer than needed.
-                pinCode[0] = '\0';
-                pinAutoSubmitted_ = true;
+                const std::string code = trimAscii(pinCode);
+                if (!code.empty()) {
+                    authHandler.submitSecurityCode(code);
+                    // Don't keep the code around longer than needed.
+                    pinCode[0] = '\0';
+                    pinAutoSubmitted_ = true;
+                }
             }
         }
 
@@ -651,9 +671,9 @@ void AuthScreen::attemptAuth(auth::AuthHandler& authHandler) {
 
     // Build the auth-protocol candidate chain for this attempt. The profile's
     // own value is always tried first; vanilla-family profiles get the other
-    // vanilla protocol byte appended as a fallback, because 1.12 servers
-    // disagree on it (vmangos-derived: 8, stock mangos/cmangos: 3) and the
-    // profile can only name one. TBC/WotLK have no such ambiguity.
+    // vanilla protocol byte appended as a fallback, because vanilla-family
+    // servers disagree on it (Turtle/vmangos-derived: 8, older mangos/cmangos:
+    // 3) and the profile can only name one. TBC/WotLK have no such ambiguity.
     authProtocols_.clear();
     authProtocolAttempt_ = 0;
     {
@@ -728,6 +748,7 @@ void AuthScreen::beginAuthAttempt(auth::AuthHandler& authHandler) {
         authTimer = 0.0f;
         setStatus(isRetry ? "Reconnected, authenticating..." : "Connected, authenticating...", false);
         pinAutoSubmitted_ = false;
+        securityPromptFocused_ = false;
 
         // Save login info for next session
         saveLoginInfo(false);

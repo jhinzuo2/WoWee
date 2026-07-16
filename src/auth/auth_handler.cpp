@@ -19,6 +19,10 @@ constexpr uint8_t kSecurityFlagPin           = 0x01;  // PIN grid challenge
 constexpr uint8_t kSecurityFlagMatrixCard    = 0x02;  // Matrix card (unused by most servers)
 constexpr uint8_t kSecurityFlagAuthenticator = 0x04;  // TOTP authenticator token
 
+bool isLegacyVanillaAuth(const ClientInfo& info) {
+    return info.majorVersion == 1 && info.protocolVersion < 8;
+}
+
 AuthHandler::AuthHandler() {
     LOG_DEBUG("AuthHandler created");
 }
@@ -219,6 +223,16 @@ void AuthHandler::handleLogonChallengeResponse(network::Packet& packet) {
                << " build " << clientInfo.build
                << ", auth protocol " << static_cast<int>(clientInfo.protocolVersion) << ")";
             fail(ss.str(), /*protocolRelated=*/true);
+        } else if (response.result == AuthResult::BUSY && isLegacyVanillaAuth(clientInfo)) {
+            // Turtle/vmangos-derived realms can answer protocol 3 challenges
+            // with BUSY before sending the v8 security-flags byte. Let the UI
+            // try the alternate vanilla auth protocol instead of stopping here.
+            std::ostringstream ss;
+            ss << "LOGON_CHALLENGE failed: "
+               << getAuthResultString(response.result)
+               << " (auth protocol " << static_cast<int>(clientInfo.protocolVersion)
+               << " may be incompatible)";
+            fail(ss.str(), /*protocolRelated=*/true);
         } else {
             // Account-level rejections (unknown account, wrong password, banned,
             // suspended, in use) are NOT protocol problems — never retry those.
@@ -236,6 +250,12 @@ void AuthHandler::handleLogonChallengeResponse(network::Packet& packet) {
 
     LOG_INFO("Challenge: N=", response.N.size(), "B g=", response.g.size(), "B salt=",
              response.salt.size(), "B secFlags=0x", std::hex, static_cast<int>(response.securityFlags), std::dec);
+
+    if (clientInfo.protocolVersion < 8 && response.securityFlags != 0) {
+        fail("Server requires auth protocol 8 security extensions",
+             /*protocolRelated=*/true);
+        return;
+    }
 
     // Feed SRP with server challenge data
     srp->feed(response.B, response.g, response.N, response.salt);
@@ -340,6 +360,10 @@ void AuthHandler::sendLogonProof() {
         socket->send(packet);
     } else {
         auto packet = LogonProofPacket::build(A, M1, securityFlags_, crcHashPtr, pinClientSaltPtr, pinHashPtr);
+        LOG_INFO("LOGON_PROOF payload: protocol=", static_cast<int>(clientInfo.protocolVersion),
+                 " secFlags=0x", std::hex, static_cast<int>(securityFlags_), std::dec,
+                 " pinData=", ((pinClientSaltPtr && pinHashPtr) ? "yes" : "no"),
+                 " payloadSize=", packet.getSize(), "B");
         socket->send(packet);
 
         if (securityFlags_ & kSecurityFlagAuthenticator) {
@@ -379,7 +403,12 @@ void AuthHandler::handleLogonProofResponse(network::Packet& packet) {
         // Credential/account rejection — a different protocol won't help, and
         // retrying can trip the server's failed-login lockout.
         std::string reason = "Login failed: ";
-        reason += getAuthResultString(static_cast<AuthResult>(response.status));
+        if (response.status == static_cast<uint8_t>(AuthResult::ACCOUNT_INVALID) &&
+            (securityFlags_ & kSecurityFlagPin)) {
+            reason += "PIN/2FA proof was rejected";
+        } else {
+            reason += getAuthResultString(static_cast<AuthResult>(response.status));
+        }
         fail(reason);
         return;
     }
