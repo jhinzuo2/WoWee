@@ -69,6 +69,18 @@ public:
     // Equipment weapon loading (reads inventory, attaches weapon M2 models)
     void loadEquippedWeapons();
 
+    // Runtime-tunable 2H back-sheath placement. Live-adjusted in game via the
+    // /sheathtune chat command (weapons reload on change); the defaults here
+    // are what ships.
+    struct SheathTuning {
+        float tx = -0.01f;      // attachment-frame X (character front/back)
+        float ty = 0.0f;        // attachment-frame Y (across the back)
+        float tz = 0.04f;       // attachment-frame Z (up/down)
+        float cantDeg = 35.0f;  // diagonal cant across the back
+        float rollDeg = 90.0f;  // roll about the blade's long axis (flat to back)
+    };
+    static SheathTuning& sheathTuning();
+
     // Weapon sheathe state
     void setWeaponsSheathed(bool sheathed) { weaponsSheathed_ = sheathed; }
     bool isWeaponsSheathed() const { return weaponsSheathed_; }

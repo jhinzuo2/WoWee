@@ -53,14 +53,14 @@ glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
         // front/back axis. First rotate weapon X completely onto character Z, then
         // cant that vertical axis within the Y/Z back plane. This ordering is
         // important: rotating around X cannot change an X-aligned blade.
-        transform = glm::translate(transform, glm::vec3(-0.01f, 0.0f, 0.04f));
-        transform = glm::rotate(transform, glm::radians(35.0f), glm::vec3(1, 0, 0));
+        // The final innermost roll spins the blade about its own long axis so
+        // the flat rests against the back instead of the sharp edge.
+        // All values live-tunable via /sheathtune.
+        const auto& st = AppearanceComposer::sheathTuning();
+        transform = glm::translate(transform, glm::vec3(st.tx, st.ty, st.tz));
+        transform = glm::rotate(transform, glm::radians(st.cantDeg), glm::vec3(1, 0, 0));
         transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(0, 1, 0));
-        // Roll the blade a quarter turn about its own long axis (innermost op,
-        // model X) so the flat of the blade rests against the back — without
-        // this the edge plane stays on the character's front/back axis and the
-        // sharp edge digs into the back.
-        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(1, 0, 0));
+        transform = glm::rotate(transform, glm::radians(st.rollDeg), glm::vec3(1, 0, 0));
     } else {
         // Hip-sheathed one-handers have the same X-aligned long axis. Rotate it
         // onto -Z so the blade points down alongside the leg.
@@ -70,6 +70,11 @@ glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
 }
 
 } // namespace
+
+AppearanceComposer::SheathTuning& AppearanceComposer::sheathTuning() {
+    static SheathTuning tuning;
+    return tuning;
+}
 
 AppearanceComposer::AppearanceComposer(rendering::Renderer* renderer,
                                        pipeline::AssetManager* assetManager,
