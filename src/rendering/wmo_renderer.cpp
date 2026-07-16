@@ -2254,13 +2254,33 @@ void WMORenderer::getVisibleGroupsViaPortals(const ModelData& model,
         }
     }
 
-    // BFS through portals from camera's group
+    // Exterior groups are never portal-culled. AABB containment misclassifies
+    // doorway/awning thresholds as indoors (interior boxes spill past the
+    // door and outdoor boxes don't always overlap them), and a wrong BFS
+    // start then hides the whole city. Portal traversal below only decides
+    // interior-only groups; streets and facades always draw (distance culling
+    // still bounds them).
+    for (size_t gi = 0; gi < model.groups.size(); ++gi) {
+        const uint32_t f = model.groups[gi].groupFlags;
+        if (!(f & WMO_GROUP_FLAG_INDOOR) || (f & WMO_GROUP_FLAG_OUTDOOR))
+            outVisibleGroups.insert(static_cast<uint32_t>(gi));
+    }
+
+    // BFS through portals from the viewer's group plus every always-visible
+    // exterior group, so interiors seen through open doors still draw even
+    // when the viewer's containing group was misclassified.
     std::vector<bool> visited(model.groups.size(), false);
     std::vector<uint32_t> queue;
     queue.reserve(model.groups.size());
     queue.push_back(static_cast<uint32_t>(cameraGroup));
     visited[cameraGroup] = true;
     outVisibleGroups.insert(static_cast<uint32_t>(cameraGroup));
+    for (uint32_t gi : outVisibleGroups) {
+        if (!visited[gi]) {
+            visited[gi] = true;
+            queue.push_back(gi);
+        }
+    }
 
     size_t queueIdx = 0;
     while (queueIdx < queue.size()) {
