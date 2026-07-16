@@ -2433,7 +2433,8 @@ void Application::setupUICallbacks() {
 
     // ── Transport: mount, taxi, transport spawn/move ──
     transportCallbacks_ = std::make_unique<TransportCallbackHandler>(
-        *entitySpawner_, *renderer, *gameHandler, worldLoader_.get());
+        *entitySpawner_, *renderer, *gameHandler, worldLoader_.get(),
+        appearanceComposer_.get());
     transportCallbacks_->setupCallbacks();
 }
 

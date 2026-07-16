@@ -1,4 +1,5 @@
 #include "core/transport_callback_handler.hpp"
+#include "core/appearance_composer.hpp"
 #include "core/entity_spawner.hpp"
 #include "core/world_loader.hpp"
 #include "core/coordinates.hpp"
@@ -20,11 +21,13 @@ TransportCallbackHandler::TransportCallbackHandler(
     EntitySpawner& entitySpawner,
     rendering::Renderer& renderer,
     game::GameHandler& gameHandler,
-    WorldLoader* worldLoader)
+    WorldLoader* worldLoader,
+    AppearanceComposer* appearanceComposer)
     : entitySpawner_(entitySpawner)
     , renderer_(renderer)
     , gameHandler_(gameHandler)
     , worldLoader_(worldLoader)
+    , appearanceComposer_(appearanceComposer)
 {
 }
 
@@ -44,6 +47,12 @@ void TransportCallbackHandler::setupCallbacks() {
         }
         // Queue the mount for processing in the next update() frame
         entitySpawner_.setMountDisplayId(mountDisplayId);
+
+        // Mounting stows drawn weapons, matching the original client.
+        if (appearanceComposer_ && !appearanceComposer_->isWeaponsSheathed()) {
+            appearanceComposer_->setWeaponsSheathed(true);
+            appearanceComposer_->loadEquippedWeapons();
+        }
     });
 
     // Taxi precache callback - preload terrain tiles along flight path
