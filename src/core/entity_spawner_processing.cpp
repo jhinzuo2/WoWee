@@ -992,7 +992,19 @@ void EntitySpawner::processPendingTransportRegistrations() {
         const PendingTransportRegistration pending = *it;
         auto goIt = gameObjectInstances_.find(pending.guid);
         if (goIt == gameObjectInstances_.end()) {
-            it = pendingTransportRegistrations_.erase(it);
+            // GO model spawns are budgeted per frame and often land AFTER the
+            // transport registration is queued. Erasing on the first miss
+            // silently raced the spawn queue and left transports (Deeprun
+            // Tram cars) permanently unregistered. Retry until the instance
+            // exists; give up loudly after ~30s (despawned/failed model).
+            if (++it->retryFrames > 1800) {
+                LOG_WARNING("Transport registration dropped: GO render instance never "
+                            "spawned for GUID 0x", std::hex, pending.guid, std::dec,
+                            " entry=", pending.entry, " displayId=", pending.displayId);
+                it = pendingTransportRegistrations_.erase(it);
+            } else {
+                ++it;
+            }
             continue;
         }
 

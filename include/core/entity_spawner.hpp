@@ -411,6 +411,7 @@ private:
         uint32_t entry = 0;
         uint32_t displayId = 0;
         float x = 0.0f, y = 0.0f, z = 0.0f, orientation = 0.0f;
+        int retryFrames = 0;  // waiting for the GO's render instance to spawn
     };
     std::unordered_map<uint64_t, PendingTransportMove> pendingTransportMoves_;
     std::deque<PendingTransportRegistration> pendingTransportRegistrations_;

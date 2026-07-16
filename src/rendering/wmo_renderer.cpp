@@ -3380,14 +3380,21 @@ bool WMORenderer::checkWallCollision(const glm::vec3& from, const glm::vec3& to,
                 float triHeight = tb.maxZ - tb.minZ;
                 if (triHeight < 1.0f && tb.maxZ <= localFeetZ + 1.2f) continue;
 
-                // Use MOPY flags to filter wall collision.
-                // Collide with triangles that have the collision flag (0x08) or no flags at all.
-                // Skip detail/decorative (0x04) and render-only (0x20 without 0x08) surfaces.
+                // Use MOPY flags to filter wall collision. Blocking set is the
+                // union of both flag conventions seen in the assets:
+                //  - explicit collision hulls (0x08), rendered or not — tunnel
+                //    walls rely on invisible hulls;
+                //  - rendered geometry (0x20) that is not detail (0x04) — the
+                //    Deeprun Tram gates carry render flags without 0x08 and
+                //    were walk-through when only 0x08 blocked.
+                // Detail/decorative (0x04: gears, railings, webs) never blocks.
                 uint32_t triIdx = triStart / 3;
                 if (!group.triMopyFlags.empty() && triIdx < group.triMopyFlags.size()) {
                     uint8_t mopy = group.triMopyFlags[triIdx];
                     if (mopy != 0) {
-                        if ((mopy & 0x04) || !(mopy & 0x08)) continue;
+                        const bool collisionHull = (mopy & 0x08) != 0;
+                        const bool renderedSolid = (mopy & 0x20) != 0 && !(mopy & 0x04);
+                        if (!collisionHull && !renderedSolid) continue;
                     }
                 }
 
