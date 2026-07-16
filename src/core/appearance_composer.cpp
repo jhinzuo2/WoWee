@@ -56,6 +56,11 @@ glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
         transform = glm::translate(transform, glm::vec3(-0.01f, 0.0f, 0.04f));
         transform = glm::rotate(transform, glm::radians(35.0f), glm::vec3(1, 0, 0));
         transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(0, 1, 0));
+        // Roll the blade a quarter turn about its own long axis (innermost op,
+        // model X) so the flat of the blade rests against the back — without
+        // this the edge plane stays on the character's front/back axis and the
+        // sharp edge digs into the back.
+        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(1, 0, 0));
     } else {
         // Hip-sheathed one-handers have the same X-aligned long axis. Rotate it
         // onto -Z so the blade points down alongside the leg.
