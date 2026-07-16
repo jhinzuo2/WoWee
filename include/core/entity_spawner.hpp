@@ -471,7 +471,12 @@ private:
     uint64_t spawnedPlayerGuid_ = 0;
 
     // --- Weapon model ID counter ---
-    uint32_t nextWeaponModelId_ = 1000;
+    // Weapon model ids share CharacterRenderer's models map with NPC
+    // composites, which are keyed by creature displayId (1..~35000). Starting
+    // at 1000 collided with loaded NPC models once enough weapon reloads
+    // advanced the counter — attachWeapon then instanced an NPC mesh as the
+    // weapon. Reserve a range no displayId can reach.
+    uint32_t nextWeaponModelId_ = 0x40000000u;
 
     // --- Spawn internal methods ---
     void spawnOnlineCreature(uint64_t guid, uint32_t displayId,
