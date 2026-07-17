@@ -87,6 +87,16 @@ TEST_CASE("Ranged weapon auto-attacks ignore placeholder DBC resource costs",
     REQUIRE_FALSE(isRangedWeaponAutoAttack(19434)); // Aimed Shot still uses real costs
 }
 
+TEST_CASE("Fishing ranks use targetless server-placed casts", "[spell][fishing]") {
+    for (uint32_t spellId : {7620u, 7731u, 7732u, 18248u, 33095u, 51294u}) {
+        REQUIRE(isFishingCast(spellId));
+    }
+
+    REQUIRE_FALSE(isFishingCast(0));
+    REQUIRE_FALSE(isFishingCast(2366));  // Herbalism
+    REQUIRE_FALSE(isFishingCast(2575));  // Mining
+}
+
 // ---------------------------------------------------------------------------
 // Rank strings
 // ---------------------------------------------------------------------------

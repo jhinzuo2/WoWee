@@ -67,6 +67,15 @@ bool isBandageSpell(const GameHandler& owner, uint32_t spellId) {
 std::string castFailureMessage(const GameHandler& owner, uint32_t spellId,
                                uint8_t result, int powerType, uint32_t miscArg = 0,
                                uint32_t miscArg2 = 0) {
+    if (spellclass::isFishingCast(spellId)) {
+        if (result == 11 || result == 60 || result == 178)
+            return "Face open water and try casting again.";
+        if (result == 58)
+            return "You can't fish in this area.";
+        if (result == 156)
+            return "The water there is too shallow.";
+    }
+
     // Bandages use a hidden target aura to enforce the Recently Bandaged
     // lockout. Exposing the protocol label ("Target aurastate") gives the
     // player no actionable information.
@@ -149,6 +158,11 @@ std::string gatherCastFailureMessage(uint8_t result, const std::string& fallback
 std::optional<audio::PlayerErrorSpeech> errorSpeechForCastResult(
         uint32_t spellId, uint8_t result, int powerType) {
     using audio::PlayerErrorSpeech;
+    // Fishing has no unit target: the server validates a randomly sampled water
+    // point in front of the caster. The generic "no target" voice line is both
+    // misleading and contradicted by the on-screen fishing-specific guidance.
+    if (spellclass::isFishingCast(spellId) && (result == 11 || result == 60 || result == 156 || result == 178))
+        return std::nullopt;
     switch (result) {
         case 11:  // Bad implicit targets
         case 178: // No valid targets
@@ -563,11 +577,12 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
         owner_.sendMovement(Opcode::MSG_MOVE_STOP);
     }
 
+    const bool fishingCast = spellclass::isFishingCast(spellId);
     uint64_t target = targetGuid != 0 ? targetGuid : owner_.getTargetGuid();
     // Self-targeted spells (hearthstone, shouts, self-buffs) always land on the
     // caster, so they must not carry the current target along.
     const bool selfCast = (spellId == 8690) || isSelfCastSpell(spellId);
-    if (selfCast) target = 0;
+    if (selfCast || fishingCast) target = 0;
 
     // Track whether a spell-specific block already handled facing so the generic
     // facing block below doesn't send redundant SET_FACING packets.
@@ -684,7 +699,7 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
         }
     }
     // Heartbeat ensures the server has the updated orientation before the cast packet.
-    if (target != 0) {
+    if (target != 0 || fishingCast) {
         owner_.sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
     }
 
@@ -1254,6 +1269,15 @@ void SpellHandler::handleCastFailed(network::Packet& packet) {
     bool ok = owner_.getPacketParsers() ? owner_.getPacketParsers()->parseCastFailed(packet, data)
                                     : CastFailedParser::parse(packet, data);
     if (!ok) return;
+
+    if (spellclass::isFishingCast(data.spellId)) {
+        const auto& movement = owner_.movementInfoRef();
+        LOG_WARNING("Fishing cast failed: spell=", data.spellId,
+                    " result=", static_cast<int>(data.result),
+                    " pos=(", movement.x, ",", movement.y, ",", movement.z, ")",
+                    " facing=", movement.orientation,
+                    " selectedTarget=0x", std::hex, owner_.getTargetGuid(), std::dec);
+    }
 
     const uint64_t gatherGoGuid = owner_.lastInteractedGoGuidRef();
     const bool gatherCast = gatherGoGuid != 0 && isGatherSpellId(data.spellId);
@@ -2910,6 +2934,14 @@ void SpellHandler::handleCastResult(network::Packet& packet) {
                                                    castResultMiscArg, castResultMiscArg2)) {
         LOG_DEBUG("SMSG_CAST_RESULT: spellId=", castResultSpellId, " result=", static_cast<int>(castResult));
         if (castResult != 0) {
+            if (spellclass::isFishingCast(castResultSpellId)) {
+                const auto& movement = owner_.movementInfoRef();
+                LOG_WARNING("Fishing cast failed: spell=", castResultSpellId,
+                            " result=", static_cast<int>(castResult),
+                            " pos=(", movement.x, ",", movement.y, ",", movement.z, ")",
+                            " facing=", movement.orientation,
+                            " selectedTarget=0x", std::hex, owner_.getTargetGuid(), std::dec);
+            }
             const uint64_t gatherGoGuid = owner_.lastInteractedGoGuidRef();
             const bool gatherCast = gatherGoGuid != 0 && isGatherSpellId(castResultSpellId);
             casting_ = false; castIsChannel_ = false; currentCastSpellId_ = 0; castTimeRemaining_ = 0.0f;

@@ -45,6 +45,21 @@ inline bool isRangedWeaponAutoAttack(uint32_t spellId) {
            spellId == 2764;    // Throw
 }
 
+/// The learnable Fishing casts across Classic, TBC, and WotLK.
+///
+/// Fishing is unusual: it has no explicit unit target. The server chooses a point in
+/// a narrow cone in front of the caster and validates water depth there. Keeping this
+/// classification explicit prevents a selected creature from leaking into the cast
+/// packet and lets the client select the pole-specific animation sequence.
+inline bool isFishingCast(uint32_t spellId) {
+    return spellId == 7620 ||   // Fishing (Apprentice)
+           spellId == 7731 ||   // Fishing (Journeyman)
+           spellId == 7732 ||   // Fishing (Expert)
+           spellId == 18248 ||  // Fishing (Artisan)
+           spellId == 33095 ||  // Fishing (Master)
+           spellId == 51294;    // Fishing (Grand Master)
+}
+
 /// Spell.dbc stores the rank as a display string ("Rank 3"). Rankless spells sort as 0.
 inline int rankValue(const std::string& rank) {
     int value = 0;

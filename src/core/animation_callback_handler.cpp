@@ -9,6 +9,7 @@
 #include "rendering/animation_controller.hpp"
 #include "rendering/animation/animation_ids.hpp"
 #include "game/game_handler.hpp"
+#include "game/spell_classification.hpp"
 #include "game/world_packets.hpp"
 #include "audio/audio_engine.hpp"
 
@@ -384,13 +385,8 @@ void AnimationCallbackHandler::setupCallbacks() {
         const bool isArea     = (castType == game::SpellCastType::AREA);
 
         if (start) {
-            // Detect fishing spells (channeled) — use FISHING_LOOP instead of generic cast
-            auto isFishingSpell = [](uint32_t spellId) {
-                return spellId == 7620 || spellId == 7731 || spellId == 7732 ||
-                       spellId == 18248 || spellId == 33095 || spellId == 51294;
-            };
             uint32_t currentSpell = isLocalPlayer ? gameHandler_.getCurrentCastSpellId() : 0;
-            bool isFishing = isChannel && isFishingSpell(currentSpell);
+            bool isFishing = isChannel && game::spellclass::isFishingCast(currentSpell);
 
             // Helper: pick first animation the model supports from a list
             auto pickFirst = [&](std::initializer_list<uint32_t> ids) -> uint32_t {
@@ -450,10 +446,20 @@ void AnimationCallbackHandler::setupCallbacks() {
                     ac->startSpellCast(useStart, useLoop ? useLoop : rendering::anim::STAND, true, useEnd);
                 }
             } else if (isFishing && cr->hasAnimation(instanceId, rendering::anim::FISHING_LOOP)) {
-                // Fishing: use FISHING_LOOP (looping idle) for the channel duration
+                // Fishing is a one-shot pole cast followed by the channel idle. If the
+                // player had weapons sheathed, move the equipped pole into their hand
+                // before starting so the cast animation actually swings it.
                 if (isLocalPlayer) {
+                    if (appearanceComposer_.isWeaponsSheathed()) {
+                        appearanceComposer_.setWeaponsSheathed(false);
+                        appearanceComposer_.loadEquippedWeapons();
+                    }
                     auto* ac = renderer_.getAnimationController();
-                    if (ac) ac->startSpellCast(0, rendering::anim::FISHING_LOOP, true, 0);
+                    if (ac) {
+                        uint32_t castAnim = cr->hasAnimation(instanceId, rendering::anim::FISHING_CAST)
+                            ? rendering::anim::FISHING_CAST : 0;
+                        ac->startSpellCast(castAnim, rendering::anim::FISHING_LOOP, true, 0);
+                    }
                 } else {
                     cr->playAnimation(instanceId, rendering::anim::FISHING_LOOP, true);
                 }
