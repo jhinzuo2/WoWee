@@ -440,7 +440,9 @@ void AuthHandler::sendLogonProof() {
                 for (const auto& dir : candidateDirs) {
                     for (const auto& exe : candidateExes) {
                         std::string err;
-                        if (computeIntegrityHashWin32WithExe(checksumSalt_, crcA, dir, exe, crcHash, err)) {
+                        if (computeIntegrityHashWin32WithExe(checksumSalt_, crcA, dir, exe,
+                                                             static_cast<uint16_t>(clientInfo.build),
+                                                             crcHash, err)) {
                             crcHashPtr = &crcHash;
                             LOG_WARNING("Integrity hash computed from ", dir, " (", exe, ")");
                             ok = true;

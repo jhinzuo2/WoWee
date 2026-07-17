@@ -355,7 +355,9 @@ AuthResultData authenticate(const Options& opt) {
         } else {
             std::string err;
             if (auth::computeIntegrityHashWin32WithExe(checksumSalt, A, opt.integrityDir,
-                                                       opt.integrityExe, crcHash, err)) {
+                                                       opt.integrityExe,
+                                                       static_cast<uint16_t>(opt.build),
+                                                       crcHash, err)) {
                 crcHashPtr = &crcHash;
                 std::cerr << "Auth: computed integrity hash from " << opt.integrityDir
                           << " (" << opt.integrityExe << ")\n";
