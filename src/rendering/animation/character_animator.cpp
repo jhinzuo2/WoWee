@@ -147,8 +147,14 @@ AnimOutput CharacterAnimator::resolveAnimation() {
     combatIn.currentAnimTime = fi.currentAnimTime;
     combatIn.currentAnimDuration = fi.currentAnimDuration;
     combatIn.haveAnimState = fi.haveAnimState;
-    combatIn.hasUnsheathe = caps_.resolvedUnsheathe != 0;
-    combatIn.hasSheathe = caps_.resolvedSheathe != 0;
+    // A character model supporting draw/sheath animations does not mean the
+    // character currently has something to draw. Empty-handed combat must go
+    // directly to READY_UNARMED / ATTACK_UNARMED. Equipped fist weapons still
+    // have inventoryType ONE_HAND and retain their dedicated fist animation path.
+    const bool hasDrawableWeapon = loadout_.inventoryType != game::InvType::NON_EQUIP ||
+        (rangedWeaponActive_ && loadout_.rangedType != RangedWeaponType::NONE);
+    combatIn.hasUnsheathe = hasDrawableWeapon && caps_.resolvedUnsheathe != 0;
+    combatIn.hasSheathe = hasDrawableWeapon && caps_.resolvedSheathe != 0;
 
     // ── Combat FSM (highest priority for non-mount) ─────────────────────
     auto combatOut = combat_.resolve(combatIn, caps_, loadout_);

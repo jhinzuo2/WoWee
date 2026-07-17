@@ -1340,7 +1340,27 @@ void Application::update(float deltaTime) {
             updateCheckpoint = "in_game: auto-unsheathe";
             if (gameHandler) {
                 const bool autoAttacking = gameHandler->isAutoAttacking();
-                if (autoAttacking && !wasAutoAttacking_ && appearanceComposer_ && appearanceComposer_->isWeaponsSheathed()) {
+                // Keep the attachment state consistent with the ongoing attack, not
+                // just the initial false -> true transition. Z can be pressed after
+                // combat has already started, and pre-WotLK servers briefly send
+                // ATTACKSTOP while the client retains attack intent for a retry.
+                const bool attackWeaponNeeded = autoAttacking || gameHandler->hasAutoAttackIntent();
+                const auto& inventory = gameHandler->getInventory();
+                const auto& mainHand = inventory.getEquipSlot(game::EquipSlot::MAIN_HAND);
+                const auto& offHand = inventory.getEquipSlot(game::EquipSlot::OFF_HAND);
+                const auto& ranged = inventory.getEquipSlot(game::EquipSlot::RANGED);
+                const bool hasOffHandWeapon = !offHand.empty() &&
+                    offHand.item.inventoryType == game::InvType::ONE_HAND;
+                const bool hasRangedWeapon = !ranged.empty() &&
+                    (ranged.item.inventoryType == game::InvType::RANGED_BOW ||
+                     ranged.item.inventoryType == game::InvType::RANGED_GUN ||
+                     ranged.item.inventoryType == game::InvType::THROWN);
+                const bool hasDrawableWeapon = !mainHand.empty() || hasOffHandWeapon || hasRangedWeapon;
+                if (attackWeaponNeeded && hasDrawableWeapon && appearanceComposer_ &&
+                    appearanceComposer_->isWeaponsSheathed()) {
+                    if (renderer && renderer->getAnimationController()) {
+                        renderer->getAnimationController()->playWeaponSheathAnimation(false);
+                    }
                     appearanceComposer_->setWeaponsSheathed(false);
                     appearanceComposer_->loadEquippedWeapons();
                 }
