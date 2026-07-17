@@ -21,6 +21,7 @@ struct ClientInfo {
     // legacy realm-list/proof packet layouts.
     uint8_t logonProtocolVersion = 8;
     uint8_t protocolVersion = 8;
+    bool legacyVanillaRealmList = false;
     std::string game = "WoW";
     std::string platform = "x86";
     std::string os = "Win";

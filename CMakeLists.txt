@@ -1470,6 +1470,7 @@ install(TARGETS auth_login_probe RUNTIME DESTINATION bin)
 # ---- Tool: world_char_probe (auth + world character enum probe) ----
 add_executable(world_char_probe
     tools/world_char_probe/main.cpp
+    tools/world_char_probe/runtime_compat.cpp
     src/auth/auth_packets.cpp
     src/auth/auth_opcodes.cpp
     src/auth/crypto.cpp
@@ -1485,6 +1486,7 @@ add_executable(world_char_probe
     src/game/opcode_table.cpp
     src/game/opcodes.cpp
     src/game/world_packets.cpp
+    src/game/expansion_profile.cpp
     src/game/world_packets_social.cpp
     src/game/world_packets_entity.cpp
     src/game/world_packets_world.cpp
