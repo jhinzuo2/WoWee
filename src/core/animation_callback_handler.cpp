@@ -8,6 +8,7 @@
 #include "rendering/camera_controller.hpp"
 #include "rendering/animation_controller.hpp"
 #include "rendering/animation/animation_ids.hpp"
+#include "rendering/animation/emote_registry.hpp"
 #include "game/game_handler.hpp"
 #include "game/spell_classification.hpp"
 #include "game/world_packets.hpp"
@@ -342,7 +343,12 @@ void AnimationCallbackHandler::setupCallbacks() {
                 // Emote state cleared → return to idle
                 cr->playAnimation(emoteInstanceId, rendering::anim::STAND, true);
             } else {
-                cr->playAnimation(emoteInstanceId, emoteAnim, false);
+                const uint32_t stateAnim =
+                    rendering::EmoteRegistry::instance().getStateVariant(emoteAnim);
+                const uint32_t persistentAnim =
+                    stateAnim != 0 && cr->hasAnimation(emoteInstanceId, stateAnim)
+                        ? stateAnim : emoteAnim;
+                cr->playAnimation(emoteInstanceId, persistentAnim, true);
             }
             return;
         }
@@ -454,6 +460,7 @@ void AnimationCallbackHandler::setupCallbacks() {
                         appearanceComposer_.setWeaponsSheathed(false);
                         appearanceComposer_.loadEquippedWeapons();
                     }
+                    appearanceComposer_.showFishingPole(true);
                     auto* ac = renderer_.getAnimationController();
                     if (ac) {
                         uint32_t castAnim = cr->hasAnimation(instanceId, rendering::anim::FISHING_CAST)
@@ -560,6 +567,7 @@ void AnimationCallbackHandler::setupCallbacks() {
             // Cast/channel ended — plays finalization anim completely then returns to idle
             if (isLocalPlayer) {
                 appearanceComposer_.showMiningPick(false);
+                appearanceComposer_.showFishingPole(false);
                 auto* ac = renderer_.getAnimationController();
                 if (ac) ac->stopSpellCast();
             } else if (isChannel) {

@@ -96,6 +96,10 @@ public:
     // Mining casts temporarily replace the held main-hand model with a pickaxe.
     void showMiningPick(bool show);
 
+    // Fishing casts temporarily replace the held main-hand model with a pole
+    // found in the player's equipped slots or bags.
+    void showFishingPole(bool show);
+
     // Saved skin state accessors (used by game_screen.cpp for equipment re-compositing)
     const std::string& getBodySkinPath() const { return bodySkinPath_; }
     const std::vector<std::string>& getUnderwearPaths() const { return underwearPaths_; }
@@ -125,6 +129,7 @@ private:
     bool showingRanged_ = false;
     bool showingMiningPick_ = false;
     uint32_t miningPickInstanceId_ = 0;
+    bool showingFishingPole_ = false;
 };
 
 } // namespace core

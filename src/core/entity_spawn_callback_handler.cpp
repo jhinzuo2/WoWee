@@ -107,8 +107,8 @@ void EntitySpawnCallbackHandler::setupCallbacks() {
         auto* m2r = renderer_.getM2Renderer();
         if (!m2r) return;
         uint32_t instId = info.instanceId;
-        // GO states: 0=READY(closed), 1=OPEN, 2=DESTROYED/ACTIVE
-        if (goState == 1) {
+        // Canonical GOState: 0=ACTIVE/open, 1=READY/closed, 2=ACTIVE_ALTERNATIVE.
+        if (goState == 0) {
             // Opening: play OPEN(148) one-shot, fall back to unfreezing
             if (m2r->hasAnimation(instId, 148))
                 m2r->setInstanceAnimation(instId, 148, false);

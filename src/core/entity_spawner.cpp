@@ -11,6 +11,7 @@
 #include "pipeline/m2_loader.hpp"
 #include "pipeline/wmo_loader.hpp"
 #include "rendering/animation/animation_ids.hpp"
+#include "rendering/animation/emote_registry.hpp"
 #include "pipeline/dbc_loader.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/dbc_layout.hpp"
@@ -2275,6 +2276,13 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
         uint32_t npcEmoteAnim = npcEmote != 0
             ? rendering::AnimationController::getEmoteAnimByEmotesId(npcEmote)
             : 0;
+        if (npcEmoteAnim != 0) {
+            const uint32_t stateAnim =
+                rendering::EmoteRegistry::instance().getStateVariant(npcEmoteAnim);
+            if (stateAnim != 0 && charRenderer->hasAnimation(instanceId, stateAnim)) {
+                npcEmoteAnim = stateAnim;
+            }
+        }
         if (npcEmoteAnim != 0 && charRenderer->hasAnimation(instanceId, npcEmoteAnim)) {
             charRenderer->playAnimation(instanceId, npcEmoteAnim, true);
         } else if (charRenderer->hasAnimation(instanceId, rendering::anim::BIRTH)) {

@@ -685,6 +685,87 @@ void AppearanceComposer::showMiningPick(bool show) {
     }
 }
 
+void AppearanceComposer::showFishingPole(bool show) {
+    if (show == showingFishingPole_) return;
+
+    if (!show) {
+        showingFishingPole_ = false;
+        loadEquippedWeapons();
+        return;
+    }
+    if (!renderer_ || !renderer_->getCharacterRenderer() || !gameHandler_ ||
+        !assetManager_ || !assetManager_->isInitialized() || !entitySpawner_) {
+        return;
+    }
+
+    const auto isFishingPole = [this](const game::ItemSlot& slot) {
+        if (slot.empty()) return false;
+        if (slot.item.subclassName == "Fishing Pole") return true;
+        const auto* info = gameHandler_->getItemInfo(slot.item.itemId);
+        return info && info->valid && info->itemClass == 2 && info->subClass == 20;
+    };
+
+    const game::ItemSlot* pole = nullptr;
+    const auto& inventory = gameHandler_->getInventory();
+    const auto& mainHand = inventory.getEquipSlot(game::EquipSlot::MAIN_HAND);
+    if (isFishingPole(mainHand)) pole = &mainHand;
+    for (int i = 0; !pole && i < inventory.getBackpackSize(); ++i) {
+        const auto& slot = inventory.getBackpackSlot(i);
+        if (isFishingPole(slot)) pole = &slot;
+    }
+    for (int bag = 0; !pole && bag < game::Inventory::NUM_BAG_SLOTS; ++bag) {
+        for (int slotIndex = 0; !pole && slotIndex < inventory.getBagSize(bag); ++slotIndex) {
+            const auto& slot = inventory.getBagSlot(bag, slotIndex);
+            if (isFishingPole(slot)) pole = &slot;
+        }
+    }
+    if (!pole || pole->item.displayInfoId == 0) {
+        LOG_WARNING("showFishingPole: no fishing pole with display data found in inventory");
+        return;
+    }
+
+    auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
+    if (!displayInfoDbc) return;
+    const int32_t recIdx = displayInfoDbc->findRecordById(pole->item.displayInfoId);
+    if (recIdx < 0) return;
+
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    std::string modelName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModel"] : 1);
+    std::string textureName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModelTexture"] : 3);
+    if (modelName.empty()) return;
+
+    const size_t dotPos = modelName.rfind('.');
+    const std::string modelFile = dotPos == std::string::npos
+        ? modelName + ".m2" : modelName.substr(0, dotPos) + ".m2";
+    std::string m2Path = "Item\\ObjectComponents\\Weapon\\" + modelFile;
+    pipeline::M2Model poleModel;
+    if (!loadWeaponM2(m2Path, poleModel)) return;
+
+    std::string texturePath;
+    if (!textureName.empty()) {
+        texturePath = "Item\\ObjectComponents\\Weapon\\" + textureName + ".blp";
+    }
+
+    auto* charRenderer = renderer_->getCharacterRenderer();
+    const uint32_t charInstanceId = renderer_->getCharacterInstanceId();
+    if (charInstanceId == 0) return;
+    charRenderer->detachWeapon(charInstanceId, kAttachRightHand);
+    const uint32_t modelId = entitySpawner_->allocateWeaponModelId();
+    if (charRenderer->attachWeapon(charInstanceId, kAttachRightHand, poleModel,
+                                   modelId, texturePath)) {
+        showingFishingPole_ = true;
+        showingRanged_ = false;
+        if (renderer_->getAnimationController())
+            renderer_->getAnimationController()->setRangedWeaponActive(false);
+        LOG_INFO("Fishing pole attached at right hand: ", m2Path);
+    } else {
+        loadEquippedWeapons();
+    }
+}
+
 void AppearanceComposer::showRangedWeapon(bool show) {
     if (show == showingRanged_) return;
 

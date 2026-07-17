@@ -1281,6 +1281,27 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
 
                 rendering::Ray ray = camera->screenToWorldRay(leftClickPressPos_.x, leftClickPressPos_.y, screenW, screenH);
 
+                // Use the same authoritative position and forgiving click volume
+                // as right-click for a hooked bobber. Its tiny, partly submerged
+                // render bounds must not let a click fall through to a character.
+                const uint64_t hookedBobber = gameHandler.getHookedFishingBobberGuid();
+                if (hookedBobber != 0) {
+                    auto bobber = gameHandler.getEntityManager().getEntity(hookedBobber);
+                    if (bobber && bobber->getType() == game::ObjectType::GAMEOBJECT) {
+                        glm::vec3 bobberCenter = core::coords::canonicalToRender(
+                            glm::vec3(bobber->getX(), bobber->getY(), bobber->getZ()));
+                        bobberCenter.z += 0.35f;
+                        float hitT = 0.0f;
+                        constexpr float kFishingBobberClickRadius = 4.0f;
+                        if (raySphereIntersect(ray, bobberCenter, kFishingBobberClickRadius, hitT)) {
+                            LOG_WARNING("Fishing bobber direct left click: guid=0x", std::hex,
+                                        hookedBobber, std::dec, " hitDistance=", hitT);
+                            gameHandler.interactWithGameObject(hookedBobber);
+                            return;
+                        }
+                    }
+                }
+
                 float closestT = 1e30f;
                 uint64_t closestGuid = 0;
                 float closestHostileUnitT = 1e30f;
@@ -1345,7 +1366,11 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                 }
 
                 if (closestGuid != 0) {
-                    gameHandler.setTarget(closestGuid);
+                    if (closestGuid == gameHandler.getHookedFishingBobberGuid()) {
+                        gameHandler.interactWithGameObject(closestGuid);
+                    } else {
+                        gameHandler.setTarget(closestGuid);
+                    }
                 } else {
                     // Clicked empty space — deselect current target
                     gameHandler.clearTarget();
@@ -1357,6 +1382,36 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
     // Right-click: select NPC (if needed) then interact / loot / auto-attack
     // Suppress when left button is held (both-button run)
     if (!io.WantCaptureMouse && input.isMouseButtonJustPressed(SDL_BUTTON_RIGHT) && !input.isMouseButtonPressed(SDL_BUTTON_LEFT)) {
+        // Fishing bobbers are tiny and partly submerged, so their model bounds can
+        // miss a cursor ray that visibly lands on the float. Test the authoritative
+        // water position first with a forgiving sphere and reel directly, before
+        // normal unit targeting can fall through to the player/self target.
+        const uint64_t hookedBobber = gameHandler.getHookedFishingBobberGuid();
+        if (hookedBobber != 0) {
+            auto bobber = gameHandler.getEntityManager().getEntity(hookedBobber);
+            auto* renderer = services_.renderer;
+            auto* camera = renderer ? renderer->getCamera() : nullptr;
+            auto* window = services_.window;
+            if (bobber && bobber->getType() == game::ObjectType::GAMEOBJECT && camera && window) {
+                const glm::vec2 mousePos = input.getMousePosition();
+                const rendering::Ray ray = camera->screenToWorldRay(
+                    mousePos.x, mousePos.y,
+                    static_cast<float>(window->getWidth()),
+                    static_cast<float>(window->getHeight()));
+                glm::vec3 bobberCenter = core::coords::canonicalToRender(
+                    glm::vec3(bobber->getX(), bobber->getY(), bobber->getZ()));
+                bobberCenter.z += 0.35f;
+                float hitT = 0.0f;
+                constexpr float kFishingBobberClickRadius = 4.0f;
+                if (raySphereIntersect(ray, bobberCenter, kFishingBobberClickRadius, hitT)) {
+                    LOG_WARNING("Fishing bobber direct click: guid=0x", std::hex,
+                                hookedBobber, std::dec, " hitDistance=", hitT);
+                    gameHandler.interactWithGameObject(hookedBobber);
+                    return;
+                }
+            }
+        }
+
         // If a gameobject is already targeted, prioritize interacting with that target
         // instead of re-picking under cursor (which can hit nearby decorative GOs).
         // Exclude chair-type GOs (type 7): otherwise any right-click (including the
@@ -1412,6 +1467,8 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                 uint64_t closestHostileUnitGuid = 0;
                 float closestQuestGoT = 1e30f;
                 uint64_t closestQuestGoGuid = 0;
+                float hookedBobberT = 1e30f;
+                uint64_t hookedBobberGuid = 0;
                 float closestGoT = 1e30f;
                 uint64_t closestGoGuid = 0;
                 const uint64_t myGuid = gameHandler.getPlayerGuid();
@@ -1478,6 +1535,10 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                             }
                         }
                         if (t == game::ObjectType::GAMEOBJECT) {
+                            if (guid == gameHandler.getHookedFishingBobberGuid() && hitT < hookedBobberT) {
+                                hookedBobberT = hitT;
+                                hookedBobberGuid = guid;
+                            }
                             if (hitT < closestGoT) {
                                 closestGoT = hitT;
                                 closestGoGuid = guid;
@@ -1500,8 +1561,13 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                     }
                 }
 
-                // Priority: quest GO > closer of (GO, hostile unit) > closest anything.
-                if (closestQuestGoGuid != 0) {
+                // A hooked fishing bobber is time-sensitive and intentionally small:
+                // if its click sphere was hit, reel it rather than selecting an
+                // overlapping unit or decorative object.
+                if (hookedBobberGuid != 0) {
+                    closestGuid = hookedBobberGuid;
+                    closestType = game::ObjectType::GAMEOBJECT;
+                } else if (closestQuestGoGuid != 0) {
                     closestGuid = closestQuestGoGuid;
                     closestType = game::ObjectType::GAMEOBJECT;
                 } else if (closestGoGuid != 0 && closestHostileUnitGuid != 0) {

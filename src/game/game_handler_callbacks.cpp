@@ -2188,8 +2188,12 @@ void GameHandler::interactWithGameObject(uint64_t guid) {
     LOG_DEBUG("[GO-DIAG] interactWithGameObject called: guid=0x", std::hex, guid, std::dec);
     if (guid == 0) { LOG_DEBUG("[GO-DIAG] BLOCKED: guid==0"); return; }
     if (!isInWorld()) { LOG_DEBUG("[GO-DIAG] BLOCKED: not in world"); return; }
-    // Do not overlap an actual spell cast.
-    if (spellHandler_ && spellHandler_->isCasting() && spellHandler_->getCurrentCastSpellId() != 0) {
+    // Do not overlap an actual spell cast. Reeling an owned fishing bobber is
+    // the deliberate exception: the fishing spell remains channelled while the
+    // bobber is in the water, and using the hooked bobber is what ends it.
+    const bool reelingHookedFishingBobber = guid == hookedFishingBobberGuid_;
+    if (!reelingHookedFishingBobber && spellHandler_ && spellHandler_->isCasting() &&
+        spellHandler_->getCurrentCastSpellId() != 0) {
         LOG_DEBUG("[GO-DIAG] BLOCKED: already casting spellId=", spellHandler_->getCurrentCastSpellId());
         return;
     }
@@ -2229,6 +2233,7 @@ void GameHandler::performGameObjectInteractionNow(uint64_t guid) {
     uint32_t goType = 0;
     std::string goName;
     const GameObjectQueryResponseData* goInfo = nullptr;
+    float interactionDistance = -1.0f;
 
     if (entity) {
         if (entity->getType() == ObjectType::GAMEOBJECT) {
@@ -2250,6 +2255,7 @@ void GameHandler::performGameObjectInteractionNow(uint64_t guid) {
         float dy = entity->getY() - movementInfo.y;
         float dz = entity->getZ() - movementInfo.z;
         float dist3d = std::sqrt(dx * dx + dy * dy + dz * dz);
+        interactionDistance = dist3d;
         // Fishing bobbers are intentionally cast beyond normal GO-use range.
         // Only the owned bobber whose bite we observed gets the extended range.
         const float maxInteractDistance = (guid == hookedFishingBobberGuid_) ? 30.0f : 10.0f;
@@ -2350,7 +2356,11 @@ void GameHandler::performGameObjectInteractionNow(uint64_t guid) {
     auto usePacket = GameObjectUsePacket::build(guid);
     socket->send(usePacket);
     lastInteractedGoGuid_ = guid;
-    if (guid == hookedFishingBobberGuid_) hookedFishingBobberGuid_ = 0;
+    if (guid == hookedFishingBobberGuid_) {
+        LOG_WARNING("Fishing bobber reel sent: guid=0x", std::hex, guid, std::dec,
+                    " distance=", interactionDistance);
+        hookedFishingBobberGuid_ = 0;
+    }
 
     if (chestLike || metadataPending) {
         // Don't send CMSG_LOOT immediately — the server may start a timed cast

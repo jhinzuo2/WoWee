@@ -914,31 +914,34 @@ void GameHandler::registerOpcodeHandlers() {
         if (packet.getSize() < 12) return;
         uint64_t guid = packet.readUInt64();
         uint32_t animId = packet.readUInt32();
-        if (gameObjectCustomAnimCallback_)
-            gameObjectCustomAnimCallback_(guid, animId);
-        if (animId == 0) {
-            auto goEnt = entityController_->getEntityManager().getEntity(guid);
-            if (goEnt && goEnt->getType() == ObjectType::GAMEOBJECT) {
-                auto go = std::static_pointer_cast<GameObject>(goEnt);
-                // Only show fishing message if the bobber belongs to us
-                // OBJECT_FIELD_CREATED_BY is a uint64 at field indices 6-7
-                uint64_t createdBy = static_cast<uint64_t>(go->getField(6))
-                                   | (static_cast<uint64_t>(go->getField(7)) << 32);
-                if (createdBy == playerGuid) {
-                    auto* info = getCachedGameObjectInfo(go->getEntry());
-                    // The bite can arrive before GAMEOBJECT_QUERY_RESPONSE. An
-                    // owned GO with unknown metadata is safe to remember here;
-                    // once metadata exists, still require FISHINGNODE (type 17).
-                    if (!info || info->type == 17) {
-                        hookedFishingBobberGuid_ = guid;
-                        setTarget(guid);
-                        addUIError("A fish is on your line! Right-click to reel it in.");
-                        addSystemChatMessage("A fish is on your line! Right-click to reel it in.");
-                        withSoundManager(&audio::AudioCoordinator::getUiSoundManager, [](auto* sfx) { sfx->playQuestUpdate(); });
-                    }
-                }
+        bool ownedFishingBite = false;
+        auto goEnt = entityController_->getEntityManager().getEntity(guid);
+        if (goEnt && goEnt->getType() == ObjectType::GAMEOBJECT) {
+            auto go = std::static_pointer_cast<GameObject>(goEnt);
+            // Only treat custom animation as a bite when this is our bobber.
+            // AzerothCore sends the GO's animation progress (normally 100), not
+            // M2 animation id 0, so the packet payload itself cannot identify it.
+            uint64_t createdBy = static_cast<uint64_t>(go->getField(6))
+                               | (static_cast<uint64_t>(go->getField(7)) << 32);
+            auto* info = getCachedGameObjectInfo(go->getEntry());
+            ownedFishingBite = createdBy == playerGuid && (!info || info->type == 17);
+            if (ownedFishingBite) {
+                hookedFishingBobberGuid_ = guid;
+                // G_FishingBobber.m2 sequence 153 is its authored 1.33s bite/splash
+                // animation; sequence 0 is the normal three-second idle bob.
+                constexpr uint32_t kFishingBobberBiteAnimation = 153;
+                if (gameObjectCustomAnimCallback_)
+                    gameObjectCustomAnimCallback_(guid, kFishingBobberBiteAnimation);
+                addUIError("A fish is on your line! Right-click to reel it in.");
+                addSystemChatMessage("A fish is on your line! Right-click to reel it in.");
+                withSoundManager(&audio::AudioCoordinator::getUiSoundManager,
+                                 [](auto* sfx) { sfx->playFishingBite(); });
+                LOG_WARNING("Fishing bite ready: guid=0x", std::hex, guid, std::dec,
+                            " serverAnimProgress=", animId);
             }
         }
+        if (!ownedFishingBite && gameObjectCustomAnimCallback_)
+            gameObjectCustomAnimCallback_(guid, animId);
     };
 
     // Item refund / socket gems / item time
