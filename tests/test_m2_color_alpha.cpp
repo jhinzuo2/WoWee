@@ -1,6 +1,7 @@
 #include <catch_amalgamated.hpp>
 
 #include "pipeline/m2_loader.hpp"
+#include "rendering/m2_track_sampler.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -38,6 +39,35 @@ float firstAlpha(const M2Model& model, size_t colorIdx, size_t seqIdx) {
 }
 
 } // namespace
+
+TEST_CASE("M2 track sampling respects discrete and linear interpolation", "[m2][track]") {
+    wowee::pipeline::M2AnimationTrack track;
+    track.sequences.resize(1);
+    track.sequences[0].timestamps = {0, 100};
+    track.sequences[0].floatValues = {0.0f, 1.0f};
+
+    track.interpolationType = 0;
+    CHECK(wowee::rendering::m2_track::sampleFloat(
+              track, 0, 50.0f, 0.0f, {}, -1.0f) == Catch::Approx(0.0f));
+    CHECK(wowee::rendering::m2_track::sampleFloat(
+              track, 0, 100.0f, 0.0f, {}, -1.0f) == Catch::Approx(1.0f));
+
+    track.interpolationType = 1;
+    CHECK(wowee::rendering::m2_track::sampleFloat(
+              track, 0, 50.0f, 0.0f, {}, -1.0f) == Catch::Approx(0.5f));
+}
+
+TEST_CASE("M2 global tracks use their independent wrapped clock", "[m2][track]") {
+    wowee::pipeline::M2AnimationTrack track;
+    track.interpolationType = 1;
+    track.globalSequence = 0;
+    track.sequences.resize(1);
+    track.sequences[0].timestamps = {0, 1000};
+    track.sequences[0].floatValues = {0.0f, 1.0f};
+
+    CHECK(wowee::rendering::m2_track::sampleFloat(
+              track, 7, 900.0f, 1250.0f, {1000}, -1.0f) == Catch::Approx(0.25f));
+}
 
 TEST_CASE("WotLK peasant wood model parses per-animation color alpha", "[m2][color]") {
     auto data = readFile("Data/creature/humanmalepeasant/humanmalepeasantwood.m2");

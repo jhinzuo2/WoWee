@@ -15,6 +15,7 @@
  * the original WoW Model Viewer (charcontrol.h, REGION_FAC=2).
  */
 #include "rendering/character_renderer.hpp"
+#include "rendering/m2_track_sampler.hpp"
 #include "rendering/animation/animation_ids.hpp"
 #include "core/thread_pool.hpp"
 #include "rendering/vk_context.hpp"
@@ -192,35 +193,15 @@ static bool sceneDiagEnabled() {
 // typically drive pulsing glows, not visibility gating).
 static float evalBatchColorAlpha(const pipeline::M2Model& model,
                                  const pipeline::M2Batch& batch,
-                                 int sequenceIndex, float timeMs) {
+                                 int sequenceIndex, float animationTimeMs,
+                                 float globalTimeMs) {
     if (batch.colorIndex == 0xFFFF ||
         batch.colorIndex >= model.colorAlphaTracks.size()) {
         return 1.0f;
     }
-    const auto& track = model.colorAlphaTracks[batch.colorIndex];
-    if (track.globalSequence >= 0 || track.sequences.empty()) return 1.0f;
-    if (sequenceIndex < 0 ||
-        static_cast<size_t>(sequenceIndex) >= track.sequences.size()) {
-        return 1.0f;
-    }
-    const auto& seq = track.sequences[sequenceIndex];
-    const size_t n = std::min(seq.timestamps.size(), seq.floatValues.size());
-    if (n == 0) return 1.0f;
-    if (n == 1 || timeMs <= static_cast<float>(seq.timestamps[0])) {
-        return seq.floatValues[0];
-    }
-    for (size_t k = 1; k < n; k++) {
-        float t1 = static_cast<float>(seq.timestamps[k]);
-        if (timeMs <= t1) {
-            // Interpolation type 0 is stepwise — hold the earlier key.
-            if (track.interpolationType == 0) return seq.floatValues[k - 1];
-            float t0 = static_cast<float>(seq.timestamps[k - 1]);
-            float f = (t1 > t0) ? (timeMs - t0) / (t1 - t0) : 1.0f;
-            return seq.floatValues[k - 1] +
-                   (seq.floatValues[k] - seq.floatValues[k - 1]) * f;
-        }
-    }
-    return seq.floatValues[n - 1];
+    return m2_track::sampleFloat(model.colorAlphaTracks[batch.colorIndex],
+                                 sequenceIndex, animationTimeMs, globalTimeMs,
+                                 model.globalSequenceDurations, 1.0f);
 }
 
 // CharMaterial UBO layout (matches character.frag.glsl set=1 binding=1)
@@ -2178,110 +2159,6 @@ void CharacterRenderer::updateAnimation(CharacterInstance& instance, float delta
     calculateBoneMatrices(instance);
 }
 
-// --- Keyframe interpolation helpers ---
-
-int CharacterRenderer::findKeyframeIndex(const std::vector<uint32_t>& timestamps, float time) {
-    if (timestamps.empty()) return -1;
-    if (timestamps.size() == 1) return 0;
-
-    // Binary search using float comparison to match original semantics exactly
-    auto it = std::upper_bound(timestamps.begin(), timestamps.end(), time,
-        [](float t, uint32_t ts) { return t < static_cast<float>(ts); });
-    if (it == timestamps.begin()) return 0;
-    size_t idx = static_cast<size_t>(it - timestamps.begin()) - 1;
-    return static_cast<int>(std::min(idx, timestamps.size() - 2));
-}
-
-// Resolve sequence index and time for a track, handling global sequences.
-// globalSeqTime is a separate accumulating timer that is NOT wrapped at the
-// current animation's sequence duration, so global sequences get full range.
-static void resolveTrackTime(const pipeline::M2AnimationTrack& track,
-                              int seqIdx, float animTime, float globalSeqTime,
-                              const std::vector<uint32_t>& globalSeqDurations,
-                              int& outSeqIdx, float& outTime) {
-    if (track.globalSequence >= 0 &&
-        static_cast<size_t>(track.globalSequence) < globalSeqDurations.size()) {
-        outSeqIdx = 0;
-        float dur = static_cast<float>(globalSeqDurations[track.globalSequence]);
-        if (dur > 0.0f) {
-            outTime = std::fmod(globalSeqTime, dur);
-            if (outTime < 0.0f) outTime += dur;
-        } else {
-            outTime = 0.0f;
-        }
-    } else {
-        outSeqIdx = seqIdx;
-        outTime = animTime;
-    }
-}
-
-glm::vec3 CharacterRenderer::interpolateVec3(const pipeline::M2AnimationTrack& track,
-                                              int seqIdx, float time, const glm::vec3& defaultVal) {
-    if (!track.hasData()) return defaultVal;
-    if (seqIdx < 0 || seqIdx >= static_cast<int>(track.sequences.size())) return defaultVal;
-
-    const auto& keys = track.sequences[seqIdx];
-    if (keys.timestamps.empty() || keys.vec3Values.empty()) return defaultVal;
-
-    auto safeVec3 = [&](const glm::vec3& v) -> glm::vec3 {
-        if (std::isnan(v.x) || std::isnan(v.y) || std::isnan(v.z)) return defaultVal;
-        return v;
-    };
-
-    if (keys.vec3Values.size() == 1) return safeVec3(keys.vec3Values[0]);
-
-    int idx = findKeyframeIndex(keys.timestamps, time);
-    if (idx < 0) return defaultVal;
-
-    size_t i0 = static_cast<size_t>(idx);
-    size_t i1 = std::min(i0 + 1, keys.vec3Values.size() - 1);
-
-    if (i0 == i1) return safeVec3(keys.vec3Values[i0]);
-
-    float t0 = static_cast<float>(keys.timestamps[i0]);
-    float t1 = static_cast<float>(keys.timestamps[i1]);
-    float duration = t1 - t0;
-    float t = (duration > 0.0f) ? glm::clamp((time - t0) / duration, 0.0f, 1.0f) : 0.0f;
-
-    return safeVec3(glm::mix(keys.vec3Values[i0], keys.vec3Values[i1], t));
-}
-
-glm::quat CharacterRenderer::interpolateQuat(const pipeline::M2AnimationTrack& track,
-                                              int seqIdx, float time) {
-    glm::quat identity(1.0f, 0.0f, 0.0f, 0.0f);
-    if (!track.hasData()) return identity;
-    if (seqIdx < 0 || seqIdx >= static_cast<int>(track.sequences.size())) return identity;
-
-    const auto& keys = track.sequences[seqIdx];
-    if (keys.timestamps.empty() || keys.quatValues.empty()) return identity;
-
-    auto safeQuat = [&](const glm::quat& q) -> glm::quat {
-        float lenSq = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
-        if (lenSq < 0.000001f || std::isnan(lenSq)) return identity;
-        return q;
-    };
-
-    if (keys.quatValues.size() == 1) return safeQuat(keys.quatValues[0]);
-
-    int idx = findKeyframeIndex(keys.timestamps, time);
-    if (idx < 0) return identity;
-
-    size_t i0 = static_cast<size_t>(idx);
-    size_t i1 = std::min(i0 + 1, keys.quatValues.size() - 1);
-
-    if (i0 == i1) return safeQuat(keys.quatValues[i0]);
-
-    glm::quat q0 = safeQuat(keys.quatValues[i0]);
-    glm::quat q1 = safeQuat(keys.quatValues[i1]);
-
-    float t0 = static_cast<float>(keys.timestamps[i0]);
-    float t1 = static_cast<float>(keys.timestamps[i1]);
-    float duration = t1 - t0;
-    float t = (duration > 0.0f) ? glm::clamp((time - t0) / duration, 0.0f, 1.0f) : 0.0f;
-
-    return glm::slerp(q0, q1, t);
-}
-
 // --- Bone transform calculation ---
 
 constexpr int32_t kKeyBoneSpineLow = 4;
@@ -2364,15 +2241,15 @@ glm::mat4 CharacterRenderer::getBoneTransform(const pipeline::M2Bone& bone, floa
     // Resolve global sequences: bones with globalSequence >= 0 use sequence 0
     // with time wrapped at the global sequence duration, independent of the
     // character's current animation.
-    int tSeq, rSeq, sSeq;
-    float tTime, rTime, sTime;
-    resolveTrackTime(bone.translation, sequenceIndex, animTime, globalSeqTime, globalSeqDurations, tSeq, tTime);
-    resolveTrackTime(bone.rotation, sequenceIndex, animTime, globalSeqTime, globalSeqDurations, rSeq, rTime);
-    resolveTrackTime(bone.scale, sequenceIndex, animTime, globalSeqTime, globalSeqDurations, sSeq, sTime);
-
-    glm::vec3 translation = interpolateVec3(bone.translation, tSeq, tTime, glm::vec3(0.0f));
-    glm::quat rotation = interpolateQuat(bone.rotation, rSeq, rTime);
-    glm::vec3 scale = interpolateVec3(bone.scale, sSeq, sTime, glm::vec3(1.0f));
+    glm::vec3 translation = m2_track::sampleVec3(
+        bone.translation, sequenceIndex, animTime, globalSeqTime,
+        globalSeqDurations, glm::vec3(0.0f));
+    glm::quat rotation = m2_track::sampleQuat(
+        bone.rotation, sequenceIndex, animTime, globalSeqTime,
+        globalSeqDurations);
+    glm::vec3 scale = m2_track::sampleVec3(
+        bone.scale, sequenceIndex, animTime, globalSeqTime,
+        globalSeqDurations, glm::vec3(1.0f));
 
     // M2 bone transform: T(pivot) * T(trans) * R(rot) * S(scale) * T(-pivot).
     // Build directly instead of chaining glm::translate/rotate/scale (each of
@@ -2744,9 +2621,13 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                 // submeshes and only one is alpha-1 in any given animation.
                 // Opaque batches can't express alpha in the shader, so cull
                 // batches whose track evaluates to ~0 for the current sequence.
-                if (evalBatchColorAlpha(gpuModel.data, batch,
+                const float batchColorAlpha = glm::clamp(
+                    evalBatchColorAlpha(gpuModel.data, batch,
                                         instance.currentSequenceIndex,
-                                        instance.animationTime) <= 0.01f) {
+                                        instance.animationTime,
+                                        instance.globalSequenceTime),
+                    0.0f, 1.0f);
+                if (batchColorAlpha <= 0.01f) {
                     continue;
                 }
                 // Resolve texture for this batch (prefer hair textures for hair geosets).
@@ -2849,7 +2730,7 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                     // declare Mod/alpha blending, which would composite that black
                     // background as an opaque quad — force additive so only the light adds.
                     desiredPipeline = additivePipeline_;
-                } else if (instance.opacity < 0.999f) {
+                } else if (instance.opacity * batchColorAlpha < 0.999f) {
                     // Whole-instance fade (ghost form, spawn fade-in): the opaque and
                     // alpha-test pipelines have blending disabled, so the shader's
                     // texColor.a * opacity output is discarded and only hair (via
@@ -2908,7 +2789,7 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
 
                 // Create per-batch material UBO
                 CharMaterialUBO matData{};
-                matData.opacity = instance.opacity;
+                matData.opacity = instance.opacity * batchColorAlpha;
                 matData.alphaTest = blendNeedsCutout ? 1 : 0;
                 matData.colorKeyBlack = colorKeyBlack ? 1 : 0;
                 matData.unlit = unlit ? 1 : 0;

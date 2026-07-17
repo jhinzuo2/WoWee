@@ -286,13 +286,6 @@ private:
     void destroyModelGPU(M2ModelGPU& gpuModel, bool defer = false);
     void destroyInstanceBones(CharacterInstance& inst, bool defer = false);
 
-    // Keyframe interpolation helpers
-    static int findKeyframeIndex(const std::vector<uint32_t>& timestamps, float time);
-    static glm::vec3 interpolateVec3(const pipeline::M2AnimationTrack& track,
-                                      int seqIdx, float time, const glm::vec3& defaultVal);
-    static glm::quat interpolateQuat(const pipeline::M2AnimationTrack& track,
-                                      int seqIdx, float time);
-
     // Attachment point lookup helper — shared by attachWeapon() and getAttachmentTransform()
     bool findAttachmentBone(uint32_t modelId, uint32_t attachmentId,
                            uint16_t& outBoneIndex, glm::vec3& outOffset) const;
