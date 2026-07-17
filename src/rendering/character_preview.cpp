@@ -118,7 +118,8 @@ void CharacterPreview::ensureAppearanceGeosetsLoaded() {
 
 uint16_t CharacterPreview::selectedHairScalpGeoset() const {
     const uint8_t raceId = static_cast<uint8_t>(race_);
-    const uint8_t sexId = (gender_ == game::Gender::FEMALE) ? 1u : 0u;
+    const uint8_t sexId = (gender_ == game::Gender::FEMALE ||
+                           (gender_ == game::Gender::NONBINARY && useFemaleModel_)) ? 1u : 0u;
     const uint32_t key = (static_cast<uint32_t>(raceId) << 16) |
                          (static_cast<uint32_t>(sexId) << 8) |
                          static_cast<uint32_t>(hairStyle_);
@@ -137,7 +138,8 @@ std::unordered_set<uint16_t> CharacterPreview::buildBaseGeosets() {
     ensureAppearanceGeosetsLoaded();
 
     const uint8_t raceId = static_cast<uint8_t>(race_);
-    const uint8_t sexId = (gender_ == game::Gender::FEMALE) ? 1u : 0u;
+    const uint8_t sexId = (gender_ == game::Gender::FEMALE ||
+                           (gender_ == game::Gender::NONBINARY && useFemaleModel_)) ? 1u : 0u;
     const uint16_t selectedHairScalp = selectedHairScalpGeoset();
 
     std::unordered_set<uint16_t> activeGeosets;
@@ -537,11 +539,15 @@ bool CharacterPreview::loadCharacter(game::Race race, game::Gender gender,
             }
         }
         frameCameraForModelBounds(*camera_, frameMin, frameMax);
+        modelBoundMinZ_ = frameMin.z;
+        modelBoundMaxZ_ = frameMax.z;
+        fullBodyDistance_ = camera_->getPosition().y;
     }
 
     // Look up CharSections.dbc for all appearance textures
     uint32_t targetRaceId = static_cast<uint32_t>(race);
-    uint32_t targetSexId = (gender == game::Gender::FEMALE) ? 1u : 0u;
+    uint32_t targetSexId = (gender == game::Gender::FEMALE ||
+                            (gender == game::Gender::NONBINARY && useFemaleModel)) ? 1u : 0u;
 
     std::string faceLowerPath;
     std::string faceUpperPath;
@@ -1201,13 +1207,22 @@ void CharacterPreview::attachWeaponEnchantVisual(uint32_t attachmentId, uint32_t
 
 void CharacterPreview::loadRacialBackdrop(game::Race race) {
     if (!charRenderer_ || !assetManager_) return;
-    if (backdropRace_ == static_cast<int>(race) && backdropInstanceId_ != 0) return;  // already loaded
+    if (backdropRace_ == static_cast<int>(race) && backdropInstanceId_ != 0) {
+        // Appearance changes recreate the character instance but keep the racial
+        // scene. Reapply its stand mark and camera rig to the new instance.
+        applyPreviewView();
+        return;
+    }
 
     if (backdropInstanceId_ != 0) {
         charRenderer_->removeInstance(backdropInstanceId_);
         backdropInstanceId_ = 0;
     }
     backdropRace_ = static_cast<int>(race);
+    previewStandPosition_ = glm::vec3(0.0f);
+    previewViewDirection_ = glm::vec3(0.0f, 1.0f, 0.0f);
+    modelYaw_ = 90.0f;
+    applyPreviewView();
 
     // The glue screens each stand the character in their racial home — humans in
     // Stormwind, orcs in Durotar, and so on. Undead reuse the Scourge scene.
@@ -1260,30 +1275,15 @@ void CharacterPreview::loadRacialBackdrop(game::Race race) {
     if (backdropInstanceId_ == 0) return;
     charRenderer_->setInstanceSceneModel(backdropInstanceId_, true);
 
-    // loadCharacter() has already framed the camera on the character: it sits on
-    // +Y at (0, distance, centerZ). Keep that framing distance and height, but move
-    // the whole rig into the scene and swing it round to the artist's viewing angle.
-    const glm::vec3 framed = camera_->getPosition();
-    const float frameDistance = framed.y;
-    const float focusHeight = framed.z;
-
-    const glm::vec3 focus = standPos + glm::vec3(0.0f, 0.0f, focusHeight);
+    // Keep the character on the scene's authored stand mark and use the scene
+    // camera only for viewing direction. Distance and focus come from our portrait
+    // rig so scroll-wheel zoom can move naturally toward the face.
     glm::vec3 toCamera = sceneCam.positionBase - sceneCam.targetBase;
     if (glm::length(toCamera) < 0.001f) toCamera = glm::vec3(0.0f, 1.0f, 0.0f);
-    toCamera = glm::normalize(toCamera);
-
-    const glm::vec3 camPos = focus + toCamera * frameDistance;
-    camera_->setPosition(camPos);
-
-    const glm::vec3 forward = glm::normalize(focus - camPos);
-    const float yaw = glm::degrees(std::atan2(forward.y, forward.x));
-    const float pitch = glm::degrees(std::asin(std::clamp(forward.z, -1.0f, 1.0f)));
-    camera_->setRotation(yaw, pitch);
-
-    // Stand the character on the mark, facing the camera.
-    charRenderer_->setInstancePosition(instanceId_, standPos);
-    modelYaw_ = glm::degrees(std::atan2(toCamera.y, toCamera.x));
-    charRenderer_->setInstanceRotation(instanceId_, glm::vec3(0.0f, 0.0f, modelYaw_));
+    previewStandPosition_ = standPos;
+    previewViewDirection_ = glm::normalize(toCamera);
+    modelYaw_ = glm::degrees(std::atan2(previewViewDirection_.y, previewViewDirection_.x));
+    applyPreviewView();
 
     LOG_INFO("CharacterPreview: racial backdrop ", scenePath,
              " stand=(", standPos.x, ",", standPos.y, ",", standPos.z, ")");
@@ -1351,6 +1351,45 @@ void CharacterPreview::compositePass(VkCommandBuffer cmd, uint32_t frameIndex) {
 void CharacterPreview::rotate(float yawDelta) {
     modelYaw_ += yawDelta;
     if (instanceId_ > 0 && charRenderer_) {
+        charRenderer_->setInstanceRotation(instanceId_, glm::vec3(0.0f, 0.0f, modelYaw_));
+    }
+}
+
+void CharacterPreview::zoom(float wheelDelta) {
+    if (!std::isfinite(wheelDelta) || wheelDelta == 0.0f) return;
+    zoomLevel_ = std::clamp(zoomLevel_ + wheelDelta * 0.12f, 0.0f, 1.0f);
+    applyPreviewView();
+}
+
+void CharacterPreview::resetView() {
+    zoomLevel_ = 0.0f;
+    applyPreviewView();
+}
+
+void CharacterPreview::applyPreviewView() {
+    if (!camera_) return;
+
+    const float modelHeight = std::max(modelBoundMaxZ_ - modelBoundMinZ_, 0.1f);
+    const float bodyFocusZ = (modelBoundMinZ_ + modelBoundMaxZ_) * 0.5f;
+    const float faceFocusZ = modelBoundMinZ_ + modelHeight * 0.82f;
+    const float focusZ = bodyFocusZ + (faceFocusZ - bodyFocusZ) * zoomLevel_;
+
+    // Stay outside the near plane while getting close enough to inspect facial
+    // textures and hair. Large races retain proportionally more distance.
+    const float faceDistance = std::max(1.15f, modelHeight * 0.70f);
+    const float distance = fullBodyDistance_ +
+                           (std::min(faceDistance, fullBodyDistance_) - fullBodyDistance_) * zoomLevel_;
+    const glm::vec3 focus = previewStandPosition_ + glm::vec3(0.0f, 0.0f, focusZ);
+    const glm::vec3 camPos = focus + previewViewDirection_ * distance;
+    camera_->setPosition(camPos);
+
+    const glm::vec3 forward = glm::normalize(focus - camPos);
+    const float yaw = glm::degrees(std::atan2(forward.y, forward.x));
+    const float pitch = glm::degrees(std::asin(std::clamp(forward.z, -1.0f, 1.0f)));
+    camera_->setRotation(yaw, pitch);
+
+    if (instanceId_ > 0 && charRenderer_) {
+        charRenderer_->setInstancePosition(instanceId_, previewStandPosition_);
         charRenderer_->setInstanceRotation(instanceId_, glm::vec3(0.0f, 0.0f, modelYaw_));
     }
 }
