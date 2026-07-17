@@ -7,12 +7,14 @@
 #include "core/logger.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -24,10 +26,13 @@ static void usage() {
     std::cerr
         << "Usage:\n"
         << "  auth_login_probe <host> <port> <account> <major> <minor> <patch> <build> <proto> <locale> \\\n"
-        << "                 (--password <pass> | --hash <hexsha1>) [--proof legacy|v8|auto]\n"
+        << "                 (--password <pass> | --password-stdin | --hash <hexsha1>) [--proof legacy|v8|auto]\n"
         << "\n"
         << "Notes:\n"
         << "  - --hash expects SHA1(UPPER(user):UPPER(pass)) in hex.\n"
+        << "  - --integrity static|file|zero selects the LOGON_PROOF crc_hash mode; default is file.\n"
+        << "  - --misc-dir points to the client folder containing WoW.exe and classic DLLs.\n"
+        << "  - --realm-list requests the realm list after proof success.\n"
         << "  - This tool only probes auth; it does not connect to world.\n";
 }
 
@@ -57,6 +62,7 @@ static std::string upperAscii(std::string s) {
 enum class ProofFormat { Auto, Legacy, V8 };
 enum class CrcAFormat { Wire, BigEndian };
 enum class WireAFormat { Little, Big };
+enum class IntegrityMode { Static, File, Zero };
 
 int main(int argc, char** argv) {
     if (argc < 11) {
@@ -78,19 +84,38 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> authHash;
     bool havePassword = false;
     bool haveHash = false;
+    bool readPasswordStdin = false;
     ProofFormat proofFmt = ProofFormat::Auto;
     CrcAFormat crcA = CrcAFormat::Wire;
     WireAFormat wireA = WireAFormat::Little;
+    IntegrityMode integrityMode = IntegrityMode::File;
+    std::array<uint8_t, 20> overrideVersionHash{};
+    bool haveOverrideVersionHash = false;
     std::string integrityExe = "WoW.exe";
     bool serverValuesBigEndian = false;
     std::string miscDir = "Data/misc";
     bool useHashedK = false;
     bool hashBigEndian = false;
+    bool requestRealmList = false;
 
     for (int i = 10; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--password" && i + 1 < argc) {
             password = argv[++i];
+            havePassword = true;
+            continue;
+        }
+        if (a == "--password-stdin") {
+            readPasswordStdin = true;
+            continue;
+        }
+        if (a == "--password-env" && i + 1 < argc) {
+            const char* value = std::getenv(argv[++i]);
+            if (!value) {
+                std::cerr << "Password env var is not set\n";
+                return 2;
+            }
+            password = value;
             havePassword = true;
             continue;
         }
@@ -118,6 +143,27 @@ int main(int argc, char** argv) {
                 std::cerr << "Unknown --crc-a value: " << v << " (expected wire|be)\n";
                 return 2;
             }
+            continue;
+        }
+        if (a == "--integrity" && i + 1 < argc) {
+            std::string v = argv[++i];
+            if (v == "static") integrityMode = IntegrityMode::Static;
+            else if (v == "file" || v == "hmac") integrityMode = IntegrityMode::File;
+            else if (v == "zero") integrityMode = IntegrityMode::Zero;
+            else {
+                std::cerr << "Unknown --integrity value: " << v << " (expected static|file|zero)\n";
+                return 2;
+            }
+            continue;
+        }
+        if (a == "--integrity-hash" && i + 1 < argc) {
+            auto bytes = hexToBytes(argv[++i]);
+            if (bytes.size() != overrideVersionHash.size()) {
+                std::cerr << "--integrity-hash expects 20-byte hex\n";
+                return 2;
+            }
+            std::copy(bytes.begin(), bytes.end(), overrideVersionHash.begin());
+            haveOverrideVersionHash = true;
             continue;
         }
         if (a == "--integrity-exe" && i + 1 < argc) {
@@ -168,8 +214,20 @@ int main(int argc, char** argv) {
             }
             continue;
         }
+        if (a == "--realm-list") {
+            requestRealmList = true;
+            continue;
+        }
         std::cerr << "Unknown arg: " << a << "\n";
         return 2;
+    }
+
+    if (readPasswordStdin) {
+        std::getline(std::cin, password);
+        if (!password.empty() && password.back() == '\r') {
+            password.pop_back();
+        }
+        havePassword = true;
     }
 
     if (!havePassword && !haveHash) {
@@ -190,6 +248,8 @@ int main(int argc, char** argv) {
     std::atomic<bool> done{false};
     std::atomic<bool> sawDisconnect{false};
     std::atomic<bool> challengeOk{false};
+    std::atomic<bool> proofOk{false};
+    std::atomic<bool> realmListOk{false};
     std::atomic<int> proofStatus{-1};
     std::atomic<int> chalCode{-1};
 
@@ -213,10 +273,33 @@ int main(int argc, char** argv) {
             fmt = (info.protocolVersion < 8) ? ProofFormat::Legacy : ProofFormat::V8;
         }
 
-        // Try to compute the classic client integrity hash using local Data/misc.
+        // Compute the classic client integrity hash / version proof.
         std::array<uint8_t, 20> crcHash{};
         const std::array<uint8_t, 20>* crcHashPtr = nullptr;
-        {
+        if (integrityMode == IntegrityMode::Zero) {
+            crcHash.fill(0);
+            crcHashPtr = &crcHash;
+            std::cerr << "Using zero integrity hash\n";
+        } else if (integrityMode == IntegrityMode::Static) {
+            std::array<uint8_t, 20> versionHash{};
+            bool haveVersionHash = false;
+            if (haveOverrideVersionHash) {
+                versionHash = overrideVersionHash;
+                haveVersionHash = true;
+                std::cerr << "Using override static version hash\n";
+            } else if (auth::getKnownClientVersionHash(static_cast<uint16_t>(build), info.os, versionHash)) {
+                haveVersionHash = true;
+                std::cerr << "Using known static version hash for build " << build << " os " << info.os << "\n";
+            }
+
+            std::string err;
+            if (haveVersionHash && auth::computeIntegrityHashFromVersionHash(A, versionHash, crcHash, err)) {
+                crcHashPtr = &crcHash;
+            } else {
+                std::cerr << "Static integrity hash not computed"
+                          << (err.empty() ? "" : (": " + err)) << "\n";
+            }
+        } else {
             std::string err;
             std::vector<uint8_t> crcABytes = A;
             if (crcA == CrcAFormat::BigEndian) {
@@ -255,8 +338,13 @@ int main(int argc, char** argv) {
             }
             chalCode = static_cast<int>(resp.result);
             if (!resp.isSuccess()) {
-                std::cerr << "Challenge FAIL: " << auth::getAuthResultString(resp.result)
-                          << " (0x" << std::hex << (int)resp.result << std::dec << ")\n";
+                if (challengeOk) {
+                    std::cerr << "Version/integrity proof FAIL: " << auth::getAuthResultString(resp.result)
+                              << " (0x" << std::hex << (int)resp.result << std::dec << ")\n";
+                } else {
+                    std::cerr << "Challenge FAIL: " << auth::getAuthResultString(resp.result)
+                              << " (0x" << std::hex << (int)resp.result << std::dec << ")\n";
+                }
                 done = true;
                 return;
             }
@@ -299,8 +387,36 @@ int main(int argc, char** argv) {
             proofStatus = resp.status;
             if (resp.isSuccess()) {
                 std::cerr << "Proof SUCCESS\n";
+                if (srp && !srp->verifyServerProof(resp.M2)) {
+                    std::cerr << "Server proof verification failed\n";
+                    done = true;
+                    return;
+                }
+                proofOk = true;
+                if (requestRealmList) {
+                    auto realm = auth::RealmListPacket::build();
+                    sock.send(realm);
+                    std::cerr << "Sent REALM_LIST request\n";
+                    return;
+                }
             } else {
                 std::cerr << "Proof FAIL status=0x" << std::hex << (int)resp.status << std::dec << "\n";
+            }
+            done = true;
+            return;
+        }
+
+        if (opcode == static_cast<uint8_t>(auth::AuthOpcode::REALM_LIST)) {
+            auth::RealmListResponse resp{};
+            if (!auth::RealmListResponseParser::parse(pkt, resp, info.protocolVersion)) {
+                std::cerr << "Realm list parse failed\n";
+                done = true;
+                return;
+            }
+            realmListOk = true;
+            std::cerr << "Realm list SUCCESS: " << resp.realms.size() << " realms\n";
+            for (const auto& realm : resp.realms) {
+                std::cerr << "  realm: " << realm.name << " @ " << realm.address << "\n";
             }
             done = true;
             return;
@@ -345,6 +461,7 @@ int main(int argc, char** argv) {
     }
 
     if (chalCode.load() >= 0 && chalCode.load() != 0) return chalCode.load();
+    if (requestRealmList && proofOk && !realmListOk) return 7;
     if (proofStatus.load() >= 0) return proofStatus.load();
     return 0;
 }

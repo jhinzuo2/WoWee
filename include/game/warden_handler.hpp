@@ -18,6 +18,7 @@ class WardenCrypto;
 class WardenMemory;
 class WardenModule;
 class WardenModuleManager;
+class WardenPlatformServices;
 
 class WardenHandler {
 public:
@@ -51,11 +52,14 @@ public:
     /** Called from GameHandler::update() to drain async warden response + log gate timing. */
     void update(float deltaTime);
 
+    void setPlatformServices(std::shared_ptr<WardenPlatformServices> platformServices);
+
 private:
     void handleWardenData(network::Packet& packet);
     bool loadWardenCRFile(const std::string& moduleHashHex);
 
     GameHandler& owner_;
+    std::shared_ptr<WardenPlatformServices> platformServices_;
 
     // --- Warden state ---
     bool requiresWarden_ = false;

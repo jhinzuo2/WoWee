@@ -14,6 +14,7 @@ namespace game {
 // Forward declarations
 class WardenEmulator;
 class WardenCrypto;
+class WardenPlatformServices;
 
 /**
  * Represents Warden callback functions exported by loaded module
@@ -106,6 +107,8 @@ public:
     bool processCheckRequest(const std::vector<uint8_t>& checkData,
                             std::vector<uint8_t>& responseOut);
 
+    bool processPacket(const std::vector<uint8_t>& packetData);
+
     /**
      * Periodic tick for module state updates
      *
@@ -133,6 +136,7 @@ public:
     // network layer and crypto state.
     using SendPacketFunc = std::function<void(const uint8_t*, size_t)>;
     void setCallbackDependencies(WardenCrypto* crypto, SendPacketFunc sendFunc);
+    void setSessionKey(std::vector<uint8_t> sessionKey);
 
 private:
     bool loaded_;                          // Module successfully loaded
@@ -150,15 +154,27 @@ private:
     void* moduleMemory_;                   // Allocated executable memory region
     size_t moduleSize_;                    // Size of loaded code
     uint32_t moduleBase_;                  // Module base address (for emulator)
-    size_t relocDataOffset_ = 0;           // Offset into decompressedData_ where relocation data starts
+    uint32_t relocOffset_ = 0;
+    uint32_t relocCount_ = 0;
+    uint32_t exportTableOffset_ = 0;
+    uint32_t exportCount_ = 0;
+    uint32_t exportBaseIndex_ = 0;
+    uint32_t importTableOffset_ = 0;
+    uint32_t importCount_ = 0;
+    uint32_t sectionCount_ = 0;
+    size_t relocDataOffset_ = 0;           // Legacy fallback offset into decompressedData_
     WardenFuncList funcList_;              // Callback functions
     std::unique_ptr<WardenEmulator> emulator_; // Cross-platform x86 emulator
     uint32_t emulatedPacketHandlerAddr_ = 0;   // Raw emulated VA for 4-arg PacketHandler call
+    uint32_t emulatedObjectAddr_ = 0;
+    uint32_t emulatedInitAddr_ = 0;
 
     // Dependencies injected via setCallbackDependencies() for module callbacks.
     // These are NOT owned — the handler owns the crypto and socket lifetime.
     WardenCrypto* callbackCrypto_ = nullptr;
     SendPacketFunc callbackSendPacket_;
+    std::vector<uint8_t> sessionKey_;
+    std::vector<uint8_t> callbackSavedData_;
 
     // Validation and loading steps
     bool verifyMD5(const std::vector<uint8_t>& data,
@@ -173,6 +189,7 @@ private:
     bool applyRelocations();
     bool bindAPIs();
     bool initializeModule();
+    uint32_t resolveExport(uint32_t ordinal) const;
 };
 
 /**
@@ -183,7 +200,7 @@ private:
  */
 class WardenModuleManager {
 public:
-    WardenModuleManager();
+    explicit WardenModuleManager(std::shared_ptr<WardenPlatformServices> platformServices = nullptr);
     ~WardenModuleManager();
 
     /**
@@ -236,6 +253,7 @@ private:
     std::map<std::vector<uint8_t>, std::shared_ptr<WardenModule>> modules_;
     std::map<std::vector<uint8_t>, std::vector<uint8_t>> downloadBuffer_; // Partial downloads
     std::string cacheDirectory_;
+    std::shared_ptr<WardenPlatformServices> platformServices_;
 
     std::string getCachePath(const std::vector<uint8_t>& md5Hash);
 };

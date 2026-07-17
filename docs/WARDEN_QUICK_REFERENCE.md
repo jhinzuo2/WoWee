@@ -7,13 +7,18 @@ via Unicorn Engine CPU emulation — no Wine required.
 
 ## How It Works
 
-Warden modules are native x86 Windows DLLs that the server encrypts and delivers at login.
+Warden modules are encrypted native x86 Windows code blobs that the server delivers
+at login. Classic/Turtle modules are not normal PE DLLs after decompression.
 
 1. Server sends `SMSG_WARDEN_DATA` (0x2E6) with the encrypted module
 2. Client decrypts: RC4 → RSA-2048 signature verify → zlib decompress
-3. Parses the PE: relocations applied, imports resolved (Windows API hooks)
-4. Executes entry point via Unicorn Engine x86 emulator
-5. Client responds with check results via `CMSG_WARDEN_DATA` (0x2E7)
+3. Parses the native Warden image header/copy stream, then applies image-internal relocations
+4. Resolves export ordinal `1`, calls the factory, and dispatches packets through the returned object's vtable
+5. Client responds with check results via module callbacks that send `CMSG_WARDEN_DATA` (0x2E7)
+
+Common trap: do not treat the decompressed payload as `[size][data][relocs][imports]`
+or as a PE file. Native WoW copies only the 0x28-byte header into the image, skips
+the section descriptors, then alternates copy/zero spans until the image is filled.
 
 ---
 
@@ -25,6 +30,7 @@ Warden modules are native x86 Windows DLLs that the server encrypts and delivers
 | AzerothCore (local) | Works |
 | ChromieCraft | Should work |
 | Warmane | Should work |
+| Turtle WoW | Use `scripts/probe_turtle_chars.sh` with `WOWEE_WARDEN_WAIT_MS` to verify post-character-list disconnect behavior |
 
 ---
 
@@ -75,7 +81,7 @@ grep -i warden logs/wowee.log
 
 Key messages:
 - `Warden: module loaded from cache` — cached path, fast startup
-- `Warden: executing module entry point` — emulation running
+- `WardenModule: Warden object=` — factory returned a native-style module object
 - `Warden: check response sent` — working correctly
 - `packetsAfterGate=0` — server not responding after Warden exchange
 
@@ -93,4 +99,4 @@ Key messages:
 
 ---
 
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-07-04

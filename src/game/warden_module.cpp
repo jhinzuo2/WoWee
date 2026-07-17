@@ -1,10 +1,12 @@
 #include "game/warden_module.hpp"
 #include "game/warden_crypto.hpp"
+#include "game/warden_platform.hpp"
 #include "auth/crypto.hpp"
 #include "core/logger.hpp"
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <utility>
 #include <zlib.h>
 #include <openssl/rsa.h>
 #include <openssl/bn.h>
@@ -42,6 +44,10 @@ static thread_local WardenModule* tl_activeModule = nullptr;
 void WardenModule::setCallbackDependencies(WardenCrypto* crypto, SendPacketFunc sendFunc) {
     callbackCrypto_ = crypto;
     callbackSendPacket_ = std::move(sendFunc);
+}
+
+void WardenModule::setSessionKey(std::vector<uint8_t> sessionKey) {
+    sessionKey_ = std::move(sessionKey);
 }
 
 WardenModule::WardenModule()
@@ -256,6 +262,37 @@ void WardenModule::generateRC4Keys(uint8_t* packet) {
         return;
     }
     funcList_.generateRC4Keys(packet);
+}
+
+bool WardenModule::processPacket(const std::vector<uint8_t>& packetData) {
+    if (!loaded_ || !emulator_ || !emulator_->isInitialized() ||
+        emulatedObjectAddr_ == 0 || emulatedPacketHandlerAddr_ == 0) {
+        LOG_WARNING("Warden path: module/Unicorn processPacket unavailable"
+                    " loaded=", loaded_ ? "yes" : "no",
+                    " emulator=", emulator_ ? "yes" : "no",
+                    " object=0x", std::hex, emulatedObjectAddr_,
+                    " packetHandler=0x", emulatedPacketHandlerAddr_, std::dec);
+        return false;
+    }
+
+    LOG_WARNING("Warden path: module/Unicorn processPacket invoking emulated PacketHandler"
+                " packetSize=", packetData.size());
+    uint32_t dataAddr = emulator_->writeData(packetData.data(), packetData.size());
+    uint32_t status = 0;
+    uint32_t statusAddr = emulator_->writeData(&status, sizeof(status));
+    if (dataAddr == 0 || statusAddr == 0) {
+        LOG_WARNING("Warden path: module/Unicorn processPacket allocation failed");
+        if (dataAddr) emulator_->freeMemory(dataAddr);
+        if (statusAddr) emulator_->freeMemory(statusAddr);
+        return false;
+    }
+
+    emulator_->callThiscall(emulatedPacketHandlerAddr_, emulatedObjectAddr_,
+                            { dataAddr, static_cast<uint32_t>(packetData.size()), statusAddr });
+    emulator_->freeMemory(statusAddr);
+    emulator_->freeMemory(dataAddr);
+    LOG_WARNING("Warden path: module/Unicorn processPacket completed");
+    return true;
 }
 
 void WardenModule::unload() {
@@ -509,23 +546,52 @@ bool WardenModule::decompressZlib(const std::vector<uint8_t>& compressed,
 }
 
 bool WardenModule::parseExecutableFormat(const std::vector<uint8_t>& exeData) {
-    if (exeData.size() < 4) {
+    if (exeData.size() < 0x28) {
         LOG_ERROR("WardenModule: Executable data too small for header");
         return false;
     }
 
-    // Read final code size (little-endian 4 bytes)
-    uint32_t finalCodeSize =
-        exeData[0] |
-        (exeData[1] << 8) |
-        (exeData[2] << 16) |
-        (exeData[3] << 24);
+    auto readU16LE = [&](size_t at) -> uint16_t {
+        return static_cast<uint16_t>(exeData[at] | (exeData[at + 1] << 8));
+    };
+    auto readU32LE = [&](size_t at) -> uint32_t {
+        return static_cast<uint32_t>(exeData[at])
+             | (static_cast<uint32_t>(exeData[at + 1]) << 8)
+             | (static_cast<uint32_t>(exeData[at + 2]) << 16)
+             | (static_cast<uint32_t>(exeData[at + 3]) << 24);
+    };
 
-    LOG_INFO("WardenModule: Final code size: ", finalCodeSize, " bytes");
+    const uint32_t imageSize = readU32LE(0x00);
+    relocOffset_ = readU32LE(0x08);
+    relocCount_ = readU32LE(0x0C);
+    exportTableOffset_ = readU32LE(0x10);
+    exportCount_ = readU32LE(0x14);
+    exportBaseIndex_ = readU32LE(0x18);
+    importTableOffset_ = readU32LE(0x1C);
+    importCount_ = readU32LE(0x20);
+    sectionCount_ = readU32LE(0x24);
 
-    // Sanity check (executable shouldn't be larger than 5MB)
-    if (finalCodeSize > 5 * 1024 * 1024 || finalCodeSize == 0) {
-        LOG_ERROR("WardenModule: Invalid final code size: ", finalCodeSize);
+    LOG_INFO("WardenModule: Native image size: ", imageSize, " bytes");
+    LOG_INFO("WardenModule: Header reloc=0x", std::hex, relocOffset_, " count=", std::dec, relocCount_,
+             " exports=0x", std::hex, exportTableOffset_, " count=", std::dec, exportCount_,
+             " base=", exportBaseIndex_, " imports=0x", std::hex, importTableOffset_,
+             " count=", std::dec, importCount_, " sections=", sectionCount_);
+
+    if (imageSize > 5 * 1024 * 1024 || imageSize == 0 || sectionCount_ > 128) {
+        LOG_ERROR("WardenModule: Invalid native image header");
+        return false;
+    }
+
+    const size_t sectionTableSize = static_cast<size_t>(sectionCount_) * 12u;
+    const size_t copyStreamOffset = 0x28u + sectionTableSize;
+    if (copyStreamOffset > exeData.size()) {
+        LOG_ERROR("WardenModule: Section table extends past decompressed data");
+        return false;
+    }
+
+    const uint32_t firstSectionOffset = sectionCount_ > 0 ? readU32LE(0x28) : 0;
+    if (firstSectionOffset > imageSize) {
+        LOG_ERROR("WardenModule: Invalid first section offset: ", firstSectionOffset);
         return false;
     }
 
@@ -535,7 +601,7 @@ bool WardenModule::parseExecutableFormat(const std::vector<uint8_t>& exeData) {
     #ifdef _WIN32
         moduleMemory_ = VirtualAlloc(
             nullptr,
-            finalCodeSize,
+            imageSize,
             MEM_COMMIT | MEM_RESERVE,
             PAGE_EXECUTE_READWRITE
         );
@@ -560,7 +626,7 @@ bool WardenModule::parseExecutableFormat(const std::vector<uint8_t>& exeData) {
         #endif
         moduleMemory_ = mmap(
             nullptr,
-            finalCodeSize,
+            imageSize,
             mmapProt,
             mmapFlags,
             -1,
@@ -573,172 +639,49 @@ bool WardenModule::parseExecutableFormat(const std::vector<uint8_t>& exeData) {
         }
     #endif
 
-    moduleSize_ = finalCodeSize;
+    moduleSize_ = imageSize;
     std::memset(moduleMemory_, 0, moduleSize_); // Zero-initialize
 
     LOG_INFO("WardenModule: Allocated ", moduleSize_, " bytes of executable memory");
 
-    auto readU16LE = [&](size_t at) -> uint16_t {
-        return static_cast<uint16_t>(exeData[at] | (exeData[at + 1] << 8));
-    };
+    // Native WoW copies only the 0x28-byte module header, not the external
+    // section descriptors. The alternating copy/zero stream then populates the
+    // image from the first section offset through imageSize.
+    std::memcpy(moduleMemory_, exeData.data(), 0x28);
 
-    enum class PairFormat {
-        CopyDataSkip,  // [copy][data][skip]
-        SkipCopyData,  // [skip][copy][data]
-        CopySkipData   // [copy][skip][data]
-    };
+    size_t srcPos = copyStreamOffset;
+    size_t dstPos = firstSectionOffset;
+    bool copySpan = true;
+    int spanCount = 0;
+    while (dstPos < moduleSize_) {
+        if (srcPos + 2 > exeData.size()) {
+            LOG_ERROR("WardenModule: Native copy stream ended early");
+            return false;
+        }
+        uint16_t span = readU16LE(srcPos);
+        srcPos += 2;
 
-    auto tryParsePairs = [&](PairFormat format,
-                             std::vector<uint8_t>& imageOut,
-                             size_t& relocPosOut,
-                             size_t& finalOffsetOut,
-                             int& pairCountOut) -> bool {
-        imageOut.assign(moduleSize_, 0);
-        size_t pos = 4; // Skip 4-byte final size header
-        size_t destOffset = 0;
-        int pairCount = 0;
-
-        while (pos + 2 <= exeData.size()) {
-            uint16_t copyCount = 0;
-            uint16_t skipCount = 0;
-
-            switch (format) {
-                case PairFormat::CopyDataSkip: {
-                    copyCount = readU16LE(pos);
-                    pos += 2;
-                    if (copyCount == 0) {
-                        relocPosOut = pos;
-                        finalOffsetOut = destOffset;
-                        pairCountOut = pairCount;
-                        imageOut.resize(moduleSize_);
-                        return true;
-                    }
-
-                    if (pos + copyCount > exeData.size() || destOffset + copyCount > moduleSize_) {
-                        return false;
-                    }
-
-                    std::memcpy(imageOut.data() + destOffset, exeData.data() + pos, copyCount);
-                    pos += copyCount;
-                    destOffset += copyCount;
-
-                    if (pos + 2 > exeData.size()) {
-                        return false;
-                    }
-                    skipCount = readU16LE(pos);
-                    pos += 2;
-                    break;
-                }
-
-                case PairFormat::SkipCopyData: {
-                    if (pos + 4 > exeData.size()) {
-                        return false;
-                    }
-                    skipCount = readU16LE(pos);
-                    pos += 2;
-                    copyCount = readU16LE(pos);
-                    pos += 2;
-
-                    if (skipCount == 0 && copyCount == 0) {
-                        relocPosOut = pos;
-                        finalOffsetOut = destOffset;
-                        pairCountOut = pairCount;
-                        imageOut.resize(moduleSize_);
-                        return true;
-                    }
-
-                    if (destOffset + skipCount > moduleSize_) {
-                        return false;
-                    }
-                    destOffset += skipCount;
-
-                    if (pos + copyCount > exeData.size() || destOffset + copyCount > moduleSize_) {
-                        return false;
-                    }
-                    std::memcpy(imageOut.data() + destOffset, exeData.data() + pos, copyCount);
-                    pos += copyCount;
-                    destOffset += copyCount;
-                    break;
-                }
-
-                case PairFormat::CopySkipData: {
-                    if (pos + 4 > exeData.size()) {
-                        return false;
-                    }
-                    copyCount = readU16LE(pos);
-                    pos += 2;
-                    skipCount = readU16LE(pos);
-                    pos += 2;
-
-                    if (copyCount == 0 && skipCount == 0) {
-                        relocPosOut = pos;
-                        finalOffsetOut = destOffset;
-                        pairCountOut = pairCount;
-                        imageOut.resize(moduleSize_);
-                        return true;
-                    }
-
-                    if (pos + copyCount > exeData.size() || destOffset + copyCount > moduleSize_) {
-                        return false;
-                    }
-                    std::memcpy(imageOut.data() + destOffset, exeData.data() + pos, copyCount);
-                    pos += copyCount;
-                    destOffset += copyCount;
-                    break;
-                }
-            }
-
-            if (destOffset + skipCount > moduleSize_) {
+        if (copySpan) {
+            if (srcPos + span > exeData.size() || dstPos + span > moduleSize_) {
+                LOG_ERROR("WardenModule: Native copy span out of range");
                 return false;
             }
-            destOffset += skipCount;
-            pairCount++;
+            std::memcpy(static_cast<uint8_t*>(moduleMemory_) + dstPos, exeData.data() + srcPos, span);
+            srcPos += span;
+        } else if (dstPos + span > moduleSize_) {
+            LOG_ERROR("WardenModule: Native zero span out of range");
+            return false;
         }
 
-        return false;
-    };
-
-    std::vector<uint8_t> parsedImage;
-    size_t parsedRelocPos = 0;
-    size_t parsedFinalOffset = 0;
-    int parsedPairCount = 0;
-
-    PairFormat usedFormat = PairFormat::CopyDataSkip;
-    bool parsed = tryParsePairs(PairFormat::CopyDataSkip, parsedImage, parsedRelocPos, parsedFinalOffset, parsedPairCount);
-    if (!parsed) {
-        usedFormat = PairFormat::SkipCopyData;
-        parsed = tryParsePairs(PairFormat::SkipCopyData, parsedImage, parsedRelocPos, parsedFinalOffset, parsedPairCount);
-    }
-    if (!parsed) {
-        usedFormat = PairFormat::CopySkipData;
-        parsed = tryParsePairs(PairFormat::CopySkipData, parsedImage, parsedRelocPos, parsedFinalOffset, parsedPairCount);
+        dstPos += span;
+        copySpan = !copySpan;
+        ++spanCount;
     }
 
-    if (parsed) {
-        std::memcpy(moduleMemory_, parsedImage.data(), parsedImage.size());
-        relocDataOffset_ = parsedRelocPos;
-        moduleImageUsable_ = true;  // a real code image: safe to hand to the emulator
-
-        const char* formatName = "copy/data/skip";
-        if (usedFormat == PairFormat::SkipCopyData) formatName = "skip/copy/data";
-        if (usedFormat == PairFormat::CopySkipData) formatName = "copy/skip/data";
-
-        LOG_INFO("WardenModule: Parsed ", parsedPairCount, " pairs using format ",
-                 formatName, ", final offset: ", parsedFinalOffset, "/", finalCodeSize);
-        LOG_INFO("WardenModule: Relocation data starts at decompressed offset ", relocDataOffset_,
-                 " (", (exeData.size() - relocDataOffset_), " bytes remaining)");
-        return true;
-    }
-
-    // Fallback: copy raw payload (without the 4-byte size header) into module memory.
-    // This keeps loading alive for servers where packet flow can continue with hash/check fallbacks.
-    if (exeData.size() > 4) {
-        size_t rawCopySize = std::min(moduleSize_, exeData.size() - 4);
-        std::memcpy(moduleMemory_, exeData.data() + 4, rawCopySize);
-    }
     relocDataOffset_ = 0;
-    moduleImageUsable_ = false;
-    LOG_WARNING("WardenModule: Could not parse copy/skip pairs (all known layouts failed); using raw payload fallback");
+    LOG_INFO("WardenModule: Parsed native image stream spans=", spanCount,
+             " copyStreamUsed=", srcPos, "/", exeData.size(),
+             " finalOffset=", dstPos, "/", moduleSize_);
     return true;
 }
 
@@ -748,34 +691,53 @@ bool WardenModule::applyRelocations() {
         return false;
     }
 
-    // Relocation data is in decompressedData_ starting at relocDataOffset_
-    // Format: delta-encoded 2-byte LE offsets, terminated by 0x0000
-    // Each offset in the module image has moduleBase_ added to the 32-bit value there
-
-    if (relocDataOffset_ == 0 || relocDataOffset_ >= decompressedData_.size()) {
+    // Native Warden relocation table lives inside the loaded image at
+    // header[2], with header[3] entries. 2-byte entries are big-endian deltas;
+    // entries with the high bit set are 4-byte absolute big-endian offsets.
+    if (relocOffset_ == 0 || relocCount_ == 0) {
         LOG_INFO("WardenModule: No relocation data available");
         return true;
     }
 
-    size_t relocPos = relocDataOffset_;
+    if (relocOffset_ >= moduleSize_) {
+        LOG_ERROR("WardenModule: Relocation table offset out of bounds: ", relocOffset_);
+        return false;
+    }
+
+    uint8_t* image = static_cast<uint8_t*>(moduleMemory_);
+    size_t relocPos = relocOffset_;
     uint32_t currentOffset = 0;
-    int relocCount = 0;
+    uint32_t appliedCount = 0;
 
-    while (relocPos + 2 <= decompressedData_.size()) {
-        uint16_t delta = decompressedData_[relocPos] | (decompressedData_[relocPos + 1] << 8);
-        relocPos += 2;
+    for (uint32_t i = 0; i < relocCount_; ++i) {
+        if (relocPos + 2 > moduleSize_) {
+            LOG_ERROR("WardenModule: Relocation table truncated");
+            return false;
+        }
 
-        if (delta == 0) break;
-
-        currentOffset += delta;
+        uint8_t first = image[relocPos++];
+        if ((first & 0x80u) == 0) {
+            uint8_t second = image[relocPos++];
+            currentOffset += (static_cast<uint32_t>(first) << 8) | second;
+        } else {
+            if (relocPos + 3 > moduleSize_) {
+                LOG_ERROR("WardenModule: Relocation table truncated in 4-byte entry");
+                return false;
+            }
+            currentOffset = (static_cast<uint32_t>(first) << 24)
+                          | (static_cast<uint32_t>(image[relocPos]) << 16)
+                          | (static_cast<uint32_t>(image[relocPos + 1]) << 8)
+                          | static_cast<uint32_t>(image[relocPos + 2]);
+            relocPos += 3;
+        }
 
         if (currentOffset + 4 <= moduleSize_) {
-            uint8_t* addr = static_cast<uint8_t*>(moduleMemory_) + currentOffset;
+            uint8_t* addr = image + currentOffset;
             uint32_t val;
             std::memcpy(&val, addr, sizeof(uint32_t));
             val += moduleBase_;
             std::memcpy(addr, &val, sizeof(uint32_t));
-            relocCount++;
+            appliedCount++;
         } else {
             LOG_ERROR("WardenModule: Relocation offset ", currentOffset,
                       " out of bounds (moduleSize=", moduleSize_, ")");
@@ -785,7 +747,8 @@ bool WardenModule::applyRelocations() {
     {
         char baseBuf[32];
         std::snprintf(baseBuf, sizeof(baseBuf), "0x%X", moduleBase_);
-        LOG_INFO("WardenModule: Applied ", relocCount, " relocations (base=", baseBuf, ")");
+        LOG_INFO("WardenModule: Applied ", appliedCount, "/", relocCount_,
+                 " relocations (base=", baseBuf, ")");
     }
 
     return true;
@@ -799,99 +762,122 @@ bool WardenModule::bindAPIs() {
 
     LOG_INFO("WardenModule: Binding Windows APIs for module...");
 
-    // The Warden module import table lives in decompressedData_ immediately after
-    // the relocation entries (which are terminated by a 0x0000 delta). Format:
-    //
-    //   Repeated library blocks until null library name:
-    //     string libraryName\0
-    //     Repeated function entries until null function name:
-    //       string functionName\0
-    //
-    // Each imported function corresponds to a sequential IAT slot at the start
-    // of the module image (first N dwords). We patch each with the emulator's
-    // stub address so calls into Windows APIs land on our Unicorn hooks.
-
-    if (relocDataOffset_ == 0 || relocDataOffset_ >= decompressedData_.size()) {
-        LOG_WARNING("WardenModule: No relocation/import data — skipping API binding");
+    if (importTableOffset_ == 0 || importCount_ == 0) {
+        LOG_INFO("WardenModule: No import table");
         return true;
     }
 
-    // Skip past relocation entries (delta-encoded uint16 pairs, 0x0000 terminated)
-    size_t pos = relocDataOffset_;
-    while (pos + 2 <= decompressedData_.size()) {
-        uint16_t delta = decompressedData_[pos] | (decompressedData_[pos + 1] << 8);
-        pos += 2;
-        if (delta == 0) break;
+    if (importTableOffset_ + importCount_ * 8u > moduleSize_) {
+        LOG_ERROR("WardenModule: Import table out of bounds");
+        return false;
     }
 
-    if (pos >= decompressedData_.size()) {
-        LOG_INFO("WardenModule: No import data after relocations");
-        return true;
-    }
-
-    // Parse import table
-    uint32_t iatSlotIndex = 0;
     int totalImports = 0;
     int resolvedImports = 0;
+    uint8_t* image = static_cast<uint8_t*>(moduleMemory_);
 
-    auto readString = [&](size_t& p) -> std::string {
+    auto readU32Image = [&](uint32_t offset) -> uint32_t {
+        uint32_t value = 0;
+        if (offset + 4 <= moduleSize_) std::memcpy(&value, image + offset, 4);
+        return value;
+    };
+
+    auto readImageString = [&](uint32_t offset) -> std::string {
         std::string s;
-        while (p < decompressedData_.size() && decompressedData_[p] != 0) {
-            s.push_back(static_cast<char>(decompressedData_[p]));
-            p++;
+        while (offset < moduleSize_ && image[offset] != 0) {
+            s.push_back(static_cast<char>(image[offset]));
+            ++offset;
         }
-        if (p < decompressedData_.size()) p++; // skip null terminator
         return s;
     };
 
-    while (pos < decompressedData_.size()) {
-        std::string libraryName = readString(pos);
-        if (libraryName.empty()) break; // null library name = end of imports
+    for (uint32_t libIndex = 0; libIndex < importCount_; ++libIndex) {
+        uint32_t desc = importTableOffset_ + libIndex * 8u;
+        uint32_t libraryNameRva = readU32Image(desc);
+        uint32_t thunkRva = readU32Image(desc + 4);
+        if (libraryNameRva >= moduleSize_ || thunkRva >= moduleSize_) {
+            LOG_WARNING("WardenModule: Import descriptor ", libIndex, " out of bounds");
+            continue;
+        }
 
-        // Read functions for this library
-        while (pos < decompressedData_.size()) {
-            std::string functionName = readString(pos);
-            if (functionName.empty()) break; // null function name = next library
-
+        std::string libraryName = readImageString(libraryNameRva);
+        for (uint32_t thunk = thunkRva; thunk + 4 <= moduleSize_; thunk += 4) {
+            uint32_t importValue = readU32Image(thunk);
+            if (importValue == 0) break;
             totalImports++;
 
-            // Look up the emulator's stub address for this API
+            std::string functionName;
+            if (importValue & 0x80000000u) {
+                functionName = "#" + std::to_string(importValue & 0x7fffffffu);
+            } else if (importValue < moduleSize_) {
+                functionName = readImageString(importValue);
+            }
+            if (functionName.empty()) {
+                functionName = "unknown";
+            }
+
             uint32_t resolvedAddr = 0;
             #ifdef HAVE_UNICORN
             if (emulator_) {
-                // Check if this API was pre-registered in setupCommonAPIHooks()
                 resolvedAddr = emulator_->getAPIAddress(libraryName, functionName);
                 if (resolvedAddr == 0) {
-                    // Not pre-registered — create a no-op stub that returns 0.
-                    // Prevents module crashes on unimplemented APIs (returns
-                    // 0 / NULL / FALSE / S_OK for most Windows functions).
                     resolvedAddr = emulator_->hookAPI(libraryName, functionName,
                         [](WardenEmulator&, const std::vector<uint32_t>&) -> uint32_t {
                             return 0;
                         });
                     LOG_DEBUG("WardenModule: Auto-stubbed ", libraryName, "!", functionName);
                 }
+                if (resolvedAddr != 0 && !emulator_->isRangeMapped(resolvedAddr, 1)) {
+                    LOG_ERROR("WardenModule: import ", libraryName, "!", functionName,
+                              " resolved outside mapped ranges: 0x",
+                              std::hex, resolvedAddr, std::dec);
+                    resolvedAddr = 0;
+                }
             }
             #endif
 
-            // Patch IAT slot in module image
             if (resolvedAddr != 0) {
-                uint32_t iatOffset = iatSlotIndex * 4;
-                if (iatOffset + 4 <= moduleSize_) {
-                    uint8_t* slot = static_cast<uint8_t*>(moduleMemory_) + iatOffset;
-                    std::memcpy(slot, &resolvedAddr, 4);
-                    resolvedImports++;
-                    LOG_DEBUG("WardenModule: IAT[", iatSlotIndex, "] = ", libraryName,
-                              "!", functionName, " → 0x", std::hex, resolvedAddr, std::dec);
-                }
+                std::memcpy(image + thunk, &resolvedAddr, 4);
+                resolvedImports++;
+                LOG_DEBUG("WardenModule: import ", libraryName, "!", functionName,
+                          " -> 0x", std::hex, resolvedAddr, std::dec);
             }
-            iatSlotIndex++;
         }
     }
 
     LOG_INFO("WardenModule: Bound ", resolvedImports, "/", totalImports,
-             " API imports (", iatSlotIndex, " IAT slots patched)");
+             " API imports");
     return true;
+}
+
+uint32_t WardenModule::resolveExport(uint32_t ordinal) const {
+    if (!moduleMemory_ || exportTableOffset_ == 0 || exportCount_ == 0) return 0;
+    if (ordinal < exportBaseIndex_) return 0;
+
+    uint32_t index = ordinal - exportBaseIndex_;
+    if (index >= exportCount_) return 0;
+
+    uint32_t slot = exportTableOffset_ + index * 4u;
+    if (slot + 4 > moduleSize_) return 0;
+
+    uint32_t rva = 0;
+    std::memcpy(&rva, static_cast<const uint8_t*>(moduleMemory_) + slot, 4);
+    uint32_t resolved = 0;
+    if (rva < moduleSize_) {
+        resolved = moduleBase_ + rva;
+        LOG_INFO("WardenModule: Export ordinal ", ordinal, " raw RVA=0x",
+                 std::hex, rva, " -> VA=0x", resolved, std::dec);
+    } else if (rva >= moduleBase_ && rva < moduleBase_ + moduleSize_) {
+        resolved = rva;
+        LOG_INFO("WardenModule: Export ordinal ", ordinal, " raw VA=0x",
+                 std::hex, rva, std::dec);
+    } else {
+        LOG_ERROR("WardenModule: Export ordinal ", ordinal, " points outside image: raw=0x",
+                  std::hex, rva, " module=[0x", moduleBase_, ",0x",
+                  moduleBase_ + static_cast<uint32_t>(moduleSize_), ")", std::dec);
+        return 0;
+    }
+    return resolved;
 }
 
 bool WardenModule::initializeModule() {
@@ -1013,7 +999,13 @@ bool WardenModule::initializeModule() {
         // patch each IAT slot with the emulator's stub address. Must happen after
         // setupCommonAPIHooks() (which registers the stubs) and before calling the
         // module entry point (which uses the resolved imports).
-        bindAPIs();
+        if (!bindAPIs()) {
+            LOG_WARNING("WardenModule: API binding reported errors; continuing for diagnostics");
+        }
+        if (!emulator_->syncModuleMemory(moduleMemory_, moduleSize_)) {
+            LOG_ERROR("WardenModule: Failed to sync patched module image into emulator");
+            return false;
+        }
 
         {
             char addrBuf[32];
@@ -1022,41 +1014,95 @@ bool WardenModule::initializeModule() {
             LOG_INFO("WardenModule:   Ready to execute module at ", addrBuf);
         }
 
-        // Allocate memory for ClientCallbacks structure in emulated space
-        uint32_t callbackStructAddr = emulator_->allocateMemory(sizeof(ClientCallbacks), 0x04);
-        if (callbackStructAddr == 0) {
-            LOG_ERROR("WardenModule: Failed to allocate memory for callbacks");
+        uint32_t sendPacketStub = emulator_->hookFunction("warden.sendPacket", 2,
+            [this](WardenEmulator& emu, const std::vector<uint32_t>& args) -> uint32_t {
+                if (args.size() < 2 || args[0] == 0 || args[1] == 0) return 0;
+                auto payload = emu.readData(args[0], args[1]);
+                if (!payload.empty() && callbackSendPacket_) {
+                    callbackSendPacket_(payload.data(), payload.size());
+                }
+                return 1;
+            });
+        uint32_t loadModuleStub = emulator_->hookFunction("warden.loadModule", 3,
+            [](WardenEmulator&, const std::vector<uint32_t>&) -> uint32_t {
+                LOG_WARNING("WardenModule Callback: loadModule is not implemented");
+                return 0;
+            });
+        uint32_t cryptoStub = emulator_->hookFunction("warden.crypto", 3,
+            [](WardenEmulator&, const std::vector<uint32_t>&) -> uint32_t {
+                return 0;
+            });
+        uint32_t allocStub = emulator_->hookFunction("warden.alloc", 1,
+            [](WardenEmulator& emu, const std::vector<uint32_t>& args) -> uint32_t {
+                return emu.allocateMemory(args.empty() ? 0 : args[0], 0x04);
+            });
+        uint32_t freeStub = emulator_->hookFunction("warden.free", 1,
+            [](WardenEmulator& emu, const std::vector<uint32_t>& args) -> uint32_t {
+                if (!args.empty()) emu.freeMemory(args[0]);
+                return 0;
+            });
+        uint32_t saveStub = emulator_->hookFunction("warden.saveBuffer", 2,
+            [this](WardenEmulator& emu, const std::vector<uint32_t>& args) -> uint32_t {
+                if (args.size() < 2 || args[0] == 0 || args[1] == 0) return 0;
+                callbackSavedData_ = emu.readData(args[0], args[1]);
+                return static_cast<uint32_t>(callbackSavedData_.size());
+            });
+        uint32_t loadStub = emulator_->hookFunction("warden.loadBuffer", 2,
+            [this](WardenEmulator& emu, const std::vector<uint32_t>& args) -> uint32_t {
+                if (args.size() < 2 || args[0] == 0 || args[1] == 0 || callbackSavedData_.empty()) return 0;
+                uint32_t requested = 0;
+                emu.readMemory(args[1], &requested, 4);
+                uint32_t copied = std::min<uint32_t>(requested, static_cast<uint32_t>(callbackSavedData_.size()));
+                emu.writeMemory(args[0], callbackSavedData_.data(), copied);
+                emu.writeMemory(args[1], &copied, 4);
+                callbackSavedData_.clear();
+                return 1;
+            });
+
+        // The module treats the factory input as a C++ object in ECX. The
+        // first dword must be a vtable; slots 3/4 are used as alloc/free.
+        std::vector<uint32_t> callbackVtable = {
+            sendPacketStub, loadModuleStub, cryptoStub, allocStub, freeStub, saveStub, loadStub,
+        };
+        uint32_t callbackVtableAddr = emulator_->writeData(callbackVtable.data(),
+                                                           callbackVtable.size() * sizeof(uint32_t));
+        if (callbackVtableAddr == 0) {
+            LOG_ERROR("WardenModule: Failed to allocate callback vtable");
             return false;
         }
 
-        // Write callback function pointers to emulated memory
-        // Note: These would be addresses of stub functions in emulated space
-        // For now, we'll write placeholder addresses
-        std::vector<uint32_t> callbackAddrs = {
-            0x70001000, // sendPacket
-            0x70001100, // validateModule
-            0x70001200, // allocMemory
-            0x70001300, // freeMemory
-            0x70001400, // generateRC4
-            0x70001500, // getTime
-            0x70001600  // logMessage
+        std::vector<uint32_t> callbackObject = {
+            callbackVtableAddr,
+            0x00000001u, 0x00000003u, 0x00000007u, 0x00000009u,
+            0x00000019u, 0x00000021u, 0x00000041u, 0x00000081u,
+            0x00000101u, 0x00000201u, 0x00000080u, 0x40400000u
         };
-
-        // Write callback struct (7 function pointers = 28 bytes)
-        for (size_t i = 0; i < callbackAddrs.size(); ++i) {
-            uint32_t addr = callbackAddrs[i];
-            emulator_->writeMemory(callbackStructAddr + (i * 4), &addr, 4);
+        uint32_t callbackObjectAddr = emulator_->writeData(callbackObject.data(),
+                                                           callbackObject.size() * sizeof(uint32_t));
+        if (callbackObjectAddr == 0) {
+            LOG_ERROR("WardenModule: Failed to allocate callback object");
+            return false;
         }
-
-        {
-            char cbBuf[32];
-            std::snprintf(cbBuf, sizeof(cbBuf), "0x%X", callbackStructAddr);
-            LOG_INFO("WardenModule: Prepared ClientCallbacks at ", cbBuf);
+        if (!emulator_->isRangeMapped(callbackVtableAddr, callbackVtable.size() * sizeof(uint32_t)) ||
+            !emulator_->isRangeMapped(callbackObjectAddr, callbackObject.size() * sizeof(uint32_t))) {
+            LOG_ERROR("WardenModule: Callback object/vtable address is not mapped: object=0x",
+                      std::hex, callbackObjectAddr, " vtable=0x", callbackVtableAddr, std::dec);
+            return false;
         }
+        LOG_INFO("WardenModule: Callback object mapped at 0x", std::hex,
+                 callbackObjectAddr, " vtable=0x", callbackVtableAddr,
+                 " size=", std::dec, callbackObject.size() * sizeof(uint32_t));
 
-        // Call module entry point
-        // Entry point is typically at module base (offset 0)
-        uint32_t entryPoint = moduleBase_;
+        uint32_t entryPoint = resolveExport(1);
+        if (entryPoint == 0) {
+            LOG_ERROR("WardenModule: Could not resolve native Warden factory export #1");
+            return false;
+        }
+        if (!emulator_->isRangeMapped(entryPoint, 1)) {
+            LOG_ERROR("WardenModule: Export #1 entry is not mapped: 0x",
+                      std::hex, entryPoint, std::dec);
+            return false;
+        }
 
         {
             char epBuf[32];
@@ -1065,84 +1111,95 @@ bool WardenModule::initializeModule() {
         }
 
         try {
-            // Call: WardenFuncList* InitModule(ClientCallbacks* callbacks)
-            std::vector<uint32_t> args = { callbackStructAddr };
-            uint32_t result = emulator_->callFunction(entryPoint, args);
-
-            if (result == 0) {
-                LOG_ERROR("WardenModule: Module entry returned NULL");
+            uint32_t objectAddr = emulator_->callThiscall(entryPoint, callbackObjectAddr, {});
+            if (objectAddr == 0) {
+                LOG_ERROR("WardenModule: Warden factory returned NULL");
+                return false;
+            }
+            if (!emulator_->isRangeMapped(objectAddr, 4)) {
+                LOG_ERROR("WardenModule: Warden object address is not mapped: 0x",
+                          std::hex, objectAddr, std::dec);
                 return false;
             }
 
-            {
-                char resBuf[32];
-                std::snprintf(resBuf, sizeof(resBuf), "0x%X", result);
-                LOG_INFO("WardenModule: Module initialized, WardenFuncList at ", resBuf);
+            uint32_t vtableAddr = 0;
+            if (!emulator_->readMemory(objectAddr, &vtableAddr, 4) || vtableAddr == 0) {
+                LOG_ERROR("WardenModule: Warden object has no vtable");
+                return false;
+            }
+            if (!emulator_->isRangeMapped(vtableAddr, sizeof(uint32_t) * 4)) {
+                LOG_ERROR("WardenModule: Warden vtable address is not mapped: 0x",
+                          std::hex, vtableAddr, std::dec);
+                return false;
             }
 
-            // Read WardenFuncList structure from emulated memory
-            // Structure has 4 function pointers (16 bytes):
-            //   [0] generateRC4Keys(uint8_t* seed)
-            //   [1] unload(uint8_t* rc4Keys)
-            //   [2] packetHandler(uint8_t* data, uint32_t size,
-            //                     uint8_t* responseOut, uint32_t* responseSizeOut)
-            //   [3] tick(uint32_t deltaMs) -> uint32_t
-            uint32_t funcAddrs[4] = {};
-            if (emulator_->readMemory(result, funcAddrs, 16)) {
-                char fb[4][32];
-                for (int fi = 0; fi < 4; ++fi)
-                    std::snprintf(fb[fi], sizeof(fb[fi]), "0x%X", funcAddrs[fi]);
-                LOG_INFO("WardenModule: Module exported functions:");
-                LOG_INFO("WardenModule:   generateRC4Keys: ", fb[0]);
-                LOG_INFO("WardenModule:   unload:          ", fb[1]);
-                LOG_INFO("WardenModule:   packetHandler:   ", fb[2]);
-                LOG_INFO("WardenModule:   tick:            ", fb[3]);
+            uint32_t methods[4] = {};
+            if (!emulator_->readMemory(vtableAddr, methods, sizeof(methods))) {
+                LOG_ERROR("WardenModule: Failed to read Warden vtable");
+                return false;
+            }
 
-                // Wrap emulated function addresses into std::function dispatchers
-                WardenEmulator* emu = emulator_.get();
-
-                if (funcAddrs[0]) {
-                    uint32_t addr = funcAddrs[0];
-                    funcList_.generateRC4Keys = [emu, addr](uint8_t* seed) {
-                        // Warden RC4 seed is a fixed 4-byte value
-                        uint32_t seedAddr = emu->writeData(seed, 4);
-                        if (seedAddr) {
-                            emu->callFunction(addr, {seedAddr});
-                            emu->freeMemory(seedAddr);
-                        }
-                    };
-                }
-
-                if (funcAddrs[1]) {
-                    uint32_t addr = funcAddrs[1];
-                    funcList_.unload = [emu, addr]([[maybe_unused]] uint8_t* rc4Keys) {
-                        emu->callFunction(addr, {0u}); // pass NULL; module saves its own state
-                    };
-                }
-
-                if (funcAddrs[2]) {
-                    // Store raw address for the 4-arg call in processCheckRequest
-                    emulatedPacketHandlerAddr_ = funcAddrs[2];
-                    uint32_t addr = funcAddrs[2];
-                    // Simple 2-arg variant for generic callers (no response extraction)
-                    funcList_.packetHandler = [emu, addr](uint8_t* data, size_t length) {
-                        uint32_t dataAddr = emu->writeData(data, length);
-                        if (dataAddr) {
-                            emu->callFunction(addr, {dataAddr, static_cast<uint32_t>(length)});
-                            emu->freeMemory(dataAddr);
-                        }
-                    };
-                }
-
-                if (funcAddrs[3]) {
-                    uint32_t addr = funcAddrs[3];
-                    funcList_.tick = [emu, addr](uint32_t deltaMs) -> uint32_t {
-                        return emu->callFunction(addr, {deltaMs});
-                    };
+            for (int i = 0; i < 4; ++i) {
+                if (methods[i] != 0 && !emulator_->isRangeMapped(methods[i], 1)) {
+                    LOG_ERROR("WardenModule: Warden vtable method ", i,
+                              " is not mapped: 0x", std::hex, methods[i], std::dec);
+                    return false;
                 }
             }
 
-            LOG_INFO("WardenModule: Module fully initialized and ready!");
+            emulatedObjectAddr_ = objectAddr;
+            emulatedInitAddr_ = methods[0];
+            emulatedPacketHandlerAddr_ = methods[2];
+
+            char objBuf[32], vtBuf[32], initBuf[32], pktBuf[32], tickBuf[32];
+            std::snprintf(objBuf, sizeof(objBuf), "0x%X", objectAddr);
+            std::snprintf(vtBuf, sizeof(vtBuf), "0x%X", vtableAddr);
+            std::snprintf(initBuf, sizeof(initBuf), "0x%X", methods[0]);
+            std::snprintf(pktBuf, sizeof(pktBuf), "0x%X", methods[2]);
+            std::snprintf(tickBuf, sizeof(tickBuf), "0x%X", methods[3]);
+            LOG_INFO("WardenModule: Warden object=", objBuf, " vtable=", vtBuf,
+                     " init=", initBuf, " packet=", pktBuf, " tick=", tickBuf);
+
+            if (methods[0] && !sessionKey_.empty()) {
+                uint32_t sessionKeyAddr = emulator_->writeData(sessionKey_.data(), sessionKey_.size());
+                if (sessionKeyAddr) {
+                    emulator_->callThiscall(methods[0], objectAddr,
+                                            { sessionKeyAddr, static_cast<uint32_t>(sessionKey_.size()) });
+                    emulator_->freeMemory(sessionKeyAddr);
+                }
+            }
+
+            WardenEmulator* emu = emulator_.get();
+            if (methods[1]) {
+                uint32_t addr = methods[1];
+                uint32_t obj = objectAddr;
+                funcList_.unload = [emu, addr, obj]([[maybe_unused]] uint8_t* rc4Keys) {
+                    emu->callThiscall(addr, obj, {});
+                };
+            }
+            if (methods[2]) {
+                uint32_t addr = methods[2];
+                uint32_t obj = objectAddr;
+                funcList_.packetHandler = [emu, addr, obj](uint8_t* data, size_t length) {
+                    uint32_t dataAddr = emu->writeData(data, length);
+                    uint32_t status = 0;
+                    uint32_t statusAddr = emu->writeData(&status, sizeof(status));
+                    if (dataAddr && statusAddr) {
+                        emu->callThiscall(addr, obj, { dataAddr, static_cast<uint32_t>(length), statusAddr });
+                    }
+                    if (statusAddr) emu->freeMemory(statusAddr);
+                    if (dataAddr) emu->freeMemory(dataAddr);
+                };
+            }
+            if (methods[3]) {
+                uint32_t addr = methods[3];
+                uint32_t obj = objectAddr;
+                funcList_.tick = [emu, addr, obj](uint32_t deltaMs) -> uint32_t {
+                    return emu->callThiscall(addr, obj, { deltaMs });
+                };
+            }
+
+            LOG_INFO("WardenModule: Module fully initialized and ready");
 
         } catch (const std::exception& e) {
             LOG_ERROR("WardenModule: Exception during module initialization: ", e.what());
@@ -1193,22 +1250,15 @@ bool WardenModule::initializeModule() {
 // WardenModuleManager Implementation
 // ============================================================================
 
-WardenModuleManager::WardenModuleManager() {
-    // Set cache directory
-#ifdef _WIN32
-    if (const char* appdata = std::getenv("APPDATA"))
-        cacheDirectory_ = std::string(appdata) + "\\wowee\\warden_cache";
-    else
-        cacheDirectory_ = ".\\warden_cache";
-#else
-    if (const char* home = std::getenv("HOME"))
-        cacheDirectory_ = std::string(home) + "/.local/share/wowee/warden_cache";
-    else
-        cacheDirectory_ = "./warden_cache";
-#endif
+WardenModuleManager::WardenModuleManager(std::shared_ptr<WardenPlatformServices> platformServices)
+    : platformServices_(std::move(platformServices)) {
+    if (!platformServices_) {
+        platformServices_ = WardenPlatformServices::defaultServices();
+    }
+    cacheDirectory_ = platformServices_->wardenCacheDir().string();
 
-    // Create cache directory if it doesn't exist
-    std::filesystem::create_directories(cacheDirectory_);
+    std::error_code ec;
+    std::filesystem::create_directories(cacheDirectory_, ec);
 
     LOG_INFO("WardenModuleManager: Cache directory: ", cacheDirectory_);
 }
@@ -1269,14 +1319,10 @@ bool WardenModuleManager::cacheModule(const std::vector<uint8_t>& md5Hash,
                                       const std::vector<uint8_t>& moduleData) {
     std::string cachePath = getCachePath(md5Hash);
 
-    std::ofstream file(cachePath, std::ios::binary);
-    if (!file) {
+    if (!platformServices_->writeFile(cachePath, moduleData)) {
         LOG_ERROR("WardenModuleManager: Failed to write cache: ", cachePath);
         return false;
     }
-
-    file.write(reinterpret_cast<const char*>(moduleData.data()), moduleData.size());
-    file.close();
 
     LOG_INFO("WardenModuleManager: Cached module to: ", cachePath);
     return true;
@@ -1286,23 +1332,9 @@ bool WardenModuleManager::loadCachedModule(const std::vector<uint8_t>& md5Hash,
                                            std::vector<uint8_t>& moduleDataOut) {
     std::string cachePath = getCachePath(md5Hash);
 
-    if (!std::filesystem::exists(cachePath)) {
-        return false;
-    }
+    if (!platformServices_->readFile(cachePath, moduleDataOut)) return false;
 
-    std::ifstream file(cachePath, std::ios::binary | std::ios::ate);
-    if (!file) {
-        return false;
-    }
-
-    size_t fileSize = file.tellg();
-    file.seekg(0, std::ios::beg);
-
-    moduleDataOut.resize(fileSize);
-    file.read(reinterpret_cast<char*>(moduleDataOut.data()), fileSize);
-    file.close();
-
-    LOG_INFO("WardenModuleManager: Loaded cached module (", fileSize, " bytes)");
+    LOG_INFO("WardenModuleManager: Loaded cached module (", moduleDataOut.size(), " bytes)");
     return true;
 }
 

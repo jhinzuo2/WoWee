@@ -4,6 +4,7 @@
 #include "game/warden_crypto.hpp"
 #include "game/warden_memory.hpp"
 #include "game/warden_module.hpp"
+#include "game/warden_platform.hpp"
 #include "network/world_socket.hpp"
 #include "network/packet.hpp"
 #include "auth/crypto.hpp"
@@ -18,6 +19,7 @@
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <utility>
 #include <openssl/sha.h>
 #include <openssl/hmac.h>
 
@@ -143,10 +145,21 @@ const std::unordered_map<std::string, std::array<uint8_t, 20>>& knownDoorHashes(
 // ---------------------------------------------------------------------------
 
 WardenHandler::WardenHandler(GameHandler& owner)
-    : owner_(owner) {}
+    : owner_(owner)
+    , platformServices_(WardenPlatformServices::defaultServices()) {}
+
+void WardenHandler::setPlatformServices(std::shared_ptr<WardenPlatformServices> platformServices) {
+    platformServices_ = std::move(platformServices);
+    if (!platformServices_) {
+        platformServices_ = WardenPlatformServices::defaultServices();
+    }
+    if (wardenModuleManager_) {
+        wardenModuleManager_ = std::make_unique<WardenModuleManager>(platformServices_);
+    }
+}
 
 void WardenHandler::initModuleManager() {
-    wardenModuleManager_ = std::make_unique<WardenModuleManager>();
+    wardenModuleManager_ = std::make_unique<WardenModuleManager>(platformServices_);
 }
 
 // ---------------------------------------------------------------------------
@@ -221,40 +234,24 @@ void WardenHandler::update(float deltaTime) {
 bool WardenHandler::loadWardenCRFile(const std::string& moduleHashHex) {
     wardenCREntries_.clear();
 
-    // Look for .cr file in warden cache
-    std::string cacheBase;
-#ifdef _WIN32
-    if (const char* h = std::getenv("APPDATA")) cacheBase = std::string(h) + "\\wowee\\warden_cache";
-    else cacheBase = ".\\warden_cache";
-#else
-    if (const char* h = std::getenv("HOME")) cacheBase = std::string(h) + "/.local/share/wowee/warden_cache";
-    else cacheBase = "./warden_cache";
-#endif
-    std::string crPath = cacheBase + "/" + moduleHashHex + ".cr";
-
-    std::ifstream crFile(crPath, std::ios::binary);
-    if (!crFile) {
-        LOG_WARNING("Warden: No .cr file found at ", crPath);
+    auto crPath = platformServices_->wardenCacheDir() / (moduleHashHex + ".cr");
+    std::vector<uint8_t> crData;
+    if (!platformServices_->readFile(crPath, crData)) {
+        LOG_WARNING("Warden: No .cr file found at ", crPath.string());
         return false;
     }
-
-    // Get file size
-    crFile.seekg(0, std::ios::end);
-    auto fileSize = crFile.tellg();
-    crFile.seekg(0, std::ios::beg);
 
     // Header: [4 memoryRead][4 pageScanCheck][9 opcodes] = 17 bytes
     constexpr size_t CR_HEADER_SIZE = 17;
     constexpr size_t CR_ENTRY_SIZE = 68; // seed[16]+reply[20]+clientKey[16]+serverKey[16]
 
-    if (static_cast<size_t>(fileSize) < CR_HEADER_SIZE) {
-        LOG_ERROR("Warden: .cr file too small (", fileSize, " bytes)");
+    if (crData.size() < CR_HEADER_SIZE) {
+        LOG_ERROR("Warden: .cr file too small (", crData.size(), " bytes)");
         return false;
     }
 
     // Read header: [4 memoryRead][4 pageScanCheck][9 opcodes]
-    crFile.seekg(8); // skip memoryRead + pageScanCheck
-    crFile.read(reinterpret_cast<char*>(wardenCheckOpcodes_), 9);
+    std::memcpy(wardenCheckOpcodes_, crData.data() + 8, 9);
     {
         std::string opcHex;
         // CMaNGOS WindowsScanType order:
@@ -268,22 +265,23 @@ bool WardenHandler::loadWardenCRFile(const std::string& moduleHashHex) {
         LOG_DEBUG("Warden: Check opcodes: ", opcHex);
     }
 
-    size_t entryCount = (static_cast<size_t>(fileSize) - CR_HEADER_SIZE) / CR_ENTRY_SIZE;
+    size_t entryCount = (crData.size() - CR_HEADER_SIZE) / CR_ENTRY_SIZE;
     if (entryCount == 0) {
         LOG_ERROR("Warden: .cr file has no entries");
         return false;
     }
 
     wardenCREntries_.resize(entryCount);
+    size_t pos = CR_HEADER_SIZE;
     for (size_t i = 0; i < entryCount; i++) {
         auto& e = wardenCREntries_[i];
-        crFile.read(reinterpret_cast<char*>(e.seed), 16);
-        crFile.read(reinterpret_cast<char*>(e.reply), 20);
-        crFile.read(reinterpret_cast<char*>(e.clientKey), 16);
-        crFile.read(reinterpret_cast<char*>(e.serverKey), 16);
+        std::memcpy(e.seed, crData.data() + pos, 16); pos += 16;
+        std::memcpy(e.reply, crData.data() + pos, 20); pos += 20;
+        std::memcpy(e.clientKey, crData.data() + pos, 16); pos += 16;
+        std::memcpy(e.serverKey, crData.data() + pos, 16); pos += 16;
     }
 
-    LOG_INFO("Warden: Loaded ", entryCount, " CR entries from ", crPath);
+    LOG_INFO("Warden: Loaded ", entryCount, " CR entries from ", crPath.string());
     return true;
 }
 
@@ -419,25 +417,14 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
 
                 // Cache raw module to disk
                 {
-#ifdef _WIN32
-                    std::string cacheDir;
-                    if (const char* h = std::getenv("APPDATA")) cacheDir = std::string(h) + "\\wowee\\warden_cache";
-                    else cacheDir = ".\\warden_cache";
-#else
-                    std::string cacheDir;
-                    if (const char* h = std::getenv("HOME")) cacheDir = std::string(h) + "/.local/share/wowee/warden_cache";
-                    else cacheDir = "./warden_cache";
-#endif
-                    std::filesystem::create_directories(cacheDir);
-
                     std::string hashHex;
                     for (auto b : wardenModuleHash_) { char s[4]; snprintf(s, 4, "%02x", b); hashHex += s; }
-                    std::string cachePath = cacheDir + "/" + hashHex + ".wdn";
+                    auto cachePath = platformServices_->wardenCacheDir() / (hashHex + ".wdn");
 
-                    std::ofstream wf(cachePath, std::ios::binary);
-                    if (wf) {
-                        wf.write(reinterpret_cast<const char*>(wardenModuleData_.data()), wardenModuleData_.size());
-                        LOG_DEBUG("Warden: Cached module to ", cachePath);
+                    if (platformServices_->writeFile(cachePath, wardenModuleData_)) {
+                        LOG_DEBUG("Warden: Cached module to ", cachePath.string());
+                    } else {
+                        LOG_WARNING("Warden: Failed to cache module to ", cachePath.string());
                     }
                 }
 
@@ -456,11 +443,14 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
                         owner_.getSocket()->send(pkt);
                         LOG_DEBUG("Warden: Module sendPacket callback sent ", len, " bytes");
                     });
+                wardenLoadedModule_->setSessionKey(owner_.getSessionKey());
                 if (wardenLoadedModule_->load(wardenModuleData_, wardenModuleHash_, wardenModuleKey_)) { // codeql[cpp/weak-cryptographic-algorithm]
                     LOG_INFO("Warden: Module loaded successfully (image size=",
                              wardenLoadedModule_->getModuleSize(), " bytes)");
+                    LOG_WARNING("Warden path: module loader completed; HASH_REQUEST may try module/Unicorn path");
                 } else {
                     LOG_ERROR("Warden: Module loading FAILED");
+                    LOG_WARNING("Warden path: module loader unavailable; using CR/silence/manual fallback paths");
                     wardenLoadedModule_.reset();
                 }
 
@@ -481,6 +471,22 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
             }
 
             std::vector<uint8_t> seed(decrypted.begin() + 1, decrypted.begin() + 17);
+            bool handledByModule = false;
+            if (wardenLoadedModule_) {
+                LOG_WARNING("Warden path: HASH_REQUEST trying module/Unicorn processPacket path");
+                handledByModule = wardenLoadedModule_->processPacket(decrypted);
+            } else {
+                LOG_WARNING("Warden path: HASH_REQUEST has no loaded module; using CR/silence/fallback path");
+            }
+            if (handledByModule) {
+                LOG_WARNING("Warden: HASH_REQUEST handled by native Warden module");
+                LOG_WARNING("Warden path: HASH_REQUEST handled by module/Unicorn path");
+                wardenState_ = WardenState::WAIT_CHECKS;
+                break;
+            } else if (wardenLoadedModule_) {
+                LOG_WARNING("Warden path: HASH_REQUEST module/Unicorn path declined; using CR/silence/fallback path");
+            }
+
             auto applyWardenSeedRekey = [&](const std::vector<uint8_t>& rekeySeed) {
                 // Derive new RC4 keys from the seed using SHA1Randx.
                 uint8_t newEncryptKey[16], newDecryptKey[16];
@@ -506,6 +512,7 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
 
                 if (match) {
                     LOG_DEBUG("Warden: HASH_REQUEST — CR entry MATCHED, sending pre-computed reply");
+                    LOG_WARNING("Warden path: HASH_REQUEST handled by .cr precomputed response");
 
                     // Send HASH_RESULT
                     std::vector<uint8_t> resp;
@@ -535,6 +542,21 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
 
                 bool isTurtle = isActiveExpansion("turtle");
                 bool isClassic = (owner_.getBuild() <= 6005) && !isTurtle;
+                const char* turtleModeEnv = std::getenv("WOWEE_WARDEN_TURTLE_NO_CR");
+                const bool turtleFallbackAllowed =
+                    turtleModeEnv && std::string(turtleModeEnv) == "fallback";
+
+                if (isTurtle && !turtleFallbackAllowed) {
+                    // Turtle closes the world connection when we send an invented HASH_RESULT.
+                    // Without a matching .cr entry, silence is safer and matches the headless
+                    // probe behavior that successfully reaches SMSG_CHAR_ENUM.
+                    LOG_WARNING("Warden: HASH_REQUEST seed=", seedHex,
+                                " — no CR match, skipping response for Turtle "
+                                "(set WOWEE_WARDEN_TURTLE_NO_CR=fallback to test legacy fallback)");
+                    LOG_WARNING("Warden path: HASH_REQUEST handled by Turtle no-CR silence path");
+                    wardenState_ = WardenState::WAIT_CHECKS;
+                    break;
+                }
 
                 if (!isTurtle && !isClassic) {
                     // WotLK/TBC: don't respond to HASH_REQUEST without a valid CR match.
@@ -543,12 +565,14 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
                     // Staying silent lets the server continue the session without Warden checks.
                     LOG_DEBUG("Warden: HASH_REQUEST seed=", seedHex,
                                 " — no CR match, skipping response (server tolerates silence)");
+                    LOG_WARNING("Warden path: HASH_REQUEST handled by non-Classic no-CR silence path");
                     wardenState_ = WardenState::WAIT_CHECKS;
                     break;
                 }
 
                 LOG_WARNING("Warden: No CR match (seed=", seedHex,
                             "), sending fallback hash (lenient server)");
+                LOG_WARNING("Warden path: HASH_REQUEST handled by fallback HASH_RESULT path");
 
                 std::vector<uint8_t> fallbackReply;
                 if (wardenLoadedModule_ && wardenLoadedModule_->isLoaded()) {
@@ -579,6 +603,7 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
 
         case WARDEN_SMSG_CHEAT_CHECKS_REQUEST: { // CHEAT_CHECKS_REQUEST
             LOG_DEBUG("Warden: CHEAT_CHECKS_REQUEST (", decrypted.size(), " bytes)");
+            LOG_WARNING("Warden path: CHEAT_CHECKS_REQUEST using manual parser path");
 
             if (decrypted.size() < 3) {
                 LOG_ERROR("Warden: CHEAT_CHECKS_REQUEST too short");
@@ -617,9 +642,10 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
                 }
                 if (hasSlowChecks && !wardenResponsePending_) {
                     LOG_WARNING("Warden: PAGE_A/PAGE_B detected — building response async to avoid main-loop stall");
+                    LOG_WARNING("Warden path: CHEAT_CHECKS_REQUEST handled by manual async response path");
                     // Ensure wardenMemory_ is loaded on main thread before launching async task
                     if (!wardenMemory_) {
-                        wardenMemory_ = std::make_unique<WardenMemory>();
+                        wardenMemory_ = std::make_unique<WardenMemory>(platformServices_);
                         if (!wardenMemory_->load(static_cast<uint16_t>(owner_.getBuild()), isActiveExpansion("turtle"))) {
                             LOG_WARNING("Warden: Could not load WoW.exe for MEM_CHECK");
                         }
@@ -906,6 +932,7 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
             }
 
             // Check type enum indices
+            LOG_WARNING("Warden path: CHEAT_CHECKS_REQUEST handled by manual sync response path");
             enum CheckType { CT_MEM=0, CT_PAGE_A=1, CT_PAGE_B=2, CT_MPQ=3, CT_LUA=4,
                              CT_DRIVER=5, CT_TIMING=6, CT_PROC=7, CT_MODULE=8, CT_UNKNOWN=9 };
             const char* checkTypeNames[] = {"MEM","PAGE_A","PAGE_B","MPQ","LUA","DRIVER","TIMING","PROC","MODULE","UNKNOWN"};
@@ -1054,7 +1081,7 @@ void WardenHandler::handleWardenData(network::Packet& packet) {
 
                         // Lazy-load WoW.exe PE image on first MEM_CHECK
                         if (!wardenMemory_) {
-                            wardenMemory_ = std::make_unique<WardenMemory>();
+                            wardenMemory_ = std::make_unique<WardenMemory>(platformServices_);
                             if (!wardenMemory_->load(static_cast<uint16_t>(owner_.getBuild()), isActiveExpansion("turtle"))) {
                                 LOG_WARNING("Warden: Could not load WoW.exe for MEM_CHECK");
                             }

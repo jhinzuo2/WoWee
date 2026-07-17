@@ -16,6 +16,7 @@ public:
     bool isConnected() const override { return connected; }
 
     void send(const Packet& packet) override;
+    void sendRaw(const std::vector<uint8_t>& data);
     void update() override;
 
 private:

@@ -19,9 +19,66 @@ constexpr uint8_t kSecurityFlagPin           = 0x01;  // PIN grid challenge
 constexpr uint8_t kSecurityFlagMatrixCard    = 0x02;  // Matrix card (unused by most servers)
 constexpr uint8_t kSecurityFlagAuthenticator = 0x04;  // TOTP authenticator token
 
-bool isLegacyVanillaAuth(const ClientInfo& info) {
-    return info.majorVersion == 1 && info.protocolVersion < 8;
+namespace {
+bool hexToHash20(const char* hex, std::array<uint8_t, 20>& out) {
+    if (!hex) return false;
+
+    std::string clean;
+    clean.reserve(40);
+    for (const char* p = hex; *p; ++p) {
+        unsigned char c = static_cast<unsigned char>(*p);
+        if (std::isspace(c) || *p == ':' || *p == '-') continue;
+        clean.push_back(static_cast<char>(*p));
+    }
+    if (clean.size() != 40) return false;
+
+    auto nibble = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+
+    for (size_t i = 0; i < out.size(); ++i) {
+        int hi = nibble(clean[i * 2]);
+        int lo = nibble(clean[i * 2 + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = static_cast<uint8_t>((hi << 4) | lo);
+    }
+    return true;
 }
+
+void applySrpEnvOverrides(SRP& srp) {
+    if (const char* env = std::getenv("WOWEE_SRP_EPHEMERAL_BYTES")) {
+        if (env && *env) {
+            int bytes = std::atoi(env);
+            if (bytes > 0 && bytes <= 32) {
+                srp.setEphemeralBytes(bytes);
+                LOG_WARNING("SRP ephemeral private key bytes set to ", bytes,
+                            " by WOWEE_SRP_EPHEMERAL_BYTES");
+            }
+        }
+    }
+    if (const char* env = std::getenv("WOWEE_SRP_HASH_ENDIAN")) {
+        if (std::string(env) == "be") {
+            srp.setHashBigEndian(true);
+            LOG_WARNING("SRP hash integer endian set to big-endian by WOWEE_SRP_HASH_ENDIAN=be");
+        }
+    }
+    if (const char* env = std::getenv("WOWEE_SRP_INTERLEAVE_TRIM")) {
+        if (std::string(env) == "0") {
+            srp.setTrimSessionKeyZeros(false);
+            LOG_WARNING("SRP S-key zero trimming disabled by WOWEE_SRP_INTERLEAVE_TRIM=0");
+        }
+    }
+    if (const char* env = std::getenv("WOWEE_SRP_K")) {
+        if (std::string(env) == "hashed") {
+            srp.setUseHashedK(true);
+            LOG_WARNING("SRP multiplier k set to H(N|g) by WOWEE_SRP_K=hashed");
+        }
+    }
+}
+} // namespace
 
 AuthHandler::AuthHandler() {
     LOG_DEBUG("AuthHandler created");
@@ -150,6 +207,7 @@ void AuthHandler::authenticate(const std::string& user, const std::string& pass,
 
     // Initialize SRP
     srp = std::make_unique<SRP>();
+    applySrpEnvOverrides(*srp);
     srp->initialize(username, password);
 
     // Send LOGON_CHALLENGE
@@ -186,6 +244,7 @@ void AuthHandler::authenticateWithHash(const std::string& user, const std::vecto
 
     // Initialize SRP with pre-computed hash
     srp = std::make_unique<SRP>();
+    applySrpEnvOverrides(*srp);
     srp->initializeWithHash(username, authHash);
 
     // Send LOGON_CHALLENGE
@@ -221,18 +280,9 @@ void AuthHandler::handleLogonChallengeResponse(network::Packet& packet) {
                << static_cast<int>(clientInfo.minorVersion) << "."
                << static_cast<int>(clientInfo.patchVersion)
                << " build " << clientInfo.build
-               << ", auth protocol " << static_cast<int>(clientInfo.protocolVersion) << ")";
-            fail(ss.str(), /*protocolRelated=*/true);
-        } else if (response.result == AuthResult::BUSY && isLegacyVanillaAuth(clientInfo)) {
-            // Turtle/vmangos-derived realms can answer protocol 3 challenges
-            // with BUSY before sending the v8 security-flags byte. Let the UI
-            // try the alternate vanilla auth protocol instead of stopping here.
-            std::ostringstream ss;
-            ss << "LOGON_CHALLENGE failed: "
-               << getAuthResultString(response.result)
-               << " (auth protocol " << static_cast<int>(clientInfo.protocolVersion)
-               << " may be incompatible)";
-            fail(ss.str(), /*protocolRelated=*/true);
+               << ", logon protocol " << static_cast<int>(clientInfo.logonProtocolVersion)
+               << ", realm/proof protocol " << static_cast<int>(clientInfo.protocolVersion) << ")";
+            fail(ss.str());
         } else {
             // Account-level rejections (unknown account, wrong password, banned,
             // suspended, in use) are NOT protocol problems — never retry those.
@@ -248,8 +298,8 @@ void AuthHandler::handleLogonChallengeResponse(network::Packet& packet) {
         if (response.securityFlags & kSecurityFlagAuthenticator) LOG_WARNING("  Authenticator required (not supported)");
     }
 
-    LOG_INFO("Challenge: N=", response.N.size(), "B g=", response.g.size(), "B salt=",
-             response.salt.size(), "B secFlags=0x", std::hex, static_cast<int>(response.securityFlags), std::dec);
+    LOG_WARNING("Auth challenge accepted: N=", response.N.size(), "B g=", response.g.size(), "B salt=",
+                response.salt.size(), "B secFlags=0x", std::hex, static_cast<int>(response.securityFlags), std::dec);
 
     if (clientInfo.protocolVersion < 8 && response.securityFlags != 0) {
         fail("Server requires auth protocol 8 security extensions",
@@ -306,51 +356,106 @@ void AuthHandler::sendLogonProof() {
     // Legacy client integrity hash (aka "CRC hash"). Some servers enforce this for classic builds.
     // We compute it when checksumSalt was provided (always present on success challenge) and files exist.
     {
-        std::vector<std::string> candidateDirs;
-        if (const char* env = std::getenv("WOWEE_INTEGRITY_DIR")) {
-            if (env && *env) candidateDirs.push_back(env);
-        }
-        // Expansion-isolated extraction layouts. Select narrowly so a Wrath or
-        // stock Classic executable can never be used for a Turtle integrity hash.
-        if (clientInfo.majorVersion == 1 && clientInfo.minorVersion == 18) {
-            candidateDirs.push_back("Data/expansions/turtle/misc");
-        } else if (clientInfo.build <= 6005) {
-            candidateDirs.push_back("Data/expansions/classic/misc");
-        } else if (clientInfo.build <= 8606) {
-            candidateDirs.push_back("Data/expansions/tbc/misc");
-        } else {
-            candidateDirs.push_back("Data/expansions/wotlk/misc");
-        }
-        // Legacy flat extraction layout.
-        candidateDirs.push_back("Data/misc");
-        // Common turtle repack location used in this workspace
-        if (const char* home = std::getenv("HOME")) {
-            if (home && *home) {
-                candidateDirs.push_back(std::string(home) + "/Downloads/twmoa_1180");
-                candidateDirs.push_back(std::string(home) + "/twmoa_1180");
-            }
-        }
+        auto envEquals = [](const char* name, const char* value) {
+            const char* env = std::getenv(name);
+            return env && std::string(env) == value;
+        };
 
-        const char* candidateExes[] = { "WoW.exe", "TurtleWoW.exe", "Wow.exe", "wow.exe" };
-        bool ok = false;
-        std::string lastErr;
-        for (const auto& dir : candidateDirs) {
-            for (const char* exe : candidateExes) {
-                std::string err;
-                if (computeIntegrityHashWin32WithExe(checksumSalt_, A, dir, exe, clientInfo.build, crcHash, err)) {
-                    crcHashPtr = &crcHash;
-                    LOG_INFO("Integrity hash computed from ", dir, " (", exe, ")");
-                    ok = true;
-                    break;
+        const char* integrityModeEnv = std::getenv("WOWEE_INTEGRITY_MODE");
+        const std::string mode = integrityModeEnv ? std::string(integrityModeEnv) : "file";
+        if (mode == "zero") {
+            crcHash.fill(0);
+            crcHashPtr = &crcHash;
+            LOG_WARNING("Integrity hash forced to zeros by WOWEE_INTEGRITY_MODE=zero");
+        } else {
+            bool versionProofOk = false;
+            if (mode == "static") {
+                std::array<uint8_t, 20> versionHash{};
+                bool haveVersionHash = false;
+
+                if (const char* envHash = std::getenv("WOWEE_INTEGRITY_HASH")) {
+                    if (hexToHash20(envHash, versionHash)) {
+                        haveVersionHash = true;
+                        LOG_WARNING("Integrity hash using WOWEE_INTEGRITY_HASH static version hash");
+                    } else {
+                        LOG_WARNING("Ignoring invalid WOWEE_INTEGRITY_HASH; expected 20-byte hex");
+                    }
                 }
-                lastErr = err;
+
+                if (!haveVersionHash && getKnownClientVersionHash(clientInfo.build, clientInfo.os, versionHash)) {
+                    haveVersionHash = true;
+                    LOG_WARNING("Integrity hash using known static version hash for build ",
+                                clientInfo.build, " os ", clientInfo.os);
+                }
+
+                if (haveVersionHash) {
+                    std::string err;
+                    if (computeIntegrityHashFromVersionHash(A, versionHash, crcHash, err)) {
+                        crcHashPtr = &crcHash;
+                        versionProofOk = true;
+                    } else {
+                        LOG_WARNING("Static version integrity hash failed: ", err);
+                    }
+                }
             }
-            if (ok) break;
-        }
-        if (!ok) {
-            LOG_WARNING("Integrity hash not computed (", lastErr,
-                        "). Server may reject classic clients without it. "
-                        "Set WOWEE_INTEGRITY_DIR to your client folder.");
+
+            if (versionProofOk) {
+                // Matched CMaNGOS/vMaNGOS strict version proof; skip file-HMAC fallback.
+            } else {
+                std::vector<std::string> candidateDirs;
+                if (const char* env = std::getenv("WOWEE_INTEGRITY_DIR")) {
+                    if (env && *env) candidateDirs.push_back(env);
+                }
+                // Default local extraction layout
+                candidateDirs.push_back("Data/misc");
+                // Common Turtle client locations used in this workspace. The integrity
+                // check needs root-level client DLLs, not just the MPQ-extracted tree.
+                if (const char* home = std::getenv("HOME")) {
+                    if (home && *home) {
+                        candidateDirs.push_back(std::string(home) + "/Downloads/TurtleWoW");
+                        candidateDirs.push_back(std::string(home) + "/Downloads/tw/TurtleWoW");
+                        candidateDirs.push_back(std::string(home) + "/Downloads/twmoa_1180");
+                        candidateDirs.push_back(std::string(home) + "/twmoa_1180");
+                    }
+                }
+
+                std::vector<std::string> candidateExes;
+                if (const char* env = std::getenv("WOWEE_INTEGRITY_EXE")) {
+                    if (env && *env) {
+                        candidateExes.push_back(env);
+                    }
+                }
+                if (candidateExes.empty()) {
+                    candidateExes = { "WoW.exe", "Wow.exe", "TurtleWoW.exe", "turtle-wow.exe", "VanillaFixes.exe" };
+                }
+
+                std::vector<uint8_t> crcA = A;
+                if (envEquals("WOWEE_INTEGRITY_A_ENDIAN", "be")) {
+                    std::reverse(crcA.begin(), crcA.end());
+                    LOG_WARNING("Integrity hash using big-endian A by WOWEE_INTEGRITY_A_ENDIAN=be");
+                }
+
+                bool ok = false;
+                std::string lastErr;
+                for (const auto& dir : candidateDirs) {
+                    for (const auto& exe : candidateExes) {
+                        std::string err;
+                        if (computeIntegrityHashWin32WithExe(checksumSalt_, crcA, dir, exe, crcHash, err)) {
+                            crcHashPtr = &crcHash;
+                            LOG_WARNING("Integrity hash computed from ", dir, " (", exe, ")");
+                            ok = true;
+                            break;
+                        }
+                        lastErr = err;
+                    }
+                    if (ok) break;
+                }
+                if (!ok) {
+                    LOG_WARNING("Integrity hash not computed (", lastErr,
+                                "). Server may reject classic clients without it. "
+                                "Set WOWEE_INTEGRITY_DIR to your client folder.");
+                }
+            }
         }
     }
 
@@ -534,7 +639,8 @@ void AuthHandler::handlePacket(network::Packet& packet) {
                            << static_cast<int>(clientInfo.minorVersion) << "."
                            << static_cast<int>(clientInfo.patchVersion)
                            << " build " << clientInfo.build
-                           << ", auth protocol " << static_cast<int>(clientInfo.protocolVersion) << ")";
+                           << ", logon protocol " << static_cast<int>(clientInfo.logonProtocolVersion)
+                           << ", realm/proof protocol " << static_cast<int>(clientInfo.protocolVersion) << ")";
                     } else {
                         ss << ": " << getAuthResultString(response.result)
                            << " (code 0x" << std::hex << std::setw(2) << std::setfill('0')
