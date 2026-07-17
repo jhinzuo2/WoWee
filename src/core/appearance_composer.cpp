@@ -55,12 +55,12 @@ glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
         // important: rotating around X cannot change an X-aligned blade.
         // The final innermost roll spins the blade about its own long axis so
         // the flat rests against the back instead of the sharp edge.
-        // All values live-tunable via /sheathtune.
-        const auto& st = AppearanceComposer::sheathTuning();
-        transform = glm::translate(transform, glm::vec3(st.tx, st.ty, st.tz));
-        transform = glm::rotate(transform, glm::radians(st.cantDeg), glm::vec3(1, 0, 0));
+        // Values tuned against the live attachment frame. Its Z axis moves the
+        // weapon laterally rather than vertically.
+        transform = glm::translate(transform, glm::vec3(-0.03f, -0.10f, 0.0f));
+        transform = glm::rotate(transform, glm::radians(33.0f), glm::vec3(1, 0, 0));
         transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(0, 1, 0));
-        transform = glm::rotate(transform, glm::radians(st.rollDeg), glm::vec3(1, 0, 0));
+        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(1, 0, 0));
     } else {
         // Hip-sheathed one-handers have the same X-aligned long axis. Rotate it
         // onto -Z so the blade points down alongside the leg.
@@ -70,11 +70,6 @@ glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
 }
 
 } // namespace
-
-AppearanceComposer::SheathTuning& AppearanceComposer::sheathTuning() {
-    static SheathTuning tuning;
-    return tuning;
-}
 
 AppearanceComposer::AppearanceComposer(rendering::Renderer* renderer,
                                        pipeline::AssetManager* assetManager,

@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
+#include <chrono>
 #include <optional>
 #include <future>
 #include <mutex>
@@ -104,8 +105,10 @@ public:
     std::string getGameObjectModelPathForDisplayId(uint32_t displayId) const;
     audio::VoiceType detectVoiceTypeFromDisplayId(uint32_t displayId) const;
 
-    // Weapon attachment for NPC virtual weapons
-    bool tryAttachCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId);
+    // Attempts one deferred attachment and owns retry bookkeeping. Returns true
+    // only when this call consumed the caller's per-frame attachment budget.
+    bool retryCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId,
+                                     uint8_t maxAttempts);
 
     // Mount
     void setMountDisplayId(uint32_t displayId) { pendingMountDisplayId_ = displayId; }
@@ -155,8 +158,6 @@ public:
     std::unordered_map<uint64_t, bool>& getCreatureWalkingState() { return creatureWalkingState_; }
     std::unordered_map<uint64_t, bool>& getCreatureFlyingState() { return creatureFlyingState_; }
     std::unordered_map<uint64_t, uint32_t>& getCreatureActiveEmotes() { return creatureActiveEmotes_; }
-    std::unordered_set<uint64_t>& getCreatureWeaponsAttached() { return creatureWeaponsAttached_; }
-    std::unordered_map<uint64_t, uint8_t>& getCreatureWeaponAttachAttempts() { return creatureWeaponAttachAttempts_; }
     std::unordered_map<uint32_t, bool>& getModelIdIsWolfLike() { return modelIdIsWolfLike_; }
 
     // Player instance accessors (for movement sync in Application::update)
@@ -217,6 +218,7 @@ private:
     // CharFacialHairStyles.dbc: key = (raceId<<16)|(sexId<<8)|variationId → {geoset100, geoset300, geoset200}
     std::unordered_map<uint32_t, FacialHairGeosets> facialHairGeosetMap_;
     bool creatureLookupsBuilt_ = false;
+    bool tryAttachCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId);
 
     // CharSections.dbc lookup cache
     std::unordered_map<uint64_t, std::string> charSectionsCache_;
@@ -324,9 +326,10 @@ private:
     std::deque<PendingCreatureSpawn> pendingCreatureSpawns_;
     static constexpr int MAX_SPAWNS_PER_FRAME = 3;
     static constexpr int MAX_NEW_CREATURE_MODELS_PER_FRAME = 1;
-    static constexpr uint16_t MAX_CREATURE_SPAWN_RETRIES = 300;
+    static constexpr auto CREATURE_SPAWN_RETRY_WINDOW = std::chrono::seconds(5);
     std::unordered_set<uint64_t> pendingCreatureSpawnGuids_;
-    std::unordered_map<uint64_t, uint16_t> creatureSpawnRetryCounts_;
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point>
+        creatureSpawnRetryDeadlines_;
     std::unordered_set<uint32_t> nonRenderableCreatureDisplayIds_;
     std::unordered_set<uint64_t> creaturePermanentFailureGuids_;
     void processCreatureSpawnQueue(bool unlimited = false);

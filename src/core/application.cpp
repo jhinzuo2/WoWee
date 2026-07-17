@@ -1946,8 +1946,6 @@ void Application::update(float deltaTime) {
                 }
                 const float syncRadiusSq = 320.0f * 320.0f;
                 auto& _creatureInstances = entitySpawner_->getCreatureInstances();
-                auto& _creatureWeaponsAttached = entitySpawner_->getCreatureWeaponsAttached();
-                auto& _creatureWeaponAttachAttempts = entitySpawner_->getCreatureWeaponAttachAttempts();
                 auto& _creatureModelIds = entitySpawner_->getCreatureModelIds();
                 auto& _modelIdIsWolfLike = entitySpawner_->getModelIdIsWolfLike();
                 auto& _creatureRenderPosCache = entitySpawner_->getCreatureRenderPosCache();
@@ -1964,19 +1962,9 @@ void Application::update(float deltaTime) {
                     if (!entity || entity->getType() != game::ObjectType::UNIT) continue;
 
                     if (npcWeaponRetryTick &&
-                        weaponAttachesThisTick < EntitySpawner::MAX_WEAPON_ATTACHES_PER_TICK &&
-                        !_creatureWeaponsAttached.count(guid)) {
-                        uint8_t attempts = 0;
-                        auto itAttempts = _creatureWeaponAttachAttempts.find(guid);
-                        if (itAttempts != _creatureWeaponAttachAttempts.end()) attempts = itAttempts->second;
-                        if (attempts < 30) {
+                        weaponAttachesThisTick < EntitySpawner::MAX_WEAPON_ATTACHES_PER_TICK) {
+                        if (entitySpawner_->retryCreatureVirtualWeapons(guid, instanceId, 30)) {
                             weaponAttachesThisTick++;
-                            if (entitySpawner_->tryAttachCreatureVirtualWeapons(guid, instanceId)) {
-                                _creatureWeaponsAttached.insert(guid);
-                                _creatureWeaponAttachAttempts.erase(guid);
-                            } else {
-                                _creatureWeaponAttachAttempts[guid] = static_cast<uint8_t>(attempts + 1);
-                            }
                         }
                     }
 

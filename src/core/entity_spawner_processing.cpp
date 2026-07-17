@@ -77,12 +77,12 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
             nonRenderableCreatureDisplayIds_.insert(result.displayId);
             creaturePermanentFailureGuids_.insert(result.guid);
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             continue;
         }
         if (!result.valid || !result.model) {
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             continue;
         }
 
@@ -90,7 +90,7 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
         // task was still running; in that case, skip duplicate GPU upload.
         if (displayIdModelCache_.find(result.displayId) != displayIdModelCache_.end()) {
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             if (!creatureInstances_.count(result.guid) &&
                 !creaturePermanentFailureGuids_.count(result.guid)) {
                 PendingCreatureSpawn s{};
@@ -112,7 +112,7 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
             // Re-queue this result — it needs a GPU upload but we're at budget.
             // Push a new pending spawn so it's retried next frame.
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             PendingCreatureSpawn s{};
             s.guid = result.guid;
             s.displayId = result.displayId;
@@ -144,7 +144,7 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
             nonRenderableCreatureDisplayIds_.insert(result.displayId);
             creaturePermanentFailureGuids_.insert(result.guid);
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             continue;
         }
         charRenderer->setPredecodedBLPCache(nullptr);
@@ -162,7 +162,7 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
         }
         displayIdModelCache_[result.displayId] = result.modelId;
         pendingCreatureSpawnGuids_.erase(result.guid);
-        creatureSpawnRetryCounts_.erase(result.guid);
+        creatureSpawnRetryDeadlines_.erase(result.guid);
 
         // Re-queue as a normal pending spawn — model is now cached, so sync spawn is fast
         // (only creates instance + applies textures, no file I/O).
@@ -312,7 +312,7 @@ void EntitySpawner::processCreatureSpawnQueue(bool unlimited) {
 
         if (nonRenderableCreatureDisplayIds_.count(s.displayId)) {
             pendingCreatureSpawnGuids_.erase(s.guid);
-            creatureSpawnRetryCounts_.erase(s.guid);
+            creatureSpawnRetryDeadlines_.erase(s.guid);
             processed++;
             rotationsLeft = pendingCreatureSpawns_.size();
             continue;
@@ -343,7 +343,7 @@ void EntitySpawner::processCreatureSpawnQueue(bool unlimited) {
                 nonRenderableCreatureDisplayIds_.insert(s.displayId);
                 creaturePermanentFailureGuids_.insert(s.guid);
                 pendingCreatureSpawnGuids_.erase(s.guid);
-                creatureSpawnRetryCounts_.erase(s.guid);
+                creatureSpawnRetryDeadlines_.erase(s.guid);
                 processed++;
                 rotationsLeft = pendingCreatureSpawns_.size();
                 continue;
@@ -606,29 +606,28 @@ void EntitySpawner::processCreatureSpawnQueue(bool unlimited) {
         }
         pendingCreatureSpawnGuids_.erase(s.guid);
 
-        // If spawn still failed, retry for a limited number of frames.
+        // If spawn still failed, retry for a bounded wall-clock window. A frame
+        // count made the timeout vary wildly with refresh rate and load stalls.
         if (!creatureInstances_.count(s.guid)) {
             if (creaturePermanentFailureGuids_.erase(s.guid) > 0) {
-                creatureSpawnRetryCounts_.erase(s.guid);
+                creatureSpawnRetryDeadlines_.erase(s.guid);
                 processed++;
                 continue;
             }
-            uint16_t retries = 0;
-            auto it = creatureSpawnRetryCounts_.find(s.guid);
-            if (it != creatureSpawnRetryCounts_.end()) {
-                retries = it->second;
-            }
-            if (retries < MAX_CREATURE_SPAWN_RETRIES) {
-                creatureSpawnRetryCounts_[s.guid] = static_cast<uint16_t>(retries + 1);
+            const auto now = std::chrono::steady_clock::now();
+            const auto deadlineIt = creatureSpawnRetryDeadlines_.try_emplace(
+                s.guid, now + CREATURE_SPAWN_RETRY_WINDOW).first;
+            if (now < deadlineIt->second) {
                 pendingCreatureSpawns_.push_back(s);
                 pendingCreatureSpawnGuids_.insert(s.guid);
             } else {
-                creatureSpawnRetryCounts_.erase(s.guid);
-                LOG_WARNING("Dropping creature spawn after retries: guid=0x", std::hex, s.guid, std::dec,
+                creatureSpawnRetryDeadlines_.erase(s.guid);
+                LOG_WARNING("Dropping creature spawn after retry window: guid=0x",
+                            std::hex, s.guid, std::dec,
                             " displayId=", s.displayId);
             }
         } else {
-            creatureSpawnRetryCounts_.erase(s.guid);
+            creatureSpawnRetryDeadlines_.erase(s.guid);
         }
         rotationsLeft = pendingCreatureSpawns_.size();
         processed++;
@@ -1594,7 +1593,7 @@ void EntitySpawner::despawnCreature(uint64_t guid) {
     pendingCreatureSpawnGuids_.erase(guid);
     requestedCreatureDisplayIds_.erase(guid);
     creatureActiveEmotes_.erase(guid);
-    creatureSpawnRetryCounts_.erase(guid);
+    creatureSpawnRetryDeadlines_.erase(guid);
     creaturePermanentFailureGuids_.erase(guid);
     deadCreatureGuids_.erase(guid);
 

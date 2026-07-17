@@ -291,7 +291,7 @@ void EntitySpawner::clearAllQueues() {
     pendingCreatureSpawns_.clear();
     pendingCreatureSpawnGuids_.clear();
     requestedCreatureDisplayIds_.clear();
-    creatureSpawnRetryCounts_.clear();
+    creatureSpawnRetryDeadlines_.clear();
     creaturePermanentFailureGuids_.clear();
     deadCreatureGuids_.clear();
     pendingPlayerSpawns_.clear();
@@ -483,6 +483,23 @@ bool EntitySpawner::tryAttachCreatureVirtualWeapons(uint64_t guid, uint32_t inst
     charRenderer->detachWeapon(instanceId, 2);
     // Success if main-hand attached when there was at least one candidate.
     return hadWeaponCandidate && attachedMain;
+}
+
+bool EntitySpawner::retryCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId,
+                                                uint8_t maxAttempts) {
+    if (creatureWeaponsAttached_.count(guid)) return false;
+    const auto attemptIt = creatureWeaponAttachAttempts_.find(guid);
+    const uint8_t attempts = attemptIt != creatureWeaponAttachAttempts_.end()
+        ? attemptIt->second : 0;
+    if (attempts >= maxAttempts) return false;
+
+    if (tryAttachCreatureVirtualWeapons(guid, instanceId)) {
+        creatureWeaponsAttached_.insert(guid);
+        creatureWeaponAttachAttempts_.erase(guid);
+    } else {
+        creatureWeaponAttachAttempts_[guid] = static_cast<uint8_t>(attempts + 1);
+    }
+    return true;
 }
 
 
