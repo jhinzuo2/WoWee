@@ -62,7 +62,7 @@ void PostProcessPipeline::manageResources() {
     // FXAA resource management — FXAA can coexist with FSR1 and FSR3.
     // When both FXAA and FSR3 are enabled, FXAA runs as a post-FSR3 pass.
     // Do not force this pass for ghost mode; keep AA quality strictly user-controlled.
-    const bool useFXAA = fxaa_.enabled;
+    const bool useFXAA = needsFXAAPass();
     if ((fxaa_.needsRecreate || !useFXAA) && fxaa_.sceneFramebuffer) {
         destroyFXAAResources();
         fxaa_.needsRecreate = false;
@@ -71,13 +71,14 @@ void PostProcessPipeline::manageResources() {
     if (useFXAA && !fxaa_.sceneFramebuffer) {
         if (!initFXAAResources()) {
             LOG_ERROR("FXAA: initialization failed, disabling");
-            fxaa_.enabled = false;
+            if (fxaa_.enabled) fxaa_.enabled = false;
+            intoxication_ = 0.0f;
         }
     }
 }
 
 void PostProcessPipeline::handleSwapchainResize() {
-    const bool useFXAA = fxaa_.enabled;
+    const bool useFXAA = needsFXAAPass();
     // Recreate FSR resources for new swapchain dimensions
     if (fsr_.enabled && !fsr2_.enabled) {
         destroyFSRResources();
@@ -128,7 +129,7 @@ void PostProcessPipeline::applyJitter(Camera* camera) {
 VkFramebuffer PostProcessPipeline::getSceneFramebuffer() const {
     if (fsr2_.enabled && fsr2_.sceneFramebuffer)
         return fsr2_.sceneFramebuffer;
-    if (fxaa_.enabled && fxaa_.sceneFramebuffer)
+    if (needsFXAAPass() && fxaa_.sceneFramebuffer)
         return fxaa_.sceneFramebuffer;
     if (fsr_.enabled && fsr_.sceneFramebuffer)
         return fsr_.sceneFramebuffer;
@@ -138,7 +139,7 @@ VkFramebuffer PostProcessPipeline::getSceneFramebuffer() const {
 VkExtent2D PostProcessPipeline::getSceneRenderExtent() const {
     if (fsr2_.enabled && fsr2_.sceneFramebuffer)
         return { fsr2_.internalWidth, fsr2_.internalHeight };
-    if (fxaa_.enabled && fxaa_.sceneFramebuffer)
+    if (needsFXAAPass() && fxaa_.sceneFramebuffer)
         return vkCtx_->getSwapchainExtent();  // native resolution — no downscaling
     if (fsr_.enabled && fsr_.sceneFramebuffer)
         return { fsr_.internalWidth, fsr_.internalHeight };
@@ -147,7 +148,7 @@ VkExtent2D PostProcessPipeline::getSceneRenderExtent() const {
 
 bool PostProcessPipeline::hasActivePostProcess() const {
     return (fsr2_.enabled && fsr2_.sceneFramebuffer)
-        || (fxaa_.enabled && fxaa_.sceneFramebuffer)
+        || (needsFXAAPass() && fxaa_.sceneFramebuffer)
         || (fsr_.enabled && fsr_.sceneFramebuffer);
 }
 
@@ -200,7 +201,7 @@ bool PostProcessPipeline::executePostProcessing(VkCommandBuffer cmd, uint32_t im
         // This must happen outside the render pass (descriptor updates are CPU-side).
         // Use per-frame descriptor set to avoid race with in-flight command buffers.
         uint32_t fxaaFrameIdx = vkCtx_->getCurrentFrame();
-        if (fxaa_.enabled && fxaa_.descSet[fxaaFrameIdx] && fxaa_.sceneSampler) {
+        if (needsFXAAPass() && fxaa_.descSet[fxaaFrameIdx] && fxaa_.sceneSampler) {
             VkImageView fsr3OutputView = VK_NULL_HANDLE;
             if (fsr2_.useAmdBackend) {
                 if (fsr2_.amdFsr3FramegenRuntimeActive && fsr2_.framegenOutput.image)
@@ -259,7 +260,7 @@ bool PostProcessPipeline::executePostProcessing(VkCommandBuffer cmd, uint32_t im
         // of RCAS sharpening. FXAA descriptor is temporarily pointed to the FSR3
         // history buffer (which is already in SHADER_READ_ONLY_OPTIMAL). This gives
         // FSR3 temporal stability + FXAA spatial edge smoothing ("ultra quality native").
-        if (fxaa_.enabled && fxaa_.pipeline && fxaa_.descSet[fxaaFrameIdx]) {
+        if (needsFXAAPass() && fxaa_.pipeline && fxaa_.descSet[fxaaFrameIdx]) {
             renderFXAAPass();
         } else {
             // Draw RCAS sharpening from accumulated history buffer
@@ -268,7 +269,7 @@ bool PostProcessPipeline::executePostProcessing(VkCommandBuffer cmd, uint32_t im
 
         // Restore this frame's FXAA descriptor to its normal scene color source
         // so standalone FXAA frames are not affected by the FSR3 history pointer.
-        if (fxaa_.enabled && fxaa_.descSet[fxaaFrameIdx] && fxaa_.sceneSampler && fxaa_.sceneColor.imageView) {
+        if (needsFXAAPass() && fxaa_.descSet[fxaaFrameIdx] && fxaa_.sceneSampler && fxaa_.sceneColor.imageView) {
             VkDescriptorImageInfo restoreInfo{};
             restoreInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             restoreInfo.imageView   = fxaa_.sceneColor.imageView;
@@ -292,7 +293,7 @@ bool PostProcessPipeline::executePostProcessing(VkCommandBuffer cmd, uint32_t im
         }
         fsr2_.frameIndex = (fsr2_.frameIndex + 1) % 256;  // Wrap to keep Halton values well-distributed
 
-    } else if (fxaa_.enabled && fxaa_.sceneFramebuffer) {
+    } else if (needsFXAAPass() && fxaa_.sceneFramebuffer) {
         inlineMode = true;
         // End the off-screen scene render pass
         vkCmdEndRenderPass(currentCmd_);
@@ -1879,7 +1880,7 @@ void PostProcessPipeline::renderFXAAPass() {
         1.0f / static_cast<float>(ext.width),
         1.0f / static_cast<float>(ext.height),
         sharpness,
-        0.0f
+        intoxication_
     };
     vkCmdPushConstants(currentCmd_, fxaa_.pipelineLayout,
                        VK_SHADER_STAGE_FRAGMENT_BIT, 0, 16, pc);

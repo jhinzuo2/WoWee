@@ -191,17 +191,34 @@ static int lua_GetAddOnMetadata(lua_State* L) {
 // Returns: name, rank, icon, count, debuffType, duration, expirationTime, caster, isStealable, shouldConsolidate, spellId
 
 static int lua_GetLocale(lua_State* L) {
-    lua_pushstring(L, "enUS");
+    auto* svc = getLuaServices(L);
+    auto* profile = svc && svc->expansionRegistry
+        ? svc->expansionRegistry->getActive() : nullptr;
+    lua_pushstring(L, profile ? profile->locale.c_str() : "enUS");
     return 1;
 }
 
 static int lua_GetBuildInfo(lua_State* L) {
-    // Return WotLK defaults; expansion-specific version detection would need
-    // access to the expansion registry which isn't available here.
-    lua_pushstring(L, "3.3.5a");    // 1: version
-    lua_pushnumber(L, 12340);       // 2: buildNumber
-    lua_pushstring(L, "Jan 1 2025");// 3: date
-    lua_pushnumber(L, 30300);       // 4: tocVersion
+    auto* svc = getLuaServices(L);
+    auto* profile = svc && svc->expansionRegistry
+        ? svc->expansionRegistry->getActive() : nullptr;
+    if (!profile) {
+        lua_pushstring(L, "3.3.5a");
+        lua_pushnumber(L, 12340);
+        lua_pushstring(L, "");
+        lua_pushnumber(L, 30300);
+        return 4;
+    }
+
+    const std::string version = profile->versionString();
+    uint32_t tocVersion = 11200;
+    if (profile->majorVersion == 2) tocVersion = 20400;
+    else if (profile->majorVersion >= 3) tocVersion = 30300;
+
+    lua_pushstring(L, version.c_str());
+    lua_pushnumber(L, profile->build);
+    lua_pushstring(L, "");
+    lua_pushnumber(L, tocVersion);
     return 4;
 }
 

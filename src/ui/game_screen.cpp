@@ -56,20 +56,8 @@ namespace {
     using namespace wowee::ui::colors;
     using namespace wowee::ui::helpers;
     constexpr auto& kColorRed        = kRed;
-    constexpr auto& kColorGreen      = kGreen;
     constexpr auto& kColorBrightGreen= kBrightGreen;
     constexpr auto& kColorYellow     = kYellow;
-    constexpr auto& kColorGray       = kGray;
-    constexpr auto& kColorDarkGray   = kDarkGray;
-
-    // Abbreviated month names (indexed 0-11)
-    constexpr const char* kMonthAbbrev[12] = {
-        "Jan","Feb","Mar","Apr","May","Jun",
-        "Jul","Aug","Sep","Oct","Nov","Dec"
-    };
-
-    // Common ImGui window flags for popup dialogs
-    const ImGuiWindowFlags kDialogFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
 
     bool raySphereIntersect(const wowee::rendering::Ray& ray, const glm::vec3& center, float radius, float& tOut) {
         glm::vec3 oc = ray.origin - center;
@@ -134,6 +122,17 @@ GameScreen::GameScreen() {
 // Set UI services and propagate to child components
 void GameScreen::setServices(const UIServices& services) {
     services_ = services;
+    // Settings are loaded by the constructor before services are injected.
+    // Apply the saved display pacing as soon as the actual window is available.
+    if (services_.window &&
+        services_.window->isVsyncEnabled() != settingsPanel_.pendingVsync) {
+        services_.window->setVsync(settingsPanel_.pendingVsync);
+    }
+    if (services_.window && settingsPanel_.displaySettingsLoaded_) {
+        services_.window->setFullscreen(settingsPanel_.pendingFullscreen);
+        services_.window->applyResolution(settingsPanel_.pendingResolutionWidth,
+                                          settingsPanel_.pendingResolutionHeight);
+    }
     // Update legacy pointer for compatibility
     appearanceComposer_ = services.appearanceComposer;
     // Propagate to child panels
@@ -145,6 +144,22 @@ void GameScreen::setServices(const UIServices& services) {
     socialPanel_.setServices(services);
     actionBarPanel_.setServices(services);
     windowManager_.setServices(services);
+    applyCameraControlSettings();
+}
+
+void GameScreen::applyCameraControlSettings() {
+    auto* renderer = services_.renderer;
+    if (!renderer) return;
+
+    if (auto* cam = renderer->getCameraController()) {
+        cam->setMouseSensitivity(settingsPanel_.pendingMouseSensitivity);
+        cam->setInvertMouse(settingsPanel_.pendingInvertMouse);
+        cam->setExtendedZoom(settingsPanel_.pendingExtendedZoom);
+        cam->setCameraSmoothSpeed(settingsPanel_.pendingCameraStiffness);
+        cam->setPivotHeight(settingsPanel_.pendingPivotHeight);
+        cam->setIdleOrbitEnabled(settingsPanel_.pendingIdleCameraOrbit);
+        cam->setSmoothCameraFollow(settingsPanel_.pendingSmoothCameraFollow);
+    }
 }
 
 void GameScreen::render(game::GameHandler& gameHandler) {
@@ -224,6 +239,21 @@ void GameScreen::render(game::GameHandler& gameHandler) {
         }
     }
 
+    // Settings are loaded before renderer services are injected. Apply the
+    // saved lighting state once the renderer exists so opening the settings
+    // window cannot become the first operation that changes scene lighting.
+    if (!settingsPanel_.lightingSettingsApplied_) {
+        if (auto* renderer = services_.renderer) {
+            renderer->setShadowsEnabled(settingsPanel_.pendingShadows);
+            renderer->setShadowDistance(settingsPanel_.pendingShadowDistance);
+            renderer->setViewDistance(settingsPanel_.pendingViewDistance);
+            if (auto* post = renderer->getPostProcessPipeline()) {
+                post->setBrightness(static_cast<float>(settingsPanel_.pendingBrightness) / 50.0f);
+            }
+            settingsPanel_.lightingSettingsApplied_ = true;
+        }
+    }
+
     // Apply saved volume settings once when audio managers first become available
     if (!settingsPanel_.volumeSettingsApplied_) {
         auto* ac = services_.audioCoordinator;
@@ -290,6 +320,18 @@ void GameScreen::render(game::GameHandler& gameHandler) {
     if (!settingsPanel_.fsrSettingsApplied_) {
         auto* renderer = services_.renderer;
         if (renderer) {
+#ifdef __APPLE__
+            // FidelityFX and AMD frame generation are unsupported through the
+            // macOS MoltenVK path. Old settings files must not silently retain
+            // either feature after the controls are hidden.
+            settingsPanel_.pendingUpscalingMode = 0;
+            settingsPanel_.pendingFSR = false;
+            settingsPanel_.pendingAMDFramegen = false;
+            renderer->getPostProcessPipeline()->setAmdFsr3FramegenEnabled(false);
+            renderer->setFSREnabled(false);
+            renderer->setFSR2Enabled(false);
+            settingsPanel_.fsrSettingsApplied_ = true;
+#else
             static constexpr float fsrScales[] = { 0.77f, 0.67f, 0.59f, 1.00f };
             settingsPanel_.pendingFSRQuality = std::clamp(settingsPanel_.pendingFSRQuality, 0, 3);
             renderer->getPostProcessPipeline()->setFSRQuality(fsrScales[settingsPanel_.pendingFSRQuality]);
@@ -308,6 +350,7 @@ void GameScreen::render(game::GameHandler& gameHandler) {
                 renderer->setFSR2Enabled(effectiveMode == 2);
                 settingsPanel_.fsrSettingsApplied_ = true;
             }
+#endif
         }
     }
 
@@ -367,6 +410,8 @@ void GameScreen::render(game::GameHandler& gameHandler) {
         chatPanel_.getSpellIcon = [this](uint32_t id, pipeline::AssetManager* am) {
             return getSpellIcon(id, am);
         };
+        if (!chatPanel_.saveSettingsFn)
+            chatPanel_.saveSettingsFn = [this]() { saveSettings(); };
         chatPanel_.render(gameHandler, inventoryScreen, spellbookScreen, questLogScreen);
         // Process slash commands that affect GameScreen state
         auto cmds = chatPanel_.consumeSlashCommands();
@@ -385,7 +430,9 @@ void GameScreen::render(game::GameHandler& gameHandler) {
         [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); });
     actionBarPanel_.renderStanceBar(gameHandler, settingsPanel_, spellbookScreen,
         [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); });
-    actionBarPanel_.renderBagBar(gameHandler, settingsPanel_, inventoryScreen);
+    if (actionBarPanel_.renderBagBar(gameHandler, settingsPanel_, inventoryScreen))
+        saveSettings();
+    renderMicroMenu(gameHandler);
     actionBarPanel_.renderXpBar(gameHandler, settingsPanel_);
     actionBarPanel_.renderRepBar(gameHandler, settingsPanel_);
     auto spellIconFn = [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); };
@@ -408,7 +455,7 @@ void GameScreen::render(game::GameHandler& gameHandler) {
     dialogManager_.renderDialogs(gameHandler, inventoryScreen, chatPanel_);
     socialPanel_.renderGuildRoster(gameHandler, chatPanel_);
     socialPanel_.renderSocialFrame(gameHandler, chatPanel_);
-    combatUI_.renderBuffBar(gameHandler, spellbookScreen, spellIconFn);
+    combatUI_.renderBuffBar(gameHandler, spellbookScreen, inventoryScreen, settingsPanel_, spellIconFn);
     windowManager_.renderLootWindow(gameHandler, inventoryScreen, chatPanel_);
     windowManager_.renderGossipWindow(gameHandler, chatPanel_);
     windowManager_.renderQuestDetailsWindow(gameHandler, chatPanel_, inventoryScreen);
@@ -416,7 +463,11 @@ void GameScreen::render(game::GameHandler& gameHandler) {
     windowManager_.renderQuestOfferRewardWindow(gameHandler, chatPanel_, inventoryScreen);
     windowManager_.renderVendorWindow(gameHandler, inventoryScreen, chatPanel_);
     windowManager_.renderTrainerWindow(gameHandler,
-        [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); });
+        [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); },
+        inventoryScreen);
+    windowManager_.renderCraftingWindow(gameHandler,
+        [this](uint32_t id, pipeline::AssetManager* am) { return getSpellIcon(id, am); },
+        inventoryScreen);
     windowManager_.renderBarberShopWindow(gameHandler);
     windowManager_.renderStableWindow(gameHandler);
     windowManager_.renderTaxiWindow(gameHandler);
@@ -512,6 +563,9 @@ void GameScreen::render(game::GameHandler& gameHandler) {
 
     // Character screen (C key toggle handled inside render())
     inventoryScreen.renderCharacterScreen(gameHandler);
+
+    // Item-target cursor (sharpening stone / oil awaiting the item it applies to)
+    inventoryScreen.renderItemTargetCursor();
 
     // Insert item link into chat if player shift-clicked any inventory/equipment slot
     {
@@ -667,6 +721,7 @@ void GameScreen::render(game::GameHandler& gameHandler) {
 
     // Screen edge damage flash — red vignette that fires on HP decrease
     {
+        const bool deadOrGhost = gameHandler.isPlayerDead() || gameHandler.isPlayerGhost();
         auto playerEntity = gameHandler.getEntityManager().getEntity(gameHandler.getPlayerGuid());
         uint32_t currentHp = 0;
         if (playerEntity && (playerEntity->getType() == game::ObjectType::PLAYER ||
@@ -677,9 +732,17 @@ void GameScreen::render(game::GameHandler& gameHandler) {
         }
 
         // Detect HP drop (ignore transitions from 0 — entity just spawned or uninitialized)
-        if (settingsPanel_.damageFlashEnabled_ && lastPlayerHp_ > 0 && currentHp < lastPlayerHp_ && currentHp > 0)
+        if (!deadOrGhost && settingsPanel_.damageFlashEnabled_ &&
+            lastPlayerHp_ > 0 && currentHp < lastPlayerHp_ && currentHp > 0) {
             damageFlashAlpha_ = 1.0f;
+        }
         lastPlayerHp_ = currentHp;
+
+        // Spirit release can leave a low/non-zero health value on the local
+        // entity. Never carry a pre-death damage flash into ghost form.
+        if (deadOrGhost) {
+            damageFlashAlpha_ = 0.0f;
+        }
 
         // Fade out over ~0.5 seconds
         if (damageFlashAlpha_ > 0.0f) {
@@ -693,9 +756,9 @@ void GameScreen::render(game::GameHandler& gameHandler) {
     // Persistent low-health vignette — pulsing red edges when HP < 20%
     {
         auto playerEntity = gameHandler.getEntityManager().getEntity(gameHandler.getPlayerGuid());
-        bool isDead = gameHandler.isPlayerDead();
+        const bool deadOrGhost = gameHandler.isPlayerDead() || gameHandler.isPlayerGhost();
         float hpPct = 1.0f;
-        if (!isDead && playerEntity &&
+        if (!deadOrGhost && playerEntity &&
             (playerEntity->getType() == game::ObjectType::PLAYER ||
              playerEntity->getType() == game::ObjectType::UNIT)) {
             auto unit = std::static_pointer_cast<game::Unit>(playerEntity);
@@ -704,7 +767,8 @@ void GameScreen::render(game::GameHandler& gameHandler) {
         }
 
         // Only show when alive and below 20% HP; intensity increases as HP drops
-        if (settingsPanel_.lowHealthVignetteEnabled_ && !isDead && hpPct < 0.20f && hpPct > 0.0f) {
+        if (settingsPanel_.lowHealthVignetteEnabled_ && !deadOrGhost &&
+            hpPct < 0.20f && hpPct > 0.0f) {
             // Base intensity from HP deficit (0 at 20%, 1 at 0%); pulse at ~1.5 Hz
             float danger = (0.20f - hpPct) / 0.20f;
             float pulse  = 0.55f + 0.45f * std::sin(static_cast<float>(ImGui::GetTime()) * 9.4f);
@@ -739,6 +803,89 @@ void GameScreen::render(game::GameHandler& gameHandler) {
 
     // Restore previous alpha
     ImGui::GetStyle().Alpha = prevAlpha;
+}
+
+void GameScreen::renderMicroMenu(game::GameHandler& gameHandler) {
+    if (!settingsPanel_.pendingShowMicroMenu) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+    constexpr float buttonSize = 28.0f;
+    constexpr float margin = 10.0f;
+    const float y = std::max(8.0f, io.DisplaySize.y - buttonSize - 18.0f);
+
+    ImGui::SetNextWindowPos(ImVec2(margin, y), ImGuiCond_Always);
+    ImGuiWindowFlags flags =
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_AlwaysAutoResize;
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(4.0f, 4.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(2.0f, 0.0f));
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, IM_COL32(8, 8, 12, 145));
+    ImGui::PushStyleColor(ImGuiCol_Border, IM_COL32(120, 130, 165, 90));
+
+    if (ImGui::Begin("##MicroMenu", nullptr, flags)) {
+        auto button = [&](const char* label, const char* tooltip, bool active) {
+            if (active) {
+                ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(64, 82, 132, 210));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(82, 102, 160, 230));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, IM_COL32(98, 120, 180, 245));
+            }
+            const bool clicked = ImGui::Button(label, ImVec2(buttonSize, buttonSize));
+            if (active) ImGui::PopStyleColor(3);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tooltip);
+            return clicked;
+        };
+
+        if (button("C##MicroCharacter", "Character", inventoryScreen.isCharacterOpen())) {
+            const bool wasOpen = inventoryScreen.isCharacterOpen();
+            inventoryScreen.toggleCharacter();
+            if (!wasOpen && gameHandler.isConnected()) gameHandler.requestPlayedTime();
+        }
+        ImGui::SameLine();
+        if (button("B##MicroBags", "Backpack", inventoryScreen.isBackpackOpen())) {
+            inventoryScreen.toggleBackpack();
+        }
+        ImGui::SameLine();
+        if (button("P##MicroSpellbook", "Spellbook", spellbookScreen.isOpen())) {
+            spellbookScreen.toggle();
+        }
+        ImGui::SameLine();
+        if (button("N##MicroTalents", "Talents", talentScreen.isOpen())) {
+            talentScreen.toggle();
+        }
+        ImGui::SameLine();
+        if (button("L##MicroQuests", "Quest Log", questLogScreen.isOpen())) {
+            questLogScreen.toggle();
+        }
+        ImGui::SameLine();
+        if (button("K##MicroSkills", "Skills", windowManager_.showSkillsWindow_)) {
+            windowManager_.showSkillsWindow_ = !windowManager_.showSkillsWindow_;
+        }
+        ImGui::SameLine();
+        if (button("O##MicroSocial", "Social", socialPanel_.showSocialFrame_)) {
+            socialPanel_.showSocialFrame_ = !socialPanel_.showSocialFrame_;
+        }
+        ImGui::SameLine();
+        if (button("G##MicroGroup", "Party/Raid Frames", socialPanel_.showRaidFrames_)) {
+            socialPanel_.showRaidFrames_ = !socialPanel_.showRaidFrames_;
+        }
+        ImGui::SameLine();
+        if (button("M##MicroMap", "World Map", showWorldMap_)) {
+            showWorldMap_ = !showWorldMap_;
+        }
+        ImGui::SameLine();
+        if (button("*##MicroSettings", "Settings", settingsPanel_.showSettingsWindow)) {
+            settingsPanel_.showSettingsWindow = !settingsPanel_.showSettingsWindow;
+        }
+    }
+
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
 }
 
 void GameScreen::renderPlayerInfo(game::GameHandler& gameHandler) {
@@ -948,24 +1095,6 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                 gameHandler.closeQuestRequestItems();
             } else if (gameHandler.isTradeOpen()) {
                 gameHandler.cancelTrade();
-            } else if (socialPanel_.showWhoWindow_) {
-                socialPanel_.showWhoWindow_ = false;
-            } else if (combatUI_.showCombatLog_) {
-                combatUI_.showCombatLog_ = false;
-            } else if (socialPanel_.showSocialFrame_) {
-                socialPanel_.showSocialFrame_ = false;
-            } else if (talentScreen.isOpen()) {
-                talentScreen.setOpen(false);
-            } else if (spellbookScreen.isOpen()) {
-                spellbookScreen.setOpen(false);
-            } else if (questLogScreen.isOpen()) {
-                questLogScreen.setOpen(false);
-            } else if (inventoryScreen.isCharacterOpen()) {
-                inventoryScreen.toggleCharacter();
-            } else if (inventoryScreen.isOpen()) {
-                inventoryScreen.setOpen(false);
-            } else if (showWorldMap_) {
-                showWorldMap_ = false;
             } else {
                 windowManager_.showEscapeMenu = true;
             }
@@ -1065,7 +1194,9 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
 
             for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
                 if (!ctrlDown && input.isKeyJustPressed(actionBarKeys[i])) {
-                    int slotIdx = shiftDown ? (game::GameHandler::SLOTS_PER_BAR + i) : i;
+                    int slotIdx = shiftDown
+                        ? ActionBarPanel::actionSlotForPage(ActionBarPanel::kBottomLeftActionPage, i)
+                        : ActionBarPanel::actionSlotForPage(actionBarPanel_.getMainActionBarPage(), i);
                     if (bar[slotIdx].type == game::ActionBarSlot::SPELL && bar[slotIdx].isReady()) {
                         uint64_t target = gameHandler.hasTarget() ? gameHandler.getTargetGuid() : 0;
                         gameHandler.castSpell(bar[slotIdx].id, target);
@@ -1107,7 +1238,9 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                     hitCenter = core::coords::canonicalToRender(glm::vec3(entity->getX(), entity->getY(), entity->getZ()));
                     hitCenter.z += isGo ? 1.2f : 1.0f;
                 } else {
-                    hitRadius = std::max(hitRadius * 1.25f, 1.0f);
+                    // Resource nodes can have very tight render bounds; keep
+                    // their click target close to the no-bounds fallback.
+                    hitRadius = std::max(hitRadius * 1.25f, isGo ? 2.5f : 1.0f);
                 }
 
                 float hitT;
@@ -1148,6 +1281,27 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
 
                 rendering::Ray ray = camera->screenToWorldRay(leftClickPressPos_.x, leftClickPressPos_.y, screenW, screenH);
 
+                // Use the same authoritative position and forgiving click volume
+                // as right-click for a hooked bobber. Its tiny, partly submerged
+                // render bounds must not let a click fall through to a character.
+                const uint64_t hookedBobber = gameHandler.getHookedFishingBobberGuid();
+                if (hookedBobber != 0) {
+                    auto bobber = gameHandler.getEntityManager().getEntity(hookedBobber);
+                    if (bobber && bobber->getType() == game::ObjectType::GAMEOBJECT) {
+                        glm::vec3 bobberCenter = core::coords::canonicalToRender(
+                            glm::vec3(bobber->getX(), bobber->getY(), bobber->getZ()));
+                        bobberCenter.z += 0.35f;
+                        float hitT = 0.0f;
+                        constexpr float kFishingBobberClickRadius = 4.0f;
+                        if (raySphereIntersect(ray, bobberCenter, kFishingBobberClickRadius, hitT)) {
+                            LOG_WARNING("Fishing bobber direct left click: guid=0x", std::hex,
+                                        hookedBobber, std::dec, " hitDistance=", hitT);
+                            gameHandler.interactWithGameObject(hookedBobber);
+                            return;
+                        }
+                    }
+                }
+
                 float closestT = 1e30f;
                 uint64_t closestGuid = 0;
                 float closestHostileUnitT = 1e30f;
@@ -1184,7 +1338,9 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                         hitCenter = core::coords::canonicalToRender(glm::vec3(entity->getX(), entity->getY(), entity->getZ()));
                         hitCenter.z += heightOffset;
                     } else {
-                        hitRadius = std::max(hitRadius * 1.25f, 1.0f);
+                        hitRadius = std::max(
+                            hitRadius * 1.25f,
+                            t == game::ObjectType::GAMEOBJECT ? 2.5f : 1.0f);
                     }
 
                     float hitT;
@@ -1210,7 +1366,11 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                 }
 
                 if (closestGuid != 0) {
-                    gameHandler.setTarget(closestGuid);
+                    if (closestGuid == gameHandler.getHookedFishingBobberGuid()) {
+                        gameHandler.interactWithGameObject(closestGuid);
+                    } else {
+                        gameHandler.setTarget(closestGuid);
+                    }
                 } else {
                     // Clicked empty space — deselect current target
                     gameHandler.clearTarget();
@@ -1222,6 +1382,36 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
     // Right-click: select NPC (if needed) then interact / loot / auto-attack
     // Suppress when left button is held (both-button run)
     if (!io.WantCaptureMouse && input.isMouseButtonJustPressed(SDL_BUTTON_RIGHT) && !input.isMouseButtonPressed(SDL_BUTTON_LEFT)) {
+        // Fishing bobbers are tiny and partly submerged, so their model bounds can
+        // miss a cursor ray that visibly lands on the float. Test the authoritative
+        // water position first with a forgiving sphere and reel directly, before
+        // normal unit targeting can fall through to the player/self target.
+        const uint64_t hookedBobber = gameHandler.getHookedFishingBobberGuid();
+        if (hookedBobber != 0) {
+            auto bobber = gameHandler.getEntityManager().getEntity(hookedBobber);
+            auto* renderer = services_.renderer;
+            auto* camera = renderer ? renderer->getCamera() : nullptr;
+            auto* window = services_.window;
+            if (bobber && bobber->getType() == game::ObjectType::GAMEOBJECT && camera && window) {
+                const glm::vec2 mousePos = input.getMousePosition();
+                const rendering::Ray ray = camera->screenToWorldRay(
+                    mousePos.x, mousePos.y,
+                    static_cast<float>(window->getWidth()),
+                    static_cast<float>(window->getHeight()));
+                glm::vec3 bobberCenter = core::coords::canonicalToRender(
+                    glm::vec3(bobber->getX(), bobber->getY(), bobber->getZ()));
+                bobberCenter.z += 0.35f;
+                float hitT = 0.0f;
+                constexpr float kFishingBobberClickRadius = 4.0f;
+                if (raySphereIntersect(ray, bobberCenter, kFishingBobberClickRadius, hitT)) {
+                    LOG_WARNING("Fishing bobber direct click: guid=0x", std::hex,
+                                hookedBobber, std::dec, " hitDistance=", hitT);
+                    gameHandler.interactWithGameObject(hookedBobber);
+                    return;
+                }
+            }
+        }
+
         // If a gameobject is already targeted, prioritize interacting with that target
         // instead of re-picking under cursor (which can hit nearby decorative GOs).
         // Exclude chair-type GOs (type 7): otherwise any right-click (including the
@@ -1277,6 +1467,8 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                 uint64_t closestHostileUnitGuid = 0;
                 float closestQuestGoT = 1e30f;
                 uint64_t closestQuestGoGuid = 0;
+                float hookedBobberT = 1e30f;
+                uint64_t hookedBobberGuid = 0;
                 float closestGoT = 1e30f;
                 uint64_t closestGoGuid = 0;
                 const uint64_t myGuid = gameHandler.getPlayerGuid();
@@ -1327,7 +1519,9 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                             }
                         }
                     } else {
-                        hitRadius = std::max(hitRadius * 1.25f, 1.0f);
+                        hitRadius = std::max(
+                            hitRadius * 1.25f,
+                            t == game::ObjectType::GAMEOBJECT ? 2.5f : 1.0f);
                     }
 
                     float hitT;
@@ -1341,6 +1535,10 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                             }
                         }
                         if (t == game::ObjectType::GAMEOBJECT) {
+                            if (guid == gameHandler.getHookedFishingBobberGuid() && hitT < hookedBobberT) {
+                                hookedBobberT = hitT;
+                                hookedBobberGuid = guid;
+                            }
                             if (hitT < closestGoT) {
                                 closestGoT = hitT;
                                 closestGoGuid = guid;
@@ -1363,8 +1561,13 @@ void GameScreen::processTargetInput(game::GameHandler& gameHandler) {
                     }
                 }
 
-                // Priority: quest GO > closer of (GO, hostile unit) > closest anything.
-                if (closestQuestGoGuid != 0) {
+                // A hooked fishing bobber is time-sensitive and intentionally small:
+                // if its click sphere was hit, reel it rather than selecting an
+                // overlapping unit or decorative object.
+                if (hookedBobberGuid != 0) {
+                    closestGuid = hookedBobberGuid;
+                    closestType = game::ObjectType::GAMEOBJECT;
+                } else if (closestQuestGoGuid != 0) {
                     closestGuid = closestQuestGoGuid;
                     closestType = game::ObjectType::GAMEOBJECT;
                 } else if (closestGoGuid != 0 && closestHostileUnitGuid != 0) {

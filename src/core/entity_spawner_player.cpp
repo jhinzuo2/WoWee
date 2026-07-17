@@ -23,6 +23,8 @@
 #include <cctype>
 #include <sstream>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace wowee {
 namespace core {
@@ -32,7 +34,7 @@ namespace {
 // Each group's base is groupNumber * 100; variant 01 is typically bare/default.
 constexpr uint16_t kGeosetDefaultConnector = 101;   // Group  1: default hair connector
 constexpr uint16_t kGeosetBareForearms     = 401;   // Group  4: no gloves
-constexpr uint16_t kGeosetBareShins        = 503;   // Group  5: no boots
+constexpr uint16_t kGeosetBareShins        = 501;   // Group  5: no boots
 constexpr uint16_t kGeosetDefaultEars      = 702;   // Group  7: ears
 constexpr uint16_t kGeosetBareSleeves      = 801;   // Group  8: no chest armor sleeves
 constexpr uint16_t kGeosetDefaultKneepads  = 902;   // Group  9: kneepads
@@ -41,6 +43,20 @@ constexpr uint16_t kGeosetBarePants        = 1301;  // Group 13: no leggings
 constexpr uint16_t kGeosetNoCape           = 1501;  // Group 15: no cape
 constexpr uint16_t kGeosetWithCape         = 1502;  // Group 15: with cape
 constexpr uint16_t kGeosetBareFeet         = 2002;  // Group 20: bare feet
+
+uint16_t selectHairScalpGeoset(const std::unordered_map<uint32_t, uint16_t>& hairGeosets,
+                               uint8_t raceId,
+                               uint8_t genderId,
+                               uint8_t hairStyleId) {
+    const uint32_t key = (static_cast<uint32_t>(raceId) << 16) |
+                         (static_cast<uint32_t>(genderId) << 8) |
+                         static_cast<uint32_t>(hairStyleId);
+    auto it = hairGeosets.find(key);
+    if (it != hairGeosets.end() && it->second > 0) {
+        return it->second;
+    }
+    return 1;
+}
 } // namespace
 
 void EntitySpawner::spawnOnlinePlayer(uint64_t guid,
@@ -70,7 +86,16 @@ void EntitySpawner::spawnOnlinePlayer(uint64_t guid,
     auto itCache = playerModelCache_.find(cacheKey);
     if (itCache != playerModelCache_.end()) {
         modelId = itCache->second;
-    } else {
+        if (!charRenderer->getModelData(modelId)) {
+            LOG_WARNING("spawnOnlinePlayer: cached player model missing after world reload, reloading modelId=",
+                        modelId, " race=", static_cast<int>(raceId),
+                        " gender=", static_cast<int>(genderId));
+            playerTextureSlotsByModelId_.erase(modelId);
+            playerModelCache_.erase(itCache);
+            modelId = 0;
+        }
+    }
+    if (modelId == 0) {
         game::Race race = static_cast<game::Race>(raceId);
         game::Gender gender = (genderId == 1) ? game::Gender::FEMALE : game::Gender::MALE;
         std::string m2Path = game::getPlayerModelPath(race, gender);
@@ -292,23 +317,40 @@ void EntitySpawner::spawnOnlinePlayer(uint64_t guid,
         charRenderer->setTextureSlotOverride(instanceId, static_cast<uint16_t>(slots.underwear), underwearTex);
     }
 
-    // Geosets: body + hair/facial hair selections
+    // Geosets: body + selected hair/facial hair. Do not enable every group-0
+    // submesh; that activates all hair scalp variants at once.
     std::unordered_set<uint16_t> activeGeosets;
-    // Body parts (group 0: IDs 0-99, some models use up to 27)
-    for (uint16_t i = 0; i <= 99; i++) activeGeosets.insert(i);
-    activeGeosets.insert(static_cast<uint16_t>(100 + hairStyleId + 1));
-    activeGeosets.insert(static_cast<uint16_t>(200 + facialFeatures + 1));
+    const uint16_t selectedHairScalp = selectHairScalpGeoset(hairGeosetMap_, raceId, genderId, hairStyleId);
+    activeGeosets.insert(0);
+    activeGeosets.insert(selectedHairScalp);
+    const uint32_t facialKey = (static_cast<uint32_t>(raceId) << 16) |
+                               (static_cast<uint32_t>(genderId) << 8) |
+                               static_cast<uint32_t>(facialFeatures);
+    auto itFacial = facialHairGeosetMap_.find(facialKey);
+    if (itFacial != facialHairGeosetMap_.end()) {
+        activeGeosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(itFacial->second.geoset100, 1)));
+        activeGeosets.insert(static_cast<uint16_t>(200 + std::max<uint16_t>(itFacial->second.geoset200, 1)));
+        activeGeosets.insert(static_cast<uint16_t>(300 + std::max<uint16_t>(itFacial->second.geoset300, 1)));
+    } else {
+        activeGeosets.insert(101);
+        activeGeosets.insert(201);
+        activeGeosets.insert(301);
+    }
     activeGeosets.insert(kGeosetBareForearms);
     activeGeosets.insert(kGeosetBareShins);
     activeGeosets.insert(kGeosetDefaultEars);
     activeGeosets.insert(kGeosetBareSleeves);
     activeGeosets.insert(kGeosetDefaultKneepads);
     activeGeosets.insert(kGeosetBarePants);
-    activeGeosets.insert(kGeosetWithCape);
+    activeGeosets.insert(kGeosetNoCape);
     activeGeosets.insert(kGeosetBareFeet);
     charRenderer->setActiveGeosets(instanceId, activeGeosets);
 
-    charRenderer->playAnimation(instanceId, rendering::anim::STAND, true);
+    if (deadCreatureGuids_.count(guid)) {
+        charRenderer->playAnimation(instanceId, rendering::anim::DEATH, false);
+    } else {
+        charRenderer->playAnimation(instanceId, rendering::anim::STAND, true);
+    }
     playerInstances_[guid] = instanceId;
 
     OnlinePlayerAppearanceState st;
@@ -403,12 +445,23 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
     // Group 4 (4xx) = forearms/gloves, 5 (5xx) = shins/boots, 8 (8xx) = wrists/sleeves,
     // 13 (13xx) = legs/trousers.  Missing defaults caused the shin-mesh gap (status.md).
     std::unordered_set<uint16_t> geosets;
-    // Body parts (group 0: IDs 0-99, some models use up to 27)
-    for (uint16_t i = 0; i <= 99; i++) geosets.insert(i);
-
     uint8_t hairStyleId = static_cast<uint8_t>((st.appearanceBytes >> 16) & 0xFF);
-    geosets.insert(static_cast<uint16_t>(100 + hairStyleId + 1));
-    geosets.insert(static_cast<uint16_t>(200 + st.facialFeatures + 1));
+    const uint16_t selectedHairScalp = selectHairScalpGeoset(hairGeosetMap_, st.raceId, st.genderId, hairStyleId);
+    geosets.insert(0);
+    geosets.insert(selectedHairScalp);
+    const uint32_t facialKey = (static_cast<uint32_t>(st.raceId) << 16) |
+                               (static_cast<uint32_t>(st.genderId) << 8) |
+                               static_cast<uint32_t>(st.facialFeatures);
+    auto itFacial = facialHairGeosetMap_.find(facialKey);
+    if (itFacial != facialHairGeosetMap_.end()) {
+        geosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(itFacial->second.geoset100, 1)));
+        geosets.insert(static_cast<uint16_t>(200 + std::max<uint16_t>(itFacial->second.geoset200, 1)));
+        geosets.insert(static_cast<uint16_t>(300 + std::max<uint16_t>(itFacial->second.geoset300, 1)));
+    } else {
+        geosets.insert(101);
+        geosets.insert(201);
+        geosets.insert(301);
+    }
     geosets.insert(701);                  // Ears
     geosets.insert(kGeosetDefaultKneepads); // Kneepads
     geosets.insert(kGeosetBareFeet);        // Bare feet mesh
@@ -416,41 +469,74 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
     const uint32_t geosetGroup1Field = idiL ? (*idiL)["GeosetGroup1"] : 7;
     const uint32_t geosetGroup3Field = idiL ? (*idiL)["GeosetGroup3"] : 9;
 
+    std::unordered_set<uint16_t> modelGeosets;
+    if (const auto* modelData = charRenderer->getModelData(st.modelId)) {
+        for (const auto& batch : modelData->batches) {
+            modelGeosets.insert(batch.submeshId);
+        }
+    }
+
+    auto eraseGroup = [&](uint16_t group) {
+        for (auto it = geosets.begin(); it != geosets.end();) {
+            if ((*it / 100) == group) {
+                it = geosets.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
+
+    auto pickGeoset = [&](uint16_t preferred, uint16_t fallback) -> uint16_t {
+        if (preferred != 0 && modelGeosets.count(preferred) > 0) return preferred;
+        if (fallback != 0 && modelGeosets.count(fallback) > 0) return fallback;
+        return 0;
+    };
+
+    // Find the lowest submesh ID in a group (e.g., group 5 → lowest 5xx).
+    // Races like Gnome (no 501) and Tauren (only 505) need this fallback.
+    auto lowestInGroup = [&](uint16_t group) -> uint16_t {
+        uint16_t best = 0;
+        for (uint16_t g : modelGeosets) {
+            if (g / 100 == group && (best == 0 || g < best)) best = g;
+        }
+        return best;
+    };
+
     // Per-group defaults — overridden below when equipment provides a geoset value.
-    uint16_t geosetGloves  = kGeosetBareForearms;
-    uint16_t geosetBoots   = kGeosetBareShins;
-    uint16_t geosetSleeves = kGeosetBareSleeves;
-    uint16_t geosetPants   = kGeosetBarePants;
+    uint16_t geosetGloves  = pickGeoset(kGeosetBareForearms, kGeosetBareForearms);
+    uint16_t geosetBoots   = pickGeoset(kGeosetBareShins, lowestInGroup(5));
+    uint16_t geosetSleeves = pickGeoset(kGeosetBareSleeves, kGeosetBareSleeves);
+    uint16_t geosetPants   = pickGeoset(kGeosetBarePants, kGeosetBarePants);
 
     // Chest/Shirt/Robe (invType 4,5,20) → wrist/sleeve group 8
     {
         uint32_t did = findDisplayIdByInvType({4, 5, 20});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetSleeves = static_cast<uint16_t>(kGeosetBareSleeves + gg1);
+        if (gg1 > 0) geosetSleeves = pickGeoset(static_cast<uint16_t>(kGeosetBareSleeves + gg1), kGeosetBareSleeves);
         // Robe kilt → leg group 13
         uint32_t gg3 = getGeosetGroup(did, geosetGroup3Field);
-        if (gg3 > 0) geosetPants = static_cast<uint16_t>(kGeosetBarePants + gg3);
+        if (gg3 > 0) geosetPants = pickGeoset(static_cast<uint16_t>(kGeosetBarePants + gg3), kGeosetBarePants);
     }
 
     // Legs (invType 7) → leg group 13
     {
         uint32_t did = findDisplayIdByInvType({7});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetPants = static_cast<uint16_t>(kGeosetBarePants + gg1);
+        if (gg1 > 0) geosetPants = pickGeoset(static_cast<uint16_t>(kGeosetBarePants + gg1), kGeosetBarePants);
     }
 
     // Feet/Boots (invType 8) → shin group 5
     {
         uint32_t did = findDisplayIdByInvType({8});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetBoots = static_cast<uint16_t>(501 + gg1);
+        if (gg1 > 0) geosetBoots = pickGeoset(static_cast<uint16_t>(501 + gg1), lowestInGroup(5));
     }
 
     // Hands/Gloves (invType 10) → forearm group 4
     {
         uint32_t did = findDisplayIdByInvType({10});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetGloves = static_cast<uint16_t>(kGeosetBareForearms + gg1);
+        if (gg1 > 0) geosetGloves = pickGeoset(static_cast<uint16_t>(kGeosetBareForearms + gg1), kGeosetBareForearms);
     }
 
     // Wrists/Bracers (invType 9) → sleeve group 8 (only if chest/shirt didn't set it)
@@ -458,7 +544,7 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
         uint32_t did = findDisplayIdByInvType({9});
         if (did != 0 && geosetSleeves == kGeosetBareSleeves) {
             uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-            if (gg1 > 0) geosetSleeves = static_cast<uint16_t>(kGeosetBareSleeves + gg1);
+            if (gg1 > 0) geosetSleeves = pickGeoset(static_cast<uint16_t>(kGeosetBareSleeves + gg1), kGeosetBareSleeves);
         }
     }
 
@@ -467,25 +553,33 @@ void EntitySpawner::setOnlinePlayerEquipment(uint64_t guid,
     {
         uint32_t did = findDisplayIdByInvType({6});
         uint32_t gg1 = getGeosetGroup(did, geosetGroup1Field);
-        if (gg1 > 0) geosetBelt = static_cast<uint16_t>(1801 + gg1);
+        if (gg1 > 0) geosetBelt = pickGeoset(static_cast<uint16_t>(1801 + gg1), 0);
     }
 
-    geosets.insert(geosetGloves);
-    geosets.insert(geosetBoots);
-    geosets.insert(geosetSleeves);
-    geosets.insert(geosetPants);
+    eraseGroup(4);
+    eraseGroup(5);
+    eraseGroup(8);
+    eraseGroup(13);
+    eraseGroup(15);
+    eraseGroup(18);
+    if (geosetGloves != 0) geosets.insert(geosetGloves);
+    if (geosetBoots != 0) geosets.insert(geosetBoots);
+    if (geosetSleeves != 0) geosets.insert(geosetSleeves);
+    if (geosetPants != 0) geosets.insert(geosetPants);
     if (geosetBelt != 0) geosets.insert(geosetBelt);
     // Back/Cloak (invType 16)
-    geosets.insert(hasInvType({16}) ? kGeosetWithCape : kGeosetNoCape);
+    uint16_t geosetCape = pickGeoset(
+        hasInvType({16}) ? kGeosetWithCape : kGeosetNoCape,
+        kGeosetNoCape);
+    if (geosetCape != 0) geosets.insert(geosetCape);
     // Tabard (invType 19)
     if (hasInvType({19})) geosets.insert(kGeosetDefaultTabard);
 
     // Hide hair under helmets: replace style-specific scalp with bald scalp
     // HEAD slot is index 0 in the 19-element equipment array
     if (displayInfoIds[0] != 0 && hairStyleId > 0) {
-        uint16_t hairGeoset = static_cast<uint16_t>(hairStyleId + 1);
-        geosets.erase(static_cast<uint16_t>(100 + hairGeoset)); // Remove style group 1
-        geosets.insert(kGeosetDefaultConnector);  // Default group 1 connector
+        geosets.erase(selectedHairScalp);                              // Remove style scalp
+        geosets.insert(1);    // Bald scalp cap (group 0)
     }
 
     charRenderer->setActiveGeosets(st.instanceId, geosets);
@@ -885,10 +979,16 @@ void EntitySpawner::despawnPlayer(uint64_t guid) {
     if (!renderer_ || !renderer_->getCharacterRenderer()) return;
     auto it = playerInstances_.find(guid);
     if (it == playerInstances_.end()) return;
-    renderer_->getCharacterRenderer()->removeInstance(it->second);
+    auto* charRenderer = renderer_->getCharacterRenderer();
+    // Player composites get a fresh model id per spawn (unlike displayId-keyed
+    // creature models, which stay cached), so free the model with the instance.
+    const uint32_t compositeModelId = charRenderer->getInstanceModelId(it->second);
+    charRenderer->removeInstance(it->second);
+    if (compositeModelId != 0) charRenderer->unloadModelIfUnused(compositeModelId);
     playerInstances_.erase(it);
     onlinePlayerAppearance_.erase(guid);
     pendingOnlinePlayerEquipment_.erase(guid);
+    deadCreatureGuids_.erase(guid);
     creatureRenderPosCache_.erase(guid);
     creatureSwimmingState_.erase(guid);
     creatureWalkingState_.erase(guid);
@@ -913,6 +1013,22 @@ void EntitySpawner::spawnOnlineGameObject(uint64_t guid, uint32_t entry, uint32_
 
     auto goIt = gameObjectInstances_.find(guid);
     if (goIt != gameObjectInstances_.end()) {
+        if (gameHandler_ && gameHandler_->isTransportGuid(guid)) {
+            if (auto* transportManager = gameHandler_->getTransportManager()) {
+                if (transportManager->getTransport(guid)) {
+                    transportManager->rebindTransportInstance(
+                        guid, goIt->second.instanceId, !goIt->second.isWmo, displayId);
+                    transportManager->updateServerTransport(
+                        guid, glm::vec3(x, y, z), orientation);
+                } else {
+                    gameHandler_->notifyTransportSpawned(guid, entry, displayId, x, y, z, orientation);
+                }
+            } else {
+                gameHandler_->notifyTransportSpawned(guid, entry, displayId, x, y, z, orientation);
+            }
+            return;
+        }
+
         // Already have a render instance — update its position (e.g. transport re-creation)
         auto& info = goIt->second;
         glm::vec3 renderPos = core::coords::canonicalToRender(glm::vec3(x, y, z));
@@ -963,7 +1079,7 @@ void EntitySpawner::spawnOnlineGameObject(uint64_t guid, uint32_t entry, uint32_
             } else if (displayId == 3831) {
                 // Deeprun Tram car
                 modelPath = "World\\Generic\\Gnome\\Passive Doodads\\Subway\\SubwayCar.m2";
-                LOG_WARNING("Overriding transport displayId ", displayId, " → SubwayCar.m2");
+                LOG_INFO("Overriding transport displayId ", displayId, " → SubwayCar.m2");
             }
         }
 
@@ -1162,6 +1278,10 @@ void EntitySpawner::spawnOnlineGameObject(uint64_t guid, uint32_t entry, uint32_
             }
 
             pipeline::M2Model model = pipeline::M2Loader::load(m2Data);
+            // Collision classification needs the asset path. Embedded M2 names
+            // are often generic and caused herb/grass gameobjects to be treated
+            // as solid props.
+            model.name = modelPath;
             if (model.vertices.empty()) {
                 LOG_WARNING("Failed to parse gameobject M2: ", modelPath);
                 gameObjectDisplayIdFailedCache_.insert(displayId);
@@ -1197,6 +1317,17 @@ void EntitySpawner::spawnOnlineGameObject(uint64_t guid, uint32_t entry, uint32_
         if (instanceId == 0) {
             LOG_WARNING("Failed to create gameobject instance for guid 0x", std::hex, guid, std::dec);
             return;
+        }
+
+        // Deeprun Tram cars: riding never used real mesh collision to begin with (Z is
+        // fully code-locked to the transport's simulated position while boarded, not
+        // derived from a floor query), so the solid SubwayCar.m2 body was only ever in
+        // the way - reported live as getting physically stuck walking back across a car
+        // after crossing it once. Skip collision so the model is purely visual/decorative
+        // for movement purposes, matching how the boarding logic already treats it (a
+        // proximity/footprint check, not a physical block).
+        if (displayId == 3831u) {
+            m2Renderer->setSkipCollision(instanceId, true);
         }
 
         // Freeze animation for static gameobjects, but let portals/effects/transports animate

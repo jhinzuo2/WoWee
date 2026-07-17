@@ -88,6 +88,9 @@ public:
     void updateAutoAttack(float deltaTime);
 
     // --- Targeting ---
+    /// False for creature corpses that are neither lootable nor skinnable —
+    /// those cannot be selected. Living units, players and non-units are always selectable.
+    bool isSelectableUnit(uint64_t guid) const;
     void setTarget(uint64_t guid);
     void clearTarget();
     std::shared_ptr<Entity> getTarget() const;
@@ -125,6 +128,10 @@ public:
     void removeCombatTextForGuid(uint64_t guid);
 
 private:
+    // Last tab-target press (steady-clock ms); a pause restarts the cycle
+    // from the nearest enemy instead of resuming a stale rotation.
+    uint64_t lastTabTargetMs_ = 0;
+
     // --- Packet handlers ---
     void handleAttackStart(network::Packet& packet);
     void handleAttackStop(network::Packet& packet);

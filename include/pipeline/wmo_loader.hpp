@@ -175,6 +175,10 @@ struct WMOGroup {
 
 // Complete WMO Model
 struct WMOModel {
+    // Runtime source path when known. The binary format does not store its root
+    // filename, but a few rendering classifications need the owning WMO family.
+    std::string sourcePath;
+
     // Root WMO data (from MOHD chunk)
     uint32_t version;
     uint32_t nTextures;  // Added - was missing, caused offset issues

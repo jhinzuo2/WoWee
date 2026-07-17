@@ -72,6 +72,9 @@ public:
     static constexpr uint8_t STAND_STATE_KNEEL    = 8;
 
     void setStandState(uint8_t standState);
+    // Overrides the seated loop without skipping SIT_GROUND_DOWN. Passing zero
+    // restores the normal seated idle.
+    void setSeatedLoopAnimation(uint32_t animationId);
     uint8_t getStandState() const { return standState_; }
 
     // ── Loot management ─────────────────────────────────────────────────
@@ -92,6 +95,7 @@ private:
     uint8_t standState_ = 0;
     uint32_t sitDownAnim_ = 0;
     uint32_t sitLoopAnim_ = 0;
+    uint32_t seatedLoopOverride_ = 0;
     uint32_t sitUpAnim_ = 0;
     bool sitDownAnimSeen_ = false;  // Track whether one-shot has started playing
     bool sitUpAnimSeen_ = false;

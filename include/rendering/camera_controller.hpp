@@ -22,6 +22,7 @@ public:
     void update(float deltaTime);
     void processMouseMotion(const SDL_MouseMotionEvent& event);
     void processMouseButton(const SDL_MouseButtonEvent& event);
+    void releaseMouseCapture();
 
     void setMovementSpeed(float speed) { movementSpeed = speed; }
     void setMouseSensitivity(float sensitivity) { mouseSensitivity = sensitivity; }
@@ -60,6 +61,15 @@ public:
     void startIntroPan(float durationSec = 2.8f, float orbitDegrees = 140.0f);
     bool isIntroActive() const { return introActive; }
     bool isIdleOrbit() const { return idleOrbit_; }
+    void setIdleOrbitEnabled(bool enabled) {
+        idleOrbitEnabled_ = enabled;
+        if (!enabled && idleOrbit_) {
+            introActive = false;
+            idleOrbit_ = false;
+            idleTimer_ = 0.0f;
+        }
+    }
+    bool isIdleOrbitEnabled() const { return idleOrbitEnabled_; }
 
     float getMovementSpeed() const { return movementSpeed; }
     const glm::vec3& getDefaultPosition() const { return defaultPosition; }
@@ -67,17 +77,30 @@ public:
     float getYaw() const { return yaw; }
     float getPitch() const { return pitch; }
     float getFacingYaw() const { return facingYaw; }
+    float getTravelYaw() const { return travelYaw_; }
     bool isThirdPerson() const { return thirdPerson; }
     bool isFirstPersonView() const { return thirdPerson && (userTargetDistance <= MIN_DISTANCE + 0.15f); }
     bool isGrounded() const { return grounded; }
     bool isJumping() const { return !grounded && verticalVelocity > 0.0f; }
     bool isFalling() const { return !grounded && verticalVelocity <= 0.0f; }
+
+    // Call every frame while riding a transport that forces Z to a locked value
+    // externally (e.g. the Deeprun Tram, which has no real floor mid-tunnel).
+    // Without this, gravity keeps integrating verticalVelocity every frame since
+    // grounded never goes true on a moving M2 deck, even though the position
+    // itself is being overwritten and looks static - the huge fall speed that
+    // silently built up over the whole ride would then unleash all at once the
+    // instant the external Z lock releases at disembark, clipping the player
+    // through the floor.
+    void suppressVerticalPhysics() { verticalVelocity = 0.0f; grounded = true; }
     bool isJumpKeyPressed() const { return jumpBufferTimer > 0.0f; }
     bool isSprinting() const;
     bool isMovingForward() const { return moveForwardActive; }
     bool isMovingBackward() const { return moveBackwardActive; }
     bool isStrafingLeft() const { return strafeLeftActive; }
     bool isStrafingRight() const { return strafeRightActive; }
+    bool isTurningLeft() const { return turningLeftActive; }
+    bool isTurningRight() const { return turningRightActive; }
     bool isAutoRunning() const { return autoRunning; }
     bool isRightMouseHeld() const { return rightMouseDown; }
     bool isSitting() const { return sitting; }
@@ -128,6 +151,7 @@ public:
     bool isDescending() const { return wasDescending_; }
     void setHoverActive(bool active) { hoverActive_ = active; }
     void setMounted(bool m) { mounted_ = m; }
+    void setIntoxication(float amount) { intoxication_ = std::clamp(amount, 0.0f, 1.0f); }
     void setMountHeightOffset(float offset) { mountHeightOffset_ = offset; }
     void setExternalFollow(bool enabled) { externalFollow_ = enabled; }
     void setExternalMoving(bool moving) { externalMoving_ = moving; }
@@ -177,6 +201,7 @@ private:
     float yaw = 180.0f;
     float pitch = -30.0f;
     float facingYaw = 180.0f;  // Character-facing yaw (can differ from camera yaw)
+    float travelYaw_ = 180.0f; // Heading of actual movement vector (see getTravelYaw)
 
     // Movement settings
     float movementSpeed = 50.0f;
@@ -185,7 +210,7 @@ private:
 
     // Mouse settings
     float mouseSensitivity = 0.2f;
-    bool invertMouse = true;
+    bool invertMouse = false;
     bool mouseButtonDown = false;
     bool leftMouseDown = false;
     bool rightMouseDown = false;
@@ -204,9 +229,15 @@ private:
     static constexpr float ZOOM_SMOOTH_SPEED = 15.0f;  // How fast zoom eases
     static constexpr float CAM_SMOOTH_SPEED_DEFAULT = 30.0f;
     float camSmoothSpeed_ = CAM_SMOOTH_SPEED_DEFAULT;  // User-configurable camera smoothing (higher = tighter)
+    // When true the camera keeps its exponential lerp even while actively
+    // dragging or keyboard-turning — the pre-snap "floaty follow" feel.
+    // When false (default), rotation input moves the camera 1:1.
+    bool smoothCameraFollow_ = false;
 public:
     void setCameraSmoothSpeed(float speed) { camSmoothSpeed_ = std::clamp(speed, 5.0f, 100.0f); }
     float getCameraSmoothSpeed() const { return camSmoothSpeed_; }
+    void setSmoothCameraFollow(bool smooth) { smoothCameraFollow_ = smooth; }
+    bool isSmoothCameraFollow() const { return smoothCameraFollow_; }
     void setPivotHeight(float h) { pivotHeight_ = std::clamp(h, 0.0f, 3.0f); }
     float getPivotHeight() const { return pivotHeight_; }
 private:
@@ -229,6 +260,8 @@ private:
     static constexpr float CROUCH_EYE_HEIGHT = 0.6f; // Crouching eye height
     float eyeHeight = STAND_EYE_HEIGHT;
     float lastGroundZ = 0.0f;  // Last known ground height (fallback when no terrain)
+    glm::vec3 lastGroundedPos_{0.0f};  // Last position that had ground under it (void recovery)
+    bool hasLastGroundedPos_ = false;
     static constexpr float GRAVITY = -30.0f;
     static constexpr float JUMP_VELOCITY = 15.0f;
     float jumpBufferTimer = 0.0f;   // Time since space was pressed
@@ -267,6 +300,12 @@ private:
 
     // Helper to get cached floor height (reduces expensive queries)
     std::optional<float> getCachedFloorHeight(float x, float y, float z);
+
+    // Ray-march the terrain heightfield along pivot→camDir and return the
+    // farthest camera distance that keeps clearance above the terrain surface.
+    // Returns maxDist when the ray stays clear (or terrain is unavailable).
+    float raymarchTerrainCameraLimit(const glm::vec3& pivot, const glm::vec3& camDir,
+                                     float maxDist) const;
 
     // Swimming
     bool swimming = false;
@@ -311,6 +350,8 @@ private:
     bool moveBackwardActive = false;
     bool strafeLeftActive = false;
     bool strafeRightActive = false;
+    bool turningLeftActive = false;
+    bool turningRightActive = false;
 
     // Movement callback
     MovementCallback movementCallback;
@@ -383,6 +424,7 @@ private:
     // Idle camera: triggers intro pan after IDLE_TIMEOUT seconds of no input
     float idleTimer_ = 0.0f;
     bool idleOrbit_ = false;  // true when current intro pan is an idle orbit (loops)
+    bool idleOrbitEnabled_ = true;
     static constexpr float IDLE_TIMEOUT = 120.0f; // 2 minutes
 
     // Last known safe position (saved periodically when grounded on real geometry)
@@ -421,6 +463,10 @@ private:
     float shakeDuration_  = 0.0f;
     float shakeMagnitude_ = 0.0f;
     float shakeFrequency_ = 0.0f;
+
+    // Server-authored drunkenness (0 sober, 1 smashed).
+    float intoxication_ = 0.0f;
+    float intoxicationTime_ = 0.0f;
 };
 
 } // namespace rendering

@@ -7,6 +7,7 @@
 #include "game/expansion_profile.hpp"
 #include "game/world_packets.hpp"
 #include "pipeline/asset_manager.hpp"
+#include <cstdlib>
 
 namespace wowee { namespace core {
 
@@ -27,6 +28,11 @@ UIScreenCallbackHandler::UIScreenCallbackHandler(
 }
 
 void UIScreenCallbackHandler::setupCallbacks() {
+    authHandler_.setOnSuccess([this](const std::vector<uint8_t>& sessionKey) {
+        authenticatedSessionKey_ = sessionKey;
+        LOG_INFO("Cached auth session key for world handoff (", authenticatedSessionKey_.size(), " bytes)");
+    });
+
     // Authentication screen callback
     uiManager_.getAuthScreen().setOnSuccess([this]() {
         LOG_INFO("Authentication successful, transitioning to realm selection");
@@ -48,8 +54,27 @@ void UIScreenCallbackHandler::setupCallbacks() {
             catch (...) { LOG_WARNING("Invalid port in realm address: ", realmAddress); }
         }
 
+        // LAN clients are often handed a public realm address by MaNGOS. On
+        // routers without NAT reflection that address cannot hairpin back to
+        // the local world server. Allow a client-side host override while
+        // retaining the realm-advertised port and authentication identity.
+        if (const char* overrideHost = std::getenv("WOWEE_REALM_HOST_OVERRIDE");
+            overrideHost && *overrideHost) {
+            LOG_WARNING("Overriding realm host '", host, "' with '", overrideHost,
+                        "' via WOWEE_REALM_HOST_OVERRIDE");
+            host = overrideHost;
+        }
+
         // Connect to world server
-        const auto& sessionKey = authHandler_.getSessionKey();
+        auto sessionKey = authHandler_.getSessionKey();
+        if (sessionKey.empty() && !authenticatedSessionKey_.empty()) {
+            LOG_WARNING("Auth handler session key was empty at realm selection; using cached key");
+            sessionKey = authenticatedSessionKey_;
+        }
+        if (sessionKey.size() != 40) {
+            LOG_ERROR("Cannot connect to realm: auth session key has ", sessionKey.size(),
+                      " bytes; expected 40. Re-authenticate and try again.");
+        }
         std::string accountName = authHandler_.getUsername();
         if (accountName.empty()) {
             LOG_WARNING("Auth username missing; falling back to TESTACCOUNT");

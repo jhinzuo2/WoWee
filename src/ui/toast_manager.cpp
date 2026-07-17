@@ -1077,9 +1077,8 @@ void ToastManager::renderResurrectFlash() {
     bg->AddRect(ImVec2(px + 3.0f, py + 3.0f), ImVec2(px + PANEL_W - 3.0f, py + PANEL_H - 3.0f),
                 IM_COL32(255, 255, 180, static_cast<uint8_t>(80 * alpha)), 6.0f, 0, 1.0f);
 
-    // "✦ You have been resurrected! ✦" centered
-    // UTF-8 heavy four-pointed star U+2726: \xe2\x9c\xa6
-    const char* banner = "\xe2\x9c\xa6 You have been resurrected! \xe2\x9c\xa6";
+    // Resurrection message centered without decorative punctuation.
+    const char* banner = "You have been resurrected";
     ImFont* font = ImGui::GetFont();
     float fontSize = ImGui::GetFontSize();
     ImVec2 textSz = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, banner);

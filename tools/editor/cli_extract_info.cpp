@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -110,15 +111,15 @@ int handleInfoExtract(int& i, int argc, char** argv) {
     }
     std::printf("Extracted asset tree: %s\n", dataDir.c_str());
     std::printf("  total bytes  : %.2f GB\n", totalBytes / (1024.0 * 1024.0 * 1024.0));
-    std::printf("  BLP textures : %lu  (%lu PNG sidecar = %.1f%% open)\n",
+    std::printf("  BLP textures : %" PRIu64 "  (%" PRIu64 " PNG sidecar = %.1f%% open)\n",
                 blpCount, pngSidecar, pct(pngSidecar, blpCount));
-    std::printf("  DBC tables   : %lu  (%lu JSON sidecar = %.1f%% open)\n",
+    std::printf("  DBC tables   : %" PRIu64 "  (%" PRIu64 " JSON sidecar = %.1f%% open)\n",
                 dbcCount, jsonSidecar, pct(jsonSidecar, dbcCount));
-    std::printf("  M2 models    : %lu  (%lu WOM sidecar = %.1f%% open)\n",
+    std::printf("  M2 models    : %" PRIu64 "  (%" PRIu64 " WOM sidecar = %.1f%% open)\n",
                 m2Count, womSidecar, pct(womSidecar, m2Count));
-    std::printf("  WMO buildings: %lu  (%lu WOB sidecar = %.1f%% open)\n",
+    std::printf("  WMO buildings: %" PRIu64 "  (%" PRIu64 " WOB sidecar = %.1f%% open)\n",
                 wmoCount, wobSidecar, pct(wobSidecar, wmoCount));
-    std::printf("  ADT terrain  : %lu  (%lu WHM sidecar = %.1f%% open)\n",
+    std::printf("  ADT terrain  : %" PRIu64 "  (%" PRIu64 " WHM sidecar = %.1f%% open)\n",
                 adtCount, whmSidecar, pct(whmSidecar, adtCount));
     uint64_t openTotal = pngSidecar + jsonSidecar + womSidecar + wobSidecar + whmSidecar;
     uint64_t propTotal = blpCount + dbcCount + m2Count + wmoCount + adtCount;

@@ -48,6 +48,10 @@ struct SplineBlockData {
 
 // ── Spline flag constants ───────────────────────────────────────
 namespace SplineFlag {
+    // Classic/TBC ground locomotion for SMSG_MONSTER_MOVE: set means Run,
+    // clear means Walk. WotLK repurposed this bit as DONE and sends separate
+    // SET_WALK_MODE / SET_RUN_MODE opcodes instead.
+    constexpr uint32_t PRE_WOTLK_RUNMODE = 0x00000100;
     constexpr uint32_t FINAL_POINT    = 0x00010000;
     constexpr uint32_t FINAL_TARGET   = 0x00020000;
     constexpr uint32_t FINAL_ANGLE    = 0x00040000;
@@ -63,6 +67,10 @@ namespace SplineFlag {
     // TBC-era alternative for uncompressed check
     constexpr uint32_t UNCOMPRESSED_MASK_TBC = CATMULLROM | 0x00002000;
 } // namespace SplineFlag
+
+[[nodiscard]] constexpr bool isPreWotlkSplineWalking(uint32_t splineFlags) {
+    return (splineFlags & SplineFlag::PRE_WOTLK_RUNMODE) == 0;
+}
 
 /// Decode a single packed-delta waypoint.
 /// Format: bits [0:10] = X (11-bit signed), [11:21] = Y (11-bit signed), [22:31] = Z (10-bit signed).

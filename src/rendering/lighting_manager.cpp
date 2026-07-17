@@ -49,6 +49,7 @@ bool LightingManager::initialize(pipeline::AssetManager* assetManager) {
     // Load DBCs (non-fatal if missing, will use fallback lighting)
     loadLightDbc(assetManager);
     loadLightParamsDbc(assetManager);
+    loadLightSkyboxDbc(assetManager);
     loadLightBandDbcs(assetManager);
 
     initialized_ = true;
@@ -140,10 +141,36 @@ bool LightingManager::loadLightParamsDbc(pipeline::AssetManager* assetManager) {
         uint32_t paramId = dbc->getUInt32(i, lpL ? (*lpL)["LightParamsID"] : 0);
         LightParamsProfile profile;
         profile.lightParamsId = paramId;
+        if (dbc->getFieldCount() > 2) {
+            profile.lightSkyboxId = dbc->getUInt32(i, 2);
+        }
         lightParamsProfiles_[paramId] = profile;
     }
 
     return true;
+}
+
+bool LightingManager::loadLightSkyboxDbc(pipeline::AssetManager* assetManager) {
+    auto dbcData = assetManager->readFile("DBFilesClient\\LightSkybox.dbc");
+    if (dbcData.empty()) {
+        LOG_WARNING("LightSkybox.dbc not found");
+        return false;
+    }
+
+    pipeline::DBCFile dbc;
+    if (!dbc.load(dbcData) || dbc.getFieldCount() < 2) {
+        LOG_ERROR("Failed to load LightSkybox.dbc");
+        return false;
+    }
+
+    lightSkyboxPaths_.clear();
+    for (uint32_t i = 0; i < dbc.getRecordCount(); ++i) {
+        const uint32_t id = dbc.getUInt32(i, 0);
+        std::string path = dbc.getString(i, 1);
+        if (id != 0 && !path.empty()) lightSkyboxPaths_[id] = std::move(path);
+    }
+    LOG_INFO("Loaded LightSkybox.dbc: ", lightSkyboxPaths_.size(), " model paths");
+    return !lightSkyboxPaths_.empty();
 }
 
 bool LightingManager::loadLightBandDbcs(pipeline::AssetManager* assetManager) {
@@ -234,7 +261,7 @@ bool LightingManager::loadLightBandDbcs(pipeline::AssetManager* assetManager) {
     return true;
 }
 
-void LightingManager::update(const glm::vec3& playerPos, uint32_t mapId,
+void LightingManager::update(const glm::vec3& playerPos, uint32_t mapId, uint32_t zoneId,
                               float gameTime,
                               bool isRaining, bool isUnderwater) {
     if (!initialized_) return;
@@ -257,8 +284,14 @@ void LightingManager::update(const glm::vec3& playerPos, uint32_t mapId,
     }
     // else: manualTime_ is set, use timeOfDay_ as-is
 
-    // Convert time to half-minutes (WoW DBC format: 0-2879)
-    uint16_t timeHalfMinutes = static_cast<uint16_t>(timeOfDay_ * static_cast<float>(kHalfMinutesPerDay)) % kHalfMinutesPerDay;
+    // Duskwood's visible sky is permanently late-night even while the global
+    // world clock continues normally for gameplay and every other zone.
+    visualTimeOfDayHours_ = resolveZoneVisualTimeHours(
+        zoneId, isIndoors_, timeOfDay_ * 24.0f);
+
+    // Convert visual time to half-minutes (WoW DBC format: 0-2879).
+    const float visualDayFraction = visualTimeOfDayHours_ / 24.0f;
+    uint16_t timeHalfMinutes = static_cast<uint16_t>(visualDayFraction * static_cast<float>(kHalfMinutesPerDay)) % kHalfMinutesPerDay;
 
     // Update player position and map
     currentPlayerPos_ = playerPos;
@@ -266,6 +299,19 @@ void LightingManager::update(const glm::vec3& playerPos, uint32_t mapId,
 
     // Find light volumes for blending
     activeVolumes_ = findLightVolumes(playerPos, mapId);
+    activeSkyboxPath_.clear();
+    if (!isIndoors_) {
+        for (const auto& wv : activeVolumes_) {
+            const uint32_t paramsId = selectLightParamsId(wv.volume, isRaining, isUnderwater);
+            auto profileIt = lightParamsProfiles_.find(paramsId);
+            if (profileIt == lightParamsProfiles_.end() || profileIt->second.lightSkyboxId == 0) continue;
+            auto skyIt = lightSkyboxPaths_.find(profileIt->second.lightSkyboxId);
+            if (skyIt != lightSkyboxPaths_.end()) {
+                activeSkyboxPath_ = skyIt->second;
+                break;
+            }
+        }
+    }
 
     // Sample and blend lighting
     LightingParams newParams;
@@ -338,6 +384,10 @@ void LightingManager::update(const glm::vec3& playerPos, uint32_t mapId,
             newParams.diffuseColor *= (0.2f + 0.8f * (1.0f - nightness));
             newParams.ambientColor.b += nightness * 0.1f;
         }
+    }
+
+    if (!isIndoors_) {
+        applyZoneAmbienceOverride(zoneId, newParams);
     }
 
     // Smooth temporal blending to avoid snapping (5.0 = blend rate)

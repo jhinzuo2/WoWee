@@ -85,6 +85,29 @@ bool AssetManager::initialize(const std::string& dataPath_) {
     return true;
 }
 
+bool AssetManager::switchDataPath(const std::string& newDataPath) {
+    if (newDataPath.empty()) return false;
+    if (initialized && newDataPath == dataPath) return true;
+
+    const std::string manifestPath = newDataPath + "/manifest.json";
+    AssetManifest nextManifest;
+    if (!std::filesystem::exists(manifestPath) || !nextManifest.load(manifestPath)) {
+        LOG_ERROR("Cannot switch asset path; valid manifest not found in: ", newDataPath);
+        return false;
+    }
+
+    clearCache();
+    manifest_ = std::move(nextManifest);
+    baseFallbackManifest_ = AssetManifest{};
+    baseFallbackDataPath_.clear();
+    dataPath = newDataPath;
+    overridePath_ = dataPath + "/override";
+    initialized = true;
+    LOG_INFO("Switched asset manager to: ", dataPath, " (",
+             manifest_.getEntryCount(), " files indexed)");
+    return true;
+}
+
 void AssetManager::setupFileCacheBudget() {
     auto& memMonitor = core::MemoryMonitor::getInstance();
     size_t recommendedBudget = memMonitor.getRecommendedCacheBudget();
@@ -146,7 +169,20 @@ std::string AssetManager::resolveFile(const std::string& normalizedPath) const {
     // If a base-path fallback is configured (expansion-specific primary that only
     // holds DBC overrides), retry against the base extraction.
     if (!baseFallbackDataPath_.empty()) {
-        return baseFallbackManifest_.resolveFilesystemPath(normalizedPath);
+        std::string baseFallbackPath = baseFallbackManifest_.resolveFilesystemPath(normalizedPath);
+        if (!baseFallbackPath.empty()) return baseFallbackPath;
+    }
+
+    // Last resort: some files (e.g. DBFilesClient\TransportAnimation.dbc) can end up
+    // present on disk under dataPath without ever having been captured by whatever
+    // extraction produced manifest.json. Try the loose file directly at its expected
+    // location before giving up, so a missing manifest entry doesn't silently mean
+    // "file doesn't exist" when it plainly does.
+    std::string looseCandidate = normalizedPath;
+    std::replace(looseCandidate.begin(), looseCandidate.end(), '\\', '/');
+    looseCandidate = dataPath + "/" + looseCandidate;
+    if (LooseFileReader::fileExists(looseCandidate)) {
+        return looseCandidate;
     }
     return {};
 }
@@ -337,21 +373,49 @@ std::shared_ptr<DBCFile> AssetManager::loadDBC(const std::string& name) {
 
     // Try Data/db/ directory (pre-extracted binary DBCs shared across expansions)
     if (dbcData.empty()) {
-        // dataPath is expansion-specific (e.g. Data/expansions/wotlk/); go up to Data/
-        for (const std::string& base : {dataPath + "/db/" + name,
-                                         dataPath + "/../../db/" + name,
-                                         "Data/db/" + name}) {
-            if (std::filesystem::exists(base)) {
-                std::ifstream f(base, std::ios::binary | std::ios::ate);
-                if (f) {
-                    auto size = f.tellg();
-                    if (size > 0) {
-                        f.seekg(0);
-                        dbcData.resize(static_cast<size_t>(size));
-                        f.read(reinterpret_cast<char*>(dbcData.data()), size);
-                        LOG_INFO("Loaded binary DBC from: ", base, " (", size, " bytes)");
+        // Expansion overlay first (e.g. Data/expansions/tbc/overlay/db/), then
+        // expansion db/, then shared Data/db/.
+        std::vector<std::string> dbDirs;
+        if (!expansionDataPath_.empty())
+            dbDirs.push_back(expansionDataPath_ + "/overlay/db");
+        dbDirs.push_back(dataPath + "/db");
+        dbDirs.push_back(dataPath + "/../../db");
+        dbDirs.push_back("Data/db");
+        // Try exact-case first, then case-insensitive scan (Linux is case-sensitive
+        // but DBC filenames in Data/db/ are often all-lowercase).
+        std::string nameLower = name;
+        std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+
+        for (const auto& dir : dbDirs) {
+            if (!std::filesystem::is_directory(dir)) continue;
+            std::string exact = dir + "/" + name;
+            std::string resolved;
+            if (std::filesystem::exists(exact)) {
+                resolved = exact;
+            } else {
+                for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+                    if (!entry.is_regular_file()) continue;
+                    std::string fn = entry.path().filename().string();
+                    std::string fnLower = fn;
+                    std::transform(fnLower.begin(), fnLower.end(), fnLower.begin(),
+                                   [](unsigned char c) { return std::tolower(c); });
+                    if (fnLower == nameLower) {
+                        resolved = entry.path().string();
                         break;
                     }
+                }
+            }
+            if (resolved.empty()) continue;
+            std::ifstream f(resolved, std::ios::binary | std::ios::ate);
+            if (f) {
+                auto size = f.tellg();
+                if (size > 0) {
+                    f.seekg(0);
+                    dbcData.resize(static_cast<size_t>(size));
+                    f.read(reinterpret_cast<char*>(dbcData.data()), size);
+                    LOG_INFO("Loaded binary DBC from: ", resolved, " (", size, " bytes)");
+                    break;
                 }
             }
         }

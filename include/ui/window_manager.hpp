@@ -12,11 +12,15 @@
 #include <string>
 #include <unordered_map>
 #include <functional>
+#include <memory>
+#include <vector>
+#include <imgui.h>
 #include <vulkan/vulkan.h>
 
 namespace wowee {
 namespace game { class GameHandler; }
 namespace pipeline { class AssetManager; }
+namespace rendering { class CharacterPreview; }
 namespace ui {
 
 class ChatPanel;
@@ -26,6 +30,9 @@ class SpellbookScreen;
 
 class WindowManager {
 public:
+    WindowManager() = default;
+    ~WindowManager();
+
     // Callback type for resolving spell icons (spellId, assetMgr) → VkDescriptorSet
     using SpellIconFn = std::function<VkDescriptorSet(uint32_t, pipeline::AssetManager*)>;
 
@@ -48,7 +55,18 @@ public:
                             InventoryScreen& inventoryScreen,
                             ChatPanel& chatPanel);
     void renderTrainerWindow(game::GameHandler& gameHandler,
-                             SpellIconFn getSpellIcon);
+                             SpellIconFn getSpellIcon,
+                             InventoryScreen& inventoryScreen);
+    // Standalone crafting window (crafting_window.cpp) — opened by casting a
+    // profession spell (Cooking, First Aid, ...); recipe list with difficulty
+    // colors, reagent counts, and multi-craft controls.
+    void renderCraftingWindow(game::GameHandler& gameHandler,
+                              SpellIconFn getSpellIcon,
+                              InventoryScreen& inventoryScreen);
+    // Recipe difficulty vs current skill (orange/yellow/green/gray), shared by
+    // the trainer panel and the crafting window.
+    static ImVec4 recipeDifficultyColor(game::GameHandler& gameHandler, uint32_t spellId);
+    static const char* recipeDifficultyLabel(game::GameHandler& gameHandler, uint32_t spellId);
     void renderBarberShopWindow(game::GameHandler& gameHandler);
     void renderStableWindow(game::GameHandler& gameHandler);
     void renderTaxiWindow(game::GameHandler& gameHandler);
@@ -135,16 +153,40 @@ public:
     bool vendorBagsOpened_ = false;
 
     // Barber shop
+    struct BarberStyleOption {
+        uint32_t entryId = 0;       // BarberShopStyle.dbc ID sent to the server
+        uint8_t appearanceId = 0;   // CharSections/geoset variation used by preview
+        std::string name;
+    };
+    std::vector<BarberStyleOption> barberHairStyles_;
+    std::vector<BarberStyleOption> barberFacialStyles_;
+    std::vector<BarberStyleOption> barberSkinStyles_;
+    std::vector<uint8_t> barberHairColors_;
     int barberHairStyle_ = 0;
     int barberHairColor_ = 0;
     int barberFacialHair_ = 0;
-    int barberOrigHairStyle_ = 0;
-    int barberOrigHairColor_ = 0;
-    int barberOrigFacialHair_ = 0;
+    int barberSkinColor_ = 0;
+    uint8_t barberOrigHairStyle_ = 0;
+    uint8_t barberOrigHairColor_ = 0;
+    uint8_t barberOrigFacialHair_ = 0;
+    uint8_t barberOrigSkinColor_ = 0;
+    uint8_t barberColorsForHairStyle_ = 0xFF;
+    float barberBaseCost_ = 0.0f;
+    int barberPreviewSkin_ = -1;
+    int barberPreviewHairStyle_ = -1;
+    int barberPreviewHairColor_ = -1;
+    int barberPreviewFacialHair_ = -1;
+    std::unique_ptr<rendering::CharacterPreview> barberPreview_;
     bool barberInitialized_ = false;
 
     // Trainer
     char trainerSearchFilter_[128] = "";
+
+    // Crafting window
+    char craftSearchFilter_[128] = "";
+    uint32_t craftSelectedRecipe_ = 0;
+    int craftQuantity_ = 1;
+    bool craftOnlyMakeable_ = false;
 
     // Auction house
     char auctionSearchName_[256] = "";

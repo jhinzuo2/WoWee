@@ -140,6 +140,20 @@ void TalentScreen::renderTalentTrees(game::GameHandler& gameHandler) {
         ImGui::TextColored(ui::colors::kDarkGray, "No points available");
     }
 
+    if (!classTabs.empty()) {
+        uint32_t totalSpent = 0;
+        for (size_t ti = 0; ti < classTabs.size() && ti < 3; ti++) {
+            totalSpent += treeTotals[ti];
+        }
+
+        ImGui::Spacing();
+        ImGui::TextDisabled("Spent: %u", totalSpent);
+        for (size_t ti = 0; ti < classTabs.size() && ti < 3; ti++) {
+            ImGui::SameLine(0, 16);
+            ImGui::Text("%s: %u", classTabs[ti]->name.c_str(), treeTotals[ti]);
+        }
+    }
+
     ImGui::Separator();
 
     // Render tabs with point counts in tab labels
@@ -615,16 +629,20 @@ void TalentScreen::loadSpellDBC(pipeline::AssetManager* assetManager) {
 
     const auto* spellL = pipeline::getActiveDBCLayout() ? pipeline::getActiveDBCLayout()->getLayout("Spell") : nullptr;
     uint32_t fieldCount = dbc->getFieldCount();
-    // Detect DBC/layout mismatch: Classic layout expects ~173 fields but we may
-    // load the WotLK base DBC (234 fields).  Use WotLK field indices in that case.
     uint32_t idField = 0, iconField = 133, tooltipField = 139;
     if (spellL) {
-        uint32_t layoutIcon = (*spellL)["IconID"];
-        if (layoutIcon < fieldCount && fieldCount <= layoutIcon + 20) {
-            idField = (*spellL)["ID"];
-            iconField = layoutIcon;
-            try { tooltipField = (*spellL)["Tooltip"]; } catch (...) {}
-        }
+        try {
+            uint32_t layoutId = (*spellL)["ID"];
+            uint32_t layoutIcon = (*spellL)["IconID"];
+            if (layoutId < fieldCount && layoutIcon < fieldCount) {
+                idField = layoutId;
+                iconField = layoutIcon;
+                try {
+                    uint32_t layoutTooltip = (*spellL)["Tooltip"];
+                    if (layoutTooltip < fieldCount) tooltipField = layoutTooltip;
+                } catch (...) {}
+            }
+        } catch (...) {}
     }
     uint32_t count = dbc->getRecordCount();
     for (uint32_t i = 0; i < count; ++i) {

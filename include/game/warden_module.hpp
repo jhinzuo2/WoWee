@@ -140,6 +140,11 @@ public:
 
 private:
     bool loaded_;                          // Module successfully loaded
+    // False when the module did not unpack into a real code image — typically because
+    // the server sent something other than a genuine Blizzard Warden module, which is
+    // normal on private servers. Running the emulator over that image just executes
+    // garbage, so we go straight to the stub callbacks instead.
+    bool moduleImageUsable_ = false;
     std::vector<uint8_t> md5Hash_;         // Module identifier
     std::vector<uint8_t> moduleData_;      // Raw encrypted data
     std::vector<uint8_t> decryptedData_;   // RC4 decrypted data

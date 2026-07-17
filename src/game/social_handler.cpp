@@ -13,10 +13,31 @@
 #include "core/application.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <vector>
 
 namespace wowee {
 namespace game {
+
+namespace {
+
+std::filesystem::path guildNameCachePath() {
+#ifdef _WIN32
+    if (const char* appData = std::getenv("APPDATA")) {
+        return std::filesystem::path(appData) / "wowee" / "guild_names.tsv";
+    }
+#else
+    if (const char* home = std::getenv("HOME")) {
+        return std::filesystem::path(home) / ".wowee" / "guild_names.tsv";
+    }
+#endif
+    return std::filesystem::path("guild_names.tsv");
+}
+
+} // namespace
 
 
 
@@ -59,10 +80,350 @@ static const char* lfgTeleportDeniedString(uint8_t reason) {
     }
 }
 
+static bool parseInspectEquipmentPayload(network::Packet& packet,
+                                         uint64_t& outGuid,
+                                         std::array<uint32_t, 19>& outItems,
+                                         std::array<uint16_t, 19>& outEnchants) {
+    const size_t start = packet.getReadPos();
+    constexpr size_t kGearBytes = 19 * sizeof(uint32_t);
+    constexpr uint32_t kEquipmentSlotMask = (1u << 19) - 1u;
+
+    auto reset = [&]() {
+        packet.setReadPos(start);
+        outGuid = 0;
+        outItems.fill(0);
+        outEnchants.fill(0);
+    };
+
+    auto countSlots = [](uint32_t mask) {
+        int count = 0;
+        for (int slot = 0; slot < 19; ++slot) {
+            if (mask & (1u << slot)) ++count;
+        }
+        return count;
+    };
+
+    auto parseMaskedItems = [&](const char* guidEncoding) -> bool {
+        if (!packet.hasRemaining(sizeof(uint32_t))) return false;
+        const uint32_t slotMask = packet.readUInt32();
+        if ((slotMask & ~kEquipmentSlotMask) != 0) return false;
+
+        const int slotCount = countSlots(slotMask);
+        if (slotCount <= 0) return false;
+
+        const size_t remaining = packet.getRemainingSize();
+        const size_t candidateRecordSizes[] = {24, 20, 16, 12, 8, 4};
+        size_t recordSize = 0;
+        for (size_t candidate : candidateRecordSizes) {
+            if (remaining == static_cast<size_t>(slotCount) * candidate) {
+                recordSize = candidate;
+                break;
+            }
+        }
+        if (recordSize == 0) {
+            // Some cores append a tiny trailer. Prefer the largest plausible
+            // record that fits cleanly, but do not consume packets that are
+            // clearly not the masked inspect format.
+            for (size_t candidate : candidateRecordSizes) {
+                const size_t needed = static_cast<size_t>(slotCount) * candidate;
+                if (remaining >= needed && remaining - needed <= 8) {
+                    recordSize = candidate;
+                    break;
+                }
+            }
+        }
+        if (recordSize < sizeof(uint32_t)) return false;
+
+        int nonZero = 0;
+        for (int slot = 0; slot < 19; ++slot) {
+            if ((slotMask & (1u << slot)) == 0) continue;
+            if (!packet.hasRemaining(recordSize)) return false;
+
+            const size_t recordStart = packet.getReadPos();
+            const uint32_t itemEntry = packet.readUInt32();
+            uint16_t enchantId = 0;
+            if (recordSize >= sizeof(uint32_t) + sizeof(uint16_t) &&
+                packet.hasRemaining(sizeof(uint16_t))) {
+                enchantId = packet.readUInt16();
+            }
+            packet.setReadPos(recordStart + recordSize);
+
+            outItems[slot] = itemEntry;
+            outEnchants[slot] = enchantId;
+            if (itemEntry != 0) ++nonZero;
+        }
+
+        if (nonZero == 0) return false;
+        LOG_INFO("SMSG_INSPECT_RESULTS_UPDATE masked gear: guidEncoding=", guidEncoding,
+                 " mask=0x", std::hex, slotMask, std::dec,
+                 " slots=", slotCount, " recordSize=", recordSize,
+                 " nonZero=", nonZero);
+        return true;
+    };
+
+    auto readItems = [&]() -> bool {
+        for (uint32_t& item : outItems) {
+            if (!packet.hasRemaining(sizeof(uint32_t))) return false;
+            item = packet.readUInt32();
+        }
+        return true;
+    };
+
+    reset();
+    if (packet.hasRemaining(sizeof(uint64_t))) {
+        outGuid = packet.readUInt64();
+        if (outGuid != 0 && parseMaskedItems("uint64")) {
+            return true;
+        }
+    }
+
+    reset();
+    if (packet.hasFullPackedGuid()) {
+        outGuid = packet.readPackedGuid();
+        if (outGuid != 0 && parseMaskedItems("packed")) {
+            return true;
+        }
+    }
+
+    reset();
+    if (packet.getRemainingSize() >= sizeof(uint64_t) + kGearBytes) {
+        outGuid = packet.readUInt64();
+        if (outGuid != 0 && readItems()) {
+            LOG_INFO("SMSG_INSPECT_RESULTS_UPDATE flat gear: guidEncoding=uint64 slots=19");
+            return true;
+        }
+    }
+
+    reset();
+    if (packet.hasFullPackedGuid()) {
+        outGuid = packet.readPackedGuid();
+        if (outGuid != 0 && packet.getRemainingSize() >= kGearBytes && readItems()) {
+            LOG_INFO("SMSG_INSPECT_RESULTS_UPDATE flat gear: guidEncoding=packed slots=19");
+            return true;
+        }
+    }
+
+    reset();
+    return false;
+}
+
+static bool isTbcInspectTalentBitSet(const std::vector<uint8_t>& bitfield, uint32_t bitIndex) {
+    const uint32_t slot = bitIndex / 7u;
+    const uint32_t offset = bitIndex % 7u;
+    return slot < bitfield.size() && (bitfield[slot] & (1u << offset)) != 0;
+}
+
+static bool decodeTbcInspectTalentBitfield(GameHandler& owner,
+                                           uint8_t classId,
+                                           const std::vector<uint8_t>& bitfield,
+                                           std::array<uint32_t, 3>& outTreePoints,
+                                           uint32_t& outSpentTalents) {
+    outTreePoints.fill(0);
+    outSpentTalents = 0;
+    if (classId == 0 || bitfield.empty()) return false;
+
+    owner.loadTalentDbc();
+
+    const uint32_t classMask = 1u << (classId - 1u);
+    std::vector<const TalentTabEntry*> classTabs;
+    for (const auto& [tabId, tab] : owner.getAllTalentTabs()) {
+        if (tab.classMask & classMask) {
+            classTabs.push_back(&tab);
+        }
+    }
+    std::sort(classTabs.begin(), classTabs.end(),
+              [](const auto* a, const auto* b) { return a->orderIndex < b->orderIndex; });
+    if (classTabs.empty()) return false;
+
+    uint32_t tabBitStart = 0;
+    for (size_t tabIndex = 0; tabIndex < classTabs.size() && tabIndex < outTreePoints.size(); ++tabIndex) {
+        std::vector<const TalentEntry*> talents;
+        for (const auto& [talentId, talent] : owner.getAllTalents()) {
+            if (talent.tabId == classTabs[tabIndex]->tabId && talent.maxRank > 0) {
+                talents.push_back(&talent);
+            }
+        }
+        std::sort(talents.begin(), talents.end(), [](const auto* a, const auto* b) {
+            if (a->row != b->row) return a->row < b->row;
+            if (a->column != b->column) return a->column < b->column;
+            return a->talentId < b->talentId;
+        });
+
+        uint32_t tabBits = 0;
+        for (const auto* talent : talents) {
+            uint8_t rank = 0;
+            for (uint8_t r = 1; r <= talent->maxRank; ++r) {
+                if (isTbcInspectTalentBitSet(bitfield, tabBitStart + tabBits + (r - 1u))) {
+                    rank = r;
+                }
+            }
+            outTreePoints[tabIndex] += rank;
+            outSpentTalents += rank;
+            tabBits += talent->maxRank;
+        }
+        tabBitStart += tabBits;
+    }
+
+    return true;
+}
+
+static bool parseTbcInspectTalentPayload(network::Packet& packet,
+                                         GameHandler& owner,
+                                         uint8_t classId,
+                                         uint32_t& outUnspentTalents,
+                                         uint32_t& outSpentTalents,
+                                         std::array<uint32_t, 3>& outTreePoints,
+                                         bool& outHasTreePoints) {
+    const size_t start = packet.getReadPos();
+    outUnspentTalents = 0;
+    outSpentTalents = 0;
+    outTreePoints.fill(0);
+    outHasTreePoints = false;
+
+    const size_t payloadSize = packet.getRemainingSize();
+    if (payloadSize < sizeof(uint32_t)) {
+        packet.setReadPos(start);
+        return false;
+    }
+
+    auto parseTalentRecords = [](network::Packet& p, size_t count) {
+        uint32_t spent = 0;
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t talentId = p.readUInt32();
+            const uint8_t rank = p.readUInt8();
+            if (talentId == 0) continue;
+            spent += static_cast<uint32_t>(rank) + 1u;
+        }
+        return spent;
+    };
+
+    const uint32_t firstValue = packet.readUInt32();
+
+    // TBC/CMaNGOS sends SMSG_INSPECT_TALENT as:
+    //   uint32 byteCount, byte[byteCount] compact talent bitfield.
+    // Older attempts treated byteCount (0x3d) as talent points; keep the
+    // fallback list-style parser below for other 2.x cores, but prefer this
+    // server-authored bitfield when the size lines up exactly.
+    if (firstValue > 0 && firstValue <= 256 && packet.getRemainingSize() == firstValue) {
+        std::vector<uint8_t> bitfield;
+        bitfield.reserve(firstValue);
+        for (uint32_t i = 0; i < firstValue; ++i) {
+            bitfield.push_back(packet.readUInt8());
+        }
+
+        outHasTreePoints = decodeTbcInspectTalentBitfield(owner, classId, bitfield, outTreePoints, outSpentTalents);
+        if (!outHasTreePoints) {
+            outSpentTalents = 0;
+        }
+        LOG_INFO("SMSG_INSPECT_TALENT (TBC): parsed cmangos bitfield bytes=", firstValue,
+                 " spent=", outSpentTalents,
+                 " trees=", outTreePoints[0], "/", outTreePoints[1], "/", outTreePoints[2],
+                 " class=", static_cast<int>(classId),
+                 " decoded=", (outHasTreePoints ? "yes" : "no"),
+                 " trailingBytes=", packet.getRemainingSize());
+        return true;
+    }
+
+    // The regular talents-info packet uses uint32 unspent + uint8 count.
+    // Accept that shape too so different 2.x cores still render something useful.
+    if (packet.hasRemaining(1)) {
+        const uint8_t nextByte = packet.readUInt8();
+        const size_t afterHeaderBytes = packet.getRemainingSize();
+
+        if (afterHeaderBytes > 0 && (afterHeaderBytes % 5u) == 0u) {
+            const size_t recordCount = afterHeaderBytes / 5u;
+            const uint32_t rankSpent = parseTalentRecords(packet, recordCount);
+            outUnspentTalents = 0;
+            outSpentTalents = firstValue != 0 ? firstValue : rankSpent;
+            LOG_INFO("SMSG_INSPECT_TALENT (TBC): parsed cmangos talents records=", recordCount,
+                     " spent=", outSpentTalents, " rankSpent=", rankSpent,
+                     " unk=", static_cast<int>(nextByte),
+                     " trailingBytes=", packet.getRemainingSize());
+            return true;
+        }
+
+        const uint8_t talentCount = nextByte;
+        if (packet.hasRemaining(static_cast<size_t>(talentCount) * 5u)) {
+            const uint32_t spentTalents = parseTalentRecords(packet, talentCount);
+            outUnspentTalents = firstValue;
+            outSpentTalents = spentTalents;
+            LOG_INFO("SMSG_INSPECT_TALENT (TBC): parsed talents count=", static_cast<int>(talentCount),
+                     " spent=", spentTalents, " unspent=", firstValue,
+                     " trailingBytes=", packet.getRemainingSize());
+            return true;
+        }
+    }
+
+    if ((payloadSize % 5u) == 0u) {
+        packet.setReadPos(start);
+        const size_t recordCount = payloadSize / 5u;
+        outSpentTalents = parseTalentRecords(packet, recordCount);
+        LOG_INFO("SMSG_INSPECT_TALENT (TBC): parsed bare talents records=", recordCount,
+                 " spent=", outSpentTalents,
+                 " trailingBytes=", packet.getRemainingSize());
+        return true;
+    }
+
+    packet.setReadPos(start);
+    return false;
+}
+
 static const std::string kEmptyString;
 
 SocialHandler::SocialHandler(GameHandler& owner)
-    : owner_(owner) {}
+    : owner_(owner) {
+    loadGuildNameCache();
+}
+
+void SocialHandler::loadGuildNameCache() {
+    std::ifstream in(guildNameCachePath());
+    if (!in.is_open()) return;
+
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const auto separator = line.find('\t');
+        if (separator == std::string::npos) continue;
+
+        try {
+            const uint32_t guildId = static_cast<uint32_t>(std::stoul(line.substr(0, separator)));
+            std::string guildName = line.substr(separator + 1);
+            if (guildId != 0 && !guildName.empty()) {
+                guildNameCache_[guildId] = std::move(guildName);
+            }
+        } catch (...) {
+            // Ignore stale or hand-edited cache lines.
+        }
+    }
+}
+
+void SocialHandler::saveGuildNameCache() const {
+    const std::filesystem::path path = guildNameCachePath();
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+
+    std::ofstream out(path);
+    if (!out.is_open()) {
+        LOG_WARNING("Could not save guild name cache to ", path.string());
+        return;
+    }
+
+    for (const auto& [guildId, guildName] : guildNameCache_) {
+        if (guildId != 0 && !guildName.empty()) {
+            out << guildId << '\t' << guildName << '\n';
+        }
+    }
+}
+
+void SocialHandler::rememberGuildName(uint32_t guildId, const std::string& guildName) {
+    if (guildId == 0 || guildName.empty()) return;
+
+    auto it = guildNameCache_.find(guildId);
+    if (it != guildNameCache_.end() && it->second == guildName) return;
+
+    guildNameCache_[guildId] = guildName;
+    saveGuildNameCache();
+}
 
 // ============================================================
 // registerOpcodes
@@ -226,7 +587,7 @@ void SocialHandler::registerOpcodes(DispatchTable& table) {
         owner_.addUIError("You are out of the duel area!");
         owner_.addSystemChatMessage("You are out of the duel area!");
     };
-    table[Opcode::SMSG_DUEL_INBOUNDS] = [this](network::Packet& /*packet*/) {};
+    table[Opcode::SMSG_DUEL_INBOUNDS] = [](network::Packet& /*packet*/) {};
     table[Opcode::SMSG_DUEL_COUNTDOWN] = [this](network::Packet& packet) {
         if (packet.hasRemaining(4)) {
             uint32_t ms = packet.readUInt32();
@@ -526,7 +887,14 @@ const std::string& SocialHandler::lookupGuildName(uint32_t guildId) {
     if (guildId == 0) return kEmptyString;
     auto it = guildNameCache_.find(guildId);
     if (it != guildNameCache_.end()) return it->second;
-    if (pendingGuildNameQueries_.insert(guildId).second) {
+
+    const auto now = std::chrono::steady_clock::now();
+    auto pendingIt = pendingGuildNameQueries_.find(guildId);
+    const bool shouldQuery =
+        pendingIt == pendingGuildNameQueries_.end() ||
+        std::chrono::duration_cast<std::chrono::seconds>(now - pendingIt->second).count() >= 2;
+    if (shouldQuery) {
+        pendingGuildNameQueries_[guildId] = now;
         queryGuildInfo(guildId);
     }
     return kEmptyString;
@@ -563,6 +931,101 @@ void SocialHandler::inspectTarget() {
 }
 
 void SocialHandler::handleInspectResults(network::Packet& packet) {
+    if (isActiveExpansion("tbc") && packet.getOpcode() == wireOpcode(Opcode::SMSG_INSPECT_RESULTS_UPDATE)) {
+        uint64_t guid = 0;
+        std::array<uint32_t, 19> items{};
+        std::array<uint16_t, 19> enchantIds{};
+        if (parseInspectEquipmentPayload(packet, guid, items, enchantIds)) {
+            owner_.cacheInspectedPlayerEquipment(guid, items);
+
+            auto entity = owner_.getEntityManager().getEntity(guid);
+            std::string playerName = "Target";
+            if (entity) {
+                auto player = std::dynamic_pointer_cast<Player>(entity);
+                if (player && !player->getName().empty()) playerName = player->getName();
+            }
+
+            // TBC servers send inspected gear separately from talent data. Make the
+            // gear-only response visible to the Inspect window immediately while
+            // preserving talents if a matching talent response already arrived.
+            if (inspectResult_.guid != guid) {
+                inspectResult_ = InspectResult{};
+                inspectResult_.guid = guid;
+            }
+            inspectResult_.playerName = playerName;
+            inspectResult_.itemEntries = items;
+            inspectResult_.enchantIds = enchantIds;
+
+            LOG_INFO("SMSG_INSPECT_RESULTS_UPDATE (TBC gear): ", playerName, " has gear in ",
+                     std::count_if(items.begin(), items.end(),
+                                   [](uint32_t e) { return e != 0; }), "/19 slots");
+            if (owner_.addonEventCallbackRef()) {
+                char guidBuf[32];
+                snprintf(guidBuf, sizeof(guidBuf), "0x%016llX", (unsigned long long)guid);
+                owner_.addonEventCallbackRef()("INSPECT_READY", {guidBuf});
+            }
+            return;
+        }
+        LOG_DEBUG("SMSG_INSPECT_RESULTS_UPDATE (TBC gear): unrecognized payload size=",
+                  packet.getSize());
+    }
+
+    if (isActiveExpansion("tbc") &&
+        packet.getOpcode() == wireOpcode(Opcode::SMSG_INSPECT_TALENT)) {
+        if (!packet.hasFullPackedGuid()) return;
+        uint64_t guid = packet.readPackedGuid();
+        if (guid == 0) return;
+
+        auto entity = owner_.getEntityManager().getEntity(guid);
+        std::string playerName = "Target";
+        if (entity) {
+            auto player = std::dynamic_pointer_cast<Player>(entity);
+            if (player && !player->getName().empty()) playerName = player->getName();
+        }
+
+        if (inspectResult_.guid != guid) {
+            inspectResult_ = InspectResult{};
+            inspectResult_.guid = guid;
+        }
+        inspectResult_.playerName = playerName;
+
+        uint32_t unspentTalents = 0;
+        uint32_t spentTalents = 0;
+        std::array<uint32_t, 3> treePoints{};
+        bool hasTreePoints = false;
+        const uint8_t classId = owner_.lookupPlayerClass(guid);
+        const size_t talentPayloadStart = packet.getReadPos();
+        if (parseTbcInspectTalentPayload(packet, owner_, classId, unspentTalents, spentTalents,
+                                         treePoints, hasTreePoints)) {
+            inspectResult_.totalTalents = spentTalents;
+            inspectResult_.unspentTalents = unspentTalents;
+            inspectResult_.hasTalentData = true;
+            inspectResult_.hasTalentTreePoints = hasTreePoints;
+            inspectResult_.talentTreePoints = treePoints;
+            inspectResult_.talentGroups = 1;
+            inspectResult_.activeTalentGroup = 0;
+        } else {
+            packet.setReadPos(talentPayloadStart);
+            LOG_INFO("SMSG_INSPECT_TALENT (TBC): ", playerName,
+                     " unparsed payload bytes=", packet.getRemainingSize());
+        }
+
+        auto gearIt = owner_.inspectedPlayerItemEntriesRef().find(guid);
+        if (gearIt != owner_.inspectedPlayerItemEntriesRef().end()) {
+            inspectResult_.itemEntries = gearIt->second;
+        }
+
+        LOG_INFO("SMSG_INSPECT_TALENT (TBC): ", playerName,
+                 " gearCached=", (gearIt != owner_.inspectedPlayerItemEntriesRef().end() ? "yes" : "no"),
+                 " payload bytes remaining=", packet.getRemainingSize());
+        if (owner_.addonEventCallbackRef()) {
+            char guidBuf[32];
+            snprintf(guidBuf, sizeof(guidBuf), "0x%016llX", (unsigned long long)guid);
+            owner_.addonEventCallbackRef()("INSPECT_READY", {guidBuf});
+        }
+        return;
+    }
+
     if (!packet.hasRemaining(1)) return;
     uint8_t talentType = packet.readUInt8();
 
@@ -681,6 +1144,9 @@ void SocialHandler::handleInspectResults(network::Packet& packet) {
     inspectResult_.playerName        = playerName;
     inspectResult_.totalTalents      = totalTalents;
     inspectResult_.unspentTalents    = unspentTalents;
+    inspectResult_.hasTalentData     = true;
+    inspectResult_.hasTalentTreePoints = false;
+    inspectResult_.talentTreePoints  = {};
     inspectResult_.talentGroups      = talentGroupCount;
     inspectResult_.activeTalentGroup = activeTalentGroup;
     inspectResult_.enchantIds        = enchantIds;
@@ -804,13 +1270,14 @@ void SocialHandler::randomRoll(uint32_t minRoll, uint32_t maxRoll) {
 // Logout
 // ============================================================
 
-void SocialHandler::requestLogout() {
+void SocialHandler::requestLogout(bool exitAfterLogout) {
     if (!owner_.getSocket()) return;
     if (loggingOut_) { owner_.addSystemChatMessage("Already logging out."); return; }
     auto packet = LogoutRequestPacket::build();
     owner_.getSocket()->send(packet);
     loggingOut_ = true;
-    LOG_INFO("Sent logout request");
+    exitAfterLogout_ = exitAfterLogout;
+    LOG_WARNING("Sent logout request (exitAfterLogout=", exitAfterLogout ? "yes" : "no", ")");  // temporary
 }
 
 void SocialHandler::cancelLogout() {
@@ -819,6 +1286,7 @@ void SocialHandler::cancelLogout() {
     auto packet = LogoutCancelPacket::build();
     owner_.getSocket()->send(packet);
     loggingOut_ = false;
+    exitAfterLogout_ = false;
     logoutCountdown_ = 0.0f;
     owner_.addSystemChatMessage("Logout cancelled.");
     LOG_INFO("Cancelled logout");
@@ -1219,13 +1687,14 @@ void SocialHandler::requestRaidInfo() {
 
 void SocialHandler::handleGroupInvite(network::Packet& packet) {
     GroupInviteResponseData data;
-    if (!GroupInviteResponseParser::parse(packet, data)) return;
+    const bool hasCanAccept = !isPreWotlk();
+    if (!GroupInviteResponseParser::parse(packet, data, hasCanAccept)) return;
     pendingGroupInvite = true;
     pendingInviterName = data.inviterName;
-    if (!data.inviterName.empty())
-        owner_.addSystemChatMessage(data.inviterName + " has invited you to a group.");
+    owner_.addSystemChatMessage(data.inviterName + " has invited you to a group.");
+    owner_.addUIError(data.inviterName + " has invited you to join a group.");
     if (auto* ac = owner_.services().audioCoordinator)
-        if (auto* sfx = ac->getUiSoundManager()) sfx->playTargetSelect();
+        if (auto* sfx = ac->getUiSoundManager()) sfx->playQuestActivate();
     if (owner_.addonEventCallbackRef())
         owner_.addonEventCallbackRef()("PARTY_INVITE_REQUEST", {data.inviterName});
 }
@@ -1238,10 +1707,11 @@ void SocialHandler::handleGroupDecline(network::Packet& packet) {
 
 void SocialHandler::handleGroupList(network::Packet& packet) {
     const bool hasRoles = isActiveExpansion("wotlk");
+    const bool hasBattleGroupFlag = isActiveExpansion("tbc");
     const uint8_t prevLootMethod = partyData.lootMethod;
     const bool wasInGroup = !partyData.isEmpty();
     partyData = GroupListData{};
-    if (!GroupListParser::parse(packet, partyData, hasRoles)) return;
+    if (!GroupListParser::parse(packet, partyData, hasRoles, hasBattleGroupFlag)) return;
 
     const bool nowInGroup = !partyData.isEmpty();
     if (!nowInGroup && wasInGroup) {
@@ -1433,6 +1903,12 @@ void SocialHandler::handlePartyMemberStats(network::Packet& packet, bool isFull)
 void SocialHandler::handleGuildInfo(network::Packet& packet) {
     GuildInfoData data;
     if (!GuildInfoParser::parse(packet, data)) return;
+    if (!data.guildName.empty()) {
+        if (const Character* ch = owner_.getActiveCharacter(); ch && ch->hasGuild()) {
+            rememberGuildName(ch->guildId, data.guildName);
+            if (guildName_.empty()) guildName_ = data.guildName;
+        }
+    }
     // SMSG_GUILD_INFO is pushed by the server on every guild roster sync
     // (login, member join/leave, periodic refreshes). Only print when
     // something the user can see has actually changed; otherwise the
@@ -1459,9 +1935,11 @@ void SocialHandler::handleGuildRoster(network::Packet& packet) {
 void SocialHandler::handleGuildQueryResponse(network::Packet& packet) {
     GuildQueryResponseData data;
     if (!owner_.getPacketParsers()->parseGuildQueryResponse(packet, data)) return;
-    if (data.guildId != 0 && !data.guildName.empty()) {
-        guildNameCache_[data.guildId] = data.guildName;
+    if (data.guildId != 0) {
         pendingGuildNameQueries_.erase(data.guildId);
+        if (!data.guildName.empty()) {
+            rememberGuildName(data.guildId, data.guildName);
+        }
     }
     const Character* ch = owner_.getActiveCharacter();
     bool isLocalGuild = (ch && ch->hasGuild() && ch->guildId == data.guildId);
@@ -1909,13 +2387,19 @@ void SocialHandler::handleLogoutResponse(network::Packet& packet) {
         if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("PLAYER_LOGOUT", {});
     } else {
         owner_.addSystemChatMessage("Cannot logout right now.");
-        loggingOut_ = false; logoutCountdown_ = 0.0f;
+        loggingOut_ = false; exitAfterLogout_ = false; logoutCountdown_ = 0.0f;
     }
 }
 
 void SocialHandler::handleLogoutComplete(network::Packet& /*packet*/) {
+    // The countdown finishing is not the end of it: the server says when the
+    // character is actually out of the world, and only then can the client leave —
+    // to character select, or out of the game entirely for /quit and /exit.
+    const bool exiting = exitAfterLogout_;
     owner_.addSystemChatMessage("Logout complete.");
-    loggingOut_ = false; logoutCountdown_ = 0.0f;
+    loggingOut_ = false; exitAfterLogout_ = false; logoutCountdown_ = 0.0f;
+    LOG_WARNING("Logout complete (exiting=", exiting ? "yes" : "no", ")");  // temporary: visible at default log level
+    if (owner_.logoutCompleteCallbackRef()) owner_.logoutCompleteCallbackRef()(exiting);
 }
 
 // ============================================================
@@ -2735,11 +3219,15 @@ void SocialHandler::setStandState(uint8_t standState) {
     LOG_INFO("Changed stand state to: ", static_cast<int>(standState));
 }
 
-void SocialHandler::sendAlterAppearance(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair) {
+void SocialHandler::sendAlterAppearance(uint32_t hairStyleEntry, uint32_t hairColor,
+                                        uint32_t facialHairEntry, uint32_t skinColorEntry) {
     if (!owner_.isInWorld()) return;
-    auto pkt = AlterAppearancePacket::build(hairStyle, hairColor, facialHair);
+    auto pkt = AlterAppearancePacket::build(hairStyleEntry, hairColor,
+                                            facialHairEntry, skinColorEntry);
     owner_.getSocket()->send(pkt);
-    LOG_INFO("sendAlterAppearance: hair=", hairStyle, " color=", hairColor, " facial=", facialHair);
+    LOG_INFO("sendAlterAppearance: hairEntry=", hairStyleEntry,
+             " color=", hairColor, " facialEntry=", facialHairEntry,
+             " skinEntry=", skinColorEntry);
 }
 
 void SocialHandler::deleteGmTicket() {

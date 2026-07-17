@@ -494,26 +494,27 @@ bool AudioEngine::playSound3D(const std::string& mpqPath, const glm::vec3& posit
     return playSound3D(data, position, volume, pitch, maxDistance);
 }
 
-bool AudioEngine::playMusic(const std::vector<uint8_t>& musicData, float volume, bool loop) {
-    if (!initialized_ || !engine_ || musicData.empty()) {
+bool AudioEngine::playMusic(std::shared_ptr<const std::vector<uint8_t>> musicData,
+                            float volume, bool loop) {
+    if (!initialized_ || !engine_ || !musicData || musicData->empty()) {
         return false;
     }
 
-    LOG_INFO("AudioEngine::playMusic - data size: ", musicData.size(), " bytes, volume: ", volume);
+    LOG_INFO("AudioEngine::playMusic - data size: ", musicData->size(), " bytes, volume: ", volume);
 
     // Stop any currently playing music
     stopMusic();
 
-    // Keep the music data alive
-    musicData_ = musicData;
+    // Keep the encoded bytes alive for as long as miniaudio's decoder streams them.
+    musicData_ = std::move(musicData);
     musicVolume_ = volume;
 
     // Create decoder from memory (for streaming MP3/OGG)
     ma_decoder* decoder = new ma_decoder();
     ma_decoder_config decoderConfig = ma_decoder_config_init_default();
     ma_result result = ma_decoder_init_memory(
-        musicData_.data(),
-        musicData_.size(),
+        musicData_->data(),
+        musicData_->size(),
         &decoderConfig,
         decoder
     );
@@ -521,6 +522,7 @@ bool AudioEngine::playMusic(const std::vector<uint8_t>& musicData, float volume,
     if (result != MA_SUCCESS) {
         LOG_ERROR("Failed to create music decoder: ", result);
         delete decoder;
+        musicData_.reset();
         return false;
     }
 
@@ -536,6 +538,7 @@ bool AudioEngine::playMusic(const std::vector<uint8_t>& musicData, float volume,
         ma_decoder_uninit(decoder);
         delete decoder;
         musicDecoder_ = nullptr;
+        musicData_.reset();
         return false;
     }
     result = ma_sound_init_from_data_source(
@@ -553,6 +556,7 @@ bool AudioEngine::playMusic(const std::vector<uint8_t>& musicData, float volume,
         musicDecoder_ = nullptr;
         std::free(musicSound_);
         musicSound_ = nullptr;
+        musicData_.reset();
         return false;
     }
 
@@ -592,7 +596,7 @@ void AudioEngine::stopMusic() {
         delete decoder;
         musicDecoder_ = nullptr;
     }
-    musicData_.clear();
+    musicData_.reset();
 }
 
 bool AudioEngine::isMusicPlaying() const {

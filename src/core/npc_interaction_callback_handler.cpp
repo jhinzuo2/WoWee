@@ -76,7 +76,13 @@ void NPCInteractionCallbackHandler::setupCallbacks() {
         if (audioCoordinator_ && audioCoordinator_->getNpcVoiceManager()) {
             glm::vec3 renderPos = core::coords::canonicalToRender(position);
             audio::VoiceType voiceType = resolveNpcVoiceType(guid);
-            audioCoordinator_->getNpcVoiceManager()->playAggro(guid, voiceType, renderPos);
+            uint32_t displayId = 0;
+            auto entity = gameHandler_.getEntityManager().getEntity(guid);
+            if (entity && entity->getType() == game::ObjectType::UNIT) {
+                displayId = std::static_pointer_cast<game::Unit>(entity)->getDisplayId();
+            }
+            audioCoordinator_->getNpcVoiceManager()->playAggro(
+                guid, displayId, voiceType, renderPos);
         }
     });
 }

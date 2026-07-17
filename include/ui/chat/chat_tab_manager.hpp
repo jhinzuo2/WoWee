@@ -24,10 +24,13 @@ public:
     int getTabCount() const { return static_cast<int>(tabs_.size()); }
     const std::string& getTabName(int idx) const { return tabs_[idx].name; }
     uint64_t getTabTypeMask(int idx) const { return tabs_[idx].typeMask; }
+    /** One-line description of what the tab shows (for hover tooltips). */
+    static const char* getTabTooltip(int idx);
 
     // ---- Unread tracking ----
     int getUnreadCount(int idx) const;
     void clearUnread(int idx);
+    void markAllRead();
     /** Scan new messages since last call and increment unread counters for non-active tabs. */
     void updateUnread(const std::deque<game::MessageChatData>& history, int activeTab);
 

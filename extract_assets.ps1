@@ -3,7 +3,8 @@
     Extracts WoW MPQ archives for use with wowee (Windows equivalent of extract_assets.sh).
 
 .DESCRIPTION
-    Builds the asset_extract tool (if needed) and runs it against a WoW Data directory.
+    Builds the asset_extract tool (if needed) and writes each client into its own
+    Data/expansions/<id> directory so shared asset names cannot be overwritten.
 
 .PARAMETER MpqDir
     Path to the WoW client's Data directory containing .MPQ files.
@@ -99,7 +100,7 @@ Write-Host "Extracting assets from: $MpqDir"
 Write-Host "Output directory:       $OutputDir"
 Write-Host ""
 
-$extraArgs = @("--mpq-dir", $MpqDir, "--output", $OutputDir)
+$extraArgs = @("--mpq-dir", $MpqDir, "--output", $OutputDir, "--expansion-subdir")
 
 if ($Expansion -ne "auto") {
     $extraArgs += "--expansion"
@@ -111,9 +112,6 @@ $skipDbc = $false
 if ($Expansion -ne "auto") {
     $csvPath = Join-Path $OutputDir "expansions\$Expansion\db\*.csv"
     if (Get-ChildItem -Path $csvPath -ErrorAction SilentlyContinue) { $skipDbc = $true }
-} else {
-    $csvPath = Join-Path $OutputDir "expansions\*\db\*.csv"
-    if (Get-ChildItem -Path $csvPath -ErrorAction SilentlyContinue) { $skipDbc = $true }
 }
 if ($skipDbc) {
     $extraArgs += "--skip-dbc"
@@ -123,5 +121,9 @@ if ($skipDbc) {
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Host ""
-Write-Host "Done! Assets extracted to $OutputDir"
+if ($Expansion -eq "auto") {
+    Write-Host "Done! Assets extracted under $OutputDir\expansions\<detected-expansion>"
+} else {
+    Write-Host "Done! Assets extracted to $OutputDir\expansions\$Expansion"
+}
 Write-Host "You can now run wowee."

@@ -38,10 +38,8 @@ rebuild.sh
 rebuild.bat
 rebuild.ps1
 clean.sh
-debug_texture.*
 extract_assets.*
 extract_warden_rsa.py
-restart-worldserver.sh
 test.sh
 
 # macOS SDK tarballs that may be temporarily placed here

@@ -1,6 +1,7 @@
 // Entity, Unit, Player, GameObject, EntityManager tests
 #include <catch_amalgamated.hpp>
 #include "game/entity.hpp"
+#include <algorithm>
 #include <memory>
 
 using namespace wowee::game;
@@ -112,6 +113,11 @@ TEST_CASE("Unit flags", "[entity]") {
     u.setUnitFlags(0x01);
     REQUIRE(u.getUnitFlags() == 0x01);
 
+    REQUIRE_FALSE(u.hasCreepVisibility());
+    u.setVisibilityFlags(UNIT_VIS_FLAG_CREEP);
+    REQUIRE(u.getVisibilityFlags() == UNIT_VIS_FLAG_CREEP);
+    REQUIRE(u.hasCreepVisibility());
+
     u.setDynamicFlags(0x02);
     REQUIRE(u.getDynamicFlags() == 0x02);
 
@@ -121,6 +127,17 @@ TEST_CASE("Unit flags", "[entity]") {
 
     u.setNpcFlags(0);
     REQUIRE_FALSE(u.isInteractable());
+}
+
+TEST_CASE("Corpse state uses the real dynamic dead bit", "[entity][corpse]") {
+    REQUIRE(isUnitCorpseState(0, 100, 0));
+    REQUIRE(isUnitCorpseState(0, 0, UNIT_DYNFLAG_DEAD));
+    REQUIRE(isUnitCorpseState(0, 0, UNIT_DYNFLAG_LOOTABLE));
+
+    REQUIRE_FALSE(isUnitCorpseState(100, 100, 0));
+    // Regression: 0x08 is tapped-by-player, not dead.
+    REQUIRE_FALSE(isUnitCorpseState(100, 100, UNIT_DYNFLAG_TAPPED_BY_PLAYER));
+    REQUIRE(UNIT_DYNFLAG_DEAD == 0x00000020);
 }
 
 TEST_CASE("Unit faction and hostility", "[entity]") {
@@ -217,4 +234,23 @@ TEST_CASE("EntityManager getEntities returns all", "[entity]") {
     REQUIRE(all.count(10) == 1);
     REQUIRE(all.count(20) == 1);
     REQUIRE(all.count(30) == 1);
+}
+
+TEST_CASE("EntityManager spatial query filters nearby entities", "[entity][spatial]") {
+    EntityManager mgr;
+    auto origin = std::make_shared<Unit>(1);
+    origin->setPosition(-10.0f, -10.0f, 0.0f, 0.0f);
+    auto nearby = std::make_shared<Unit>(2);
+    nearby->setPosition(20.0f, 15.0f, 0.0f, 0.0f);
+    auto distant = std::make_shared<Unit>(3);
+    distant->setPosition(500.0f, 500.0f, 0.0f, 0.0f);
+    mgr.addEntity(1, origin);
+    mgr.addEntity(2, nearby);
+    mgr.addEntity(3, distant);
+
+    const auto result = mgr.getEntitiesNear(0.0f, 0.0f, 50.0f);
+    REQUIRE(result.size() == 2);
+    REQUIRE(std::any_of(result.begin(), result.end(), [](const auto& e) { return e->getGuid() == 1; }));
+    REQUIRE(std::any_of(result.begin(), result.end(), [](const auto& e) { return e->getGuid() == 2; }));
+    REQUIRE_FALSE(std::any_of(result.begin(), result.end(), [](const auto& e) { return e->getGuid() == 3; }));
 }

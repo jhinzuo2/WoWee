@@ -20,6 +20,11 @@ constexpr uint32_t COPPER_PER_SILVER = 100;
 // ---------------------------------------------------------------------------
 constexpr uint32_t UNIT_FLAG_TAXI_FLIGHT = 0x00000100;
 
+// Unit visibility flags (byte 2 of UNIT_FIELD_BYTES_1).
+// CREEP marks a unit using the client-side stealth presentation. The server
+// still decides whether an undetected stealthed unit is sent to the client.
+constexpr uint8_t UNIT_VIS_FLAG_CREEP = 0x02;
+
 // ---------------------------------------------------------------------------
 // NPC flags (UNIT_NPC_FLAGS — index 82 in UnitFields for 3.3.5a;
 // 147 in Classic/Turtle. Bitmask values below are stable across expansions.)

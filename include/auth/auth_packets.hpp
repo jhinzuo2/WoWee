@@ -135,8 +135,9 @@ struct RealmListResponse {
 // REALM_LIST response parser
 class RealmListResponseParser {
 public:
-    // protocolVersion: 3 = vanilla (uint8 realmCount, uint32 icon), 8 = WotLK (uint16 realmCount, uint8 icon)
-    [[nodiscard]] static bool parse(network::Packet& packet, RealmListResponse& response, uint8_t protocolVersion = 8);
+    // legacyVanillaLayout: vanilla/classic uses uint8 realmCount and uint32 icon;
+    // TBC/WotLK use uint16 realmCount and byte-sized icon/lock/flags.
+    [[nodiscard]] static bool parse(network::Packet& packet, RealmListResponse& response, bool legacyVanillaLayout = false);
 };
 
 } // namespace auth

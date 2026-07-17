@@ -35,24 +35,29 @@ bool computeIntegrityHashWin32WithExe(const std::array<uint8_t, 16>& checksumSal
                                       const std::vector<uint8_t>& clientPublicKeyA,
                                       const std::string& miscDir,
                                       const std::string& exeName,
+                                      uint16_t clientBuild,
                                       std::array<uint8_t, 20>& outHash,
                                       std::string& outError) {
-    // Files expected by 1.12.x Windows clients for the integrity check.
-    // If this needs to vary by build, make it data-driven in expansion.json later.
+    // Classic 1.12.x (build <=6005) ships fmod.dll, ijl15.dll, dbghelp.dll,
+    // unicows.dll alongside WoW.exe.  TBC/WotLK clients do not; hashing
+    // only the .exe is sufficient (servers rarely validate the CRC for those).
     //
     // Turtle WoW ships a custom loader DLL. Some Turtle auth servers appear to validate integrity against
     // that distribution rather than a stock 1.12.1 client, so when using Turtle's executable we include
     // Turtle-specific DLLs as well.
     const bool isTurtleExe = (exeName == "TurtleWoW.exe");
+    const bool isClassicBuild = (clientBuild <= 6005 || isTurtleExe);
     // Some macOS client layouts use FMOD dylib naming instead of fmod.dll.
     // We accept the first matching filename in each alias group.
     std::vector<std::vector<std::string>> fileGroups = {
         { exeName },
-        { "fmod.dll", "fmod.dylib", "libfmod.dylib", "fmodex.dll", "fmodex.dylib", "libfmod.so" },
-        { "ijl15.dll" },
-        { "dbghelp.dll" },
-        { "unicows.dll" },
     };
+    if (isClassicBuild) {
+        fileGroups.push_back({ "fmod.dll", "fmod.dylib", "libfmod.dylib", "fmodex.dll", "fmodex.dylib", "libfmod.so" });
+        fileGroups.push_back({ "ijl15.dll" });
+        fileGroups.push_back({ "dbghelp.dll" });
+        fileGroups.push_back({ "unicows.dll" });
+    }
     if (isTurtleExe) {
         fileGroups.push_back({ "twloader.dll" });
         fileGroups.push_back({ "twdiscord.dll" });
@@ -110,7 +115,7 @@ bool computeIntegrityHashWin32(const std::array<uint8_t, 16>& checksumSalt,
                                const std::string& miscDir,
                                std::array<uint8_t, 20>& outHash,
                                std::string& outError) {
-    return computeIntegrityHashWin32WithExe(checksumSalt, clientPublicKeyA, miscDir, "WoW.exe", outHash, outError);
+    return computeIntegrityHashWin32WithExe(checksumSalt, clientPublicKeyA, miscDir, "WoW.exe", 5875, outHash, outError);
 }
 
 bool computeIntegrityHashFromVersionHash(const std::vector<uint8_t>& clientPublicKeyA,

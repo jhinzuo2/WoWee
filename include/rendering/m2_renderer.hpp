@@ -17,6 +17,7 @@
 #include <random>
 #include <chrono>
 #include <future>
+#include <algorithm>
 
 namespace wowee {
 
@@ -53,6 +54,7 @@ struct M2ModelGPU {
         uint8_t texFlags = 0;     // M2Texture.flags (bit0=WrapS, bit1=WrapT)
         bool lanternGlowHint = false; // Texture/model hints this batch is a glow-card billboard
         bool glowCardLike = false; // Batch likely is a flat emissive card that should be sprite-replaced
+        bool preserveGlowMesh = false; // Keep emissive glass/fixture mesh below its glow sprite
         uint8_t glowTint = 0; // 0=warm, 1=cool, 2=red
         float batchOpacity = 1.0f; // Resolved texture weight opacity (0=transparent, skip batch)
         glm::vec3 center = glm::vec3(0.0f); // Center of batch geometry (model space)
@@ -86,6 +88,7 @@ struct M2ModelGPU {
     bool isFireflyEffect = false;   // Firefly/fireflies M2 (exempt from particle dampeners)
     bool isWaterfall = false;       // Waterfall model (ambient sound + splash particles)
     bool isBrazierOrFire = false;   // Brazier / campfire / bonfire model
+    bool isGroundFire = false;      // Ground fire whose halo follows its lowest flame emitter
     bool isTorch = false;           // Wall-mounted or standing torch
     AmbientEmitterType ambientEmitterType = AmbientEmitterType::None;
 
@@ -130,6 +133,7 @@ struct M2ModelGPU {
     bool isLanternLike = false;     // Model name matches lantern/lamp/light (precomputed)
     bool isKoboldFlame = false;     // Model name matches kobold+(candle/torch/mine) (precomputed)
     bool isLavaModel = false;       // Model name contains lava/molten/magma (UV scroll fallback)
+    bool isSkyBird = false;         // Flying bird/bat doodad — hide until animation range
     bool hasTextureAnimation = false; // True if any batch has UV animation
     bool hasTransparentBatches = false; // True if any batch uses alpha-blend or additive (blendMode >= 2)
     uint8_t availableLODs = 0;  // Bitmask: bit N set if any batch has submeshLevel==N
@@ -180,6 +184,7 @@ struct M2Instance {
 
     // Animation state
     float animTime = 0.0f;       // Current animation time (ms)
+    float globalSequenceTime = 0.0f; // Independent clock for global animation tracks
     float animSpeed = 1.0f;      // Animation playback speed
     int currentSequenceIndex = 0;// Index into sequences array
     float animDuration = 0.0f;   // Duration of current animation (ms)
@@ -215,9 +220,12 @@ struct M2Instance {
     bool cachedIsGroundDetail = false;
     bool cachedIsInvisibleTrap = false;
     bool cachedIsInstancePortal = false;
+    bool cachedIsSkyBird = false;
     bool cachedIsValid = false;
     bool skipCollision = false;    // WMO interior doodads — skip player wall collision
     float cachedBoundRadius = 0.0f;
+    glm::vec3 cachedCullCenter{0.0f};              // transformed visual-bounds center
+    float cachedVisualRadius = 0.0f;               // transformed visual-bounds half diagonal
     // Pre-computed per-instance cull factors (depend only on static flags + scale +
     // bound radius), populated by recomputeCachedCullFactors(). The per-frame SSBO
     // upload just multiplies by the smoothed render distance and packs the rest.
@@ -231,6 +239,10 @@ struct M2Instance {
     // Frame-skip optimization (update distant animations less frequently)
     uint8_t frameSkipCounter = 0;
     bool bonesDirty[2] = {false, false};  // Per-frame-index: set when bones recomputed, cleared after upload
+    // Mega-bone slot this instance's bones were last uploaded to, per frame
+    // index (0 = never uploaded; valid slots start at 1). Lets prepareRender
+    // skip the memcpy when the bones are unchanged and still at the same slot.
+    uint32_t megaBoneUploadedSlot[2] = {0, 0};
 
     // Per-instance bone SSBO (double-buffered) — legacy; see mega bone SSBO in M2Renderer
     ::VkBuffer boneBuffer[2] = {};
@@ -268,6 +280,7 @@ struct M2MaterialUBO {
     float fadeAlpha;
     float interiorDarken;
     float specularIntensity;
+    float emissiveBoost;
 };
 
 // M2 params UBO — matches M2Params in m2.vert.glsl (set 1, binding 1)
@@ -290,6 +303,8 @@ public:
 
     [[nodiscard]] bool initialize(VkContext* ctx, VkDescriptorSetLayout perFrameLayout,
                     pipeline::AssetManager* assets);
+    /** Configure this renderer for camera-centered sky M2s before initialize(). */
+    void setSkyMode(bool enabled) { skyMode_ = enabled; }
     void shutdown();
 
     bool hasModel(uint32_t modelId) const;
@@ -315,6 +330,12 @@ public:
     /** Dispatch GPU frustum culling compute shader on primary cmd before render pass. */
     void dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, const Camera& camera);
     void render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const Camera& camera);
+
+    /** Gather the nearest authored glow cards as inexpensive scene point lights. */
+    uint32_t gatherLocalLights(const glm::vec3& cameraPos,
+                               glm::vec4* outPosRadius,
+                               glm::vec4* outColorIntensity,
+                               uint32_t maxLights) const;
 
     /** Set the HiZ system for occlusion culling (Phase 6.3). nullptr disables HiZ. */
     void setHiZSystem(HiZSystem* hiz) { hizSystem_ = hiz; }
@@ -398,6 +419,9 @@ public:
 
     void setInsideInterior(bool inside) { insideInterior = inside; }
     void setOnTaxi(bool onTaxi) { onTaxi_ = onTaxi; }
+    void setViewDistance(float distance) {
+        viewDistanceScale_ = std::clamp(distance, 400.0f, 2400.0f) / 1200.0f;
+    }
 
     std::vector<glm::vec3> getWaterVegetationPositions(const glm::vec3& camPos, float maxDist) const;
 
@@ -453,6 +477,8 @@ private:
     // Descriptor pools
     VkDescriptorPool materialDescPool_ = VK_NULL_HANDLE;
     VkDescriptorPool boneDescPool_ = VK_NULL_HANDLE;
+    std::shared_ptr<std::atomic<uint64_t>> boneDescPoolGeneration_ =
+        std::make_shared<std::atomic<uint64_t>>(0);
     static constexpr uint32_t MAX_MATERIAL_SETS = 16384;
     static constexpr uint32_t MAX_BONE_SETS = 16384;
 
@@ -557,7 +583,7 @@ private:
     VmaAllocation m2ParticleVBAlloc_ = VK_NULL_HANDLE;
     void* m2ParticleVBMapped_ = nullptr;
     // Dedicated glow sprite vertex buffer (separate from particle VB to avoid data race)
-    static constexpr size_t MAX_GLOW_SPRITES = 2000;
+    static constexpr size_t MAX_GLOW_SPRITES = 8000;
     ::VkBuffer glowVB_ = VK_NULL_HANDLE;
     VmaAllocation glowVBAlloc_ = VK_NULL_HANDLE;
     void* glowVBMapped_ = nullptr;
@@ -664,6 +690,7 @@ private:
         float effectiveMaxDistSq;
     };
     std::vector<VisibleEntry> sortedVisible_;  // Reused each frame
+    std::vector<VisibleEntry> transparentVisible_; // Only models needing pass 2
     struct GlowSprite {
         glm::vec3 worldPos;
         glm::vec4 color;
@@ -735,18 +762,20 @@ private:
     // M2 particle emitter system
     static constexpr size_t MAX_M2_PARTICLES = 4000;
     std::mt19937 particleRng_{123};
+    bool skyMode_ = false;
 
     // Cached camera state from update() for frustum-culling bones
     glm::vec3 cachedCamPos_ = glm::vec3(0.0f);
     float cachedMaxRenderDistSq_ = 0.0f;
     float smoothedRenderDist_ = 1000.0f;  // Smoothed render distance to prevent flickering
+    float viewDistanceScale_ = 1.0f;
     bool forceNoCull_ = false;
 
     // Thread count for parallel bone animation
     uint32_t numAnimThreads_ = 1;
 
-    float interpFloat(const pipeline::M2AnimationTrack& track, float animTime, int seqIdx,
-                      const std::vector<pipeline::M2Sequence>& seqs,
+    float interpFloat(const pipeline::M2AnimationTrack& track, float animTime,
+                      float globalTime, int seqIdx,
                       const std::vector<uint32_t>& globalSeqDurations);
     float interpFBlockFloat(const pipeline::M2FBlock& fb, float lifeRatio);
     glm::vec3 interpFBlockVec3(const pipeline::M2FBlock& fb, float lifeRatio);

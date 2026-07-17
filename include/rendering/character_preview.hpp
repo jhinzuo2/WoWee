@@ -1,15 +1,18 @@
 #pragma once
 
 #include "game/character.hpp"
+#include <glm/glm.hpp>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include <memory>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace wowee {
-namespace pipeline { class AssetManager; }
+namespace pipeline { class AssetManager; struct M2Model; }
 namespace rendering {
 
 class CharacterRenderer;
@@ -37,6 +40,8 @@ public:
     void update(float deltaTime);
     void render();
     void rotate(float yawDelta);
+    void zoom(float wheelDelta);
+    void resetView();
 
     // Off-screen composite pass — call from Renderer::beginFrame() before main render pass
     void compositePass(VkCommandBuffer cmd, uint32_t frameIndex);
@@ -56,8 +61,27 @@ public:
     bool isModelLoaded() const { return modelLoaded_; }
 
 private:
+    struct FacialHairGeosets {
+        uint16_t geoset100 = 0;
+        uint16_t geoset300 = 0;
+        uint16_t geoset200 = 0;
+    };
+
     void createFBO();
     void destroyFBO();
+    void ensureAppearanceGeosetsLoaded();
+    std::unordered_set<uint16_t> buildBaseGeosets();
+    uint16_t selectedHairScalpGeoset() const;
+
+    // Read an M2 (plus its .skin for WotLK-era models) through the asset manager.
+    bool loadPreviewM2(const std::string& m2Path, pipeline::M2Model& outModel);
+    // Hang the character's weapons off the preview model's hand attachments.
+    void attachWeapons(const std::vector<game::EquipmentItem>& equipment);
+    // Put the weapon's enchant glint on it (char enum reports the ItemVisual id directly).
+    void attachWeaponEnchantVisual(uint32_t attachmentId, uint32_t itemVisualId);
+    // Load the race's glue scene (Stormwind for humans, Orgrimmar for orcs, ...) as a backdrop.
+    void loadRacialBackdrop(game::Race race);
+    void applyPreviewView();
 
     pipeline::AssetManager* assetManager_ = nullptr;
     VkContext* vkCtx_ = nullptr;
@@ -85,16 +109,38 @@ private:
     VkDescriptorSet imguiTextureId_ = VK_NULL_HANDLE;
 
     // 4:5 portrait aspect ratio — taller than wide to show full character body
-    // from head to feet in the character creation/selection screen
-    static constexpr int fboWidth_ = 400;
-    static constexpr int fboHeight_ = 500;
+    // from head to feet in the character creation/selection screen. Rendered at
+    // roughly the size it is displayed at, so the larger panel is not upscaled mush.
+    static constexpr int fboWidth_ = 640;
+    static constexpr int fboHeight_ = 800;
 
     static constexpr uint32_t PREVIEW_MODEL_ID = 9999;
+    static constexpr uint32_t PREVIEW_BACKDROP_MODEL_ID = 9996;
+
+    // CharacterRenderer::loadModel() keeps a model cache keyed by id and skips
+    // loading when the id is already present, so a fixed id per hand would hand
+    // every subsequent character the first character's weapon. Key the id by what
+    // is actually being loaded instead: same weapon reuses the model, different
+    // weapon gets its own.
+    uint32_t previewModelIdFor(const std::string& assetKey);
+    std::unordered_map<std::string, uint32_t> previewModelIds_;
+    uint32_t nextPreviewModelId_ = 20000;
+    uint32_t backdropInstanceId_ = 0;
+    int backdropRace_ = -1;   // race whose glue scene is currently loaded (-1 = none)
     uint32_t instanceId_ = 0;
     bool modelLoaded_ = false;
     bool compositeRequested_ = false;
     bool compositeRendered_ = false;  // True after first successful compositePass
     float modelYaw_ = 90.0f;
+
+    // Character-creation portrait rig. The full-body distance is recomputed for
+    // each race; wheel zoom interpolates its focus upward toward the face.
+    float zoomLevel_ = 0.0f;
+    float fullBodyDistance_ = 4.5f;
+    float modelBoundMinZ_ = 0.0f;
+    float modelBoundMaxZ_ = 2.0f;
+    glm::vec3 previewStandPosition_{0.0f};
+    glm::vec3 previewViewDirection_{0.0f, 1.0f, 0.0f};
 
     // Cached info from loadCharacter() for later recompositing.
     game::Race race_ = game::Race::HUMAN;
@@ -105,6 +151,10 @@ private:
     std::string bodySkinPath_;
     std::vector<std::string> baseLayers_; // face + underwear, etc.
     uint32_t skinTextureSlotIndex_ = 0;
+
+    bool appearanceGeosetsLoaded_ = false;
+    std::unordered_map<uint32_t, uint16_t> hairGeosetMap_;
+    std::unordered_map<uint32_t, FacialHairGeosets> facialHairGeosetMap_;
 };
 
 } // namespace rendering

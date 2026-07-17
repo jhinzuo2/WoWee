@@ -11,6 +11,11 @@ namespace pipeline {
 bool AssetManifest::load(const std::string& manifestPath) {
     auto startTime = std::chrono::steady_clock::now();
 
+    loaded_ = false;
+    basePath_.clear();
+    manifestDir_.clear();
+    entries_.clear();
+
     std::ifstream file(manifestPath);
     if (!file.is_open()) {
         LOG_ERROR("Failed to open manifest: ", manifestPath);

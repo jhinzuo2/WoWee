@@ -34,6 +34,19 @@ layout(location = 2) out vec2 TexCoord;
 layout(location = 3) out vec3 Tangent;
 layout(location = 4) out vec3 Bitangent;
 
+vec3 safeNormalize(vec3 v, vec3 fallback) {
+    float len2 = dot(v, v);
+    if (len2 > 1e-8) {
+        return v * inversesqrt(len2);
+    }
+    return fallback;
+}
+
+vec3 fallbackTangent(vec3 n) {
+    vec3 axis = abs(n.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    return safeNormalize(cross(axis, n), vec3(1.0, 0.0, 0.0));
+}
+
 void main() {
     mat4 skinMat = bones[aBoneIndices.x] * aBoneWeights.x
                  + bones[aBoneIndices.y] * aBoneWeights.y
@@ -51,10 +64,10 @@ void main() {
     TexCoord = aTexCoord;
 
     // Gram-Schmidt re-orthogonalize tangent w.r.t. normal
-    vec3 N = normalize(Normal);
-    vec3 T = normalize(modelMat3 * skinnedTan);
-    T = normalize(T - dot(T, N) * N);
-    vec3 B = cross(N, T) * aTangent.w;
+    vec3 N = safeNormalize(Normal, vec3(0.0, 0.0, 1.0));
+    vec3 T = safeNormalize(modelMat3 * skinnedTan, fallbackTangent(N));
+    T = safeNormalize(T - dot(T, N) * N, fallbackTangent(N));
+    vec3 B = safeNormalize(cross(N, T) * aTangent.w, safeNormalize(cross(N, fallbackTangent(N)), vec3(0.0, 1.0, 0.0)));
 
     Tangent = T;
     Bitangent = B;

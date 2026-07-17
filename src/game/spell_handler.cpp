@@ -1,9 +1,11 @@
 #include "game/spell_handler.hpp"
+#include "game/spell_classification.hpp"
 #include "game/game_handler.hpp"
 #include "game/game_utils.hpp"
 #include "game/packet_parsers.hpp"
 #include "game/entity.hpp"
 #include "rendering/renderer.hpp"
+#include "rendering/character_renderer.hpp"
 #include "rendering/spell_visual_system.hpp"
 #include "audio/audio_coordinator.hpp"
 #include "audio/spell_sound_manager.hpp"
@@ -13,8 +15,10 @@
 #include "core/logger.hpp"
 #include "network/world_socket.hpp"
 #include "pipeline/asset_manager.hpp"
+#include "pipeline/dbc_loader.hpp"
 #include "pipeline/dbc_layout.hpp"
 #include "audio/ui_sound_manager.hpp"
+#include "audio/player_voice_manager.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -32,6 +36,169 @@ static float mergeCooldownSeconds(float current, float incoming) {
     if (incoming > current + kEpsilon) return current;
     return incoming;
 }
+
+namespace {
+constexpr uint32_t kItemClassConsumable = 0;
+constexpr uint32_t kConsumableSubclassBandage = 7;
+constexpr uint32_t kConsumableSubclassItemEnhancement = 6;
+constexpr uint8_t kSpellFailedNotReady = 67;
+constexpr uint8_t kSpellFailedAlreadyOpen = 8;
+constexpr uint8_t kSpellFailedChestInUse = 25;
+constexpr uint8_t kSpellFailedTryAgain = 132;
+
+bool isBandageItem(const ItemQueryResponseData* info) {
+    return info && info->valid &&
+           info->itemClass == kItemClassConsumable &&
+           info->subClass == kConsumableSubclassBandage;
+}
+
+bool isBandageSpell(const GameHandler& owner, uint32_t spellId) {
+    if (spellId == 0) return false;
+    for (const auto& [itemId, info] : owner.getItemInfoCache()) {
+        (void)itemId;
+        if (!isBandageItem(&info)) continue;
+        for (const auto& itemSpell : info.spells) {
+            if (itemSpell.spellId == spellId) return true;
+        }
+    }
+    return false;
+}
+
+std::string castFailureMessage(const GameHandler& owner, uint32_t spellId,
+                               uint8_t result, int powerType, uint32_t miscArg = 0,
+                               uint32_t miscArg2 = 0) {
+    if (spellclass::isFishingCast(spellId)) {
+        if (result == 11 || result == 60 || result == 178)
+            return "Face open water and try casting again.";
+        if (result == 58)
+            return "You can't fish in this area.";
+        if (result == 156)
+            return "The water there is too shallow.";
+    }
+
+    // Bandages use a hidden target aura to enforce the Recently Bandaged
+    // lockout. Exposing the protocol label ("Target aurastate") gives the
+    // player no actionable information.
+    if (isBandageSpell(owner, spellId)) {
+        if (result == 111)
+            return "Cannot use another bandage while Recently Bandaged is active.";
+        if (result == 40 || result == 41)
+            return "Bandaging was interrupted. Remain still until it finishes.";
+    }
+
+    // "Requires spell focus" means a crafting station object must be nearby.
+    // The packet names which one via its SpellFocusObject id — surface it.
+    if (result == kCastResultRequiresSpellFocus) {
+        if (miscArg != 0) {
+            const std::string& focusName = owner.getSpellFocusName(miscArg);
+            if (!focusName.empty())
+                return "Requires " + focusName + " nearby.";
+        }
+        return "You must be near the right crafting station (forge, anvil, cooking fire, ...).";
+    }
+
+    // "Totems" / "Totem category" mean a required crafting tool is missing
+    // (blacksmith hammer, mining pick, ...). Name it from the packet's ids:
+    // TotemCategory.dbc entries for totem-category, item ids for totems.
+    if (result == kCastResultTotemCategory || result == kCastResultTotems) {
+        std::string tools;
+        for (uint32_t id : {miscArg, miscArg2}) {
+            if (id == 0) continue;
+            std::string name;
+            if (result == kCastResultTotemCategory) {
+                name = owner.getTotemCategoryName(id);
+            } else if (const auto* info = owner.getItemInfo(id); info && info->valid) {
+                name = info->name;
+            }
+            if (name.empty()) continue;
+            if (!tools.empty()) tools += " and ";
+            tools += name;
+        }
+        if (!tools.empty()) return "Requires " + tools + " in your inventory.";
+        return "Requires a crafting tool you don't have (blacksmith hammer, mining pick, ...).";
+    }
+
+    const char* reason = getSpellCastResultString(result, powerType);
+    return reason ? reason
+                  : ("Spell cast failed (error " + std::to_string(result) + ")");
+}
+
+uint64_t targetGuidForUseItem(GameHandler& owner, const ItemQueryResponseData* info) {
+    if (!info || !info->valid || info->itemClass != kItemClassConsumable) return 0;
+    if (isBandageItem(info)) {
+        return owner.getPlayerGuid();
+    }
+    if (info->subClass == kConsumableSubclassItemEnhancement) return 0;
+    return owner.getPlayerGuid();
+}
+
+bool isGatherSpellId(uint32_t spellId) {
+    static constexpr uint32_t kGatherRanks[] = {
+        2575, 2576, 3564, 10248, 29354, // Mining
+        2366, 2368, 3570, 11993, 28695  // Herbalism
+    };
+    for (uint32_t rankSpellId : kGatherRanks) {
+        if (spellId == rankSpellId) return true;
+    }
+    return false;
+}
+
+bool shouldDespawnGatherTarget(uint8_t result) {
+    return result == kSpellFailedAlreadyOpen || result == kSpellFailedChestInUse;
+}
+
+std::string gatherCastFailureMessage(uint8_t result, const std::string& fallback) {
+    if (result == kSpellFailedTryAgain) return "Failed.";
+    if (result == kSpellFailedChestInUse) return "Already in use.";
+    return fallback;
+}
+
+// Map a (WotLK-normalized) SpellCastResult to a character speech response.
+// Results without a matching voice line return nullopt.
+std::optional<audio::PlayerErrorSpeech> errorSpeechForCastResult(
+        uint32_t spellId, uint8_t result, int powerType) {
+    using audio::PlayerErrorSpeech;
+    // Fishing has no unit target: the server validates a randomly sampled water
+    // point in front of the caster. The generic "no target" voice line is both
+    // misleading and contradicted by the on-screen fishing-specific guidance.
+    if (spellclass::isFishingCast(spellId) && (result == 11 || result == 60 || result == 156 || result == 178))
+        return std::nullopt;
+    switch (result) {
+        case 11:  // Bad implicit targets
+        case 178: // No valid targets
+            return PlayerErrorSpeech::GENERIC_NO_TARGET;
+        case 12:  // Invalid target
+            return PlayerErrorSpeech::INVALID_ATTACK_TARGET;
+        case 25:  // Chest in use
+            return PlayerErrorSpeech::CHEST_IN_USE;
+        case 45:  // Item not ready
+            return PlayerErrorSpeech::ITEM_COOLDOWN;
+        case 52:  // Need ammo
+        case 53:  // Need ammo pouch
+        case 54:  // Need exotic ammo
+        case 75:  // No ammo
+            return PlayerErrorSpeech::NO_AMMO;
+        case 67:  // Not ready
+            // Ranged weapon attacks are abilities, not conventional spells. If the
+            // server rejects one (weapon/ammo/attack state), use the generic "I can't
+            // do that yet" response instead of "That spell isn't ready yet."
+            return spellclass::isRangedWeaponAutoAttack(spellId)
+                ? PlayerErrorSpeech::ABILITY_COOLDOWN
+                : PlayerErrorSpeech::SPELL_COOLDOWN;
+        case 85:  // Not enough power
+            switch (powerType) {
+                case 1:  return PlayerErrorSpeech::NO_RAGE;
+                case 3:  return PlayerErrorSpeech::NO_ENERGY;
+                case 2: case 6: return std::nullopt; // no focus/runic power voice lines
+                default: return PlayerErrorSpeech::NO_MANA;
+            }
+        case 97:  // Out of range
+            return PlayerErrorSpeech::OUT_OF_RANGE;
+        default:
+            return std::nullopt;
+    }
+}
+} // namespace
 
 static CombatTextEntry::Type combatTextTypeFromSpellMissInfo(uint8_t missInfo) {
     switch (missInfo) {
@@ -122,7 +289,8 @@ void SpellHandler::triggerCastVisual(uint32_t spellId, uint64_t casterGuid, uint
     glm::vec3 casterPos;
     if (!resolveUnitPosition(casterGuid, casterPos)) { LOG_DEBUG("SpellVisual: triggerCastVisual — cannot resolve caster position for guid=0x", std::hex, casterGuid, std::dec); return; }
     LOG_INFO("SpellVisual: triggerCastVisual visualId=", visualId, " pos=(", casterPos.x, ",", casterPos.y, ",", casterPos.z, ") castTimeMs=", castTimeMs);
-    svs->playSpellVisualPrecast(visualId, casterPos, castTimeMs);
+    svs->playSpellVisualPrecast(visualId, casterPos, castTimeMs,
+                                owner_.resolveUnitRenderInstance(casterGuid));
 }
 
 void SpellHandler::triggerImpactVisual(uint32_t spellId, uint64_t targetGuid) {
@@ -137,6 +305,67 @@ void SpellHandler::triggerImpactVisual(uint32_t spellId, uint64_t targetGuid) {
     if (!resolveUnitPosition(targetGuid, targetPos)) return;
     LOG_INFO("SpellVisual: triggerImpactVisual visualId=", visualId, " pos=(", targetPos.x, ",", targetPos.y, ",", targetPos.z, ")");
     svs->playSpellVisual(visualId, targetPos, /*useImpactKit=*/true);
+}
+
+void SpellHandler::launchRangedWeaponProjectile(uint32_t spellId, uint64_t targetGuid) {
+    if (targetGuid == 0) targetGuid = owner_.getTargetGuid();
+    auto* renderer = owner_.services().renderer;
+    auto* assets = owner_.services().assetManager;
+    if (!renderer || !assets || targetGuid == 0) return;
+    auto* visuals = renderer->getSpellVisualSystem();
+    auto* characters = renderer->getCharacterRenderer();
+    if (!visuals || !characters) return;
+
+    glm::vec3 start = renderer->getCharacterPosition() + glm::vec3(0.0f, 0.0f, 1.0f);
+    glm::mat4 handTransform(1.0f);
+    if (characters->getAttachmentTransform(renderer->getCharacterInstanceId(), 1, handTransform))
+        start = glm::vec3(handTransform[3]);
+
+    glm::vec3 end;
+    if (!resolveUnitPosition(targetGuid, end)) return;
+    end.z += 1.0f;
+
+    const auto& ranged = owner_.getInventory().getEquipSlot(EquipSlot::RANGED);
+    std::string modelPath;
+    std::string texturePath;
+    bool spin = false;
+
+    if (spellId == 2764 || (!ranged.empty() && ranged.item.inventoryType == InvType::THROWN)) {
+        spin = true;
+        if (!ranged.empty() && ranged.item.displayInfoId != 0) {
+            auto displayDbc = assets->loadDBC("ItemDisplayInfo.dbc");
+            if (displayDbc && displayDbc->isLoaded()) {
+                const int32_t row = displayDbc->findRecordById(ranged.item.displayInfoId);
+                if (row >= 0) {
+                    const auto* layout = pipeline::getActiveDBCLayout()
+                        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+                    std::string model = displayDbc->getString(
+                        static_cast<uint32_t>(row), layout ? (*layout)["LeftModel"] : 1);
+                    std::string texture = displayDbc->getString(
+                        static_cast<uint32_t>(row), layout ? (*layout)["LeftModelTexture"] : 3);
+                    if (!model.empty()) {
+                        const size_t dot = model.rfind('.');
+                        if (dot != std::string::npos) model = model.substr(0, dot);
+                        modelPath = "Item\\ObjectComponents\\Weapon\\" + model + ".m2";
+                    }
+                    if (!texture.empty())
+                        texturePath = "Item\\ObjectComponents\\Weapon\\" + texture + ".blp";
+                }
+            }
+        }
+        if (modelPath.empty())
+            modelPath = "Item\\ObjectComponents\\Weapon\\Thrown_1H_Dagger_A_01.m2";
+    } else if (spellId == 75 || (!ranged.empty() &&
+               (ranged.item.inventoryType == InvType::RANGED_BOW ||
+                ranged.item.subclassName == "Bow" || ranged.item.subclassName == "Crossbow"))) {
+        modelPath = "Item\\ObjectComponents\\Ammo\\ArrowFlight_01.m2";
+    } else {
+        modelPath = "Item\\ObjectComponents\\Ammo\\BulletFlight_01.m2";
+    }
+
+    const float distance = glm::length(end - start);
+    const float duration = std::clamp(distance / 35.0f, 0.12f, 0.8f);
+    visuals->playPhysicalProjectile(modelPath, texturePath, start, end, duration, spin);
 }
 
 
@@ -195,6 +424,29 @@ void SpellHandler::registerOpcodes(DispatchTable& table) {
     table[Opcode::SMSG_REMOVED_SPELL] = [this](network::Packet& packet) { handleRemovedSpell(packet); };
     table[Opcode::SMSG_SEND_UNLEARN_SPELLS] = [this](network::Packet& packet) { handleUnlearnSpells(packet); };
     table[Opcode::SMSG_TALENTS_INFO] = [this](network::Packet& packet) { handleTalentsInfo(packet); };
+    // Server asks the player to confirm a talent reset (guid + gold cost).
+    // Must be handled here: this handler owns the pending-wipe state that the
+    // confirm dialog reads.
+    table[Opcode::MSG_TALENT_WIPE_CONFIRM] = [this](network::Packet& packet) {
+        if (!packet.hasRemaining(12)) { packet.skipAll(); return; }
+        talentWipeNpcGuid_ = packet.readUInt64();
+        talentWipeCost_    = packet.readUInt32();
+        talentWipePending_ = true;
+        LOG_INFO("MSG_TALENT_WIPE_CONFIRM: npc=0x", std::hex, talentWipeNpcGuid_, std::dec,
+                 " cost=", talentWipeCost_);
+        owner_.fireAddonEvent("CONFIRM_TALENT_WIPE", {std::to_string(talentWipeCost_)});
+    };
+    // SMSG_PET_UNLEARN_CONFIRM: uint64 petGuid + uint32 cost (copper). Handled
+    // here for the same reason — this handler owns the pending-unlearn state.
+    // The other pet opcodes have different formats and must NOT set unlearn state.
+    table[Opcode::SMSG_PET_UNLEARN_CONFIRM] = [this](network::Packet& packet) {
+        if (packet.hasRemaining(12)) {
+            petUnlearnGuid_ = packet.readUInt64();
+            petUnlearnCost_ = packet.readUInt32();
+            petUnlearnPending_ = true;
+        }
+        packet.skipAll();
+    };
     table[Opcode::SMSG_ACHIEVEMENT_EARNED] = [this](network::Packet& packet) {
         handleAchievementEarned(packet);
     };
@@ -220,12 +472,15 @@ void SpellHandler::registerOpcodes(DispatchTable& table) {
     table[Opcode::SMSG_SPELLENERGIZELOG] = [this](network::Packet& p) { handleSpellEnergizeLog(p); };
     table[Opcode::SMSG_INIT_EXTRA_AURA_INFO_OBSOLETE] = [this](network::Packet& p) { handleExtraAuraInfo(p, true); };
     table[Opcode::SMSG_SET_EXTRA_AURA_INFO_OBSOLETE] = [this](network::Packet& p) { handleExtraAuraInfo(p, false); };
+    table[Opcode::SMSG_SET_EXTRA_AURA_INFO_NEED_UPDATE] = [this](network::Packet& p) { handleExtraAuraInfo(p, false); };
+    table[Opcode::SMSG_SET_EXTRA_AURA_INFO_NEED_UPDATE_OBSOLETE] = [this](network::Packet& p) { handleExtraAuraInfo(p, false); };
     table[Opcode::SMSG_SPELLDISPELLOG] = [this](network::Packet& p) { handleSpellDispelLog(p); };
     table[Opcode::SMSG_SPELLSTEALLOG] = [this](network::Packet& p) { handleSpellStealLog(p); };
     table[Opcode::SMSG_SPELL_CHANCE_PROC_LOG] = [this](network::Packet& p) { handleSpellChanceProcLog(p); };
     table[Opcode::SMSG_SPELLINSTAKILLLOG] = [this](network::Packet& p) { handleSpellInstaKillLog(p); };
     table[Opcode::SMSG_SPELLLOGEXECUTE] = [this](network::Packet& p) { handleSpellLogExecute(p); };
     table[Opcode::SMSG_CLEAR_EXTRA_AURA_INFO] = [this](network::Packet& p) { handleClearExtraAuraInfo(p); };
+    table[Opcode::SMSG_CLEAR_EXTRA_AURA_INFO_OBSOLETE] = [this](network::Packet& p) { handleClearExtraAuraInfo(p); };
     table[Opcode::SMSG_ITEM_ENCHANT_TIME_UPDATE] = [this](network::Packet& p) { handleItemEnchantTimeUpdate(p); };
     table[Opcode::SMSG_RESUME_CAST_BAR] = [this](network::Packet& p) { handleResumeCastBar(p); };
     table[Opcode::MSG_CHANNEL_START] = [this](network::Packet& p) { handleChannelStart(p); };
@@ -267,6 +522,12 @@ bool SpellHandler::isTargetCastInterruptible() const {
 
 void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
     LOG_DEBUG("castSpell: spellId=", spellId, " target=0x", std::hex, targetGuid, std::dec);
+    if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+
+    // Food and water are server auras, but using any action interrupts them.
+    // Cancel the aura and stand first, then allow the requested action to proceed.
+    if (restorationActive_) cancelCast();
+
     // Attack (6603) routes to auto-attack instead of cast
     if (spellId == 6603) {
         uint64_t target = targetGuid != 0 ? targetGuid : owner_.getTargetGuid();
@@ -280,7 +541,19 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
         return;
     }
 
-    if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+    // Action bars restored from the server can still hold a rank that a higher rank
+    // has since superseded. The server drops casts of superseded ranks without
+    // sending any error, so swap in the highest rank we actually know.
+    spellId = resolveHighestKnownRank(spellId);
+
+    // Profession spells (Cooking, First Aid, Alchemy, ...) open the crafting
+    // window client-side instead of being sent as casts — matching the real
+    // client, where these spells just open the tradeskill UI.
+    if (uint32_t craftSkillLine = tradeskillOpenerSkillLine(spellId)) {
+        LOG_INFO("castSpell: spell ", spellId, " opens crafting window for skill line ", craftSkillLine);
+        openCraftingWindow(craftSkillLine);
+        return;
+    }
 
     // Casting any spell while mounted → dismount instead
     if (owner_.isMounted()) {
@@ -308,9 +581,12 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
         owner_.sendMovement(Opcode::MSG_MOVE_STOP);
     }
 
+    const bool fishingCast = spellclass::isFishingCast(spellId);
     uint64_t target = targetGuid != 0 ? targetGuid : owner_.getTargetGuid();
-    // Self-targeted spells like hearthstone should not send a target
-    if (spellId == 8690) target = 0;
+    // Self-targeted spells (hearthstone, shouts, self-buffs) always land on the
+    // caster, so they must not carry the current target along.
+    const bool selfCast = (spellId == 8690) || isSelfCastSpell(spellId);
+    if (selfCast || fishingCast) target = 0;
 
     // Track whether a spell-specific block already handled facing so the generic
     // facing block below doesn't send redundant SET_FACING packets.
@@ -318,6 +594,11 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
 
     // Warrior Charge (ranks 1-3): client-side range check + charge callback
     if (spellId == 100 || spellId == 6178 || spellId == 11578) {
+        // Charge is an opener: it cannot be used once the fight has started.
+        if (owner_.isInCombat()) {
+            owner_.addSystemChatMessage("You can't do that while in combat.");
+            return;
+        }
         if (target == 0) {
             owner_.addSystemChatMessage("You have no target.");
             return;
@@ -326,6 +607,34 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
         if (!entity) {
             owner_.addSystemChatMessage("You have no target.");
             return;
+        }
+        if (auto unit = std::dynamic_pointer_cast<Unit>(entity)) {
+            // Corpses cannot be charged.
+            if (unit->getHealth() == 0) {
+                owner_.addSystemChatMessage("You cannot attack that target.");
+                return;
+            }
+            if (entity->getType() == ObjectType::UNIT) {
+                // Neutral combat creatures (yellow-name mobs such as Goretusks)
+                // are valid Charge targets even though they are not inherently
+                // hostile. Match normal right-click combat by rejecting only
+                // service NPCs and targets the server explicitly marks as
+                // non-attackable/immune, rather than requiring hostile faction.
+                constexpr uint32_t UNIT_FLAG_NON_ATTACKABLE = 0x00000002;
+                constexpr uint32_t UNIT_FLAG_IMMUNE_TO_PC   = 0x00000100;
+                constexpr uint32_t UNIT_FLAG_NOT_SELECTABLE = 0x02000000;
+                constexpr uint32_t kBlockedChargeFlags =
+                    UNIT_FLAG_NON_ATTACKABLE |
+                    UNIT_FLAG_IMMUNE_TO_PC |
+                    UNIT_FLAG_NOT_SELECTABLE;
+                const bool hostileOrAggressive =
+                    unit->isHostile() || owner_.isAggressiveTowardPlayer(target);
+                const bool clearlyFriendly = unit->isInteractable() && !hostileOrAggressive;
+                if (clearlyFriendly || (unit->getUnitFlags() & kBlockedChargeFlags) != 0) {
+                    owner_.addSystemChatMessage("You cannot attack that target.");
+                    return;
+                }
+            }
         }
         float tx = entity->getX(), ty = entity->getY(), tz = entity->getZ();
         float dx = tx - owner_.movementInfoRef().x;
@@ -349,11 +658,15 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
         facingHandled = true;
     }
 
-    // Instant melee abilities: client-side range + facing check
+    // Instant melee abilities: client-side range + facing check.
+    // Melee is decided by the spell's own range, not by its school. SpellRange calls
+    // melee "Combat Range" (5 yards), while physical-school abilities that are cast at
+    // range — Steady Shot, Multi-Shot, Taunt, Deadly Throw — carry a 30-35 yard range.
+    // Testing the school instead would range-check those at 8 yards and swallow the cast.
+    // An unknown range (SpellRange.dbc unavailable) is not treated as melee, so the
+    // server arbitrates rather than the client blocking a legitimate cast.
     if (!facingHandled) {
-        owner_.loadSpellNameCache();
-        auto cacheIt = owner_.spellNameCacheRef().find(spellId);
-        bool isMeleeAbility = (cacheIt != owner_.spellNameCacheRef().end() && cacheIt->second.schoolMask == 1);
+        const bool isMeleeAbility = spellclass::isMeleeRange(getSpellMaxRange(spellId));
         if (isMeleeAbility && target != 0) {
             auto entity = owner_.getEntityManager().getEntity(target);
             if (entity) {
@@ -390,7 +703,7 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
         }
     }
     // Heartbeat ensures the server has the updated orientation before the cast packet.
-    if (target != 0) {
+    if (target != 0 || fishingCast) {
         owner_.sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
     }
 
@@ -417,6 +730,16 @@ void SpellHandler::castSpell(uint32_t spellId, uint64_t targetGuid) {
 }
 
 void SpellHandler::cancelCast() {
+    if (restorationActive_) {
+        const uint32_t auraSpell = restorationSpellId_;
+        cancelAura(auraSpell);
+        owner_.setStandState(0);
+        stopRestorationPresentation();
+        queuedSpellId_ = 0;
+        queuedSpellTarget_ = 0;
+        LOG_INFO("Cancelled restoration aura: spellId=", auraSpell);
+        return;
+    }
     if (!casting_) return;
     // GameObject interaction cast is client-side timing only.
     if (owner_.pendingGameObjectInteractGuidRef() == 0 &&
@@ -464,6 +787,33 @@ void SpellHandler::cancelAura(uint32_t spellId) {
 float SpellHandler::getSpellCooldown(uint32_t spellId) const {
     auto it = spellCooldowns_.find(spellId);
     return (it != spellCooldowns_.end()) ? it->second : 0.0f;
+}
+
+void SpellHandler::seedCooldownFromSpellInfo(uint32_t spellId) {
+    if (spellId == 0) return;
+    auto existing = spellCooldowns_.find(spellId);
+    if (existing != spellCooldowns_.end() && existing->second > 0.5f) return;
+
+    owner_.loadSpellNameCache();
+    auto it = owner_.spellNameCacheRef().find(spellId);
+    if (it == owner_.spellNameCacheRef().end()) return;
+
+    const uint32_t cooldownMs = std::max(it->second.recoveryMs, it->second.categoryRecoveryMs);
+    if (cooldownMs <= 1500) return; // ignore GCD-sized recovery
+
+    const float seconds = cooldownMs / 1000.0f;
+    spellCooldowns_[spellId] = seconds;
+    for (auto& slot : owner_.actionBarRef()) {
+        if (slot.type != ActionBarSlot::SPELL || slot.id != spellId) continue;
+        slot.cooldownRemaining = seconds;
+        slot.cooldownTotal = seconds;
+    }
+
+    LOG_DEBUG("Seeded cooldown from Spell.dbc: spell=", spellId, " ms=", cooldownMs);
+    if (owner_.addonEventCallbackRef()) {
+        owner_.addonEventCallbackRef()("SPELL_UPDATE_COOLDOWN", {});
+        owner_.addonEventCallbackRef()("ACTIONBAR_UPDATE_COOLDOWN", {});
+    }
 }
 
 void SpellHandler::learnTalent(uint32_t talentId, uint32_t requestedRank) {
@@ -562,9 +912,11 @@ void SpellHandler::useItemBySlot(int backpackIndex) {
 
     if (itemGuid != 0 && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
         uint32_t useSpellId = findOnUseSpellId(slot.item.itemId);
+        const auto* itemInfo = owner_.getItemInfo(slot.item.itemId);
+        const uint64_t targetGuid = targetGuidForUseItem(owner_, itemInfo);
         auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId)
-            : UseItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId);
+            ? owner_.getPacketParsers()->buildUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId, targetGuid)
+            : UseItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId, targetGuid);
         owner_.getSocket()->send(packet);
     } else if (itemGuid == 0) {
         owner_.addSystemChatMessage("Cannot use that item right now.");
@@ -595,9 +947,11 @@ void SpellHandler::useItemInBag(int bagIndex, int slotIndex) {
     if (itemGuid != 0 && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
         uint32_t useSpellId = findOnUseSpellId(slot.item.itemId);
         uint8_t wowBag = static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex);
+        const auto* itemInfo = owner_.getItemInfo(slot.item.itemId);
+        const uint64_t targetGuid = targetGuidForUseItem(owner_, itemInfo);
         auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId)
-            : UseItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId);
+            ? owner_.getPacketParsers()->buildUseItem(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId, targetGuid)
+            : UseItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId, targetGuid);
         LOG_INFO("useItemInBag: sending CMSG_USE_ITEM, bag=", (int)wowBag, " slot=", slotIndex,
                  " packetSize=", packet.getSize());
         owner_.getSocket()->send(packet);
@@ -769,6 +1123,57 @@ void SpellHandler::loadTalentDbc() {
     } else {
         LOG_WARNING("Could not load TalentTab.dbc");
     }
+
+    syncPreWotlkTalentsFromKnownSpells();
+}
+
+void SpellHandler::syncPreWotlkTalentsFromKnownSpells() {
+    if (!isPreWotlk() || talentCache_.empty() || knownSpells_.empty()) return;
+
+    std::unordered_map<uint32_t, uint8_t> derived;
+    uint32_t spentPoints = 0;
+    for (const auto& [talentId, talent] : talentCache_) {
+        uint8_t rankKnown = 0;
+        for (int rank = 0; rank < 5; ++rank) {
+            uint32_t rankSpell = talent.rankSpells[rank];
+            if (rankSpell != 0 && knownSpells_.count(rankSpell) > 0) {
+                rankKnown = static_cast<uint8_t>(rank + 1);
+            }
+        }
+        if (rankKnown > 0) {
+            derived[talentId] = rankKnown;
+            spentPoints += rankKnown;
+        }
+    }
+
+    const uint32_t playerLevel = owner_.getPlayerLevel();
+    const uint32_t earnedPoints = (playerLevel > 9)
+        ? std::min<uint32_t>(playerLevel - 9, 61u)
+        : 0u;
+    const uint8_t unspent = static_cast<uint8_t>(
+        earnedPoints > spentPoints ? std::min<uint32_t>(earnedPoints - spentPoints, 255u) : 0u);
+
+    if (learnedTalents_[0] == derived && activeTalentSpec_ == 0 &&
+        unspentTalentPoints_[0] == unspent) {
+        return;
+    }
+
+    activeTalentSpec_ = 0;
+    learnedTalents_[0] = std::move(derived);
+    learnedTalents_[1].clear();
+    learnedGlyphs_[0].fill(0);
+    learnedGlyphs_[1].fill(0);
+    unspentTalentPoints_[0] = unspent;
+    unspentTalentPoints_[1] = 0;
+
+    LOG_INFO("[pre-WotLK] Derived ", learnedTalents_[0].size(),
+             " learned talent(s) from known spells; spent=", spentPoints,
+             " unspent=", static_cast<int>(unspent));
+
+    if (owner_.addonEventCallbackRef()) {
+        owner_.addonEventCallbackRef()("CHARACTER_POINTS_CHANGED", {});
+        owner_.addonEventCallbackRef()("PLAYER_TALENT_UPDATE", {});
+    }
 }
 
 void SpellHandler::updateTimers(float dt) {
@@ -776,6 +1181,23 @@ void SpellHandler::updateTimers(float dt) {
     if (casting_ && castTimeRemaining_ > 0.0f) {
         castTimeRemaining_ -= dt;
         if (castTimeRemaining_ < 0.0f) castTimeRemaining_ = 0.0f;
+    }
+    // Eating/drinking munch-gulp repeats for the whole restoration aura,
+    // matching the real client's looping consume sound.
+    if (restorationActive_) {
+        if (restorationTimeRemaining_ > 0.0f) {
+            restorationTimeRemaining_ = std::max(0.0f, restorationTimeRemaining_ - dt);
+        }
+        restorationSoundTimer_ -= dt;
+        if (restorationSoundTimer_ <= 0.0f) {
+            restorationSoundTimer_ = 1.0f;
+            if (auto* ac = owner_.services().audioCoordinator) {
+                if (auto* sfx = ac->getUiSoundManager()) {
+                    if (restorationIsFood_) sfx->playEating();
+                    else                    sfx->playDrinking();
+                }
+            }
+        }
     }
     // Tick down spell cooldowns
     for (auto it = spellCooldowns_.begin(); it != spellCooldowns_.end(); ) {
@@ -801,6 +1223,89 @@ void SpellHandler::updateTimers(float dt) {
     }
 }
 
+void SpellHandler::stopRestorationPresentation() {
+    if (!restorationActive_) return;
+    const uint32_t stoppedSpell = restorationSpellId_;
+    if (owner_.spellCastAnimCallbackRef()) {
+        owner_.spellCastAnimCallbackRef()(owner_.getPlayerGuid(), false, true,
+                                          SpellCastType::OMNI);
+    }
+    restorationActive_ = false;
+    restorationSpellId_ = 0;
+    restorationTimeRemaining_ = 0.0f;
+    restorationTimeTotal_ = 0.0f;
+    if (owner_.addonEventCallbackRef()) {
+        owner_.addonEventCallbackRef()("UNIT_SPELLCAST_CHANNEL_STOP",
+                                       {"player", std::to_string(stoppedSpell)});
+    }
+}
+
+void SpellHandler::refreshRestorationFromPlayerAuras() {
+    owner_.loadSpellNameCache();
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+
+    const AuraSlot* restorationAura = nullptr;
+    bool restorationIsFood = false;
+    for (const auto& aura : playerAuras_) {
+        if (aura.isEmpty()) continue;
+        auto nameIt = owner_.spellNameCacheRef().find(aura.spellId);
+        if (nameIt == owner_.spellNameCacheRef().end()) continue;
+        const auto kind = spellclass::classifyRestChannel(nameIt->second.name);
+        if (kind == spellclass::RestChannelKind::FOOD ||
+            kind == spellclass::RestChannelKind::DRINK) {
+            restorationAura = &aura;
+            restorationIsFood = kind == spellclass::RestChannelKind::FOOD;
+            break;
+        }
+    }
+
+    if (!restorationAura) {
+        stopRestorationPresentation();
+        return;
+    }
+
+    const uint32_t spellId = restorationAura->spellId;
+    const bool newlyActive = !restorationActive_ || restorationSpellId_ != spellId;
+    if (restorationActive_ && restorationSpellId_ != spellId) {
+        stopRestorationPresentation();
+    }
+
+    int32_t totalMs = restorationAura->maxDurationMs;
+    if (totalMs <= 0) totalMs = restorationAura->durationMs;
+    if (totalMs <= 0) {
+        const float dbcSeconds = getSpellDuration(spellId);
+        totalMs = dbcSeconds > 0.0f ? static_cast<int32_t>(dbcSeconds * 1000.0f) : 30000;
+    }
+    int32_t remainingMs = restorationAura->getRemainingMs(nowMs);
+    if (remainingMs < 0) {
+        remainingMs = (!newlyActive && restorationTimeRemaining_ > 0.0f)
+            ? static_cast<int32_t>(restorationTimeRemaining_ * 1000.0f)
+            : totalMs;
+    }
+
+    restorationActive_ = true;
+    restorationSpellId_ = spellId;
+    restorationIsFood_ = restorationIsFood;
+    restorationTimeTotal_ = static_cast<float>(totalMs) / 1000.0f;
+    restorationTimeRemaining_ = static_cast<float>(remainingMs) / 1000.0f;
+
+    if (newlyActive) {
+        restorationSoundTimer_ = 0.0f;
+        LOG_INFO("Restoration aura started: spellId=", spellId,
+                 " durationMs=", totalMs);
+        if (owner_.spellCastAnimCallbackRef()) {
+            owner_.spellCastAnimCallbackRef()(owner_.getPlayerGuid(), true, true,
+                                              SpellCastType::OMNI);
+        }
+        if (owner_.addonEventCallbackRef()) {
+            owner_.addonEventCallbackRef()("UNIT_SPELLCAST_CHANNEL_START",
+                                           {"player", std::to_string(spellId)});
+        }
+    }
+}
+
 // ============================================================
 // Packet handlers
 // ============================================================
@@ -817,6 +1322,10 @@ void SpellHandler::handleInitialSpells(network::Packet& packet) {
     // Ensure Attack (6603) and Hearthstone (8690) are always present
     knownSpells_.insert(6603u);
     knownSpells_.insert(8690u);
+    if (isPreWotlk()) {
+        loadTalentDbc();
+        syncPreWotlkTalentsFromKnownSpells();
+    }
 
     // Set initial cooldowns
     for (const auto& cd : data.cooldowns) {
@@ -875,6 +1384,18 @@ void SpellHandler::handleCastFailed(network::Packet& packet) {
                                     : CastFailedParser::parse(packet, data);
     if (!ok) return;
 
+    if (spellclass::isFishingCast(data.spellId)) {
+        const auto& movement = owner_.movementInfoRef();
+        LOG_WARNING("Fishing cast failed: spell=", data.spellId,
+                    " result=", static_cast<int>(data.result),
+                    " pos=(", movement.x, ",", movement.y, ",", movement.z, ")",
+                    " facing=", movement.orientation,
+                    " selectedTarget=0x", std::hex, owner_.getTargetGuid(), std::dec);
+    }
+
+    const uint64_t gatherGoGuid = owner_.lastInteractedGoGuidRef();
+    const bool gatherCast = gatherGoGuid != 0 && isGatherSpellId(data.spellId);
+
     casting_ = false;
     castIsChannel_ = false;
     currentCastSpellId_ = 0;
@@ -904,9 +1425,23 @@ void SpellHandler::handleCastFailed(network::Packet& packet) {
     if (auto playerUnit = std::dynamic_pointer_cast<Unit>(playerEntity)) {
         powerType = playerUnit->getPowerType();
     }
-    const char* reason = getSpellCastResultString(data.result, powerType);
-    std::string errMsg = reason ? reason
-                                : ("Spell cast failed (error " + std::to_string(data.result) + ")");
+    if (data.result == kSpellFailedNotReady) {
+        seedCooldownFromSpellInfo(data.spellId);
+    }
+    // Totem failures name tool item ids; request their info so a retry of the
+    // craft can show the tool's name even if it wasn't cached yet.
+    if (data.result == kCastResultTotems) {
+        if (data.miscArg != 0) owner_.ensureItemInfo(data.miscArg);
+        if (data.miscArg2 != 0) owner_.ensureItemInfo(data.miscArg2);
+    }
+    std::string errMsg = castFailureMessage(owner_, data.spellId, data.result, powerType,
+                                            data.miscArg, data.miscArg2);
+    if (gatherCast) {
+        errMsg = gatherCastFailureMessage(data.result, errMsg);
+        if (shouldDespawnGatherTarget(data.result)) {
+            owner_.despawnGameObjectLocally(gatherGoGuid);
+        }
+    }
     owner_.addUIError(errMsg);
     MessageChatData msg;
     msg.type = ChatType::SYSTEM;
@@ -917,6 +1452,13 @@ void SpellHandler::handleCastFailed(network::Packet& packet) {
     if (auto* ac = owner_.services().audioCoordinator) {
         if (auto* sfx = ac->getUiSoundManager())
             sfx->playError();
+    }
+
+    // Character speech response ("Not enough mana", "I'm out of range", ...)
+    // Suppressed for gather casts, whose failures are routine and already rephrased.
+    if (!gatherCast) {
+        if (auto speech = errorSpeechForCastResult(data.spellId, data.result, powerType))
+            owner_.playErrorSpeech(*speech);
     }
 
     if (owner_.addonEventCallbackRef()) {
@@ -946,9 +1488,10 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
         return SpellCastType::DIRECTED;
     };
     const SpellCastType castType = classifyCast(data.targetGuid, data.casterUnit);
+    const bool rangedWeaponAttack = spellclass::isRangedWeaponAutoAttack(data.spellId);
 
     // Track cast bar for any non-player caster
-    if (data.casterUnit != owner_.getPlayerGuid() && data.castTime > 0) {
+    if (data.casterUnit != owner_.getPlayerGuid() && data.castTime > 0 && !rangedWeaponAttack) {
         auto& s = unitCastStates_[data.casterUnit];
         s.casting        = true;
         s.isChannel      = false;
@@ -963,7 +1506,7 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
     }
 
     // Player's own cast
-    if (data.casterUnit == owner_.getPlayerGuid() && data.castTime > 0) {
+    if (data.casterUnit == owner_.getPlayerGuid() && data.castTime > 0 && !rangedWeaponAttack) {
         // Cancel pending GO retries
         owner_.pendingGameObjectLootRetriesRef().erase(
             std::remove_if(owner_.pendingGameObjectLootRetriesRef().begin(), owner_.pendingGameObjectLootRetriesRef().end(),
@@ -1003,7 +1546,7 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
     }
 
     // Fire UNIT_SPELLCAST_START
-    if (owner_.addonEventCallbackRef()) {
+    if (owner_.addonEventCallbackRef() && !rangedWeaponAttack) {
         std::string unitId = owner_.guidToUnitId(data.casterUnit);
         if (!unitId.empty())
             owner_.addonEventCallbackRef()("UNIT_SPELLCAST_START", {unitId, std::to_string(data.spellId)});
@@ -1011,7 +1554,7 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
 
     // Trigger cast visual effect (precast/cast kit M2) at the caster's position.
     // Skip profession spells (crafting has no flashy cast effects).
-    if (!owner_.isProfessionSpell(data.spellId)) {
+    if (!owner_.isProfessionSpell(data.spellId) && !rangedWeaponAttack) {
         triggerCastVisual(data.spellId, data.casterUnit, data.castTime);
     }
 }
@@ -1019,27 +1562,52 @@ void SpellHandler::handleSpellStart(network::Packet& packet) {
 void SpellHandler::handleSpellGo(network::Packet& packet) {
     SpellGoData data;
     if (!owner_.getPacketParsers()->parseSpellGo(packet, data)) return;
+    const bool rangedWeaponAttack = spellclass::isRangedWeaponAutoAttack(data.spellId);
 
     if (data.casterUnit == owner_.getPlayerGuid()) {
+        owner_.loadSpellNameCache();
+        spellclass::RestChannelKind restKind = spellclass::RestChannelKind::NONE;
+        auto spellNameIt = owner_.spellNameCacheRef().find(data.spellId);
+        if (spellNameIt != owner_.spellNameCacheRef().end()) {
+            restKind = spellclass::classifyRestChannel(spellNameIt->second.name);
+            if (spellclass::hasInebriateEffect(spellNameIt->second.effectIds, 3)) {
+                restKind = spellclass::RestChannelKind::ALCOHOL;
+            }
+        }
+        const bool restorationLoop = restKind == spellclass::RestChannelKind::FOOD ||
+                                     restKind == spellclass::RestChannelKind::DRINK;
+        // The real client sits itself when consuming food/water. Servers apply
+        // the regen aura with AURA_INTERRUPT_FLAG_NOT_SEATED and remove it
+        // immediately unless the client sends CMSG_STANDSTATECHANGE(SIT) —
+        // without this the whole eat/drink presentation never starts.
+        if (restorationLoop) {
+            owner_.setStandState(1); // UNIT_STAND_STATE_SIT
+        }
         // Play cast-complete sound
-        if (!owner_.isProfessionSpell(data.spellId))
+        if (!owner_.isProfessionSpell(data.spellId) && !rangedWeaponAttack)
             playSpellCastSound(data.spellId);
 
         // Ranged auto-attack spells (Auto Shot, Shoot, Throw) complete as timed
         // casts and are NOT classified as instant melee abilities, so trigger the
         // ranged shot animation explicitly here.
         uint32_t sid = data.spellId;
-        if (sid == 75 || sid == 5019 || sid == 2764) {
+        if (spellclass::isRangedWeaponAutoAttack(sid)) {
             if (owner_.meleeSwingCallbackRef()) owner_.meleeSwingCallbackRef()(sid);
             owner_.suppressNextMeleeSwingAnim();
+            uint64_t projectileTarget = data.targetGuid;
+            if (projectileTarget == 0 && !data.hitTargets.empty())
+                projectileTarget = data.hitTargets.front();
+            if (projectileTarget == 0 && !data.missTargets.empty())
+                projectileTarget = data.missTargets.front().targetGuid;
+            launchRangedWeaponProjectile(sid, projectileTarget);
         }
 
-        // Instant melee abilities → trigger attack animation
+        // Instant melee abilities → trigger attack animation. Range decides this, not
+        // school: physical abilities cast at range (Steady Shot, Taunt) would otherwise
+        // play a melee swing.
         bool isMeleeAbility = false;
-        if (!owner_.isProfessionSpell(sid)) {
-            owner_.loadSpellNameCache();
-            auto cacheIt = owner_.spellNameCacheRef().find(sid);
-            if (cacheIt != owner_.spellNameCacheRef().end() && cacheIt->second.schoolMask == 1) {
+        if (!owner_.isProfessionSpell(sid) && !spellclass::isRangedWeaponAutoAttack(sid)) {
+            if (spellclass::isMeleeRange(getSpellMaxRange(sid))) {
                 isMeleeAbility = (currentCastSpellId_ != sid);
             }
         }
@@ -1058,7 +1626,8 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
 
         // Instant spell cast animation — if this wasn't a timed cast and isn't a
         // melee ability, play a brief spell cast animation (one-shot)
-        if (!wasInTimedCast && !isMeleeAbility && !owner_.isProfessionSpell(data.spellId)) {
+        if (!wasInTimedCast && !isMeleeAbility && !rangedWeaponAttack && !restorationLoop &&
+            !owner_.isProfessionSpell(data.spellId)) {
             // Classify instant spell from SPELL_GO packet target info
             SpellCastType goType = SpellCastType::OMNI;
             if (data.targetGuid != 0 && data.targetGuid != data.casterUnit)
@@ -1066,6 +1635,10 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
             else if (data.targetGuid == 0 && data.hitCount > 1)
                 goType = SpellCastType::AREA;
             if (owner_.spellCastAnimCallbackRef()) {
+                // Instant item spells have no SMSG_SPELL_START, so publish the
+                // SPELL_GO id just long enough for the animation callback to
+                // distinguish potions from generic instant magic.
+                currentCastSpellId_ = data.spellId;
                 owner_.spellCastAnimCallbackRef()(owner_.getPlayerGuid(), true, false, goType);
             }
         }
@@ -1080,28 +1653,39 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
         castIsChannel_ = false;
         currentCastSpellId_ = 0;
         castTimeRemaining_ = 0.0f;
+        castTimeTotal_ = 0.0f;
 
         // Gather node looting: re-send CMSG_LOOT now that the cast completed.
         if (wasInTimedCast && owner_.lastInteractedGoGuidRef() != 0) {
             LOG_DEBUG("[GO-DIAG] Sending CMSG_LOOT for GO 0x", std::hex,
                         owner_.lastInteractedGoGuidRef(), std::dec);
             owner_.lootTarget(owner_.lastInteractedGoGuidRef());
-            owner_.lastInteractedGoGuidRef() = 0;
         }
         // Clear the GO interaction guard so future cancelCast() calls work
         // normally. Without this, pendingGameObjectInteractGuid_ stays stale
         // and suppresses CMSG_CANCEL_CAST for ALL subsequent spell casts.
         owner_.pendingGameObjectInteractGuidRef() = 0;
 
-        if (owner_.spellCastAnimCallbackRef()) {
+        if (owner_.spellCastAnimCallbackRef() && !rangedWeaponAttack && !restorationLoop) {
             owner_.spellCastAnimCallbackRef()(owner_.getPlayerGuid(), false, false, SpellCastType::OMNI);
         }
 
-        if (owner_.addonEventCallbackRef())
+        if (owner_.addonEventCallbackRef() && !rangedWeaponAttack)
             owner_.addonEventCallbackRef()("UNIT_SPELLCAST_STOP", {"player", std::to_string(data.spellId)});
 
+        // Craft queue: re-cast if more crafts remaining
+        if (craftQueueRemaining_ > 0 && craftQueueSpellId_ == data.spellId) {
+            --craftQueueRemaining_;
+            if (craftQueueRemaining_ > 0) {
+                LOG_INFO("Craft queue: re-casting spell=", craftQueueSpellId_,
+                         " remaining=", craftQueueRemaining_);
+                castSpell(craftQueueSpellId_, 0);
+            } else {
+                craftQueueSpellId_ = 0;
+            }
+        }
         // Spell queue: fire the next queued spell
-        if (queuedSpellId_ != 0) {
+        else if (queuedSpellId_ != 0) {
             uint32_t nextSpell  = queuedSpellId_;
             uint64_t nextTarget = queuedSpellTarget_;
             queuedSpellId_     = 0;
@@ -1120,17 +1704,17 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
             npcGoType = SpellCastType::DIRECTED;
         else if (data.targetGuid == 0 && data.hitCount > 1)
             npcGoType = SpellCastType::AREA;
-        if (!wasTrackedCast && owner_.spellCastAnimCallbackRef()) {
+        if (!wasTrackedCast && !rangedWeaponAttack && owner_.spellCastAnimCallbackRef()) {
             owner_.spellCastAnimCallbackRef()(data.casterUnit, true, false, npcGoType);
         }
-        if (owner_.spellCastAnimCallbackRef()) {
+        if (!rangedWeaponAttack && owner_.spellCastAnimCallbackRef()) {
             owner_.spellCastAnimCallbackRef()(data.casterUnit, false, false, SpellCastType::OMNI);
         }
         bool targetsPlayer = false;
         for (const auto& tgt : data.hitTargets) {
             if (tgt == owner_.getPlayerGuid()) { targetsPlayer = true; break; }
         }
-        if (targetsPlayer)
+        if (targetsPlayer && !rangedWeaponAttack)
             playSpellCastSound(data.spellId);
     }
 
@@ -1166,12 +1750,12 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
             owner_.addonEventCallbackRef()("UNIT_SPELLCAST_SUCCEEDED", {unitId, std::to_string(data.spellId)});
     }
 
-    if (playerIsHit || playerHitEnemy)
+    if ((playerIsHit || playerHitEnemy) && !rangedWeaponAttack)
         playSpellImpactSound(data.spellId);
 
     // Trigger spell visual effects: cast kit at caster + impact kit at each hit target.
     // Skip profession spells and melee (schoolMask == 1) abilities.
-    if (!owner_.isProfessionSpell(data.spellId)) {
+    if (!owner_.isProfessionSpell(data.spellId) && !rangedWeaponAttack) {
         uint32_t visualId = resolveSpellVisualId(data.spellId);
         if (visualId != 0) {
             // Cast-complete visual at caster (for instant spells that skip SPELL_START)
@@ -1179,7 +1763,8 @@ void SpellHandler::handleSpellGo(network::Packet& packet) {
             if (resolveUnitPosition(data.casterUnit, casterPos)) {
                 if (auto* renderer = owner_.services().renderer) {
                     if (auto* svs = renderer->getSpellVisualSystem()) {
-                        svs->playSpellVisual(visualId, casterPos, /*useImpactKit=*/false);
+                        svs->playSpellVisual(visualId, casterPos, /*useImpactKit=*/false,
+                                             owner_.resolveUnitRenderInstance(data.casterUnit));
                     }
                 }
             }
@@ -1343,6 +1928,10 @@ void SpellHandler::handleAuraUpdate(network::Packet& packet, bool isAll) {
             }
             owner_.sprintAuraCallbackRef()(hasSprint);
         }
+
+        if (data.guid == owner_.getPlayerGuid()) {
+            refreshRestorationFromPlayerAuras();
+        }
     }
 }
 
@@ -1355,6 +1944,10 @@ void SpellHandler::handleLearnedSpell(network::Packet& packet) {
     const bool alreadyKnown = knownSpells_.count(spellId) > 0;
     knownSpells_.insert(spellId);
     LOG_INFO("Learned spell: ", spellId, alreadyKnown ? " (already known, skipping chat)" : "");
+    if (isPreWotlk()) {
+        loadTalentDbc();
+        syncPreWotlkTalentsFromKnownSpells();
+    }
 
     // Check if this spell corresponds to a talent rank
     bool isTalentSpell = false;
@@ -1399,6 +1992,7 @@ void SpellHandler::handleRemovedSpell(network::Packet& packet) {
     if (packet.getRemainingSize() < minSz) return;
     uint32_t spellId = classicSpellId ? packet.readUInt16() : packet.readUInt32();
     knownSpells_.erase(spellId);
+    syncPreWotlkTalentsFromKnownSpells();
     LOG_INFO("Removed spell: ", spellId);
     if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("SPELLS_CHANGED", {});
 
@@ -1430,6 +2024,7 @@ void SpellHandler::handleSupercededSpell(network::Packet& packet) {
     const bool newSpellAlreadyAnnounced = knownSpells_.count(newSpellId) > 0;
 
     knownSpells_.insert(newSpellId);
+    syncPreWotlkTalentsFromKnownSpells();
 
     LOG_INFO("Spell superceded: ", oldSpellId, " -> ", newSpellId);
 
@@ -1782,6 +2377,10 @@ void SpellHandler::stopCasting() {
 }
 
 void SpellHandler::resetCastState() {
+    restorationActive_ = false;
+    restorationSpellId_ = 0;
+    restorationTimeRemaining_ = 0.0f;
+    restorationTimeTotal_ = 0.0f;
     casting_ = false;
     castIsChannel_ = false;
     currentCastSpellId_ = 0;
@@ -1838,6 +2437,7 @@ void SpellHandler::handleUpdateAuraDuration(uint8_t slot, uint32_t durationMs) {
     playerAuras_[slot].receivedAtMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
+    refreshRestorationFromPlayerAuras();
 }
 
 // ============================================================
@@ -1895,15 +2495,32 @@ void SpellHandler::loadSpellNameCache() const {
         if (f != 0xFFFFFFFF && f < dbc->getFieldCount()) tooltipField = f;
     }
 
+    // Targets: SpellCastTargets mask the spell demands. Item-enhancement spells
+    // (sharpening stones, weightstones, weapon oils) set TARGET_FLAG_ITEM here.
+    uint32_t targetsField = 0xFFFFFFFF;
+    if (spellL) {
+        uint32_t f = spellL->field("Targets");
+        if (f != 0xFFFFFFFF && f < dbc->getFieldCount()) targetsField = f;
+    }
+
     // Cache field indices before the loop to avoid repeated layout lookups
     const uint32_t idField   = spellL ? (*spellL)["ID"]   : 0;
     const uint32_t nameField = spellL ? (*spellL)["Name"] : 136;
     const uint32_t rankField = spellL ? (*spellL)["Rank"] : 153;
+    const uint32_t fieldCount = dbc->getFieldCount();
+    const bool hasEffectFields = (fieldCount > 109);
+    const bool hasReagentFields = (fieldCount > 67);
     const uint32_t ebp0Field = spellL ? spellL->field("EffectBasePoints0") : 0xFFFFFFFF;
     const uint32_t ebp1Field = spellL ? spellL->field("EffectBasePoints1") : 0xFFFFFFFF;
     const uint32_t ebp2Field = spellL ? spellL->field("EffectBasePoints2") : 0xFFFFFFFF;
+    const uint32_t effect0Field = spellL ? spellL->field("Effect0") : 0xFFFFFFFF;
+    const uint32_t effect1Field = spellL ? spellL->field("Effect1") : 0xFFFFFFFF;
+    const uint32_t effect2Field = spellL ? spellL->field("Effect2") : 0xFFFFFFFF;
     const uint32_t durIdxField = spellL ? spellL->field("DurationIndex") : 0xFFFFFFFF;
+    const uint32_t rangeIdxField = spellL ? spellL->field("RangeIndex") : 0xFFFFFFFF;
     const uint32_t spellVisualIdField = spellL ? spellL->field("SpellVisualID") : 0xFFFFFFFF;
+    const uint32_t recoveryField = spellL ? spellL->field("RecoveryTime") : 0xFFFFFFFF;
+    const uint32_t categoryRecoveryField = spellL ? spellL->field("CategoryRecoveryTime") : 0xFFFFFFFF;
 
     uint32_t count = dbc->getRecordCount();
     for (uint32_t i = 0; i < count; ++i) {
@@ -1912,7 +2529,9 @@ void SpellHandler::loadSpellNameCache() const {
         std::string name = dbc->getString(i, nameField);
         std::string rank = dbc->getString(i, rankField);
         if (!name.empty()) {
-            GameHandler::SpellNameEntry entry{std::move(name), std::move(rank), {}, 0, 0, 0, {0, 0, 0}, 0.0f, 0};
+            GameHandler::SpellNameEntry entry;
+            entry.name = std::move(name);
+            entry.rank = std::move(rank);
             if (tooltipField != 0xFFFFFFFF) {
                 entry.description = dbc->getString(i, tooltipField);
             }
@@ -1929,16 +2548,46 @@ void SpellHandler::loadSpellNameCache() const {
             if (hasAttrExField) {
                 entry.attrEx = dbc->getUInt32(i, attrExField);
             }
+            if (targetsField != 0xFFFFFFFF) {
+                entry.targetFlags = dbc->getUInt32(i, targetsField);
+            }
             // Load effect base points for $s1/$s2/$s3 tooltip substitution
             if (ebp0Field != 0xFFFFFFFF) entry.effectBasePoints[0] = static_cast<int32_t>(dbc->getUInt32(i, ebp0Field));
             if (ebp1Field != 0xFFFFFFFF) entry.effectBasePoints[1] = static_cast<int32_t>(dbc->getUInt32(i, ebp1Field));
             if (ebp2Field != 0xFFFFFFFF) entry.effectBasePoints[2] = static_cast<int32_t>(dbc->getUInt32(i, ebp2Field));
+            const uint32_t effectFields[3] = {effect0Field, effect1Field, effect2Field};
+            for (size_t effect = 0; effect < 3; ++effect) {
+                if (effectFields[effect] != 0xFFFFFFFF && effectFields[effect] < fieldCount) {
+                    entry.effectIds[effect] = dbc->getUInt32(i, effectFields[effect]);
+                }
+            }
             // Duration: read DurationIndex and resolve via SpellDuration.dbc later
             if (durIdxField != 0xFFFFFFFF)
                 entry.durationSec = static_cast<float>(dbc->getUInt32(i, durIdxField)); // store index temporarily
+            // Range: read RangeIndex and resolve via SpellRange.dbc later
+            if (rangeIdxField != 0xFFFFFFFF)
+                entry.maxRange = static_cast<float>(dbc->getUInt32(i, rangeIdxField)); // store index temporarily
             // SpellVisualID: references SpellVisual.dbc for cast/impact M2 effects
             if (spellVisualIdField != 0xFFFFFFFF && spellVisualIdField < dbc->getFieldCount())
                 entry.spellVisualId = dbc->getUInt32(i, spellVisualIdField);
+            if (recoveryField != 0xFFFFFFFF && recoveryField < fieldCount)
+                entry.recoveryMs = dbc->getUInt32(i, recoveryField);
+            if (categoryRecoveryField != 0xFFFFFFFF && categoryRecoveryField < fieldCount)
+                entry.categoryRecoveryMs = dbc->getUInt32(i, categoryRecoveryField);
+            if (hasEffectFields) {
+                for (int e = 0; e < 3; ++e) {
+                    if (dbc->getUInt32(i, 71 + e) == 24 || dbc->getUInt32(i, 71 + e) == 114) {
+                        entry.createdItemId = dbc->getUInt32(i, 107 + e);
+                        break;
+                    }
+                }
+            }
+            if (hasReagentFields) {
+                for (int r = 0; r < 8; ++r) {
+                    entry.reagents[r].itemId = dbc->getUInt32(i, 52 + r);
+                    entry.reagents[r].count  = dbc->getUInt32(i, 60 + r);
+                }
+            }
             owner_.spellNameCacheRef()[id] = std::move(entry);
         }
     }
@@ -1959,6 +2608,26 @@ void SpellHandler::loadSpellNameCache() const {
             }
         }
     }
+    // Resolve the stored RangeIndex into an actual max range. Entries that cannot
+    // be resolved fall back to -1 (unknown) so callers keep their old behaviour
+    // rather than mistaking a raw index for a distance in yards.
+    const auto* rangeL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("SpellRange") : nullptr;
+    auto rangeDbc = am->loadDBC("SpellRange.dbc");
+    std::unordered_map<uint32_t, float> rangeMap;
+    if (rangeDbc && rangeDbc->isLoaded() && rangeL) {
+        const uint32_t maxRangeField = rangeL->field("MaxRange");
+        if (maxRangeField != 0xFFFFFFFF && maxRangeField < rangeDbc->getFieldCount()) {
+            for (uint32_t ri = 0; ri < rangeDbc->getRecordCount(); ++ri) {
+                rangeMap[rangeDbc->getUInt32(ri, 0)] = rangeDbc->getFloat(ri, maxRangeField);
+            }
+        }
+    }
+    for (auto& [sid, entry] : owner_.spellNameCacheRef()) {
+        if (entry.maxRange < 0.0f) continue; // no RangeIndex field in this layout
+        auto it = rangeMap.find(static_cast<uint32_t>(entry.maxRange));
+        entry.maxRange = (it != rangeMap.end()) ? it->second : -1.0f;
+    }
     LOG_INFO("Trainer: Loaded ", owner_.spellNameCacheRef().size(), " spell names from Spell.dbc");
 }
 
@@ -1974,15 +2643,130 @@ void SpellHandler::loadSkillLineAbilityDbc() {
         const auto* slaL = pipeline::getActiveDBCLayout() ? pipeline::getActiveDBCLayout()->getLayout("SkillLineAbility") : nullptr;
         const uint32_t slaSkillField = slaL ? (*slaL)["SkillLineID"] : 1;
         const uint32_t slaSpellField = slaL ? (*slaL)["SpellID"]     : 2;
+        const uint32_t slaFieldCount = slaDbc->getFieldCount();
+        const bool hasDiffFields = (slaFieldCount > 11);
         for (uint32_t i = 0; i < slaDbc->getRecordCount(); i++) {
             uint32_t skillLineId = slaDbc->getUInt32(i, slaSkillField);
             uint32_t spellId = slaDbc->getUInt32(i, slaSpellField);
             if (spellId > 0 && skillLineId > 0) {
                 owner_.spellToSkillLineRef()[spellId] = skillLineId;
+                if (hasDiffFields) {
+                    uint32_t trivHigh = slaDbc->getUInt32(i, 10);
+                    uint32_t trivLow  = slaDbc->getUInt32(i, 11);
+                    uint32_t minRank  = slaDbc->getUInt32(i, 7);
+                    if (trivHigh > 0 || trivLow > 0) {
+                        auto cit = owner_.spellNameCacheRef().find(spellId);
+                        if (cit != owner_.spellNameCacheRef().end()) {
+                            cit->second.trivialSkillHigh = trivHigh;
+                            cit->second.trivialSkillLow  = trivLow;
+                            cit->second.minSkillRank     = minRank;
+                        }
+                    }
+                }
             }
         }
         LOG_INFO("Trainer: Loaded ", owner_.spellToSkillLineRef().size(), " skill line abilities");
     }
+}
+
+const std::string& SpellHandler::getSpellFocusName(uint32_t focusId) {
+    static const std::string kEmpty;
+    if (!spellFocusDbcLoaded_) {
+        spellFocusDbcLoaded_ = true;
+        auto* am = owner_.services().assetManager;
+        if (am && am->isInitialized()) {
+            auto dbc = am->loadDBC("SpellFocusObject.dbc");
+            // Layout is stable across expansions: ID(0) + Name locstring
+            // whose English text sits at field 1.
+            if (dbc && dbc->isLoaded() && dbc->getFieldCount() >= 2) {
+                for (uint32_t i = 0; i < dbc->getRecordCount(); ++i) {
+                    uint32_t id = dbc->getUInt32(i, 0);
+                    std::string name = dbc->getString(i, 1);
+                    if (id != 0 && !name.empty())
+                        spellFocusNames_[id] = std::move(name);
+                }
+                LOG_INFO("Loaded ", spellFocusNames_.size(), " spell focus object names");
+            }
+        }
+    }
+    auto it = spellFocusNames_.find(focusId);
+    return it != spellFocusNames_.end() ? it->second : kEmpty;
+}
+
+const std::string& SpellHandler::getTotemCategoryName(uint32_t categoryId) {
+    static const std::string kEmpty;
+    if (!totemCategoryDbcLoaded_) {
+        totemCategoryDbcLoaded_ = true;
+        auto* am = owner_.services().assetManager;
+        if (am && am->isInitialized()) {
+            // TBC/WotLK only — absent in Vanilla, where totem failures carry
+            // item ids instead of category ids.
+            auto dbc = am->loadDBC("TotemCategory.dbc");
+            // ID(0) + Name locstring whose English text sits at field 1.
+            if (dbc && dbc->isLoaded() && dbc->getFieldCount() >= 2) {
+                for (uint32_t i = 0; i < dbc->getRecordCount(); ++i) {
+                    uint32_t id = dbc->getUInt32(i, 0);
+                    std::string name = dbc->getString(i, 1);
+                    if (id != 0 && !name.empty())
+                        totemCategoryNames_[id] = std::move(name);
+                }
+                LOG_INFO("Loaded ", totemCategoryNames_.size(), " totem category names");
+            }
+        }
+    }
+    auto it = totemCategoryNames_.find(categoryId);
+    return it != totemCategoryNames_.end() ? it->second : kEmpty;
+}
+
+uint32_t SpellHandler::tradeskillOpenerSkillLine(uint32_t spellId) {
+    owner_.loadSpellNameCache();
+    owner_.loadSkillLineDbc();
+    owner_.loadSkillLineAbilityDbc();
+
+    // SkillLine.dbc categories that hold crafting recipes
+    static constexpr uint32_t CAT_SECONDARY  = 9;   // Cooking, First Aid, Fishing
+    static constexpr uint32_t CAT_PROFESSION = 11;  // Alchemy, Blacksmithing, ...
+    // Smelting shares the Mining skill line but isn't named after it
+    static constexpr uint32_t SPELL_SMELTING = 2656;
+
+    auto slIt = owner_.spellToSkillLineRef().find(spellId);
+    if (slIt == owner_.spellToSkillLineRef().end()) return 0;
+    const uint32_t skillLine = slIt->second;
+
+    auto catIt = owner_.skillLineCategoriesRef().find(skillLine);
+    if (catIt == owner_.skillLineCategoriesRef().end()) return 0;
+    if (catIt->second != CAT_SECONDARY && catIt->second != CAT_PROFESSION) return 0;
+
+    // Opener heuristic: the window-opening spell is named after its skill line
+    // ("Cooking" opens Cooking). Recipes, gathering casts (Disenchant, Fishing
+    // bobber cast is filtered below by the recipe requirement), and utility
+    // spells never share the skill line's name.
+    if (spellId != SPELL_SMELTING) {
+        const std::string& spellName = owner_.getSpellName(spellId);
+        auto nameIt = owner_.skillLineNamesRef().find(skillLine);
+        if (spellName.empty() || nameIt == owner_.skillLineNamesRef().end() ||
+            spellName != nameIt->second) {
+            return 0;
+        }
+    }
+
+    // Only open a window that will actually list something: require at least
+    // one known recipe (creates an item or consumes reagents) in this line.
+    // This keeps Fishing falling through to a normal bobber cast.
+    for (uint32_t known : knownSpells_) {
+        if (known == spellId) continue;
+        auto kslIt = owner_.spellToSkillLineRef().find(known);
+        if (kslIt == owner_.spellToSkillLineRef().end() || kslIt->second != skillLine) continue;
+        auto cacheIt = owner_.spellNameCacheRef().find(known);
+        if (cacheIt == owner_.spellNameCacheRef().end()) continue;
+        const auto& entry = cacheIt->second;
+        bool hasReagents = false;
+        for (const auto& reagent : entry.reagents) {
+            if (reagent.itemId != 0) { hasReagents = true; break; }
+        }
+        if (entry.createdItemId != 0 || hasReagents) return skillLine;
+    }
+    return 0;
 }
 
 void SpellHandler::categorizeTrainerSpells() {
@@ -2071,9 +2855,12 @@ std::string SpellHandler::getEnchantName(uint32_t enchantId) const {
     if (!am || !am->isInitialized()) return {};
     auto dbc = am->loadDBC("SpellItemEnchantment.dbc");
     if (!dbc || !dbc->isLoaded()) return {};
+    const auto* sieL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("SpellItemEnchantment") : nullptr;
+    const uint32_t nameField = pipeline::detectEnchantmentNameField(dbc.get(), sieL);
     for (uint32_t i = 0; i < dbc->getRecordCount(); ++i) {
         if (dbc->getUInt32(i, 0) == enchantId) {
-            return dbc->getString(i, 14);
+            return dbc->getString(i, nameField);
         }
     }
     return {};
@@ -2098,6 +2885,54 @@ uint32_t SpellHandler::getSpellSchoolMask(uint32_t spellId) const {
     loadSpellNameCache();
     auto it = owner_.spellNameCacheRef().find(spellId);
     return (it != owner_.spellNameCacheRef().end()) ? it->second.schoolMask : 0;
+}
+
+uint32_t SpellHandler::getSpellTargetFlags(uint32_t spellId) const {
+    if (spellId == 0) return 0;
+    loadSpellNameCache();
+    auto it = owner_.spellNameCacheRef().find(spellId);
+    return (it != owner_.spellNameCacheRef().end()) ? it->second.targetFlags : 0;
+}
+
+uint32_t SpellHandler::resolveHighestKnownRank(uint32_t spellId) const {
+    if (spellId == 0 || knownSpells_.count(spellId) > 0) return spellId;
+
+    loadSpellNameCache();
+    const auto& cache = owner_.spellNameCacheRef();
+
+    // Adapt the spell name cache to the pure resolver in spell_classification.hpp.
+    thread_local spellclass::SpellRankInfo scratch;
+    auto lookup = [&cache](uint32_t id) -> const spellclass::SpellRankInfo* {
+        auto it = cache.find(id);
+        if (it == cache.end()) return nullptr;
+        scratch.name = it->second.name;
+        scratch.rank = it->second.rank;
+        return &scratch;
+    };
+
+    const uint32_t best = spellclass::resolveHighestKnownRank(spellId, knownSpells_, lookup);
+    if (best != spellId) {
+        LOG_INFO("Superseded rank: casting ", best, " instead of ", spellId);
+    }
+    return best;
+}
+
+float SpellHandler::getSpellMaxRange(uint32_t spellId) const {
+    if (spellId == 0) return -1.0f;
+    loadSpellNameCache();
+    auto it = owner_.spellNameCacheRef().find(spellId);
+    return (it != owner_.spellNameCacheRef().end()) ? it->second.maxRange : -1.0f;
+}
+
+bool SpellHandler::isSelfCastSpell(uint32_t spellId) const {
+    if (spellId == 0) return false;
+    loadSpellNameCache();
+    auto it = owner_.spellNameCacheRef().find(spellId);
+    if (it == owner_.spellNameCacheRef().end()) return false;
+    // SpellRange "Self Only" has a max range of 0 — the spell cannot reach any
+    // other unit, so it is cast on the caster no matter what is targeted.
+    // A negative range means SpellRange.dbc was unavailable; assume not self-cast.
+    return spellclass::isSelfCastRange(it->second.maxRange);
 }
 
 const std::string& SpellHandler::getSkillLineName(uint32_t spellId) const {
@@ -2248,11 +3083,25 @@ void SpellHandler::extractExploredZoneFields(const FlatFieldMap& fields) {
 void SpellHandler::handleCastResult(network::Packet& packet) {
     uint32_t castResultSpellId = 0;
     uint8_t  castResult        = 0;
-    if (owner_.getPacketParsers()->parseCastResult(packet, castResultSpellId, castResult)) {
+    uint32_t castResultMiscArg = 0;
+    uint32_t castResultMiscArg2 = 0;
+    if (owner_.getPacketParsers()->parseCastResult(packet, castResultSpellId, castResult,
+                                                   castResultMiscArg, castResultMiscArg2)) {
         LOG_DEBUG("SMSG_CAST_RESULT: spellId=", castResultSpellId, " result=", static_cast<int>(castResult));
         if (castResult != 0) {
+            if (spellclass::isFishingCast(castResultSpellId)) {
+                const auto& movement = owner_.movementInfoRef();
+                LOG_WARNING("Fishing cast failed: spell=", castResultSpellId,
+                            " result=", static_cast<int>(castResult),
+                            " pos=(", movement.x, ",", movement.y, ",", movement.z, ")",
+                            " facing=", movement.orientation,
+                            " selectedTarget=0x", std::hex, owner_.getTargetGuid(), std::dec);
+            }
+            const uint64_t gatherGoGuid = owner_.lastInteractedGoGuidRef();
+            const bool gatherCast = gatherGoGuid != 0 && isGatherSpellId(castResultSpellId);
             casting_ = false; castIsChannel_ = false; currentCastSpellId_ = 0; castTimeRemaining_ = 0.0f;
             owner_.lastInteractedGoGuidRef() = 0;
+            owner_.pendingGameObjectInteractGuidRef() = 0;
             craftQueueSpellId_ = 0; craftQueueRemaining_ = 0;
             queuedSpellId_ = 0; queuedSpellTarget_ = 0;
             int playerPowerType = -1;
@@ -2260,9 +3109,24 @@ void SpellHandler::handleCastResult(network::Packet& packet) {
                 if (auto pu = std::dynamic_pointer_cast<Unit>(pe))
                     playerPowerType = static_cast<int>(pu->getPowerType());
             }
-            const char* reason = getSpellCastResultString(castResult, playerPowerType);
-            std::string errMsg = reason ? reason
-                                        : ("Spell cast failed (error " + std::to_string(castResult) + ")");
+            if (castResult == kSpellFailedNotReady) {
+                seedCooldownFromSpellInfo(castResultSpellId);
+            }
+            // Totem failures name tool item ids; request their info so a retry
+            // of the craft can show the tool's name even if it wasn't cached.
+            if (castResult == kCastResultTotems) {
+                if (castResultMiscArg != 0) owner_.ensureItemInfo(castResultMiscArg);
+                if (castResultMiscArg2 != 0) owner_.ensureItemInfo(castResultMiscArg2);
+            }
+            std::string errMsg = castFailureMessage(owner_, castResultSpellId,
+                                                     castResult, playerPowerType,
+                                                     castResultMiscArg, castResultMiscArg2);
+            if (gatherCast) {
+                errMsg = gatherCastFailureMessage(castResult, errMsg);
+                if (shouldDespawnGatherTarget(castResult)) {
+                    owner_.despawnGameObjectLocally(gatherGoGuid);
+                }
+            }
             owner_.addUIError(errMsg);
             if (owner_.spellCastFailedCallbackRef()) owner_.spellCastFailedCallbackRef()(castResultSpellId);
                 owner_.fireAddonEvent("UNIT_SPELLCAST_FAILED", {"player", std::to_string(castResultSpellId)});
@@ -2339,7 +3203,9 @@ void SpellHandler::handlePlaySpellVisual(network::Packet& packet) {
         glm::vec3 canonical(entity->getLatestX(), entity->getLatestY(), entity->getLatestZ());
         spawnPos = core::coords::canonicalToRender(canonical);
     }
-    if (auto* sv = renderer->getSpellVisualSystem()) sv->playSpellVisual(visualId, spawnPos);
+    if (auto* sv = renderer->getSpellVisualSystem())
+        sv->playSpellVisual(visualId, spawnPos, /*useImpactKit=*/false,
+                            owner_.resolveUnitRenderInstance(casterGuid));
 }
 
 void SpellHandler::handleSpellModifier(network::Packet& packet, bool isFlat) {
@@ -2494,8 +3360,8 @@ void SpellHandler::handleSpellFailure(network::Packet& packet) {
             if (auto pe = owner_.getEntityManager().getEntity(owner_.getPlayerGuid()))
                 if (auto pu = std::dynamic_pointer_cast<Unit>(pe))
                     pt = static_cast<int>(pu->getPowerType());
-            const char* reason = getSpellCastResultString(failReason, pt);
-            if (reason) {
+            std::string reason = castFailureMessage(owner_, failSpellId, failReason, pt);
+            if (!reason.empty()) {
                 // Prefix with spell name for context, e.g. "Fireball: Not in range"
                 const std::string& sName = owner_.getSpellName(failSpellId);
                 std::string fullMsg = sName.empty() ? reason
@@ -2651,17 +3517,11 @@ void SpellHandler::handleTotemCreated(network::Packet& packet) {
 }
 
 void SpellHandler::handlePeriodicAuraLog(network::Packet& packet) {
-    // WotLK: packed_guid victim + packed_guid caster + uint32 spellId + uint32 count + effects
-    // TBC: full uint64 victim + uint64 caster + uint32 spellId + uint32 count + effects
-    // Classic/Vanilla: packed_guid (same as WotLK)
-    const bool periodicTbc = isActiveExpansion("tbc");
-    const size_t guidMinSz = periodicTbc ? 8u : 2u;
-    if (!packet.hasRemaining(guidMinSz)) return;
-    uint64_t victimGuid = periodicTbc
-        ? packet.readUInt64() : packet.readPackedGuid();
-    if (!packet.hasRemaining(guidMinSz)) return;
-    uint64_t casterGuid = periodicTbc
-        ? packet.readUInt64() : packet.readPackedGuid();
+    // Classic, TBC, and WotLK all serialize victim and caster as packed GUIDs.
+    if (!packet.hasFullPackedGuid()) return;
+    uint64_t victimGuid = packet.readPackedGuid();
+    if (!packet.hasFullPackedGuid()) return;
+    uint64_t casterGuid = packet.readPackedGuid();
     if (!packet.hasRemaining(8)) return;
     uint32_t spellId = packet.readUInt32();
     uint32_t count   = packet.readUInt32();
@@ -2671,8 +3531,15 @@ void SpellHandler::handlePeriodicAuraLog(network::Packet& packet) {
         packet.skipAll();
         return;
     }
-    for (uint32_t i = 0; i < count && packet.hasRemaining(1); ++i) {
-        uint8_t auraType = packet.readUInt8();
+    // SpellPeriodicAuraLogInfo serializes AuraType as uint32 on the wire.
+    // Reading one byte leaves three zero bytes in front of the amount and
+    // turns ordinary poison ticks into corrupt multi-byte damage values.
+    if (count > 64) {
+        LOG_WARNING("SMSG_PERIODICAURALOG: unreasonable effect count ", count);
+        return;
+    }
+    for (uint32_t i = 0; i < count && packet.hasRemaining(4); ++i) {
+        uint32_t auraType = packet.readUInt32();
         if (auraType == 3 || auraType == 89) {
             // Classic/TBC: damage(4)+school(4)+absorbed(4)+resisted(4)  = 16 bytes
             // WotLK 3.3.5a: damage(4)+overkill(4)+school(4)+absorbed(4)+resisted(4)+isCrit(1) = 21 bytes
@@ -2696,18 +3563,17 @@ void SpellHandler::handlePeriodicAuraLog(network::Packet& packet) {
             if (res > 0)
                 owner_.addCombatText(CombatTextEntry::RESIST, static_cast<int32_t>(res),
                               spellId, isPlayerCaster, 0, casterGuid, victimGuid);
-        } else if (auraType == 8 || auraType == 124 || auraType == 45) {
-            // Classic/TBC: heal(4)+maxHeal(4)+overHeal(4)                  = 12 bytes
-            // WotLK 3.3.5a: heal(4)+maxHeal(4)+overHeal(4)+absorbed(4)+isCrit(1) = 17 bytes
+        } else if (auraType == 8 || auraType == 20) {
+            // Classic/TBC: heal(4)
+            // WotLK: heal(4)+overheal(4)+absorbed(4)+isCrit(1)
             const bool healWotlk = isActiveExpansion("wotlk");
-            const size_t hotSz = healWotlk ? 17u : 12u;
+            const size_t hotSz = healWotlk ? 13u : 4u;
             if (!packet.hasRemaining(hotSz)) break;
             uint32_t heal    = packet.readUInt32();
-            /*uint32_t max=*/  packet.readUInt32();
-            /*uint32_t over=*/ packet.readUInt32();
             uint32_t hotAbs  = 0;
             bool hotCrit = false;
             if (healWotlk) {
+                /*uint32_t overheal=*/ packet.readUInt32();
                 hotAbs = packet.readUInt32();
                 hotCrit = (packet.readUInt8() != 0);
             }
@@ -2717,7 +3583,7 @@ void SpellHandler::handlePeriodicAuraLog(network::Packet& packet) {
             if (hotAbs > 0)
                 owner_.addCombatText(CombatTextEntry::ABSORB, static_cast<int32_t>(hotAbs),
                               spellId, isPlayerCaster, 0, casterGuid, victimGuid);
-        } else if (auraType == 46 || auraType == 91) {
+        } else if (auraType == 21 || auraType == 24) {
             // OBS_MOD_POWER / PERIODIC_ENERGIZE: miscValue(powerType) + amount
             // Common in WotLK: Replenishment, Mana Spring Totem, Divine Plea, etc.
             if (!packet.hasRemaining(8)) break;
@@ -2726,7 +3592,7 @@ void SpellHandler::handlePeriodicAuraLog(network::Packet& packet) {
             if ((isPlayerVictim || isPlayerCaster) && amount > 0)
                 owner_.addCombatText(CombatTextEntry::ENERGIZE, static_cast<int32_t>(amount),
                               spellId, isPlayerCaster, periodicPowerType, casterGuid, victimGuid);
-        } else if (auraType == 98) {
+        } else if (auraType == 64) {
             // PERIODIC_MANA_LEECH: miscValue(powerType) + amount + float multiplier
             if (!packet.hasRemaining(12)) break;
             uint8_t powerType = static_cast<uint8_t>(packet.readUInt32());
@@ -2824,6 +3690,17 @@ void SpellHandler::handleExtraAuraInfo(network::Packet& packet, bool isInit) {
             a.maxDurationMs= (maxDurMs   == 0xFFFFFFFF) ? -1 : static_cast<int32_t>(maxDurMs);
             a.receivedAtMs = nowMs;
         }
+    }
+    if (auraList && owner_.addonEventCallbackRef()) {
+        std::string unitId;
+        if (auraTargetGuid == owner_.getPlayerGuid()) unitId = "player";
+        else if (auraTargetGuid == owner_.getTargetGuid()) unitId = "target";
+        else if (auraTargetGuid == owner_.focusGuidRef()) unitId = "focus";
+        else if (auraTargetGuid == owner_.petGuidRef()) unitId = "pet";
+        if (!unitId.empty()) owner_.addonEventCallbackRef()("UNIT_AURA", {unitId});
+    }
+    if (auraTargetGuid == owner_.getPlayerGuid()) {
+        refreshRestorationFromPlayerAuras();
     }
     packet.skipAll();
 }
@@ -3153,15 +4030,6 @@ void SpellHandler::parseEffectCreateItem(network::Packet& packet, uint32_t effec
         owner_.addSystemChatMessage(msg);
         LOG_DEBUG("SMSG_SPELLLOGEXECUTE CREATE_ITEM: spell=", spellId,
                   " item=", itemEntry, " name=", itemName);
-
-        // Repeat-craft queue: re-cast if more crafts remaining
-        if (craftQueueRemaining_ > 0 && craftQueueSpellId_ == spellId) {
-            --craftQueueRemaining_;
-            if (craftQueueRemaining_ > 0)
-                castSpell(craftQueueSpellId_, 0);
-            else
-                craftQueueSpellId_ = 0;
-        }
     }
 }
 
@@ -3237,8 +4105,8 @@ void SpellHandler::handleSpellLogExecute(network::Packet& packet) {
 
     const bool isPlayerCaster = (exeCaster == owner_.getPlayerGuid());
     for (uint32_t ei = 0; ei < exeEffectCount; ++ei) {
-        if (!packet.hasRemaining(5)) break;
-        uint8_t  effectType     = packet.readUInt8();
+        if (!packet.hasRemaining(8)) break;
+        uint32_t effectType     = packet.readUInt32();
         uint32_t effectLogCount = packet.readUInt32();
         effectLogCount = std::min(effectLogCount, 64u); // sanity
 
@@ -3275,26 +4143,53 @@ void SpellHandler::handleClearExtraAuraInfo(network::Packet& packet) {
         std::vector<AuraSlot>* auraList = nullptr;
         if (clearGuid == owner_.getPlayerGuid())       auraList = &playerAuras_;
         else if (clearGuid == owner_.getTargetGuid())   auraList = &targetAuras_;
+        else if (clearGuid != 0)                         auraList = &unitAurasCache_[clearGuid];
         if (auraList && slot < auraList->size()) {
             (*auraList)[slot] = AuraSlot{};
+        }
+        if (auraList && owner_.addonEventCallbackRef()) {
+            std::string unitId;
+            if (clearGuid == owner_.getPlayerGuid()) unitId = "player";
+            else if (clearGuid == owner_.getTargetGuid()) unitId = "target";
+            else if (clearGuid == owner_.focusGuidRef()) unitId = "focus";
+            else if (clearGuid == owner_.petGuidRef()) unitId = "pet";
+            if (!unitId.empty()) owner_.addonEventCallbackRef()("UNIT_AURA", {unitId});
+        }
+        if (clearGuid == owner_.getPlayerGuid()) {
+            refreshRestorationFromPlayerAuras();
         }
     }
     packet.skipAll();
 }
 
 void SpellHandler::handleItemEnchantTimeUpdate(network::Packet& packet) {
-    // Format: uint64 itemGuid + uint32 slot + uint32 durationSec + uint64 playerGuid
-    // slot: 0=main-hand, 1=off-hand, 2=ranged
+    // Format: uint64 itemGuid + uint32 enchantmentSlot + uint32 durationSec + uint64 playerGuid
+    //
+    // The slot here is the item's *enchantment* slot (TEMP_ENCHANTMENT_SLOT = 1),
+    // not the equipment slot — reading it as one labels every temporary enchant
+    // "Off Hand", even on a two-hander. The item GUID is what says where it sits.
     if (!packet.hasRemaining(24)) {
         packet.skipAll(); return;
     }
-    /*uint64_t itemGuid =*/ packet.readUInt64();
-    uint32_t enchSlot    = packet.readUInt32();
+    uint64_t itemGuid    = packet.readUInt64();
+    /*uint32_t enchantmentSlot =*/ packet.readUInt32();
     uint32_t durationSec = packet.readUInt32();
     /*uint64_t playerGuid =*/ packet.readUInt64();
 
-    // Clamp to known slots (0-2)
-    if (enchSlot > 2) { return; }
+    if (itemGuid == 0) return;
+
+    // Map the enchanted item to the weapon slot it is equipped in.
+    static constexpr EquipSlot kWeaponSlots[] = {
+        EquipSlot::MAIN_HAND, EquipSlot::OFF_HAND, EquipSlot::RANGED
+    };
+    uint32_t enchSlot = 0xFFFFFFFF;
+    for (uint32_t i = 0; i < 3; ++i) {
+        if (owner_.getEquipSlotGuid(static_cast<int>(kWeaponSlots[i])) == itemGuid) {
+            enchSlot = i;
+            break;
+        }
+    }
+    if (enchSlot > 2) return;  // enchanted item is not an equipped weapon
 
     uint64_t nowMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(

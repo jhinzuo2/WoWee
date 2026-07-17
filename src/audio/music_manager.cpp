@@ -1,6 +1,9 @@
 #include "audio/music_manager.hpp"
+
+#include <chrono>
 #include "audio/audio_engine.hpp"
 #include "pipeline/asset_manager.hpp"
+#include "core/thread_pool.hpp"
 #include "core/logger.hpp"
 #include <algorithm>
 #include <filesystem>
@@ -30,14 +33,21 @@ float MusicManager::effectiveMusicVolume() const {
 }
 
 void MusicManager::shutdown() {
+    cancelPendingFileLoad();
     AudioEngine::instance().stopMusic();
     playing = false;
     fadingIn = false;
+    fadingOut = false;
+    crossfading = false;
     fadeInTimer = 0.0f;
     fadeInDuration = 0.0f;
     fadeInTargetVolume = 0.0f;
     currentTrack.clear();
+    currentTrackIsFile = false;
+    pendingTrack.clear();
+    pendingIsFile = false;
     musicDataCache_.clear();
+    assetManager = nullptr;
 }
 
 void MusicManager::preloadMusic(const std::string& mpqPath) {
@@ -46,7 +56,8 @@ void MusicManager::preloadMusic(const std::string& mpqPath) {
 
     auto data = assetManager->readFile(mpqPath);
     if (!data.empty()) {
-        musicDataCache_[mpqPath] = std::move(data);
+        musicDataCache_[mpqPath] =
+            std::make_shared<const std::vector<uint8_t>>(std::move(data));
     }
 }
 
@@ -60,13 +71,17 @@ void MusicManager::playMusic(const std::string& mpqPath, bool loop, float fadeIn
         return;
     }
 
+    // A newer request always wins, regardless of whether it comes from an archive
+    // or the filesystem. Pool-backed futures can be discarded without joining.
+    cancelPendingFileLoad();
+
     // Read music file from cache or MPQ
     auto cacheIt = musicDataCache_.find(mpqPath);
     if (cacheIt == musicDataCache_.end()) {
         preloadMusic(mpqPath);
         cacheIt = musicDataCache_.find(mpqPath);
     }
-    if (cacheIt == musicDataCache_.end() || cacheIt->second.empty()) {
+    if (cacheIt == musicDataCache_.end() || !cacheIt->second || cacheIt->second->empty()) {
         LOG_WARNING("Music: Could not read: ", mpqPath);
         return;
     }
@@ -106,18 +121,52 @@ void MusicManager::playFilePath(const std::string& filePath, bool loop, float fa
         return;
     }
 
-    // Read file into memory
-    std::ifstream file(filePath, std::ios::binary | std::ios::ate);
-    if (!file) {
-        LOG_ERROR("Music: Could not open file: ", filePath);
+    // Reuse an in-flight read of the same file while honoring the newest playback
+    // options. A different request replaces it without waiting for the old read.
+    if (pendingFileLoad_ && pendingFileLoad_->path == filePath) {
+        pendingFileLoad_->loop = loop;
+        pendingFileLoad_->fadeInMs = fadeInMs;
         return;
     }
 
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
+    // Read the track on a worker. A login track is ~6MB, and reading it here stalled
+    // the render frame that asked for it. pollPendingFileLoad() picks it up from
+    // update(), so every AudioEngine call still happens on the main thread.
+    pendingFileLoad_ = PendingFileLoad{
+        core::ThreadPool::ioWorkers().submit([filePath]()
+                -> std::shared_ptr<const std::vector<uint8_t>> {
+            std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+            if (!file) return nullptr;
+            std::streamsize size = file.tellg();
+            if (size <= 0) return nullptr;
+            file.seekg(0, std::ios::beg);
+            std::vector<uint8_t> bytes(static_cast<size_t>(size));
+            if (!file.read(reinterpret_cast<char*>(bytes.data()), size)) return nullptr;
+            return std::make_shared<const std::vector<uint8_t>>(std::move(bytes));
+        }),
+        filePath, loop, fadeInMs
+    };
+}
 
-    std::vector<uint8_t> data(static_cast<size_t>(size));
-    if (!file.read(reinterpret_cast<char*>(data.data()), size)) {
+void MusicManager::cancelPendingFileLoad() {
+    // Futures returned by ThreadPool own only a shared packaged task state; unlike
+    // std::async futures, destroying one never joins the worker.
+    pendingFileLoad_.reset();
+}
+
+void MusicManager::pollPendingFileLoad() {
+    if (!pendingFileLoad_) return;
+    auto& pending = *pendingFileLoad_;
+    if (!pending.future.valid()) { pendingFileLoad_.reset(); return; }
+    if (pending.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+
+    auto data = pending.future.get();
+    const std::string filePath = pending.path;
+    const bool loop = pending.loop;
+    const float fadeInMs = pending.fadeInMs;
+    pendingFileLoad_.reset();
+
+    if (!data || data->empty()) {
         LOG_ERROR("Music: Could not read file: ", filePath);
         return;
     }
@@ -125,7 +174,7 @@ void MusicManager::playFilePath(const std::string& filePath, bool loop, float fa
     // Play with AudioEngine
     float targetVolume = effectiveMusicVolume();
     float startVolume = (fadeInMs > 0.0f) ? 0.0f : targetVolume;
-    if (AudioEngine::instance().playMusic(data, startVolume, loop)) {
+    if (AudioEngine::instance().playMusic(std::move(data), startVolume, loop)) {
         playing = true;
         fadingIn = false;
         if (fadeInMs > 0.0f) {
@@ -144,10 +193,12 @@ void MusicManager::playFilePath(const std::string& filePath, bool loop, float fa
 }
 
 void MusicManager::stopMusic(float fadeMs) {
-    if (!playing) return;
-
+    cancelPendingFileLoad();
     fadingIn = false;
     crossfading = false;
+    pendingTrack.clear();
+    pendingIsFile = false;
+    if (!playing) return;
 
     if (fadeMs > 0.0f) {
         // Begin fade-out; actual stop happens once volume reaches zero in update()
@@ -228,6 +279,9 @@ void MusicManager::crossfadeToFile(const std::string& filePath, float fadeMs) {
 }
 
 void MusicManager::update(float deltaTime) {
+    // Hand off any background-loaded track before touching playback state.
+    pollPendingFileLoad();
+
     // Check if music is still playing
     if (playing && !AudioEngine::instance().isMusicPlaying()) {
         playing = false;

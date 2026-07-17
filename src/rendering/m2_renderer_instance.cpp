@@ -51,6 +51,7 @@ void M2Renderer::setInstancePosition(uint32_t instanceId, const glm::vec3& posit
         glm::vec3 localMin, localMax;
         getTightCollisionBounds(*inst.cachedModel, localMin, localMax);
         transformAABB(inst.modelMatrix, localMin, localMax, inst.worldBoundsMin, inst.worldBoundsMax);
+        inst.recomputeCachedCullFactors();
     }
 
     // Incrementally update spatial grid
@@ -159,6 +160,7 @@ void M2Renderer::setInstanceTransform(uint32_t instanceId, const glm::mat4& tran
         glm::vec3 localMin, localMax;
         getTightCollisionBounds(*inst.cachedModel, localMin, localMax);
         transformAABB(inst.modelMatrix, localMin, localMax, inst.worldBoundsMin, inst.worldBoundsMax);
+        inst.recomputeCachedCullFactors();
     }
 
     // Incrementally update spatial grid (remove old cells, add new cells)
@@ -322,6 +324,7 @@ void M2Renderer::clear() {
             }
         }
         if (boneDescPool_) {
+            if (boneDescPoolGeneration_) boneDescPoolGeneration_->fetch_add(1, std::memory_order_relaxed);
             vkResetDescriptorPool(device, boneDescPool_, 0);
             // Re-allocate the dummy bone set (invalidated by pool reset)
             dummyBoneSet_ = allocateBoneSet();
@@ -551,8 +554,14 @@ void M2Renderer::cleanupUnusedModels() {
     // buffers — the previous frame's command buffer may still be referencing
     // vertex/index buffers that are about to be freed. Without this wait,
     // the GPU reads freed memory, which can cause VK_ERROR_DEVICE_LOST.
+    // Suspected (not yet confirmed) contributor to multi-second freezes seen
+    // right after taxi landings — timed here so the next repro pins it down.
     if (!toRemove.empty() && vkCtx_) {
+        const auto waitStart = std::chrono::steady_clock::now();
         vkDeviceWaitIdle(vkCtx_->getDevice());
+        const float waitMs = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - waitStart).count();
+        LOG_DEBUG("M2 cleanup: vkDeviceWaitIdle took ", waitMs, "ms (", toRemove.size(), " models to remove)");
     }
     for (uint32_t id : toRemove) {
         auto it = models.find(id);
@@ -1213,7 +1222,8 @@ void M2Renderer::recreatePipelines() {
             .setVertexInput({m2Binding}, m2Attrs)
             .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
             .setRasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
-            .setDepthTest(true, depthWrite, VK_COMPARE_OP_LESS_OR_EQUAL)
+            .setDepthTest(!skyMode_, skyMode_ ? false : depthWrite,
+                          skyMode_ ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL)
             .setColorBlendAttachment(blendState)
             .setMultisample(vkCtx_->getMsaaSamples())
             .setLayout(pipelineLayout_)

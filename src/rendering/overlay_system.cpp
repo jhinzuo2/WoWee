@@ -145,19 +145,32 @@ void OverlaySystem::renderSelectionCircle(const glm::mat4& view, const glm::mat4
     initSelectionCircle();
     if (selCirclePipeline_ == VK_NULL_HANDLE || cmd == VK_NULL_HANDLE) return;
 
-    // Keep circle anchored near target foot Z.
-    const float baseZ = selCirclePos_.z;
-    float floorZ = baseZ;
-    auto considerFloor = [&](std::optional<float> sample) {
-        if (!sample) return;
-        const float h = *sample;
-        if (h < baseZ - 1.25f || h > baseZ + 0.85f) return;
-        floorZ = std::max(floorZ, h);
-    };
+    // Keep circle anchored near target foot Z. The floor queries are collision
+    // raycasts; reuse the last result while the target stands still, refreshing
+    // every 30 frames in case geometry streams in around it.
+    float floorZ;
+    if (selCircleFloorCacheAge_ >= 0 && selCircleFloorCacheAge_ < 30 &&
+        selCirclePos_ == selCircleFloorCachePos_) {
+        floorZ = selCircleFloorCacheZ_;
+        selCircleFloorCacheAge_++;
+    } else {
+        const float baseZ = selCirclePos_.z;
+        floorZ = baseZ;
+        auto considerFloor = [&](std::optional<float> sample) {
+            if (!sample) return;
+            const float h = *sample;
+            if (h < baseZ - 1.25f || h > baseZ + 0.85f) return;
+            floorZ = std::max(floorZ, h);
+        };
 
-    if (terrainHeight) considerFloor(terrainHeight(selCirclePos_.x, selCirclePos_.y));
-    if (wmoHeight) considerFloor(wmoHeight(selCirclePos_.x, selCirclePos_.y, selCirclePos_.z + 3.0f));
-    if (m2Height) considerFloor(m2Height(selCirclePos_.x, selCirclePos_.y, selCirclePos_.z + 2.0f));
+        if (terrainHeight) considerFloor(terrainHeight(selCirclePos_.x, selCirclePos_.y));
+        if (wmoHeight) considerFloor(wmoHeight(selCirclePos_.x, selCirclePos_.y, selCirclePos_.z + 3.0f));
+        if (m2Height) considerFloor(m2Height(selCirclePos_.x, selCirclePos_.y, selCirclePos_.z + 2.0f));
+
+        selCircleFloorCachePos_ = selCirclePos_;
+        selCircleFloorCacheZ_ = floorZ;
+        selCircleFloorCacheAge_ = 0;
+    }
 
     glm::vec3 raisedPos = selCirclePos_;
     raisedPos.z = floorZ + 0.17f;

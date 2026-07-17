@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Usage: ./extract_assets.sh /path/to/WoW/Data [expansion]
 #
-# Extracts WoW MPQ archives into the Data/ directory for use with wowee.
+# Extracts WoW MPQ archives into an expansion-isolated directory for wowee.
 #
 # Arguments:
 #   $1  Path to WoW's Data directory (containing .MPQ files)
@@ -122,12 +122,14 @@ fi
 
 if [ "$EXPANSION" != "auto" ] && [ -d "${OUTPUT_DIR}/expansions/${EXPANSION}/db" ] && ls "${OUTPUT_DIR}/expansions/${EXPANSION}/db"/*.csv >/dev/null 2>&1; then
     EXTRA_ARGS+=(--skip-dbc)
-elif ls "${OUTPUT_DIR}"/expansions/*/db/*.csv >/dev/null 2>&1; then
-    EXTRA_ARGS+=(--skip-dbc)
 fi
 
-"$BINARY" --mpq-dir "$MPQ_DIR" --output "$OUTPUT_DIR" "${EXTRA_ARGS[@]}"
+"$BINARY" --mpq-dir "$MPQ_DIR" --output "$OUTPUT_DIR" --expansion-subdir "${EXTRA_ARGS[@]}"
 
 echo ""
-echo "Done! Assets extracted to $OUTPUT_DIR"
+if [ "$EXPANSION" = "auto" ]; then
+    echo "Done! Assets extracted under $OUTPUT_DIR/expansions/<detected-expansion>"
+else
+    echo "Done! Assets extracted to $OUTPUT_DIR/expansions/$EXPANSION"
+fi
 echo "You can now run wowee."

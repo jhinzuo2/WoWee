@@ -2,6 +2,7 @@
 #include "game/packet_parsers.hpp"
 #include "game/opcodes.hpp"
 #include "game/character.hpp"
+#include "game/game_utils.hpp"
 #include "auth/crypto.hpp"
 #include "core/logger.hpp"
 #include <algorithm>
@@ -324,12 +325,12 @@ bool TextEmoteParser::parse(network::Packet& packet, TextEmoteData& data, bool l
     }
 
     if (legacyFormat) {
-        // Classic 1.12 / TBC 2.4.3: textEmoteId(u32) + emoteNum(u32) + senderGuid(u64)
+        // Classic 1.12: textEmoteId(u32) + emoteNum(u32) + senderGuid(u64)
         data.textEmoteId = packet.readUInt32();
         data.emoteNum    = packet.readUInt32();
         data.senderGuid  = packet.readUInt64();
     } else {
-        // WotLK 3.3.5a: senderGuid(u64) + textEmoteId(u32) + emoteNum(u32)
+        // TBC/WotLK: senderGuid(u64) + textEmoteId(u32) + emoteNum(u32)
         data.senderGuid  = packet.readUInt64();
         data.textEmoteId = packet.readUInt32();
         data.emoteNum    = packet.readUInt32();
@@ -404,7 +405,11 @@ network::Packet SetActiveMoverPacket::build(uint64_t guid) {
 
 network::Packet InspectPacket::build(uint64_t targetGuid) {
     network::Packet packet(wireOpcode(Opcode::CMSG_INSPECT));
-    packet.writePackedGuid(targetGuid);
+    if (isActiveExpansion("classic") || isActiveExpansion("tbc") || isActiveExpansion("turtle")) {
+        packet.writeUInt64(targetGuid);
+    } else {
+        packet.writePackedGuid(targetGuid);
+    }
     LOG_DEBUG("Built CMSG_INSPECT: target=0x", std::hex, targetGuid, std::dec);
     return packet;
 }

@@ -13,7 +13,9 @@
 #include "pipeline/asset_manager.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <sstream>
+#include <string>
 
 namespace wowee { namespace core {
 
@@ -71,6 +73,25 @@ void WorldEntryCallbackHandler::clearStuckMovement() {
     gameHandler_.sendMovement(game::Opcode::MSG_MOVE_HEARTBEAT);
 }
 
+void WorldEntryCallbackHandler::clearMountForUnstuck() {
+    // Unstuck changes the character's position independently of the normal
+    // mount aura update path. Dismount first so the server and client agree,
+    // then remove any already-orphaned local instance left by an older reset.
+    const bool hasRenderedMount =
+        (entitySpawner_ && entitySpawner_->getMountInstanceId() != 0) ||
+        (renderer_.getAnimationController() && renderer_.getAnimationController()->isMounted());
+    if (gameHandler_.isMounted() || hasRenderedMount) {
+        gameHandler_.dismount();
+    }
+    if (entitySpawner_) {
+        entitySpawner_->clearMountState();
+    }
+    if (auto* animation = renderer_.getAnimationController();
+        animation && animation->isMounted()) {
+        animation->clearMount();
+    }
+}
+
 // Sync teleported render position to server
 void WorldEntryCallbackHandler::syncTeleportedPositionToServer(const glm::vec3& renderPos) {
     glm::vec3 canonical = core::coords::renderToCanonical(renderPos);
@@ -83,6 +104,12 @@ void WorldEntryCallbackHandler::syncTeleportedPositionToServer(const glm::vec3& 
 
 // Force server-side teleport via GM command
 void WorldEntryCallbackHandler::forceServerTeleportCommand(const glm::vec3& renderPos) {
+    const char* allowGmUnstuck = std::getenv("WOWEE_ALLOW_GM_UNSTUCK");
+    if (!allowGmUnstuck || std::string(allowGmUnstuck) != "1") {
+        LOG_WARNING("GM unstuck command suppressed. Set WOWEE_ALLOW_GM_UNSTUCK=1 to send .revive/.dismount/.go xyz.");
+        return;
+    }
+
     // Server-authoritative reset first, then teleport.
     gameHandler_.sendChatMessage(game::ChatType::SAY, ".revive", "");
     gameHandler_.sendChatMessage(game::ChatType::SAY, ".dismount", "");
@@ -235,6 +262,7 @@ void WorldEntryCallbackHandler::setupCallbacks() {
     // /unstuck — nudge player forward and snap to floor at destination.
     gameHandler_.setUnstuckCallback([this]() {
         if (!renderer_.getCameraController()) return;
+        clearMountForUnstuck();
         worldEntryMovementGraceTimer_ = std::max(worldEntryMovementGraceTimer_, 1.5f);
         taxiLandingClampTimer_ = 0.0f;
         lastTaxiFlight_ = false;
@@ -271,6 +299,7 @@ void WorldEntryCallbackHandler::setupCallbacks() {
     // /unstuckgy — stronger recovery: safe/home position, then sampled floor fallback.
     gameHandler_.setUnstuckGyCallback([this]() {
         if (!renderer_.getCameraController()) return;
+        clearMountForUnstuck();
         worldEntryMovementGraceTimer_ = std::max(worldEntryMovementGraceTimer_, 1.5f);
         taxiLandingClampTimer_ = 0.0f;
         lastTaxiFlight_ = false;
@@ -337,6 +366,8 @@ void WorldEntryCallbackHandler::setupCallbacks() {
             return;
         }
 
+        clearMountForUnstuck();
+
         worldEntryMovementGraceTimer_ = 10.0f;  // long grace — terrain load check will clear it
         taxiLandingClampTimer_ = 0.0f;
         lastTaxiFlight_ = false;
@@ -362,7 +393,13 @@ void WorldEntryCallbackHandler::setupCallbacks() {
     // Auto-unstuck: falling for > 5 seconds = void fall, teleport to map entry
     if (renderer_.getCameraController()) {
         renderer_.getCameraController()->setAutoUnstuckCallback([this]() {
+            const char* allowAutoUnstuck = std::getenv("WOWEE_ALLOW_AUTO_UNSTUCK");
+            if (!allowAutoUnstuck || std::string(allowAutoUnstuck) != "1") {
+                LOG_WARNING("Auto-unstuck suppressed. Set WOWEE_ALLOW_AUTO_UNSTUCK=1 to teleport to the map entry point after long falls.");
+                return;
+            }
             if (!renderer_.getCameraController()) return;
+            clearMountForUnstuck();
             auto* cc = renderer_.getCameraController();
 
             // Last resort: teleport to map entry point (terrain guaranteed loaded here)
@@ -375,7 +412,7 @@ void WorldEntryCallbackHandler::setupCallbacks() {
     }
 
     // Bind point update (innkeeper) — position stored in gameHandler->getHomeBind()
-    gameHandler_.setBindPointCallback([this](uint32_t mapId, float x, float y, float z) {
+    gameHandler_.setBindPointCallback([](uint32_t mapId, float x, float y, float z) {
         LOG_INFO("Bindpoint set: mapId=", mapId, " pos=(", x, ", ", y, ", ", z, ")");
     });
 

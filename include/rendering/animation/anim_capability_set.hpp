@@ -51,10 +51,6 @@ struct AnimCapabilitySet {
     uint32_t resolvedRun = 0;
     uint32_t resolvedSprint = 0;
     uint32_t resolvedWalkBackwards = 0;
-    uint32_t resolvedStrafeLeft = 0;
-    uint32_t resolvedStrafeRight = 0;
-    uint32_t resolvedRunLeft = 0;
-    uint32_t resolvedRunRight = 0;
     uint32_t resolvedJumpStart = 0;
     uint32_t resolvedJump = 0;       // Mid-air loop
     uint32_t resolvedJumpEnd = 0;

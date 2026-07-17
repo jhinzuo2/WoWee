@@ -2,7 +2,7 @@
 
 // FXAA 3.11 — Fast Approximate Anti-Aliasing post-process pass.
 // Reads the resolved scene color and outputs a smoothed result.
-// Push constant: rcpFrame = vec2(1/width, 1/height), sharpness (0=off, 2=max), desaturate (1=ghost grayscale).
+// Push constant: rcpFrame, sharpness, intoxication (0=sober, 1=smashed).
 
 layout(set = 0, binding = 0) uniform sampler2D uScene;
 
@@ -12,7 +12,7 @@ layout(location = 0) out vec4 outColor;
 layout(push_constant) uniform PC {
     vec2  rcpFrame;
     float sharpness;    // 0 = no sharpen, 2 = max (matches FSR2 RCAS range)
-    float desaturate;   // 1 = full grayscale (ghost mode), 0 = normal color
+    float intoxication;
 } pc;
 
 // Quality tuning
@@ -30,11 +30,27 @@ float luma(vec3 c) {
 }
 
 void main() {
-    vec2 uv      = TexCoord;
+    float drunk  = clamp(pc.intoxication, 0.0, 1.0);
+    vec2 uv      = TexCoord + vec2(
+        sin(TexCoord.y * 34.0) * pc.rcpFrame.x,
+        cos(TexCoord.x * 29.0) * pc.rcpFrame.y) * (3.0 * drunk);
     vec2 rcp     = pc.rcpFrame;
 
     // --- Centre and cardinal neighbours ---
     vec3 rgbM  = texture(uScene, uv).rgb;
+    if (drunk > 0.0) {
+        vec2 radius = rcp * mix(1.0, 5.0, drunk);
+        vec3 blur = rgbM;
+        blur += texture(uScene, uv + vec2( radius.x, 0.0)).rgb;
+        blur += texture(uScene, uv + vec2(-radius.x, 0.0)).rgb;
+        blur += texture(uScene, uv + vec2(0.0,  radius.y)).rgb;
+        blur += texture(uScene, uv + vec2(0.0, -radius.y)).rgb;
+        blur += texture(uScene, uv + radius).rgb;
+        blur += texture(uScene, uv - radius).rgb;
+        blur += texture(uScene, uv + vec2(radius.x, -radius.y)).rgb;
+        blur += texture(uScene, uv + vec2(-radius.x, radius.y)).rgb;
+        rgbM = mix(rgbM, blur / 9.0, 0.75 * drunk);
+    }
     vec3 rgbN  = texture(uScene, uv + vec2( 0.0, -1.0) * rcp).rgb;
     vec3 rgbS  = texture(uScene, uv + vec2( 0.0,  1.0) * rcp).rgb;
     vec3 rgbE  = texture(uScene, uv + vec2( 1.0,  0.0) * rcp).rgb;
@@ -131,6 +147,7 @@ void main() {
     if (!horzSpan) finalUV.x += pixelOffsetFinal * lengthSign;
 
     vec3 fxaaResult = texture(uScene, finalUV).rgb;
+    fxaaResult = mix(fxaaResult, rgbM, 0.75 * drunk);
 
     // Post-FXAA contrast-adaptive sharpening (unsharp mask).
     // Counteracts FXAA's sub-pixel blur when sharpness > 0.
@@ -143,12 +160,6 @@ void main() {
         // scale sharpness from [0,2] to a modest [0, 0.3] boost factor
         float s = pc.sharpness * 0.15;
         fxaaResult = clamp(fxaaResult + s * (fxaaResult - blur), 0.0, 1.0);
-    }
-
-    // Ghost mode: desaturate to grayscale (with a slight cool blue tint).
-    if (pc.desaturate > 0.5) {
-        float gray = dot(fxaaResult, vec3(0.299, 0.587, 0.114));
-        fxaaResult = mix(fxaaResult, vec3(gray, gray, gray * 1.05), pc.desaturate);
     }
 
     outColor = vec4(fxaaResult, 1.0);

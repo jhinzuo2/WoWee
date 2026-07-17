@@ -264,12 +264,9 @@ bool parseWotlkMoveUpdateSpline(
         size_t prePointCount = packet.getReadPos();
         uint32_t pc = packet.readUInt32();
         if (pc > 256) return false;
-        // Zero-point splines (e.g. FINAL_TARGET "follow" splines) have no
-        // splineMode or endPoint written — return immediately.
-        if (pc == 0) {
-            LOG_DEBUG("  Spline pointCount=0 (", tag, ")");
-            return true;
-        }
+        // AzerothCore's WriteCreate always appends splineMode and endPoint,
+        // even when the path contains no nodes.  Leaving those 13 bytes in
+        // the packet desynchronizes the next UPDATE_OBJECT block.
         size_t pointsBytes;
         if (compressed && pc > 0) {
             // First point = 3 floats (12 bytes), rest = packed uint32 (4 bytes each)
@@ -347,10 +344,33 @@ bool parseWotlkMoveUpdateSpline(
             }
         }
         if (wotlkOk) {
-            bool useCompressed = (out.splineFlags & SplineFlag::UNCOMPRESSED_MASK) == 0;
-            splineParsed = tryParseSplinePoints(useCompressed, "wotlk-compressed");
+            // AzerothCore WriteCreate serializes every path node as Vector3.
+            // Try that authoritative layout first: a compressed interpretation
+            // is shorter and can otherwise pass endpoint validation by chance,
+            // leaving unread node bytes before the next object block.
+            splineParsed = tryParseSplinePoints(false, "wotlk-uncompressed");
             if (!splineParsed) {
-                splineParsed = tryParseSplinePoints(false, "wotlk-uncompressed");
+                bool useCompressed = (out.splineFlags & SplineFlag::UNCOMPRESSED_MASK) == 0;
+                splineParsed = tryParseSplinePoints(useCompressed, "wotlk-compressed-fallback");
+            }
+        }
+    }
+
+    // Some WotLK cores serialize verticalAcceleration for every create spline,
+    // but omit effectStartTime unless the spline is actually parabolic. Taxi
+    // splines commonly use that layout. Treating the following pointCount as
+    // effectStartTime shifts the path and rejects the whole player update.
+    if (!splineParsed && !(out.splineFlags & SplineFlag::PARABOLIC_MU)) {
+        packet.setReadPos(beforeSplineHeader);
+        if (bytesAvailable(12)) {
+            packet.readFloat(); // durationMod
+            packet.readFloat(); // durationModNext
+            packet.readFloat(); // verticalAcceleration
+            splineParsed = tryParseSplinePoints(false, "wotlk-vertical-no-effect-start");
+            if (!splineParsed) {
+                bool useCompressed = (out.splineFlags & SplineFlag::UNCOMPRESSED_MASK) == 0;
+                splineParsed = tryParseSplinePoints(useCompressed,
+                                                    "wotlk-vertical-no-effect-start-compressed");
             }
         }
     }

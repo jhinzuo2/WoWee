@@ -58,18 +58,9 @@ namespace {
     constexpr auto& kColorRed        = kRed;
     constexpr auto& kColorGreen      = kGreen;
     constexpr auto& kColorBrightGreen= kBrightGreen;
-    constexpr auto& kColorYellow     = kYellow;
     constexpr auto& kColorGray       = kGray;
     constexpr auto& kColorDarkGray   = kDarkGray;
 
-    // Abbreviated month names (indexed 0-11)
-    constexpr const char* kMonthAbbrev[12] = {
-        "Jan","Feb","Mar","Apr","May","Jun",
-        "Jul","Aug","Sep","Oct","Nov","Dec"
-    };
-
-    // Common ImGui window flags for popup dialogs
-    const ImGuiWindowFlags kDialogFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
 
     bool raySphereIntersect(const wowee::rendering::Ray& ray, const glm::vec3& center, float radius, float& tOut) {
         glm::vec3 oc = ray.origin - center;
@@ -1154,6 +1145,21 @@ void GameScreen::renderTargetFrame(game::GameHandler& gameHandler) {
             }
         }
 
+        // Player class, right-aligned on the name line and tinted with the class colour.
+        if (target->getType() == game::ObjectType::PLAYER) {
+            uint8_t cid = entityClassId(target.get());
+            if (cid != 0) {  // 0 = class not received yet; would read as "Unknown"
+                const char* cls = classNameStr(cid);
+                const float textW = ImGui::CalcTextSize(cls).x;
+                ImGui::SameLine();
+                // Right-align, but never let it run back over the name or the icons.
+                const float minX = ImGui::GetCursorPosX() + 8.0f;
+                const float rightEdge = ImGui::GetWindowContentRegionMax().x;
+                ImGui::SetCursorPosX(std::max(minX, rightEdge - textW));
+                ImGui::TextColored(classColorVec4(cid), "%s", cls);
+            }
+        }
+
         // Creature subtitle (e.g. "<Warchief of the Horde>", "Captain of the Guard")
         if (target->getType() == game::ObjectType::UNIT) {
             auto unit = std::static_pointer_cast<game::Unit>(target);
@@ -1424,7 +1430,7 @@ void GameScreen::renderTargetFrame(game::GameHandler& gameHandler) {
                 if (itHi != tFields.end())
                     totGuid |= (static_cast<uint64_t>(itHi->second) << 32);
             }
-            if (totGuid != 0) {
+            if (totGuid != 0 && totGuid != targetGuid) {
                 auto totEnt = gameHandler.getEntityManager().getEntity(totGuid);
                 std::string totName;
                 ImVec4 totColor(0.7f, 0.7f, 0.7f, 1.0f);
@@ -1689,7 +1695,7 @@ void GameScreen::renderTargetFrame(game::GameHandler& gameHandler) {
                 totGuid |= (static_cast<uint64_t>(hiIt->second) << 32);
         }
 
-        if (totGuid != 0) {
+        if (totGuid != 0 && totGuid != targetGuid) {
             auto totEntity = gameHandler.getEntityManager().getEntity(totGuid);
             if (totEntity) {
                 // Position ToT frame just below and right-aligned with the target frame

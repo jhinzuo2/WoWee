@@ -66,6 +66,11 @@ public:
     void run();
     void shutdown();
 
+    /// Tell the stall watchdog we are alive. Call from long synchronous work that
+    /// keeps presenting frames itself (e.g. the world load) so it is not mistaken
+    /// for a hung main loop.
+    void beatWatchdog();
+
     // State management
     AppState getState() const { return state; }
     void setState(AppState newState);
@@ -81,6 +86,8 @@ public:
     addons::AddonManager* getAddonManager() { return addonManager_.get(); }
     game::ExpansionRegistry* getExpansionRegistry() { return expansionRegistry_.get(); }
     pipeline::DBCLayout* getDBCLayout() { return dbcLayout_.get(); }
+    bool setAssetExpansionOverride(const std::string& id);
+    const std::string& getAssetExpansionOverride() const { return assetExpansionOverrideId_; }
     void reloadExpansionData(); // Reload DBC layouts, opcodes, etc. after expansion change
 
     // Singleton access
@@ -119,6 +126,8 @@ public:
 private:
     void update(float deltaTime);
     void render();
+    void performLogoutToLogin();
+    void processDeferredLogoutToLogin();
     void setupUICallbacks();
     void spawnPlayerCharacter();
     void buildFactionHostilityMap(uint8_t playerRace);
@@ -137,6 +146,9 @@ private:
     std::unique_ptr<addons::AddonManager> addonManager_;
     bool addonsLoaded_ = false;
     std::unique_ptr<game::ExpansionRegistry> expansionRegistry_;
+    // Empty means assets follow the active protocol profile. "legacy" selects
+    // the root WOW_DATA_PATH manifest; otherwise this is an expansion id.
+    std::string assetExpansionOverrideId_;
     std::unique_ptr<pipeline::DBCLayout> dbcLayout_;
     std::unique_ptr<EntitySpawner> entitySpawner_;
     std::unique_ptr<AppearanceComposer> appearanceComposer_;
@@ -152,8 +164,15 @@ private:
     std::unique_ptr<WorldEntryCallbackHandler> worldEntryCallbacks_;
     std::unique_ptr<UIScreenCallbackHandler> uiScreenCallbacks_;
 
+    // Beat by the main loop each iteration; the watchdog treats a long silence as a
+    // hang. Long but healthy work that renders its own frames (world load) must beat
+    // it too, or the watchdog mistakes the load for a hang.
+    std::atomic<int64_t> watchdogHeartbeatMs_{0};
+
     AppState state = AppState::AUTHENTICATION;
     bool running = false;
+    bool renderingFrame_ = false;
+    bool logoutToLoginPending_ = false;
     bool playerCharacterSpawned = false;
     bool npcsSpawned = false;
     bool spawnSnapToGround = true;
@@ -175,6 +194,14 @@ private:
     float lastSentCanonicalYaw_ = 1000.0f;   // Sentinel — triggers first send
     float taxiStreamCooldown_ = 0.0f;
     bool idleYawned_ = false;
+
+    // M2 transport riding: last frame's locked (canonical) render position, used to
+    // detect how far the player tried to walk this frame so that delta can be applied
+    // on top of the fixed ride offset instead of either fully locking movement or
+    // recomputing the offset from an absolute position (see application.cpp's "M2
+    // transport riding" block for why the latter is a no-op identity).
+    glm::vec3 lastM2RideLockedCanonical_ = glm::vec3(0.0f);
+    bool hasM2RideLock_ = false;
 
     bool wasAutoAttacking_ = false;
 

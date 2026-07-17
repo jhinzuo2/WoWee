@@ -12,6 +12,7 @@
 #include "core/logger.hpp"
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <array>
 #include <sstream>
@@ -537,7 +538,7 @@ void Minimap::render(VkCommandBuffer cmd, const Camera& playerCamera,
             arrowRotation = playerOrientation;
         } else {
             glm::vec3 fwd = playerCamera.getForward();
-            arrowRotation = -std::atan2(-fwd.x, fwd.y);
+            arrowRotation = glm::pi<float>() - std::atan2(-fwd.x, fwd.y);
         }
     } else if (hasPlayerOrientation) {
         // Show character facing relative to the rotated map

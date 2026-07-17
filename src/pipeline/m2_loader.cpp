@@ -357,6 +357,37 @@ struct M2AttachmentDiskVanilla {
     uint8_t trackData[28]; // M2TrackDiskVanilla (28 bytes)
 };
 
+// M2 camera (on-disk, WotLK — 100 bytes; tracks are 20 bytes)
+struct M2CameraDisk {
+    uint32_t type;
+    float fov;
+    float farClip;
+    float nearClip;
+    uint8_t positionTrack[20];
+    float positionBase[3];
+    uint8_t targetTrack[20];
+    float targetBase[3];
+    uint8_t rollTrack[20];
+};
+
+// M2 camera (on-disk, vanilla — 124 bytes; tracks are 28 bytes)
+struct M2CameraDiskVanilla {
+    uint32_t type;
+    float fov;
+    float farClip;
+    float nearClip;
+    uint8_t positionTrack[28];
+    float positionBase[3];
+    uint8_t targetTrack[28];
+    float targetBase[3];
+    uint8_t rollTrack[28];
+};
+
+// A wrong stride here reads garbage positions and would fling the backdrop
+// somewhere arbitrary rather than fail.
+static_assert(sizeof(M2CameraDisk) == 100, "M2CameraDisk must match the WotLK on-disk layout");
+static_assert(sizeof(M2CameraDiskVanilla) == 124, "M2CameraDiskVanilla must match the vanilla on-disk layout");
+
 template<typename T>
 T readValue(const std::vector<uint8_t>& data, uint32_t offset) {
     if (offset + sizeof(T) > data.size()) {
@@ -377,6 +408,7 @@ constexpr uint32_t kMaxM2Bones        = 65536;
 constexpr uint32_t kMaxM2Animations   = 65536;
 constexpr uint32_t kMaxM2UVAnims      = 16384;
 constexpr uint32_t kMaxM2Attachments  = 4096;
+constexpr uint32_t kMaxM2Cameras      = 64;
 
 inline uint32_t capCount(uint32_t value, uint32_t maxValue, const char* what) {
     if (value > maxValue) {
@@ -423,7 +455,7 @@ std::string readString(const std::vector<uint8_t>& data, uint32_t offset, uint32
     return std::string(reinterpret_cast<const char*>(&data[offset]), actualLen);
 }
 
-enum class TrackType { VEC3, QUAT_COMPRESSED, FLOAT };
+enum class TrackType { VEC3, QUAT_COMPRESSED, FLOAT, FIXED16 };
 
 // M2 sequence flag: when set, keyframe data is embedded in the M2 file.
 // When clear, data lives in an external .anim file and the M2 offsets are
@@ -477,6 +509,7 @@ void parseAnimTrack(const std::vector<uint8_t>& data,
         // Validate key data offset
         size_t keyElementSize;
         if (type == TrackType::FLOAT) keyElementSize = sizeof(float);
+        else if (type == TrackType::FIXED16) keyElementSize = sizeof(int16_t);
         else if (type == TrackType::VEC3) keyElementSize = sizeof(float) * 3;
         else keyElementSize = sizeof(int16_t) * 4;
         if (keyOffset + keyCount * keyElementSize > data.size()) {
@@ -488,6 +521,14 @@ void parseAnimTrack(const std::vector<uint8_t>& data,
         if (type == TrackType::FLOAT) {
             auto values = readArray<float>(data, keyOffset, keyCount);
             track.sequences[i].floatValues = std::move(values);
+        } else if (type == TrackType::FIXED16) {
+            // fixed16: int16 where 0x7FFF = 1.0 (color/transparency alpha tracks)
+            auto raw = readArray<int16_t>(data, keyOffset, keyCount);
+            track.sequences[i].floatValues.reserve(raw.size());
+            for (int16_t v : raw) {
+                track.sequences[i].floatValues.push_back(
+                    std::clamp(static_cast<float>(v) / 32767.0f, 0.0f, 1.0f));
+            }
         } else if (type == TrackType::VEC3) {
             // Translation/scale: float[3] per key
             struct Vec3Disk { float x, y, z; };
@@ -550,6 +591,7 @@ void parseAnimTrackVanilla(const std::vector<uint8_t>& data,
     // vanilla = float[4] (16 bytes), TBC = compressed int16[4] (8 bytes).
     size_t keySize;
     if (type == TrackType::FLOAT) keySize = sizeof(float);
+    else if (type == TrackType::FIXED16) keySize = sizeof(int16_t);
     else if (type == TrackType::VEC3) keySize = sizeof(float) * 3;
     else keySize = compressedQuat ? sizeof(int16_t) * 4 : sizeof(float) * 4;
     if (disk.ofsKeys + disk.nKeys * keySize > data.size()) return;
@@ -578,6 +620,12 @@ void parseAnimTrackVanilla(const std::vector<uint8_t>& data,
     std::vector<CompressedQuat> allCompQuatKeys;
     if (type == TrackType::FLOAT) {
         allFloatKeys = readArray<float>(data, disk.ofsKeys, disk.nKeys);
+    } else if (type == TrackType::FIXED16) {
+        auto raw = readArray<int16_t>(data, disk.ofsKeys, disk.nKeys);
+        allFloatKeys.reserve(raw.size());
+        for (int16_t v : raw) {
+            allFloatKeys.push_back(std::clamp(static_cast<float>(v) / 32767.0f, 0.0f, 1.0f));
+        }
     } else if (type == TrackType::VEC3) {
         allVec3Keys = readArray<Vec3Disk>(data, disk.ofsKeys, disk.nKeys);
     } else if (compressedQuat) {
@@ -607,7 +655,7 @@ void parseAnimTrackVanilla(const std::vector<uint8_t>& data,
         uint32_t keyEnd = std::min(end, disk.nKeys);
         uint32_t keyCount = keyEnd - start;
 
-        if (type == TrackType::FLOAT) {
+        if (type == TrackType::FLOAT || type == TrackType::FIXED16) {
             track.sequences[i].floatValues.assign(
                 allFloatKeys.begin() + start, allFloatKeys.begin() + start + keyCount);
         } else if (type == TrackType::VEC3) {
@@ -1049,30 +1097,42 @@ M2Model M2Loader::load(const std::vector<uint8_t>& m2Data) {
         model.textureLookup = readArray<uint16_t>(m2Data, header.ofsTexLookup, header.nTexLookup);
     }
 
-    // Parse color animation alpha values (M2Color: vec3 color track + fixed16 alpha track).
-    // Each M2Color is two M2TrackDisk headers (20+20 = 40 bytes).
-    // We only need the alpha track (at offset 20) — controls per-batch opacity.
+    // Parse color animation alpha tracks (M2Color: vec3 color track + fixed16 alpha track).
+    // WotLK: two 20-byte M2TrackDisk headers (40 bytes/color).
+    // Vanilla/TBC (<264): two 28-byte M2TrackDiskVanilla headers (56 bytes/color).
+    // The alpha track gates per-batch visibility per animation — e.g. the peasant
+    // lumberjack's carry model has two wood-bundle submeshes, and only one is
+    // alpha-1 in any given animation.
     if (header.nColors > 0 && header.ofsColors > 0 && header.nColors < 4096) {
-        static constexpr uint32_t M2COLOR_SIZE = 40; // 20-byte color track + 20-byte alpha track
+        std::vector<uint32_t> seqFlags;
+        seqFlags.reserve(model.sequences.size());
+        for (const auto& seq : model.sequences) seqFlags.push_back(seq.flags);
+
+        const bool wotlk = header.version >= 264;
+        const uint32_t colorSize = wotlk ? 40u : 56u;   // 2 track headers per color
+        const uint32_t alphaOfs  = wotlk ? 20u : 28u;   // skip the vec3 color track
         model.colorAlphas.reserve(header.nColors);
+        model.colorAlphaTracks.resize(header.nColors);
         for (uint32_t ci = 0; ci < header.nColors; ci++) {
-            uint32_t alphaTrackOfs = header.ofsColors + ci * M2COLOR_SIZE + 20; // skip vec3 track
-            if (alphaTrackOfs + sizeof(M2TrackDisk) > m2Data.size()) {
-                model.colorAlphas.push_back(1.0f);
-                continue;
+            uint32_t alphaTrackOfs = header.ofsColors + ci * colorSize + alphaOfs;
+            M2AnimationTrack& track = model.colorAlphaTracks[ci];
+            if (wotlk) {
+                if (alphaTrackOfs + sizeof(M2TrackDisk) <= m2Data.size()) {
+                    M2TrackDisk td = readValue<M2TrackDisk>(m2Data, alphaTrackOfs);
+                    parseAnimTrack(m2Data, td, track, TrackType::FIXED16, seqFlags);
+                }
+            } else {
+                if (alphaTrackOfs + sizeof(M2TrackDiskVanilla) <= m2Data.size()) {
+                    M2TrackDiskVanilla td = readValue<M2TrackDiskVanilla>(m2Data, alphaTrackOfs);
+                    parseAnimTrackVanilla(m2Data, td, track, TrackType::FIXED16);
+                }
             }
-            M2TrackDisk td = readValue<M2TrackDisk>(m2Data, alphaTrackOfs);
+            // At-rest alpha (first key of the first sequence with data) — used by
+            // renderers that don't evaluate the track per frame.
             float alpha = 1.0f;
-            if (td.nKeys > 0 && td.ofsKeys > 0 && td.nKeys < 4096) {
-                for (uint32_t si = 0; si < td.nKeys; si++) {
-                    uint32_t hdOfs = td.ofsKeys + si * 8;
-                    if (hdOfs + 8 > m2Data.size()) break;
-                    uint32_t count  = readValue<uint32_t>(m2Data, hdOfs);
-                    uint32_t offset = readValue<uint32_t>(m2Data, hdOfs + 4);
-                    if (count == 0 || offset == 0) continue;
-                    if (offset + sizeof(uint16_t) > m2Data.size()) continue;
-                    uint16_t rawVal = readValue<uint16_t>(m2Data, offset);
-                    alpha = std::min(1.0f, rawVal / 32767.0f);
+            for (const auto& seq : track.sequences) {
+                if (!seq.floatValues.empty()) {
+                    alpha = seq.floatValues[0];
                     break;
                 }
             }
@@ -1203,6 +1263,35 @@ M2Model M2Loader::load(const std::vector<uint8_t>& m2Data) {
     // Read attachment lookup
     if (header.nAttachmentLookup > 0 && header.ofsAttachmentLookup > 0) {
         model.attachmentLookup = readArray<uint16_t>(m2Data, header.ofsAttachmentLookup, header.nAttachmentLookup);
+    }
+
+    // Cameras — only the static base position/target are used; scene models keep
+    // their framing here, and animated camera tracks are not needed for a backdrop.
+    if (header.nCameras > 0 && header.ofsCameras > 0) {
+        const uint32_t cameraCount = capCount(header.nCameras, kMaxM2Cameras, "nCameras");
+        model.cameras.reserve(cameraCount);
+        auto pushCamera = [&model](uint32_t type, float fov, float farClip, float nearClip,
+                                   const float* posBase, const float* tgtBase) {
+            // type 0xFFFFFFFF marks the model's own portrait/scene camera.
+            (void)type;
+            M2Camera cam;
+            cam.fov = fov;
+            cam.farClip = farClip;
+            cam.nearClip = nearClip;
+            cam.positionBase = glm::vec3(posBase[0], posBase[1], posBase[2]);
+            cam.targetBase = glm::vec3(tgtBase[0], tgtBase[1], tgtBase[2]);
+            model.cameras.push_back(cam);
+        };
+        if (header.version < 264) {
+            auto disk = readArray<M2CameraDiskVanilla>(m2Data, header.ofsCameras, cameraCount);
+            for (const auto& dc : disk)
+                pushCamera(dc.type, dc.fov, dc.farClip, dc.nearClip, dc.positionBase, dc.targetBase);
+        } else {
+            auto disk = readArray<M2CameraDisk>(m2Data, header.ofsCameras, cameraCount);
+            for (const auto& dc : disk)
+                pushCamera(dc.type, dc.fov, dc.farClip, dc.nearClip, dc.positionBase, dc.targetBase);
+        }
+        core::Logger::getInstance().debug("  Cameras: ", model.cameras.size());
     }
 
     // Parse particle emitters — struct size differs between versions:

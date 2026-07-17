@@ -182,9 +182,8 @@ void LocomotionFSM::updateTransitions(const Input& in, const AnimCapabilitySet& 
 AnimOutput LocomotionFSM::resolve(const Input& in, const AnimCapabilitySet& caps) {
     updateTransitions(in, caps);
 
-    const bool pureStrafe = !in.movingForward && !in.movingBackward; // strafe without forward/back
-    const bool anyStrafeLeft = in.strafeLeft && !in.strafeRight && pureStrafe;
-    const bool anyStrafeRight = in.strafeRight && !in.strafeLeft && pureStrafe;
+    const bool anyStrafeLeft = in.strafeLeft && !in.strafeRight && !in.movingBackward;
+    const bool anyStrafeRight = in.strafeRight && !in.strafeLeft && !in.movingBackward;
 
     uint32_t animId = anim::STAND;
     bool animSelected = true;
@@ -200,10 +199,6 @@ AnimOutput LocomotionFSM::resolve(const Input& in, const AnimCapabilitySet& caps
                 animId = caps.resolvedWalkBackwards ? caps.resolvedWalkBackwards
                        : caps.resolvedWalk           ? caps.resolvedWalk
                        :                               anim::WALK_BACKWARDS;
-            } else if (anyStrafeLeft) {
-                animId = caps.resolvedStrafeLeft ? caps.resolvedStrafeLeft : anim::SHUFFLE_LEFT;
-            } else if (anyStrafeRight) {
-                animId = caps.resolvedStrafeRight ? caps.resolvedStrafeRight : anim::SHUFFLE_RIGHT;
             } else {
                 animId = caps.resolvedWalk ? caps.resolvedWalk : anim::WALK;
             }
@@ -214,14 +209,6 @@ AnimOutput LocomotionFSM::resolve(const Input& in, const AnimCapabilitySet& caps
                 animId = caps.resolvedWalkBackwards ? caps.resolvedWalkBackwards
                        : caps.resolvedWalk           ? caps.resolvedWalk
                        :                               anim::WALK_BACKWARDS;
-            } else if (anyStrafeLeft) {
-                animId = caps.resolvedRunLeft ? caps.resolvedRunLeft
-                       : caps.resolvedRun    ? caps.resolvedRun
-                       :                       anim::RUN;
-            } else if (anyStrafeRight) {
-                animId = caps.resolvedRunRight ? caps.resolvedRunRight
-                       : caps.resolvedRun     ? caps.resolvedRun
-                       :                        anim::RUN;
             } else if (in.sprintAura) {
                 animId = caps.resolvedSprint ? caps.resolvedSprint : anim::RUN;
             } else {

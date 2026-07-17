@@ -58,19 +58,48 @@ public:
     float getSpellCooldown(uint32_t spellId) const;
 
     // Cast state
-    bool isCasting() const { return casting_; }
-    bool isChanneling() const { return casting_ && castIsChannel_; }
+    bool isCasting() const { return casting_ || restorationActive_; }
+    bool isChanneling() const { return casting_ ? castIsChannel_ : restorationActive_; }
+    bool isRestoring() const { return restorationActive_; }
     bool isGameObjectInteractionCasting() const;
-    uint32_t getCurrentCastSpellId() const { return currentCastSpellId_; }
-    float getCastProgress() const { return castTimeTotal_ > 0 ? (castTimeTotal_ - castTimeRemaining_) / castTimeTotal_ : 0.0f; }
-    float getCastTimeRemaining() const { return castTimeRemaining_; }
-    float getCastTimeTotal() const { return castTimeTotal_; }
+    uint32_t getCurrentCastSpellId() const {
+        return casting_ ? currentCastSpellId_ : restorationSpellId_;
+    }
+    float getCastProgress() const {
+        const float total = casting_ ? castTimeTotal_ : restorationTimeTotal_;
+        const float remaining = casting_ ? castTimeRemaining_ : restorationTimeRemaining_;
+        return total > 0.0f ? (total - remaining) / total : 0.0f;
+    }
+    float getCastTimeRemaining() const {
+        return casting_ ? castTimeRemaining_ : restorationTimeRemaining_;
+    }
+    float getCastTimeTotal() const {
+        return casting_ ? castTimeTotal_ : restorationTimeTotal_;
+    }
 
     // Repeat-craft queue
     void startCraftQueue(uint32_t spellId, int count);
     void cancelCraftQueue();
     int getCraftQueueRemaining() const { return craftQueueRemaining_; }
     uint32_t getCraftQueueSpellId() const { return craftQueueSpellId_; }
+
+    // Crafting window (client-side; opened by casting a profession spell
+    // like Cooking or First Aid — see tradeskillOpenerSkillLine)
+    bool isCraftingWindowOpen() const { return craftingWindowOpen_; }
+    uint32_t getCraftingSkillLine() const { return craftingSkillLine_; }
+    void openCraftingWindow(uint32_t skillLine) { craftingWindowOpen_ = true; craftingSkillLine_ = skillLine; }
+    void closeCraftingWindow() { craftingWindowOpen_ = false; }
+    // Returns the skill line id if spellId is a tradeskill-window opener
+    // (e.g. Cooking → 185) with at least one known recipe, else 0.
+    uint32_t tradeskillOpenerSkillLine(uint32_t spellId);
+
+    // SpellFocusObject.dbc name ("Anvil", "Cooking Fire", ...) for
+    // requires-spell-focus cast failures; empty if unknown.
+    const std::string& getSpellFocusName(uint32_t focusId);
+
+    // TotemCategory.dbc name ("Blacksmith Hammer", "Mining Pick", ...) for
+    // totem-category cast failures; empty if unknown.
+    const std::string& getTotemCategoryName(uint32_t categoryId);
 
     // Spell queue (400ms window)
     uint32_t getQueuedSpellId() const { return queuedSpellId_; }
@@ -142,6 +171,7 @@ public:
     const std::unordered_map<uint32_t, TalentEntry>& getAllTalents() const { return talentCache_; }
     const std::unordered_map<uint32_t, TalentTabEntry>& getAllTalentTabs() const { return talentTabCache_; }
     void loadTalentDbc();
+    void syncPreWotlkTalentsFromKnownSpells();
 
     // Auras
     const std::vector<AuraSlot>& getPlayerAuras() const { return playerAuras_; }
@@ -201,6 +231,17 @@ public:
     uint8_t getSpellDispelType(uint32_t spellId) const;
     bool isSpellInterruptible(uint32_t spellId) const;
     uint32_t getSpellSchoolMask(uint32_t spellId) const;
+    /// Spell.dbc Targets mask (SpellCastTargetFlags): 0x10 = TARGET_FLAG_ITEM.
+    uint32_t getSpellTargetFlags(uint32_t spellId) const;
+    /// Spell.dbc RangeIndex resolved via SpellRange.dbc, in yards. Melee ("Combat
+    /// Range") is 5; self-only is 0; negative means SpellRange.dbc was unavailable.
+    float getSpellMaxRange(uint32_t spellId) const;
+    /// True for "Self Only" range spells (shouts, self-buffs): they always land on
+    /// the caster, so they take no explicit target and skip melee range checks.
+    bool isSelfCastSpell(uint32_t spellId) const;
+    /// Maps a superseded spell rank to the highest rank we actually know. Returns
+    /// spellId unchanged when it is already known, or has no known same-name rank.
+    uint32_t resolveHighestKnownRank(uint32_t spellId) const;
     const std::string& getSkillLineName(uint32_t spellId) const;
 
     // Cast state
@@ -222,6 +263,7 @@ public:
 
     // Update per-frame timers (call from GameHandler::update)
     void updateTimers(float dt);
+    void refreshRestorationState() { refreshRestorationFromPlayerAuras(); }
 
     // Packet handlers dispatched from GameHandler's opcode table
     void handlePetSpells(network::Packet& packet);
@@ -292,6 +334,9 @@ private:
     void triggerCastVisual(uint32_t spellId, uint64_t casterGuid, uint32_t castTimeMs = 0);
     // Play the impact visual effect at the target's position.
     void triggerImpactVisual(uint32_t spellId, uint64_t targetGuid);
+    void launchRangedWeaponProjectile(uint32_t spellId, uint64_t targetGuid);
+    void refreshRestorationFromPlayerAuras();
+    void stopRestorationPresentation();
 
     // --- handleSpellLogExecute per-effect parsers (extracted to reduce nesting) ---
     void parseEffectPowerDrain(network::Packet& packet, uint32_t effectLogCount,
@@ -311,6 +356,7 @@ private:
     // Find the on-use spell for an item (trigger=0 Use or trigger=5 NoDelay).
     // CMSG_USE_ITEM requires a valid spellId or the server silently ignores it.
     uint32_t findOnUseSpellId(uint32_t itemId) const;
+    void seedCooldownFromSpellInfo(uint32_t spellId);
     void handleSupercededSpell(network::Packet& packet);
     void handleRemovedSpell(network::Packet& packet);
     void handleUnlearnSpells(network::Packet& packet);
@@ -328,10 +374,28 @@ private:
     uint32_t currentCastSpellId_ = 0;
     float castTimeRemaining_ = 0.0f;
     float castTimeTotal_ = 0.0f;
+    bool restorationActive_ = false;
+    uint32_t restorationSpellId_ = 0;
+    bool restorationIsFood_ = false;
+    float restorationTimeRemaining_ = 0.0f;
+    float restorationTimeTotal_ = 0.0f;
+    float restorationSoundTimer_ = 0.0f; // repeats the consume sound while active
 
     // Repeat-craft queue
     uint32_t craftQueueSpellId_ = 0;
     int craftQueueRemaining_ = 0;
+
+    // Crafting window
+    bool craftingWindowOpen_ = false;
+    uint32_t craftingSkillLine_ = 0;
+
+    // SpellFocusObject.dbc names, loaded lazily
+    std::unordered_map<uint32_t, std::string> spellFocusNames_;
+    bool spellFocusDbcLoaded_ = false;
+
+    // TotemCategory.dbc names, loaded lazily
+    std::unordered_map<uint32_t, std::string> totemCategoryNames_;
+    bool totemCategoryDbcLoaded_ = false;
 
     // Spell queue (400ms window)
     uint32_t queuedSpellId_ = 0;

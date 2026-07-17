@@ -13,6 +13,8 @@ cmake_install.cmake
 Makefile
 *.cmake
 !CMakeLists.txt
+# Hand-written CMake modules live in cmake/ and are source, not build output.
+!cmake/*.cmake
 
 # Compiled Object files
 *.o
@@ -83,6 +85,7 @@ imgui.ini
 # Config files
 config.ini
 config.json
+.env
 
 # Runtime cache (floor heights, etc.)
 cache/
@@ -108,13 +111,10 @@ node_modules/
 tools/__pycache__/
 *.pyc
 
-# artifacts
-.codex-loop/
-
 # World editor output: scaffolded/exported zones and per-user ImGui layout
 custom_zones/
 wowee_editor_layout.ini
 
-# Local agent instructions
+#agents
 AGENTS.md
 codex-loop.sh

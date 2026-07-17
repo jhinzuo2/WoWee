@@ -217,6 +217,9 @@ private:
     std::unique_ptr<CharacterRenderer> characterRenderer;
     std::unique_ptr<WMORenderer> wmoRenderer;
     std::unique_ptr<M2Renderer> m2Renderer;
+    std::unique_ptr<M2Renderer> outlandSkyRenderer_;
+    std::string outlandSkyPath_;
+    uint32_t outlandSkyInstanceId_ = 0;
     std::unique_ptr<Minimap> minimap;
     std::unique_ptr<WorldMap> worldMap;
     std::unique_ptr<QuestMarkerRenderer> questMarkerRenderer;
@@ -238,9 +241,12 @@ private:
     VkImageLayout shadowDepthLayout_[2] = {};
     glm::mat4 lightSpaceMatrix = glm::mat4(1.0f);
     glm::vec3 shadowCenter = glm::vec3(0.0f);
+    glm::vec3 shadowLightDirection_ = glm::vec3(0.0f);
     bool shadowCenterInitialized = false;
+    bool shadowLightDirectionInitialized_ = false;
     bool shadowsEnabled = true;
     float shadowDistance_ = 300.0f;  // Shadow frustum half-extent (default: 300 units)
+    float viewDistance_ = 1200.0f;
     uint32_t shadowFrameCounter_ = 0;
 
 
@@ -253,6 +259,10 @@ public:
     bool areShadowsEnabled() const { return shadowsEnabled; }
     void setShadowDistance(float dist) { shadowDistance_ = glm::clamp(dist, 40.0f, 500.0f); }
     float getShadowDistance() const { return shadowDistance_; }
+    void setViewDistance(float distance);
+    float getViewDistance() const { return viewDistance_; }
+    int getTerrainLoadRadius() const;
+    int getTerrainUnloadRadius() const { return getTerrainLoadRadius() + 3; }
     void setMsaaSamples(VkSampleCountFlagBits samples);
 
     // Post-process pipeline API — delegates to PostProcessPipeline (§4.3)
@@ -265,6 +275,7 @@ public:
 
 private:
     void applyMsaaChange();
+    bool ensureOutlandSkybox();
     VkSampleCountFlagBits pendingMsaaSamples_ = VK_SAMPLE_COUNT_1_BIT;
     bool msaaChangePending_ = false;
     void renderShadowPass();
@@ -327,15 +338,16 @@ private:
 
     // ── Multithreaded secondary command buffer recording ──
     // Indices into secondaryCmds_ arrays
-    static constexpr uint32_t SEC_SKY     = 0;  // sky (main thread)
-    static constexpr uint32_t SEC_TERRAIN = 1;  // terrain (worker 0)
-    static constexpr uint32_t SEC_WMO     = 2;  // WMO (worker 1)
-    static constexpr uint32_t SEC_CHARS   = 3;  // selection circle + characters (main thread)
-    static constexpr uint32_t SEC_M2      = 4;  // M2 + particles + glow (worker 2)
-    static constexpr uint32_t SEC_POST    = 5;  // water + weather + effects (main thread)
-    static constexpr uint32_t SEC_IMGUI   = 6;  // ImGui (main thread, non-FSR only)
-    static constexpr uint32_t NUM_SECONDARIES = 7;
-    static constexpr uint32_t NUM_WORKERS = 3;  // terrain, WMO, M2
+    static constexpr uint32_t SEC_SKY       = 0;  // sky (main thread)
+    static constexpr uint32_t SEC_TERRAIN   = 1;  // terrain (worker 0)
+    static constexpr uint32_t SEC_WMO       = 2;  // WMO (worker 1)
+    static constexpr uint32_t SEC_SELECTION = 3;  // selection circle (main thread)
+    static constexpr uint32_t SEC_CHARS     = 4;  // characters (worker 2)
+    static constexpr uint32_t SEC_M2        = 5;  // M2 + particles + glow (worker 3)
+    static constexpr uint32_t SEC_POST      = 6;  // water + weather + effects (worker 4)
+    static constexpr uint32_t SEC_IMGUI     = 7;  // ImGui (main thread, non-FSR only)
+    static constexpr uint32_t NUM_SECONDARIES = 8;
+    static constexpr uint32_t NUM_WORKERS = 5;
 
     // Per-worker command pools (thread-safe: one pool per thread)
     VkCommandPool workerCmdPools_[NUM_WORKERS] = {};

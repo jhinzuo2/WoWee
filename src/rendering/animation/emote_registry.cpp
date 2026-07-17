@@ -55,6 +55,71 @@ static uint32_t getEmoteStateVariantStatic(uint32_t oneShotAnimId) {
     return it != kStateMap.end() ? it->second : 0;
 }
 
+static std::unordered_map<uint32_t, uint32_t> makeFallbackEmotesIdMap() {
+    // Emotes.dbc IDs used on classic-family MaNGOS/CMaNGOS servers.
+    return {
+        {1, anim::EMOTE_TALK},
+        {2, anim::EMOTE_BOW},
+        {3, anim::EMOTE_WAVE},
+        {4, anim::EMOTE_CHEER},
+        {5, anim::EMOTE_EXCLAMATION},
+        {6, anim::EMOTE_QUESTION},
+        {7, anim::EMOTE_EAT},
+        {10, anim::EMOTE_DANCE},
+        {11, anim::EMOTE_LAUGH},
+        {12, anim::EMOTE_SLEEP},
+        {13, anim::EMOTE_SIT_GROUND},
+        {14, anim::EMOTE_RUDE},
+        {15, anim::EMOTE_ROAR},
+        {16, anim::EMOTE_KNEEL},
+        {17, anim::EMOTE_KISS},
+        {18, anim::EMOTE_CRY},
+        {19, anim::EMOTE_CHICKEN},
+        {20, anim::EMOTE_BEG},
+        {21, anim::EMOTE_APPLAUD},
+        {22, anim::EMOTE_SHOUT},
+        {23, anim::EMOTE_FLEX},
+        {24, anim::EMOTE_SHY},
+        {25, anim::EMOTE_POINT},
+        {33, anim::COMBAT_WOUND},
+        {34, anim::COMBAT_CRITICAL},
+        {35, anim::ATTACK_UNARMED},
+        {36, anim::ATTACK_1H},
+        {37, anim::ATTACK_2H},
+        {38, anim::ATTACK_2H_LOOSE},
+        {50, anim::SPELL_PRECAST},
+        {51, anim::SPELL_CAST},
+        {53, anim::BATTLE_ROAR},
+        {60, anim::KICK},
+        {66, anim::EMOTE_SALUTE},
+        {68, anim::KNEEL_LOOP},
+        {69, anim::EMOTE_USE_STANDING},
+        {70, anim::EMOTE_WAVE},
+        {71, anim::EMOTE_CHEER},
+        {92, anim::EMOTE_EAT},
+        {94, anim::EMOTE_DANCE},
+        {113, anim::EMOTE_SALUTE},
+        {133, anim::EMOTE_USE_STANDING_NO_SHEATHE},
+        {153, anim::EMOTE_LAUGH},
+        {173, anim::EMOTE_WORK},
+        {193, anim::SPELL_PRECAST},
+        {213, anim::READY_RIFLE},
+        {214, anim::HOLD_RIFLE},
+        {233, anim::EMOTE_WORK},
+        {234, anim::EMOTE_CHOP},
+        {253, anim::EMOTE_APPLAUD},
+        {273, anim::EMOTE_TALK_EXCLAMATION},
+        {274, anim::EMOTE_TALK_QUESTION},
+        {275, anim::EMOTE_TRAIN},
+    };
+}
+
+// Emotes.dbc IDs with EmoteSpecProc != 0 (persistent STATE_ emotes) that appear
+// in the fallback map above. Used only when Emotes.dbc is unavailable.
+static std::unordered_set<uint32_t> makeFallbackStateEmoteIds() {
+    return {10, 12, 13, 26, 28, 64, 65, 68, 69, 173, 213, 214, 233, 234, 379, 383};
+}
+
 static std::string replacePlaceholders(const std::string& text, const std::string* targetName) {
     if (text.empty()) return text;
     std::string out;
@@ -110,12 +175,25 @@ void EmoteRegistry::loadFromDbc() {
     }
 
     std::unordered_map<uint32_t, uint32_t> emoteIdToAnim;
+    animByEmotesId_.clear();
+    stateEmoteIds_.clear();
     if (auto emotesDbc = assetManager->loadDBC("Emotes.dbc"); emotesDbc && emotesDbc->isLoaded()) {
         emoteIdToAnim.reserve(emotesDbc->getRecordCount());
+        animByEmotesId_.reserve(emotesDbc->getRecordCount());
+        // EmoteSpecProc: 0 = one-shot, 1 = stand-state change, 2 = looping state
+        // anim. Column 4 in every expansion's Emotes.dbc.
+        uint32_t specField = emL ? (*emL)["EmoteSpecProc"] : 4;
+        if (specField == 0xFFFFFFFF) specField = 4;
         for (uint32_t r = 0; r < emotesDbc->getRecordCount(); ++r) {
             uint32_t emoteId = emotesDbc->getUInt32(r, emL ? (*emL)["ID"] : 0);
             uint32_t animId = emotesDbc->getUInt32(r, emL ? (*emL)["AnimID"] : 2);
-            if (animId != 0) emoteIdToAnim[emoteId] = animId;
+            if (emotesDbc->getUInt32(r, specField) != 0) {
+                stateEmoteIds_.insert(emoteId);
+            }
+            if (animId != 0) {
+                emoteIdToAnim[emoteId] = animId;
+                animByEmotesId_[emoteId] = animId;
+            }
         }
         LOG_DEBUG("Emotes: loaded ", emoteIdToAnim.size(), " anim mappings from Emotes.dbc");
     } else {
@@ -194,12 +272,18 @@ void EmoteRegistry::loadFromDbc() {
     } else {
         LOG_DEBUG("Emotes: loaded ", emoteTable_.size(), " commands from DBC");
     }
+    if (animByEmotesId_.empty()) {
+        animByEmotesId_ = makeFallbackEmotesIdMap();
+        stateEmoteIds_ = makeFallbackStateEmoteIds();
+    }
 
     buildDbcIdIndex();
 }
 
 void EmoteRegistry::loadFallbackEmotes() {
     if (!emoteTable_.empty()) return;
+    animByEmotesId_ = makeFallbackEmotesIdMap();
+    stateEmoteIds_ = makeFallbackStateEmoteIds();
     emoteTable_ = {
         {"wave",    {anim::EMOTE_WAVE,    0, false, "You wave.", "You wave at %s.", "%s waves.", "%s waves at %s.", "wave"}},
         {"bow",     {anim::EMOTE_BOW,     0, false, "You bow down graciously.", "You bow down before %s.", "%s bows down graciously.", "%s bows down before %s.", "bow"}},
@@ -253,6 +337,15 @@ uint32_t EmoteRegistry::animByDbcId(uint32_t dbcId) const {
         return it->second->animId;
     }
     return 0;
+}
+
+uint32_t EmoteRegistry::animByEmotesId(uint32_t emoteId) const {
+    auto it = animByEmotesId_.find(emoteId);
+    return it != animByEmotesId_.end() ? it->second : 0;
+}
+
+bool EmoteRegistry::isStateEmote(uint32_t emoteId) const {
+    return stateEmoteIds_.count(emoteId) != 0;
 }
 
 uint32_t EmoteRegistry::getStateVariant(uint32_t oneShotAnimId) const {

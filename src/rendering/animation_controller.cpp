@@ -99,6 +99,29 @@ void AnimationController::playEmote(const std::string& emoteName) {
     }
 }
 
+void AnimationController::playWeaponSheathAnimation(bool sheathing) {
+    if (!renderer_) return;
+    auto* characterRenderer = renderer_->getCharacterRenderer();
+    const uint32_t characterInstanceId = renderer_->getCharacterInstanceId();
+    if (!characterRenderer || characterInstanceId == 0) return;
+
+    uint32_t animId = sheathing ? anim::SHEATHE : anim::UNSHEATHE;
+    if (!characterRenderer->hasAnimation(characterInstanceId, animId)) {
+        if (sheathing && characterRenderer->hasAnimation(characterInstanceId, anim::HIP_SHEATHE)) {
+            animId = anim::HIP_SHEATHE;
+        } else {
+            return;
+        }
+    }
+
+    // ActivityFSM owns the one-shot until completion so locomotion/combat does
+    // not replace the reach animation on the next frame.
+    characterAnimator_.playEmote(animId, false);
+    characterRenderer->playAnimation(characterInstanceId, animId, false);
+    lastPlayerAnimRequest_ = animId;
+    lastPlayerAnimLoopRequest_ = false;
+}
+
 void AnimationController::cancelEmote() {
     characterAnimator_.cancelEmote();
 }
@@ -128,6 +151,18 @@ uint32_t AnimationController::getEmoteAnimByDbcId(uint32_t dbcId) {
     return registry.animByDbcId(dbcId);
 }
 
+uint32_t AnimationController::getEmoteAnimByEmotesId(uint32_t emoteId) {
+    auto& registry = EmoteRegistry::instance();
+    registry.loadFromDbc();
+    return registry.animByEmotesId(emoteId);
+}
+
+bool AnimationController::isStateEmoteById(uint32_t emoteId) {
+    auto& registry = EmoteRegistry::instance();
+    registry.loadFromDbc();
+    return registry.isStateEmote(emoteId);
+}
+
 // ── Spell casting ────────────────────────────────────────────────────────────
 
 void AnimationController::startSpellCast(uint32_t precastAnimId, uint32_t castAnimId, bool castLoop,
@@ -137,6 +172,10 @@ void AnimationController::startSpellCast(uint32_t precastAnimId, uint32_t castAn
 
 void AnimationController::stopSpellCast() {
     characterAnimator_.stopSpellCast();
+}
+
+void AnimationController::setSeatedLoopAnimation(uint32_t animationId) {
+    characterAnimator_.getActivity().setSeatedLoopAnimation(animationId);
 }
 
 // ── Loot animation ───────────────────────────────────────────────────────────
@@ -206,6 +245,8 @@ void AnimationController::resetCombatVisualState() {
     specialAttackAnimId_ = 0;
     rangedShootTimer_ = 0.0f;
     rangedAnimId_ = 0;
+    restoreWeaponAfterRangedShot_ = false;
+    characterAnimator_.setRangedWeaponActive(false);
     stunned_ = false;
     charging_ = false;
 
@@ -321,6 +362,10 @@ void AnimationController::setEquippedRangedType(RangedWeaponType type) {
     characterAnimator_.setEquippedRangedType(type);
 }
 
+void AnimationController::setRangedWeaponActive(bool active) {
+    characterAnimator_.setRangedWeaponActive(active);
+}
+
 void AnimationController::setCharging(bool c) {
     charging_ = c;
     characterAnimator_.setCharging(c);
@@ -372,6 +417,8 @@ void AnimationController::triggerRangedShot() {
     if (dur < 0.25f) dur = 0.25f;
     if (dur > 1.5f) dur = 1.5f;
     rangedShootTimer_ = dur;
+    restoreWeaponAfterRangedShot_ =
+        (weaponLoadout_.rangedType == RangedWeaponType::THROWN);
 }
 
 uint32_t AnimationController::resolveMeleeAnimId() {
@@ -709,6 +756,8 @@ void AnimationController::setMounted(uint32_t mountInstId, uint32_t mountDisplay
     mountAnims.jumpEnd   = discoveredEnd > 0 ? discoveredEnd : findFirst({anim::JUMP_END});
     mountAnims.rearUp    = findFirst({anim::MOUNT_SPECIAL, anim::RUN_RIGHT, anim::FALL});
     mountAnims.run       = findFirst({anim::RUN, anim::WALK});
+    mountAnims.runLeft   = findFirst({anim::MOUNT_RUN_LEFT, anim::RUN_LEFT});
+    mountAnims.runRight  = findFirst({anim::MOUNT_RUN_RIGHT, anim::RUN_RIGHT});
     mountAnims.stand     = findFirst({anim::STAND});
     // Discover flight animations (flying mounts only — may all be 0 for ground mounts)
     mountAnims.flyIdle      = findFirst({anim::FLY_IDLE});
@@ -781,6 +830,13 @@ void AnimationController::setMounted(uint32_t mountInstId, uint32_t mountDisplay
         " fidgets=", mountAnims.fidgets.size());
 
     // Configure MountFSM via CharacterAnimator
+    // MountFSM caches taxiFlight_ once here and never re-reads it per-frame
+    // (Input.taxiFlight is populated in updateMountedAnimation() but unused) -
+    // if this fires again mid-flight with taxiFlight_ momentarily false (e.g. a
+    // server mount-display-id update racing ahead of the taxi state flipping
+    // true), the whole taxi flight animation branch gets skipped for the rest
+    // of this mount instance, falling back to regular ground/fly resolution.
+    LOG_INFO("Mount configured: displayId=", mountDisplayId, " taxiFlight=", taxiFlight_);
     characterAnimator_.configureMountFSM(mountAnims, taxiFlight_);
 
     if (renderer_->getAudioCoordinator()->getMountSoundManager()) {
@@ -790,6 +846,7 @@ void AnimationController::setMounted(uint32_t mountInstId, uint32_t mountDisplay
 }
 
 void AnimationController::clearMount() {
+    LOG_INFO("Mount cleared: was taxiFlight=", taxiFlight_, " mountInstanceId=", mountInstanceId_);
     mountInstanceId_ = 0;
     mountHeightOffset_ = 0.0f;
     mountPitch_ = 0.0f;
@@ -831,6 +888,10 @@ void AnimationController::updateMeleeTimers(float deltaTime) {
     // Ranged shot timer (same pattern as melee)
     if (rangedShootTimer_ > 0.0f) {
         rangedShootTimer_ = std::max(0.0f, rangedShootTimer_ - deltaTime);
+        if (rangedShootTimer_ <= 0.0f && restoreWeaponAfterRangedShot_) {
+            restoreWeaponAfterRangedShot_ = false;
+            if (rangedShotCompleteCallback_) rangedShotCompleteCallback_();
+        }
     }
 }
 
@@ -1068,7 +1129,10 @@ void AnimationController::updateCharacterAnimation() {
     fi.autoRunning = cameraController->isAutoRunning();
     fi.strafeLeft = cameraController->isStrafingLeft();
     fi.strafeRight = cameraController->isStrafingRight();
-    fi.grounded = cameraController->isGrounded();
+    // See setM2TransportRiding() comment: real physics correctly reports "not grounded"
+    // over open track under a moving platform, but the animation FSM needs "grounded"
+    // to avoid playing a falling animation for the whole ride.
+    fi.grounded = m2TransportRiding_ ? true : cameraController->isGrounded();
     fi.jumping = cameraController->isJumping();
     fi.swimming = cameraController->isSwimming();
     fi.sitting = cameraController->isSitting();
@@ -1123,7 +1187,10 @@ void AnimationController::updateCharacterAnimation() {
                   " reqChanged=", requestChanged, " drifted=", drifted, " shouldPlay=", shouldPlay,
                   " lastReq=", lastPlayerAnimRequest_,
                   " locoState=", static_cast<int>(characterAnimator_.getLocomotion().getState()),
-                  " actState=", static_cast<int>(characterAnimator_.getActivity().getState()));
+                  " actState=", static_cast<int>(characterAnimator_.getActivity().getState()),
+                  " fwd=", fi.movingForward, " back=", fi.movingBackward,
+                  " strafeL=", fi.strafeLeft, " strafeR=", fi.strafeRight,
+                  " moving=", fi.moving, " sprinting=", fi.sprinting);
         dbgLastAnim = animId;
     }
 

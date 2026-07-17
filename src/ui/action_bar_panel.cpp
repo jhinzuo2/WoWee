@@ -17,6 +17,7 @@
 #include "rendering/vk_context.hpp"
 #include "core/window.hpp"
 #include "game/game_handler.hpp"
+#include "game/spell_classification.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/dbc_layout.hpp"
 #include "audio/ui_sound_manager.hpp"
@@ -30,11 +31,6 @@
 namespace {
     using namespace wowee::ui::colors;
     constexpr auto& kColorRed         = kRed;
-    constexpr auto& kColorGreen       = kGreen;
-    constexpr auto& kColorBrightGreen = kBrightGreen;
-    constexpr auto& kColorYellow      = kYellow;
-    constexpr auto& kColorGray        = kGray;
-    constexpr auto& kColorDarkGray    = kDarkGray;
 
     // Collect all non-comment, non-empty lines from a macro body.
     std::vector<std::string> allMacroCommands(const std::string& macroText) {
@@ -161,6 +157,80 @@ uint32_t ActionBarPanel::resolveMacroPrimarySpellId(uint32_t macroId, game::Game
     return result;
 }
 
+const ActionBarPanel::MacroRenderInfo& ActionBarPanel::resolveMacroRenderInfo(
+        uint32_t macroId, game::GameHandler& gameHandler) {
+    const std::string& text = gameHandler.getMacroText(macroId);
+    const size_t spellCount = gameHandler.getKnownSpells().size();
+    const size_t itemCount = gameHandler.getItemInfoCache().size();
+    auto found = macroRenderCache_.find(macroId);
+    if (found != macroRenderCache_.end() && found->second.sourceText == text &&
+        found->second.spellCount == spellCount && found->second.itemCount == itemCount)
+        return found->second;
+
+    MacroRenderInfo info;
+    info.sourceText = text;
+    info.spellCount = spellCount;
+    info.itemCount = itemCount;
+    info.primarySpellId = resolveMacroPrimarySpellId(macroId, gameHandler);
+
+    std::string displayArg = getMacroShowtooltipArg(text);
+    for (const auto& cmd : allMacroCommands(text)) {
+        std::string lower = cmd;
+        for (char& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        const bool use = lower.rfind("/use ", 0) == 0;
+        const bool cast = lower.rfind("/cast ", 0) == 0;
+        const bool sequence = lower.rfind("/castsequence ", 0) == 0;
+        if (use) info.isUse = true;
+        if ((!displayArg.empty() && displayArg != "__auto__") || (!use && !cast && !sequence)) continue;
+        size_t space = cmd.find(' ');
+        if (space == std::string::npos) continue;
+        displayArg = cmd.substr(space + 1);
+        if (!displayArg.empty() && displayArg.front() == '[') {
+            size_t end = displayArg.find(']');
+            if (end != std::string::npos) displayArg = displayArg.substr(end + 1);
+        }
+        if (sequence) {
+            size_t reset = displayArg.find("reset=");
+            if (reset != std::string::npos) {
+                size_t after = displayArg.find(' ', reset);
+                if (after != std::string::npos) displayArg = displayArg.substr(after + 1);
+            }
+        }
+        size_t separator = displayArg.find(sequence ? ',' : ';');
+        if (separator != std::string::npos) displayArg.resize(separator);
+        break;
+    }
+
+    size_t first = displayArg.find_first_not_of(" \t!");
+    if (first != std::string::npos) displayArg.erase(0, first); else displayArg.clear();
+    size_t last = displayArg.find_last_not_of(" \t");
+    if (last != std::string::npos) displayArg.resize(last + 1);
+    size_t rank = displayArg.find('(');
+    if (rank != std::string::npos) displayArg.resize(rank);
+    while (!displayArg.empty() && displayArg.back() == ' ') displayArg.pop_back();
+    for (char& c : displayArg) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    if (displayArg.empty() || displayArg == "__auto__") {
+        info.iconSpellId = info.primarySpellId;
+    } else {
+        for (uint32_t sid : gameHandler.getKnownSpells()) {
+            std::string name = gameHandler.getSpellName(sid);
+            for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (name == displayArg) { info.iconSpellId = sid; break; }
+        }
+        if (info.isUse) {
+            for (const auto& [entry, item] : gameHandler.getItemInfoCache()) {
+                if (!item.valid) continue;
+                std::string name = item.name;
+                for (char& c : name) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (name == displayArg) { info.itemEntry = entry; break; }
+            }
+        }
+    }
+
+    return macroRenderCache_.insert_or_assign(macroId, std::move(info)).first->second;
+}
+
 void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
                              SettingsPanel& settingsPanel,
                              ChatPanel& chatPanel,
@@ -178,17 +248,34 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
     float slotSize = 48.0f * settingsPanel.pendingActionBarScale;
     float spacing = 4.0f;
     float padding = 8.0f;
+
+    // Build one inventory index for all action slots. Previously each item slot
+    // rescanned backpack, equipment, and every bag both for lookup and stack count.
+    std::unordered_map<uint32_t, const game::ItemDef*> actionItemsById;
+    std::unordered_map<uint32_t, uint32_t> actionItemCounts;
+    auto indexSlot = [&](const game::ItemSlot& invSlot) {
+        if (invSlot.empty() || invSlot.item.itemId == 0) return;
+        actionItemsById.try_emplace(invSlot.item.itemId, &invSlot.item);
+        actionItemCounts[invSlot.item.itemId] += invSlot.item.stackCount;
+    };
+    auto& actionInventory = gameHandler.getInventory();
+    actionItemsById.reserve(32);
+    actionItemCounts.reserve(32);
+    for (int i = 0; i < actionInventory.getBackpackSize(); ++i)
+        indexSlot(actionInventory.getBackpackSlot(i));
+    for (int i = 0; i < game::Inventory::NUM_EQUIP_SLOTS; ++i)
+        indexSlot(actionInventory.getEquipSlot(static_cast<game::EquipSlot>(i)));
+    for (int bag = 0; bag < game::Inventory::NUM_BAG_SLOTS; ++bag)
+        for (int i = 0; i < actionInventory.getBagSize(bag); ++i)
+            indexSlot(actionInventory.getBagSlot(bag, i));
     float barW = 12 * slotSize + 11 * spacing + padding * 2;
     float barH = slotSize + 24.0f;
     float barX = (screenW - barW) / 2.0f;
     float barY = screenH - barH;
 
-    ImGui::SetNextWindowPos(ImVec2(barX, barY), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(ImVec2(barW, barH), ImGuiCond_Always);
-
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                              ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoTitleBar |
-                             ImGuiWindowFlags_NoScrollbar;
+                             ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings;
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padding, padding));
@@ -199,12 +286,11 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
     // Per-slot rendering lambda — shared by both action bars
     const auto& bar = gameHandler.getActionBar();
     static constexpr const char* keyLabels1[] = {"1","2","3","4","5","6","7","8","9","0","-","="};
-    // "⇧N" labels for bar 2 (UTF-8: E2 87 A7 = U+21E7 UPWARDS WHITE ARROW)
-    static constexpr const char* keyLabels2[] = {
-        "\xe2\x87\xa7" "1", "\xe2\x87\xa7" "2", "\xe2\x87\xa7" "3",
-        "\xe2\x87\xa7" "4", "\xe2\x87\xa7" "5", "\xe2\x87\xa7" "6",
-        "\xe2\x87\xa7" "7", "\xe2\x87\xa7" "8", "\xe2\x87\xa7" "9",
-        "\xe2\x87\xa7" "0", "\xe2\x87\xa7" "-", "\xe2\x87\xa7" "="
+
+    auto changeMainPage = [&](int delta) {
+        mainActionBarPage_ += delta;
+        if (mainActionBarPage_ < 1) mainActionBarPage_ = kFrameXmlActionBarPages;
+        if (mainActionBarPage_ > kFrameXmlActionBarPages) mainActionBarPage_ = 1;
     };
 
     auto renderBarSlot = [&](int absSlot, const char* keyLabel) {
@@ -213,6 +299,30 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
 
         const auto& slot = bar[absSlot];
         bool onCooldown = !slot.isReady();
+
+        // Item cooldowns are frequently reported against the item's on-use spell
+        // (especially on Wrath) rather than against the action-slot item ID.
+        // Resolve that shared spell cooldown just as macro buttons do.
+        float itemCooldownRemaining = 0.0f;
+        float itemCooldownTotal = 0.0f;
+        if (slot.type == game::ActionBarSlot::ITEM && slot.id != 0 && !onCooldown) {
+            if (const auto* item = gameHandler.getItemInfo(slot.id); item && item->valid) {
+                for (const auto& itemSpell : item->spells) {
+                    if (itemSpell.spellId == 0 ||
+                        (itemSpell.spellTrigger != 0 && itemSpell.spellTrigger != 5)) continue;
+                    const float cooldown = gameHandler.getSpellCooldown(itemSpell.spellId);
+                    if (cooldown > itemCooldownRemaining) itemCooldownRemaining = cooldown;
+                }
+            }
+            if (itemCooldownRemaining > 0.0f) {
+                float& rememberedTotal = itemSpellCooldownTotals_[slot.id];
+                rememberedTotal = std::max(rememberedTotal, itemCooldownRemaining);
+                itemCooldownTotal = rememberedTotal;
+                onCooldown = true;
+            } else {
+                itemSpellCooldownTotals_.erase(slot.id);
+            }
+        }
 
         // Macro cooldown: check the cached primary spell's cooldown.
         float macroCooldownRemaining = 0.0f;
@@ -245,12 +355,16 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
                 uint32_t maxRange = spellbookScreen.getSpellMaxRange(rangeCheckSpellId, assetMgr);
                 if (maxRange > 5) {
                     auto& em = gameHandler.getEntityManager();
-                    auto playerEnt = em.getEntity(gameHandler.getPlayerGuid());
                     auto targetEnt = em.getEntity(gameHandler.getTargetGuid());
-                    if (playerEnt && targetEnt) {
-                        float dx = playerEnt->getX() - targetEnt->getX();
-                        float dy = playerEnt->getY() - targetEnt->getY();
-                        float dz = playerEnt->getZ() - targetEnt->getZ();
+                    if (targetEnt) {
+                        // The local player's network entity remains at its last
+                        // server-authored position while client movement updates
+                        // movementInfo. Using the entity here made every ranged
+                        // action appear out of range after walking away from login.
+                        const auto& playerPos = gameHandler.getMovementInfo();
+                        float dx = playerPos.x - targetEnt->getX();
+                        float dy = playerPos.y - targetEnt->getY();
+                        float dz = playerPos.z - targetEnt->getZ();
                         if (std::sqrt(dx*dx + dy*dy + dz*dz) > static_cast<float>(maxRange))
                             outOfRange = true;
                     }
@@ -261,6 +375,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         // Insufficient-power check: tint when player doesn't have enough power to cast.
         // Applies to SPELL and MACRO slots with a known power cost.
         bool insufficientPower = false;
+        bool reactiveUnavailable = false;
         {
             uint32_t powerCheckSpellId = 0;
             if (slot.type == game::ActionBarSlot::SPELL && slot.id != 0)
@@ -268,17 +383,45 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             else if (slot.type == game::ActionBarSlot::MACRO && slot.id != 0)
                 powerCheckSpellId = resolveMacroPrimarySpellId(slot.id, gameHandler);
             uint32_t spellCost = 0, spellPowerType = 0;
-            if (powerCheckSpellId != 0 && !onCooldown)
+            // Auto Shot, Shoot and Throw have a dummy 1-rage/1-cost value in the
+            // legacy Spell.dbc. Their actual readiness is server/weapon driven.
+            if (powerCheckSpellId != 0 && !onCooldown &&
+                !game::spellclass::isRangedWeaponAutoAttack(powerCheckSpellId))
                 spellbookScreen.getSpellPowerInfo(powerCheckSpellId, assetMgr, spellCost, spellPowerType);
             if (spellCost > 0) {
                 auto playerEnt = gameHandler.getEntityManager().getEntity(gameHandler.getPlayerGuid());
                 if (playerEnt && (playerEnt->getType() == game::ObjectType::PLAYER ||
                                   playerEnt->getType() == game::ObjectType::UNIT)) {
                     auto unit = std::static_pointer_cast<game::Unit>(playerEnt);
-                    if (unit->getPowerType() == static_cast<uint8_t>(spellPowerType)) {
-                        if (unit->getPower() < spellCost)
-                            insufficientPower = true;
-                    }
+                    // Spell.dbc identifies the resource pool. Compare that pool directly
+                    // instead of assuming the character's currently displayed power type;
+                    // this is shared by mana, rage, focus, energy, runes and runic power.
+                    if (spellPowerType < 7 &&
+                        unit->getPowerByType(static_cast<uint8_t>(spellPowerType)) < spellCost)
+                        insufficientPower = true;
+                }
+            }
+
+            // Reactive combat abilities declare their opportunity through Spell.dbc's
+            // caster aura-state fields. The values are 1-based bit positions in
+            // UNIT_FIELD_AURASTATE (Overpower, Revenge, execute windows, etc.).
+            uint32_t requiredState = 0, forbiddenState = 0;
+            if (powerCheckSpellId != 0 && !onCooldown)
+                spellbookScreen.getSpellAuraStateInfo(powerCheckSpellId, assetMgr,
+                                                       requiredState, forbiddenState);
+            if ((requiredState > 0 && requiredState <= 32) ||
+                (forbiddenState > 0 && forbiddenState <= 32)) {
+                auto playerEnt = gameHandler.getEntityManager().getEntity(gameHandler.getPlayerGuid());
+                if (playerEnt && (playerEnt->getType() == game::ObjectType::PLAYER ||
+                                  playerEnt->getType() == game::ObjectType::UNIT)) {
+                    auto unit = std::static_pointer_cast<game::Unit>(playerEnt);
+                    const uint32_t states = unit->getAuraState();
+                    if (requiredState > 0 && requiredState <= 32 &&
+                        (states & (1u << (requiredState - 1))) == 0)
+                        reactiveUnavailable = true;
+                    if (forbiddenState > 0 && forbiddenState <= 32 &&
+                        (states & (1u << (forbiddenState - 1))) != 0)
+                        reactiveUnavailable = true;
                 }
             }
         }
@@ -297,25 +440,8 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         if (slot.type == game::ActionBarSlot::SPELL && slot.id != 0) {
             iconTex = getSpellIcon(slot.id, assetMgr);
         } else if (slot.type == game::ActionBarSlot::ITEM && slot.id != 0) {
-            auto& inv = gameHandler.getInventory();
-            for (int bi = 0; bi < inv.getBackpackSize(); bi++) {
-                const auto& bs = inv.getBackpackSlot(bi);
-                if (!bs.empty() && bs.item.itemId == slot.id) { barItemDef = &bs.item; break; }
-            }
-            if (!barItemDef) {
-                for (int ei = 0; ei < game::Inventory::NUM_EQUIP_SLOTS; ei++) {
-                    const auto& es = inv.getEquipSlot(static_cast<game::EquipSlot>(ei));
-                    if (!es.empty() && es.item.itemId == slot.id) { barItemDef = &es.item; break; }
-                }
-            }
-            if (!barItemDef) {
-                for (int bag = 0; bag < game::Inventory::NUM_BAG_SLOTS && !barItemDef; bag++) {
-                    for (int si = 0; si < inv.getBagSize(bag); si++) {
-                        const auto& bs = inv.getBagSlot(bag, si);
-                        if (!bs.empty() && bs.item.itemId == slot.id) { barItemDef = &bs.item; break; }
-                    }
-                }
-            }
+            if (auto it = actionItemsById.find(slot.id); it != actionItemsById.end())
+                barItemDef = it->second;
             if (barItemDef && barItemDef->displayInfoId != 0)
                 itemDisplayInfoId = barItemDef->displayInfoId;
             if (itemDisplayInfoId == 0) {
@@ -331,80 +457,16 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
 
         // Macro icon: #showtooltip [SpellName] → show that spell's icon on the button
         bool macroIsUseCmd = false;  // tracks if the macro's primary command is /use (for item icon fallback)
+        uint32_t macroItemEntry = 0;
         if (slot.type == game::ActionBarSlot::MACRO && slot.id != 0 && !iconTex) {
-            const std::string& macroText = gameHandler.getMacroText(slot.id);
-            if (!macroText.empty()) {
-                std::string showArg = getMacroShowtooltipArg(macroText);
-                if (showArg.empty() || showArg == "__auto__") {
-                    // No explicit #showtooltip arg — derive spell from first /cast, /castsequence, or /use line
-                    for (const auto& cmdLine : allMacroCommands(macroText)) {
-                        if (cmdLine.size() < 6) continue;
-                        std::string cl = cmdLine;
-                        for (char& c : cl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                        bool isCastCmd = (cl.rfind("/cast ", 0) == 0 || cl == "/cast");
-                        bool isCastSeqCmd = (cl.rfind("/castsequence ", 0) == 0);
-                        bool isUseCmd = (cl.rfind("/use ", 0) == 0);
-                        if (isUseCmd) macroIsUseCmd = true;
-                        if (!isCastCmd && !isCastSeqCmd && !isUseCmd) continue;
-                        size_t sp2 = cmdLine.find(' ');
-                        if (sp2 == std::string::npos) continue;
-                        showArg = cmdLine.substr(sp2 + 1);
-                        // Strip conditionals [...]
-                        if (!showArg.empty() && showArg.front() == '[') {
-                            size_t ce = showArg.find(']');
-                            if (ce != std::string::npos) showArg = showArg.substr(ce + 1);
-                        }
-                        // Strip reset= spec for castsequence
-                        if (isCastSeqCmd) {
-                            std::string tmp = showArg;
-                            while (!tmp.empty() && tmp.front() == ' ') tmp.erase(tmp.begin());
-                            if (tmp.rfind("reset=", 0) == 0) {
-                                size_t spA = tmp.find(' ');
-                                if (spA != std::string::npos) showArg = tmp.substr(spA + 1);
-                            }
-                        }
-                        // First alternative: ';' for /cast, ',' for /castsequence
-                        size_t sep = showArg.find(isCastSeqCmd ? ',' : ';');
-                        if (sep != std::string::npos) showArg = showArg.substr(0, sep);
-                        // Trim and strip '!'
-                        size_t ss = showArg.find_first_not_of(" \t!");
-                        if (ss != std::string::npos) showArg = showArg.substr(ss);
-                        size_t se = showArg.find_last_not_of(" \t");
-                        if (se != std::string::npos) showArg.resize(se + 1);
-                        break;
-                    }
-                }
-                // Look up the spell icon by name
-                if (!showArg.empty() && showArg != "__auto__") {
-                    std::string showLower = showArg;
-                    for (char& c : showLower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    // Also strip "(Rank N)" suffix for matching
-                    size_t rankParen = showLower.find('(');
-                    if (rankParen != std::string::npos) showLower.resize(rankParen);
-                    while (!showLower.empty() && showLower.back() == ' ') showLower.pop_back();
-                    for (uint32_t sid : gameHandler.getKnownSpells()) {
-                        const std::string& sn = gameHandler.getSpellName(sid);
-                        if (sn.empty()) continue;
-                        std::string snl = sn;
-                        for (char& c : snl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                        if (snl == showLower) {
-                            iconTex = assetMgr ? getSpellIcon(sid, assetMgr) : VK_NULL_HANDLE;
-                            if (iconTex) break;
-                        }
-                    }
-                    // Fallback for /use macros: if no spell matched, search item cache for the item icon
-                    if (!iconTex && macroIsUseCmd) {
-                        for (const auto& [entry, info] : gameHandler.getItemInfoCache()) {
-                            if (!info.valid) continue;
-                            std::string iName = info.name;
-                            for (char& c : iName) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                            if (iName == showLower && info.displayInfoId != 0) {
-                                iconTex = inventoryScreen.getItemIcon(info.displayInfoId);
-                                break;
-                            }
-                        }
-                    }
-                }
+            const auto& macroInfo = resolveMacroRenderInfo(slot.id, gameHandler);
+            macroIsUseCmd = macroInfo.isUse;
+            macroItemEntry = macroInfo.itemEntry;
+            if (macroInfo.iconSpellId != 0)
+                iconTex = assetMgr ? getSpellIcon(macroInfo.iconSpellId, assetMgr) : VK_NULL_HANDLE;
+            if (!iconTex && macroItemEntry != 0) {
+                if (const auto* item = gameHandler.getItemInfo(macroItemEntry); item && item->displayInfoId != 0)
+                    iconTex = inventoryScreen.getItemIcon(item->displayInfoId);
             }
         }
 
@@ -413,12 +475,12 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
                                   && barItemDef == nullptr && !onCooldown);
 
         // Ranged item out-of-range check (runs after barItemDef is populated above).
-        // invType 15=Ranged (bow/gun/crossbow), 26=Thrown, 28=RangedRight (wand/crossbow).
+        // InventoryType: 15=Ranged, 25=Thrown, 26=RangedRight.
         if (!outOfRange && slot.type == game::ActionBarSlot::ITEM && barItemDef
             && !onCooldown && gameHandler.hasTarget()) {
             constexpr uint8_t INVTYPE_RANGED      = 15;
-            constexpr uint8_t INVTYPE_THROWN      = 26;
-            constexpr uint8_t INVTYPE_RANGEDRIGHT = 28;
+            constexpr uint8_t INVTYPE_THROWN      = game::InvType::THROWN;
+            constexpr uint8_t INVTYPE_RANGEDRIGHT = game::InvType::RANGED_GUN;
             uint32_t itemMaxRange = 0;
             if (barItemDef->inventoryType == INVTYPE_RANGED ||
                 barItemDef->inventoryType == INVTYPE_RANGEDRIGHT)
@@ -446,7 +508,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             if (onCooldown)          { tintColor = ImVec4(0.4f, 0.4f, 0.4f, 0.8f); }
             else if (onGCD)          { tintColor = ImVec4(0.6f, 0.6f, 0.6f, 0.85f); }
             else if (outOfRange)     { tintColor = ImVec4(0.85f, 0.35f, 0.35f, 0.9f); }
-            else if (insufficientPower) { tintColor = ImVec4(0.6f, 0.5f, 0.9f, 0.85f); }
+            else if (insufficientPower || reactiveUnavailable) { tintColor = ImVec4(0.38f, 0.38f, 0.38f, 0.78f); }
             else if (itemMissing)    { tintColor = ImVec4(0.35f, 0.35f, 0.35f, 0.7f); }
             clicked = ImGui::ImageButton("##icon",
                 (ImTextureID)(uintptr_t)iconTex,
@@ -456,7 +518,8 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         } else {
             if (onCooldown)            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.2f, 0.2f, 0.8f));
             else if (outOfRange)       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.45f, 0.15f, 0.15f, 0.9f));
-            else if (insufficientPower)ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.15f, 0.4f, 0.9f));
+            else if (insufficientPower || reactiveUnavailable)
+                                             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.16f, 0.85f));
             else if (itemMissing)      ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.12f, 0.12f, 0.12f, 0.7f));
             else if (slot.isEmpty())   ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.15f, 0.15f, 0.8f));
             else                       ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.5f, 0.9f));
@@ -625,6 +688,9 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
                 if (insufficientPower) {
                     ImGui::TextColored(ImVec4(0.75f, 0.55f, 1.0f, 1.0f), "Not enough power");
                 }
+                if (reactiveUnavailable) {
+                    ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.75f, 1.0f), "Requires a combat opportunity");
+                }
                 if (onCooldown) {
                     float cd = slot.cooldownRemaining;
                     if (cd >= 60.0f)
@@ -652,31 +718,10 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
                 }
                 if (!showedRich) {
                     // For /use macros: try showing the item tooltip instead
-                    if (macroIsUseCmd) {
-                        const std::string& macroText = gameHandler.getMacroText(slot.id);
-                        // Extract item name from first /use command
-                        for (const auto& cmd : allMacroCommands(macroText)) {
-                            std::string cl = cmd;
-                            for (char& c : cl) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                            if (cl.rfind("/use ", 0) != 0) continue;
-                            size_t sp = cmd.find(' ');
-                            if (sp == std::string::npos) continue;
-                            std::string itemArg = cmd.substr(sp + 1);
-                            while (!itemArg.empty() && itemArg.front() == ' ') itemArg.erase(itemArg.begin());
-                            while (!itemArg.empty() && itemArg.back() == ' ') itemArg.pop_back();
-                            std::string itemLow = itemArg;
-                            for (char& c : itemLow) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                            for (const auto& [entry, info] : gameHandler.getItemInfoCache()) {
-                                if (!info.valid) continue;
-                                std::string iName = info.name;
-                                for (char& c : iName) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                                if (iName == itemLow) {
-                                    inventoryScreen.renderItemTooltip(info);
-                                    showedRich = true;
-                                    break;
-                                }
-                            }
-                            break;
+                    if (macroIsUseCmd && macroItemEntry != 0) {
+                        if (const auto* info = gameHandler.getItemInfo(macroItemEntry); info && info->valid) {
+                            inventoryScreen.renderItemTooltip(*info);
+                            showedRich = true;
                         }
                     }
                     if (!showedRich) {
@@ -726,8 +771,12 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             auto* dl = ImGui::GetWindowDrawList();
 
             // For macros, use the resolved primary spell cooldown instead of the slot's own.
-            float effCdTotal = (macroCooldownTotal > 0.0f) ? macroCooldownTotal : slot.cooldownTotal;
-            float effCdRemaining = (macroCooldownRemaining > 0.0f) ? macroCooldownRemaining : slot.cooldownRemaining;
+            float effCdTotal = (macroCooldownTotal > 0.0f) ? macroCooldownTotal
+                               : (itemCooldownTotal > 0.0f) ? itemCooldownTotal
+                               : slot.cooldownTotal;
+            float effCdRemaining = (macroCooldownRemaining > 0.0f) ? macroCooldownRemaining
+                                   : (itemCooldownRemaining > 0.0f) ? itemCooldownRemaining
+                                   : slot.cooldownRemaining;
             float total       = (effCdTotal > 0.0f) ? effCdTotal : 1.0f;
             float elapsed     = total - effCdRemaining;
             float elapsedFrac = std::min(1.0f, std::max(0.0f, elapsed / total));
@@ -803,19 +852,9 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
 
         // Item stack count overlay — bottom-right corner of icon
         if (slot.type == game::ActionBarSlot::ITEM && slot.id != 0) {
-            // Count total of this item across all inventory slots
-            auto& inv = gameHandler.getInventory();
-            int totalCount = 0;
-            for (int bi = 0; bi < inv.getBackpackSize(); bi++) {
-                const auto& bs = inv.getBackpackSlot(bi);
-                if (!bs.empty() && bs.item.itemId == slot.id) totalCount += bs.item.stackCount;
-            }
-            for (int bag = 0; bag < game::Inventory::NUM_BAG_SLOTS; bag++) {
-                for (int si = 0; si < inv.getBagSize(bag); si++) {
-                    const auto& bs = inv.getBagSlot(bag, si);
-                    if (!bs.empty() && bs.item.itemId == slot.id) totalCount += bs.item.stackCount;
-                }
-            }
+            const auto countIt = actionItemCounts.find(slot.id);
+            const int totalCount = countIt != actionItemCounts.end()
+                ? static_cast<int>(countIt->second) : 0;
             if (totalCount > 0) {
                 char countStr[16];
                 snprintf(countStr, sizeof(countStr), "%d", totalCount);
@@ -872,11 +911,8 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         ImGui::EndGroup();
     };
 
-    // Bar 2 (slots 12-23) — only show if at least one slot is populated
+    // Bottom-left extra bar (FrameXML page 6, slots 60-71)
     if (settingsPanel.pendingShowActionBar2) {
-        bool bar2HasContent = false;
-        for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i)
-            if (!bar[game::GameHandler::SLOTS_PER_BAR + i].isEmpty()) { bar2HasContent = true; break; }
 
         float bar2X = barX + settingsPanel.pendingActionBar2OffsetX;
         float bar2Y = barY - barH - 2.0f + settingsPanel.pendingActionBar2OffsetY;
@@ -886,12 +922,11 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padding, padding));
         ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(0.0f, 0.0f));
         ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg,
-            bar2HasContent ? ImVec4(0.05f, 0.05f, 0.05f, 0.85f) : ImVec4(0.05f, 0.05f, 0.05f, 0.4f));
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.05f, 0.05f, 0.05f, 0.85f));
         if (ImGui::Begin("##ActionBar2", nullptr, flags)) {
             for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
                 if (i > 0) ImGui::SameLine(0, spacing);
-                renderBarSlot(game::GameHandler::SLOTS_PER_BAR + i, keyLabels2[i]);
+                renderBarSlot(actionSlotForPage(kBottomLeftActionPage, i), "");
             }
         }
         ImGui::End();
@@ -899,11 +934,15 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         ImGui::PopStyleVar(4);
     }
 
-    // Bar 1 (slots 0-11)
+    // Main action bar (FrameXML pages 1-6)
+    bool mainBarHovered = false;
+    ImGui::SetNextWindowPos(ImVec2(barX, barY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(barW, barH), ImGuiCond_Always);
     if (ImGui::Begin("##ActionBar", nullptr, flags)) {
+        mainBarHovered = ImGui::IsWindowHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
         for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
             if (i > 0) ImGui::SameLine(0, spacing);
-            renderBarSlot(i, keyLabels1[i]);
+            renderBarSlot(actionSlotForPage(mainActionBarPage_, i), keyLabels1[i]);
         }
 
         // Macro editor modal — opened by "Edit" in action bar context menus
@@ -920,6 +959,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             if (ImGui::Button("Save")) {
                 gameHandler.setMacroText(macroEditorId_, std::string(macroEditorBuf_));
                 macroPrimarySpellCache_.clear();  // invalidate resolved spell IDs
+                macroRenderCache_.clear();
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();
@@ -931,14 +971,39 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
     }
     ImGui::End();
 
+    if (mainBarHovered) {
+        float wheel = ImGui::GetIO().MouseWheel;
+        if (wheel > 0.0f) changeMainPage(-1);
+        else if (wheel < 0.0f) changeMainPage(1);
+    }
+
+    const float pagerW = 34.0f;
+    ImGui::SetNextWindowPos(ImVec2(barX + barW + 4.0f, barY), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(pagerW, barH), ImGuiCond_Always);
+    if (ImGui::Begin("##ActionBarPager", nullptr, flags)) {
+        const float buttonH = std::max(16.0f, (barH - padding * 2.0f - 18.0f) * 0.5f);
+        if (ImGui::Button("^", ImVec2(pagerW - padding * 2.0f, buttonH))) {
+            changeMainPage(-1);
+        }
+        char pageText[8];
+        snprintf(pageText, sizeof(pageText), "%d/%d", mainActionBarPage_, kFrameXmlActionBarPages);
+        ImVec2 textSize = ImGui::CalcTextSize(pageText);
+        ImGui::SetCursorPosX((pagerW - textSize.x) * 0.5f);
+        ImGui::TextUnformatted(pageText);
+        if (ImGui::Button("v", ImVec2(pagerW - padding * 2.0f, buttonH))) {
+            changeMainPage(1);
+        }
+    }
+    ImGui::End();
+
     ImGui::PopStyleColor();
     ImGui::PopStyleVar(4);
 
-    // Right side vertical bar (bar 3, slots 24-35)
+    // Right side vertical bar (FrameXML page 3, slots 24-35)
     if (settingsPanel.pendingShowRightBar) {
         bool bar3HasContent = false;
         for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i)
-            if (!bar[game::GameHandler::SLOTS_PER_BAR * 2 + i].isEmpty()) { bar3HasContent = true; break; }
+            if (!bar[actionSlotForPage(kRightActionPage, i)].isEmpty()) { bar3HasContent = true; break; }
 
         float sideBarW = slotSize + padding * 2;
         float sideBarH = game::GameHandler::SLOTS_PER_BAR * slotSize + (game::GameHandler::SLOTS_PER_BAR - 1) * spacing + padding * 2;
@@ -955,7 +1020,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             bar3HasContent ? ImVec4(0.05f, 0.05f, 0.05f, 0.85f) : ImVec4(0.05f, 0.05f, 0.05f, 0.4f));
         if (ImGui::Begin("##ActionBarRight", nullptr, flags)) {
             for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
-                renderBarSlot(game::GameHandler::SLOTS_PER_BAR * 2 + i, "");
+                renderBarSlot(actionSlotForPage(kRightActionPage, i), "");
             }
         }
         ImGui::End();
@@ -963,11 +1028,11 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
         ImGui::PopStyleVar(4);
     }
 
-    // Left side vertical bar (bar 4, slots 36-47)
+    // Left side vertical bar (FrameXML page 4, slots 36-47)
     if (settingsPanel.pendingShowLeftBar) {
         bool bar4HasContent = false;
         for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i)
-            if (!bar[game::GameHandler::SLOTS_PER_BAR * 3 + i].isEmpty()) { bar4HasContent = true; break; }
+            if (!bar[actionSlotForPage(kLeftActionPage, i)].isEmpty()) { bar4HasContent = true; break; }
 
         float sideBarW = slotSize + padding * 2;
         float sideBarH = game::GameHandler::SLOTS_PER_BAR * slotSize + (game::GameHandler::SLOTS_PER_BAR - 1) * spacing + padding * 2;
@@ -984,7 +1049,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             bar4HasContent ? ImVec4(0.05f, 0.05f, 0.05f, 0.85f) : ImVec4(0.05f, 0.05f, 0.05f, 0.4f));
         if (ImGui::Begin("##ActionBarLeft", nullptr, flags)) {
             for (int i = 0; i < game::GameHandler::SLOTS_PER_BAR; ++i) {
-                renderBarSlot(game::GameHandler::SLOTS_PER_BAR * 3 + i, "");
+                renderBarSlot(actionSlotForPage(kLeftActionPage, i), "");
             }
         }
         ImGui::End();
@@ -1013,7 +1078,7 @@ void ActionBarPanel::renderActionBar(game::GameHandler& gameHandler,
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, colors::kLowHealthRed);
             ImGui::PushStyleColor(ImGuiCol_ButtonActive,  ImVec4(0.4f, 0.0f, 0.0f, 1.0f));
             ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.0f);
-            if (ImGui::Button("Leave Vehicle", ImVec2(btnW - 8.0f, btnH - 8.0f))) {
+            if (ImGui::Button("Dismount", ImVec2(btnW - 8.0f, btnH - 8.0f))) {
                 gameHandler.sendRequestVehicleExit();
             }
             ImGui::PopStyleVar();
@@ -1186,20 +1251,21 @@ void ActionBarPanel::renderStanceBar(game::GameHandler& gameHandler,
     ImGui::PopStyleVar(4);
 }
 
-void ActionBarPanel::renderBagBar(game::GameHandler& gameHandler,
-                         SettingsPanel& /*settingsPanel*/,
+bool ActionBarPanel::renderBagBar(game::GameHandler& gameHandler,
+                         SettingsPanel& settingsPanel,
                          InventoryScreen& inventoryScreen) {
     ImVec2 displaySize = ImGui::GetIO().DisplaySize;
     float screenW = displaySize.x > 0.0f ? displaySize.x : 1280.0f;
     float screenH = displaySize.y > 0.0f ? displaySize.y : 720.0f;
     auto* assetMgr = services_.assetManager;
+    bool settingChanged = false;
 
     float slotSize = 42.0f;
     float spacing = 4.0f;
     float padding = 6.0f;
 
-    // 5 slots: backpack + 4 bags
-    float barW = 5 * slotSize + 4 * spacing + padding * 2;
+    // Mode toggle + backpack + 4 bags
+    float barW = 6 * slotSize + 5 * spacing + padding * 2;
     float barH = slotSize + padding * 2;
 
     // Position in bottom right corner
@@ -1222,6 +1288,20 @@ void ActionBarPanel::renderBagBar(game::GameHandler& gameHandler,
     if (ImGui::Begin("##BagBar", nullptr, flags)) {
         auto& inv = gameHandler.getInventory();
 
+        // Keep this next to the bags so changing layouts never requires a trip
+        // through settings. The saved setting remains the single source of truth.
+        const bool combined = !inventoryScreen.isSeparateBags();
+        if (ImGui::Button(combined ? "Split" : "All", ImVec2(slotSize, slotSize))) {
+            inventoryScreen.toggleCombinedBags();
+            settingsPanel.pendingSeparateBags = inventoryScreen.isSeparateBags();
+            settingChanged = true;
+        }
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(combined
+                ? "Split into separate bag windows"
+                : "Combine all bag slots into one window");
+        }
+
         // Load backpack icon if needed
         if (!backpackIconTexture_ && assetMgr && assetMgr->isInitialized()) {
             auto blpData = assetMgr->readFile("Interface\\Buttons\\Button-Backpack-Up.blp");
@@ -1241,7 +1321,7 @@ void ActionBarPanel::renderBagBar(game::GameHandler& gameHandler,
 
         // Slots 1-4: Bag slots (leftmost)
         for (int i = 0; i < 4; ++i) {
-            if (i > 0) ImGui::SameLine(0, spacing);
+            ImGui::SameLine(0, spacing);
             ImGui::PushID(i + 1);
 
             game::EquipSlot bagSlot = static_cast<game::EquipSlot>(static_cast<int>(game::EquipSlot::BAG1) + i);
@@ -1462,6 +1542,7 @@ void ActionBarPanel::renderBagBar(game::GameHandler& gameHandler,
             fg->AddRect(p0, p1, IM_COL32(200, 200, 200, 255), 0.0f, 0, 2.0f);
         }
     }
+    return settingChanged;
 }
 
 void ActionBarPanel::renderXpBar(game::GameHandler& gameHandler,
@@ -1497,7 +1578,8 @@ void ActionBarPanel::renderXpBar(game::GameHandler& gameHandler,
     // bar2 top edge (when visible): bar1 top - barH - 2 + bar2 vertical offset
     float bar1TopY = screenH - barH;
     float xpBarY;
-    if (settingsPanel.pendingShowActionBar2) {
+    bool bottomLeftBarVisible = settingsPanel.pendingShowActionBar2;
+    if (bottomLeftBarVisible) {
         float bar2TopY = bar1TopY - barH - 2.0f + settingsPanel.pendingActionBar2OffsetY;
         xpBarY = bar2TopY - xpBarH - 2.0f;
     } else {
@@ -1682,7 +1764,8 @@ void ActionBarPanel::renderRepBar(game::GameHandler& gameHandler,
 
     float bar1TopY = screenH - barH_ab;
     float xpBarY;
-    if (settingsPanel.pendingShowActionBar2) {
+    bool bottomLeftBarVisible = settingsPanel.pendingShowActionBar2;
+    if (bottomLeftBarVisible) {
         float bar2TopY = bar1TopY - barH_ab - 2.0f + settingsPanel.pendingActionBar2OffsetY;
         xpBarY = bar2TopY - xpBarH - 2.0f;
     } else {

@@ -45,15 +45,30 @@ public:
     std::string helpText() const override { return "Kneel"; }
 };
 
-// --- /logout, /camp, /quit, /exit ---
+// --- /logout, /camp ---
 class LogoutEmoteCommand : public IChatCommand {
 public:
     ChatCommandResult execute(ChatCommandContext& ctx) override {
-        ctx.gameHandler.requestLogout();
+        ctx.gameHandler.requestLogout(false);
         return {};
     }
-    std::vector<std::string> aliases() const override { return {"camp", "quit", "exit"}; }
-    std::string helpText() const override { return "Logout / quit game"; }
+    // aliases() is the complete name list — "logout" itself was missing here, so
+    // /logout was never actually a command despite /help advertising it.
+    std::vector<std::string> aliases() const override { return {"logout", "camp"}; }
+    std::string helpText() const override { return "Logout to character select"; }
+};
+
+// --- /quit, /exit ---
+// Same logout handshake as /logout, but leaves the game once the server confirms
+// the character is out of the world, rather than returning to character select.
+class QuitCommand : public IChatCommand {
+public:
+    ChatCommandResult execute(ChatCommandContext& ctx) override {
+        ctx.gameHandler.requestLogout(true);
+        return {};
+    }
+    std::vector<std::string> aliases() const override { return {"quit", "exit"}; }
+    std::string helpText() const override { return "Logout and quit the game"; }
 };
 
 // --- /cancellogout ---
@@ -213,6 +228,7 @@ void registerEmoteCommands(ChatCommandRegistry& reg) {
     reg.registerCommand(std::make_unique<StandCommand>());
     reg.registerCommand(std::make_unique<KneelCommand>());
     reg.registerCommand(std::make_unique<LogoutEmoteCommand>());
+    reg.registerCommand(std::make_unique<QuitCommand>());
     reg.registerCommand(std::make_unique<CancelLogoutCommand>());
     reg.registerCommand(std::make_unique<DismountCommand>());
     reg.registerCommand(std::make_unique<CancelFormCommand>());

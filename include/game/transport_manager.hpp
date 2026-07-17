@@ -3,10 +3,12 @@
 #include "game/transport_path_repository.hpp"
 #include "game/transport_clock_sync.hpp"
 #include "game/transport_animator.hpp"
+#include <chrono>
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
 #include <string>
+#include <mutex>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
 
@@ -26,6 +28,7 @@ struct ActiveTransport {
     uint32_t wmoInstanceId;     // WMO renderer instance ID
     uint32_t pathId;            // Current path
     uint32_t entry = 0;         // GameObject entry (for MO_TRANSPORT path updates)
+    uint32_t displayId = 0;     // GameObject display id, used for model-family-specific behavior
     glm::vec3 basePosition;     // Spawn position (base offset for path)
     glm::vec3 position;         // Current world position
     glm::quat rotation;         // Current world rotation
@@ -68,15 +71,71 @@ public:
     TransportManager();
     ~TransportManager();
 
+    // Absolute wall-clock ms. Used to seed a client-animated transport's starting phase
+    // so it's deterministic across clients/restarts instead of depending on when this
+    // process happened to launch or first see a given transport - see the seed call
+    // sites in transport_clock_sync.cpp for the full explanation of why that matters.
+    // Inline (not in transport_manager.cpp): kept dependency-free of the renderer
+    // headers that file pulls in, so lightweight callers (and the transport unit
+    // tests, which link transport_clock_sync.cpp/transport_animator.cpp without the
+    // rest of TransportManager) can use it without linking the renderer subsystem.
+    static uint64_t nowEpochMs() {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    }
+
+    // True for any GameObject/path identity belonging to the Deeprun Tram (both trains,
+    // all 6 car entries). Shared by callers in other translation units (transport_clock_sync.cpp,
+    // transport_animator.cpp, application.cpp) that need Deeprun-specific behavior.
+    static bool isDeeprunTramTransport(const ActiveTransport& transport) {
+        return transport.displayId == 3831u ||
+               (transport.entry >= 176080u && transport.entry <= 176085u) ||
+               (transport.pathId >= 176080u && transport.pathId <= 176085u);
+    }
+
+    // Round a path duration to the nearest 500ms for seed-modulo purposes only. Deeprun
+    // Tram cars are meant to move as one rigid train, but their individual
+    // TransportAnimation.dbc entries don't all report the exact same durationMs (observed:
+    // two of the six cars are ~102ms longer than the other four). nowEpochMs() % durationMs
+    // takes a huge wall-clock dividend, so even a ~100ms divisor mismatch between sibling
+    // cars produces effectively uncorrelated remainders - cars seeded seconds apart end up
+    // on opposite sides of the loop instead of near each other ("solo cars"). Rounding both
+    // divisors to the same 500ms bucket before the modulo keeps sibling cars' seeds
+    // correlated by real elapsed registration time, the way they're meant to be, without
+    // needing to hardcode any specific entry's duration as "the" canonical one.
+    static uint32_t deeprunTramSeedDurationMs(uint32_t durationMs) {
+        constexpr uint32_t kRoundTo = 500;
+        return ((durationMs + kRoundTo / 2) / kRoundTo) * kRoundTo;
+    }
+
     void setWMORenderer(rendering::WMORenderer* renderer) { wmoRenderer_ = renderer; }
     void setM2Renderer(rendering::M2Renderer* renderer) { m2Renderer_ = renderer; }
 
     void update(float deltaTime);
-    void registerTransport(uint64_t guid, uint32_t wmoInstanceId, uint32_t pathId, const glm::vec3& spawnWorldPos, uint32_t entry = 0);
+    void registerTransport(uint64_t guid,
+                           uint32_t wmoInstanceId,
+                           uint32_t pathId,
+                           const glm::vec3& spawnWorldPos,
+                           uint32_t entry = 0,
+                           uint32_t displayId = 0,
+                           bool isM2 = false);
     void unregisterTransport(uint64_t guid);
 
     ActiveTransport* getTransport(uint64_t guid);
+    // MAIN-THREAD-ONLY: this reference is not lock-protected, matching EntityManager's
+    // getEntities(). Callers on another thread (e.g. a headless HTTP API thread) must
+    // use snapshotTransports() instead.
     const std::unordered_map<uint64_t, ActiveTransport>& getTransports() const { return transports_; }
+    // Thread-safe copy of all registered transports, safe to call from any thread.
+    std::vector<ActiveTransport> snapshotTransports() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<ActiveTransport> snapshot;
+        snapshot.reserve(transports_.size());
+        for (const auto& [guid, transport] : transports_) {
+            snapshot.push_back(transport);
+        }
+        return snapshot;
+    }
     glm::vec3 getPlayerWorldPosition(uint64_t transportGuid, const glm::vec3& localOffset);
     glm::mat4 getTransportInvTransform(uint64_t transportGuid);
 
@@ -119,6 +178,27 @@ public:
     // Update server-controlled transport position/rotation directly (bypasses path movement)
     void updateServerTransport(uint64_t guid, const glm::vec3& position, float orientation);
 
+    // Resolve a usable path (real entry match, inferred by spawn position, remapped fallback,
+    // or a stationary single-point path as last resort) and register a transport that hasn't
+    // been seen before. This is the path-selection cascade every caller needs regardless of
+    // whether it has a real WMO/M2 render instance for the transport (wmoInstanceId=0 is a
+    // valid "no visual instance" sentinel, e.g. for a headless client that doesn't render).
+    // Callers own deciding wmoInstanceId/isM2 (which requires knowing whether the transport's
+    // model resolved to a WMO or M2 asset) and whether to call this at all (i.e. only when
+    // getTransport(guid) is null) and whether to follow up with updateServerTransport().
+    void resolveAndRegisterSpawn(uint64_t guid,
+                                 uint32_t entry,
+                                 uint32_t displayId,
+                                 const glm::vec3& canonicalSpawnPos,
+                                 uint32_t wmoInstanceId,
+                                 bool isM2,
+                                 bool preferServerData);
+
+    // Reconnect an existing transport to a newly spawned render instance. Servers can
+    // despawn/respawn transports around visibility boundaries while the logical route
+    // remains the same.
+    void rebindTransportInstance(uint64_t guid, uint32_t instanceId, bool isM2, uint32_t displayId = 0);
+
     // Enable/disable client-side animation for transports without server updates
     void setClientSideAnimation(bool enabled) { clientSideAnimation_ = enabled; }
     bool isClientSideAnimation() const { return clientSideAnimation_; }
@@ -131,6 +211,7 @@ private:
     TransportPathRepository pathRepo_;
     TransportClockSync clockSync_;
     TransportAnimator animator_;
+    mutable std::mutex mutex_;  // Guards transports_ map insert/erase for cross-thread snapshotTransports().
     std::unordered_map<uint64_t, ActiveTransport> transports_;
     rendering::WMORenderer* wmoRenderer_ = nullptr;
     rendering::M2Renderer* m2Renderer_ = nullptr;

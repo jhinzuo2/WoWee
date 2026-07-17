@@ -27,6 +27,10 @@ public:
     /// Render character screen (C key). Standalone equipment window.
     void renderCharacterScreen(game::GameHandler& gameHandler);
 
+    /// Draw the item-target cursor armed by using a sharpening stone / weightstone /
+    /// weapon oil, and handle cancelling it. Call once per frame, after the windows.
+    void renderItemTargetCursor();
+
     bool isOpen() const { return open; }
     void toggle() { open = !open; }
     void setOpen(bool o) { open = o; }
@@ -36,6 +40,8 @@ public:
     void toggleBag(int idx);
     void openAllBags();
     void closeAllBags();
+    /// Toggle between independently positioned bag windows and one continuous grid.
+    void toggleCombinedBags();
     void setSeparateBags(bool sep) { separateBags_ = sep; }
     bool isSeparateBags() const { return separateBags_; }
     void toggleCompactBags() { compactBags_ = !compactBags_; }
@@ -136,6 +142,10 @@ private:
     // Slot rendering with interaction support
     enum class SlotKind { BACKPACK, EQUIPMENT };
 
+    // Frame the item-target cursor was armed on (-1 = not armed). Cancel input is
+    // ignored on that frame so the right-click that used the item doesn't cancel it.
+    int itemTargetArmedFrame_ = -1;
+
     // Click-and-hold pickup tracking
     bool pickupPending_ = false;
     float pickupPressTime_ = 0.0f;
@@ -150,6 +160,8 @@ private:
     void renderAggregateBags(game::Inventory& inventory, uint64_t moneyCopper);
     void renderBagWindow(const char* title, bool& isOpen, game::Inventory& inventory,
                          int bagIndex, float defaultX, float defaultY, uint64_t moneyCopper);
+    /// Shared footer for the backpack / All Bags windows: Sort Bags button + money display.
+    void renderBagsFooter(game::Inventory& inventory, uint64_t moneyCopper);
     void renderEquipmentPanel(game::Inventory& inventory);
     void renderBackpackPanel(game::Inventory& inventory, bool collapseEmptySections = false);
     void renderStatsPanel(game::Inventory& inventory, uint32_t playerLevel, int32_t serverArmor = 0,
@@ -196,6 +208,12 @@ private:
     int splitMax_ = 1;
     int splitCount_ = 1;
     std::string splitItemName_;
+
+    // ImGui starts window movement before item widgets run for the frame, so
+    // keep bag windows title-bar-draggable while bags are open.
+    bool bagMoveConfigActive_ = false;
+    bool previousMoveFromTitleBarOnly_ = false;
+    void setBagMoveConfigActive(bool active);
 
     // Server-side bag sort swap queue (one swap per frame)
     std::deque<game::Inventory::SwapOp> sortSwapQueue_;

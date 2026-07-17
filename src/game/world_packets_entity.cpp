@@ -319,6 +319,21 @@ const char* getItemSubclassName(uint32_t itemClass, uint32_t subClass) {
             default: return "Armor";
         }
     }
+    if (itemClass == 1) { // Container (plain bags stay unnamed to avoid "Bag  Bag" tooltips)
+        switch (subClass) {
+            case 1: return "Soul Bag"; case 2: return "Herb Bag";
+            case 3: return "Enchanting Bag"; case 4: return "Engineering Bag";
+            case 5: return "Gem Bag"; case 6: return "Mining Bag";
+            case 7: return "Leatherworking Bag"; case 8: return "Inscription Bag";
+            default: return "";
+        }
+    }
+    if (itemClass == 11) { // Quiver
+        switch (subClass) {
+            case 3: return "Ammo Pouch";
+            default: return "Quiver";
+        }
+    }
     return "";
 }
 
@@ -508,7 +523,7 @@ bool ItemQueryResponseParser::parse(network::Packet& packet, ItemQueryResponseDa
 
     // Post-description fields: PageText, LanguageID, PageMaterial, StartQuest
     if (packet.hasRemaining(16)) {
-        packet.readUInt32(); // PageText
+        data.pageTextId = packet.readUInt32(); // PageText
         packet.readUInt32(); // LanguageID
         packet.readUInt32(); // PageMaterial
         data.startQuestId = packet.readUInt32(); // StartQuest
@@ -944,12 +959,12 @@ bool InitialSpellsParser::parse(network::Packet& packet, InitialSpellsData& data
     }
 
     LOG_DEBUG("SMSG_INITIAL_SPELLS: spellCount=", spellCount,
-              vanillaFormat ? " (vanilla uint16 format)" : " (TBC/WotLK uint32 format)");
+              vanillaFormat ? " (uint16 spell format)" : " (uint32 spell format)");
 
     data.spellIds.reserve(spellCount);
     for (uint16_t i = 0; i < spellCount; ++i) {
-        // Vanilla spell: spellId(2) + slot(2) = 4 bytes
-        // TBC/WotLK spell: spellId(4) + unknown(2) = 6 bytes
+        // Classic/TBC spell: spellId(2) + slot/unknown(2) = 4 bytes
+        // WotLK spell: spellId(4) + unknown(2) = 6 bytes
         size_t spellEntrySize = vanillaFormat ? 4 : 6;
         if (!packet.hasRemaining(spellEntrySize)) {
             LOG_WARNING("SMSG_INITIAL_SPELLS: spell ", i, " truncated (", spellCount, " expected)");
@@ -990,8 +1005,8 @@ bool InitialSpellsParser::parse(network::Packet& packet, InitialSpellsData& data
 
     data.cooldowns.reserve(cooldownCount);
     for (uint16_t i = 0; i < cooldownCount; ++i) {
-        // Vanilla cooldown: spellId(2) + itemId(2) + categoryId(2) + cooldownMs(4) + categoryCooldownMs(4) = 14 bytes
-        // TBC/WotLK cooldown: spellId(4) + itemId(2) + categoryId(2) + cooldownMs(4) + categoryCooldownMs(4) = 16 bytes
+        // Classic/TBC cooldown: spellId(2) + itemId(2) + categoryId(2) + cooldownMs(4) + categoryCooldownMs(4) = 14 bytes
+        // WotLK cooldown: spellId(4) + itemId(2) + categoryId(2) + cooldownMs(4) + categoryCooldownMs(4) = 16 bytes
         size_t cooldownEntrySize = vanillaFormat ? 14 : 16;
         if (!packet.hasRemaining(cooldownEntrySize)) {
             LOG_WARNING("SMSG_INITIAL_SPELLS: cooldown ", i, " truncated (", cooldownCount, " expected)");
@@ -1062,6 +1077,19 @@ network::Packet CastSpellPacket::build(uint32_t spellId, uint64_t targetGuid, ui
     return packet;
 }
 
+network::Packet CastSpellPacket::buildGameObjectTarget(uint32_t spellId, uint64_t targetGuid, uint8_t castCount) {
+    network::Packet packet(wireOpcode(Opcode::CMSG_CAST_SPELL));
+    packet.writeUInt8(castCount);
+    packet.writeUInt32(spellId);
+    packet.writeUInt8(0x00); // castFlags = 0 for normal cast
+    packet.writeUInt32(0x0800); // TARGET_FLAG_GAMEOBJECT
+    packet.writePackedGuid(targetGuid);
+
+    LOG_DEBUG("Built CMSG_CAST_SPELL: spell=", spellId, " gameObject=0x",
+              std::hex, targetGuid, std::dec);
+    return packet;
+}
+
 network::Packet CancelAuraPacket::build(uint32_t spellId) {
     network::Packet packet(wireOpcode(Opcode::CMSG_CANCEL_AURA));
     packet.writeUInt32(spellId);
@@ -1084,6 +1112,9 @@ bool CastFailedParser::parse(network::Packet& packet, CastFailedData& data) {
     data.castCount = packet.readUInt8();
     data.spellId = packet.readUInt32();
     data.result = packet.readUInt8();
+    // Spell-focus and totem failures append ids naming the missing
+    // station/tool so the client can surface them.
+    readCastResultArgs(packet, data.result, data.miscArg, data.miscArg2);
     LOG_INFO("Cast failed: spell=", data.spellId, " result=", static_cast<int>(data.result));
     return true;
 }

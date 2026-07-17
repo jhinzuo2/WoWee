@@ -1,5 +1,6 @@
 #include "rendering/m2_renderer.hpp"
 #include "rendering/m2_renderer_internal.h"
+#include "core/thread_pool.hpp"
 #include "rendering/m2_model_classifier.hpp"
 #include "rendering/hiz_system.hpp"
 #include "rendering/vk_context.hpp"
@@ -90,6 +91,7 @@ uint32_t M2Renderer::createInstance(uint32_t modelId, const glm::vec3& position,
     instance.cachedIsGroundDetail = mdlRef.isGroundDetail;
     instance.cachedIsInvisibleTrap = mdlRef.isInvisibleTrap;
     instance.cachedIsInstancePortal = mdlRef.isInstancePortal;
+    instance.cachedIsSkyBird = mdlRef.isSkyBird;
     instance.cachedIsValid = mdlRef.isValid();
     instance.cachedModel = &mdlRef;
     instance.recomputeCachedCullFactors();
@@ -212,6 +214,7 @@ uint32_t M2Renderer::createInstanceWithMatrix(uint32_t modelId, const glm::mat4&
     instance.cachedBoundRadius = mdl2.boundRadius;
     instance.cachedIsGroundDetail = mdl2.isGroundDetail;
     instance.cachedIsInvisibleTrap = mdl2.isInvisibleTrap;
+    instance.cachedIsSkyBird = mdl2.isSkyBird;
     instance.cachedIsValid = mdl2.isValid();
     instance.cachedModel = &mdl2;
     instance.recomputeCachedCullFactors();
@@ -287,9 +290,10 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
 
     // Cache camera state for frustum-culling bone computation
     cachedCamPos_ = cameraPos;
-    const float maxRenderDistance = (instances.size() > rendering::M2_HIGH_DENSITY_INSTANCE_THRESHOLD)
-                                     ? rendering::M2_MAX_RENDER_DISTANCE_HIGH_DENSITY
-                                     : rendering::M2_MAX_RENDER_DISTANCE_LOW_DENSITY;
+    const float maxRenderDistance = viewDistanceScale_ *
+        ((instances.size() > rendering::M2_HIGH_DENSITY_INSTANCE_THRESHOLD)
+             ? rendering::M2_MAX_RENDER_DISTANCE_HIGH_DENSITY
+             : rendering::M2_MAX_RENDER_DISTANCE_LOW_DENSITY);
     cachedMaxRenderDistSq_ = maxRenderDistance * maxRenderDistance;
 
     // Build frustum for culling bones
@@ -373,6 +377,7 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
     // This is a tight loop touching only one float per instance — no hash lookups.
     for (auto& instance : instances) {
         instance.animTime += dtMs;
+        instance.globalSequenceTime += dtMs;
     }
     // Wrap animTime for particle-only instances so emission rate tracks keep looping.
     // 3333ms chosen as a safe wrap period: long enough to cover the longest known M2
@@ -458,9 +463,15 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
         glm::vec3 toCam = instance.position - cachedCamPos_;
         float distSq = glm::dot(toCam, toCam);
         float effectiveMaxDistSq = cachedMaxRenderDistSq_ * instance.cachedEffectiveMaxDistSqFactor;
+        if (instance.cachedIsSkyBird) {
+            constexpr float kBirdMaxDistSq =
+                rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE *
+                rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE;
+            effectiveMaxDistSq = std::min(effectiveMaxDistSq, kBirdMaxDistSq);
+        }
         if (distSq > effectiveMaxDistSq) continue;
         float paddedRadius = instance.cachedPaddedRadius;
-        if (paddedRadius > 0.0f && !updateFrustum.intersectsSphere(instance.position, paddedRadius)) continue;
+        if (paddedRadius > 0.0f && !updateFrustum.intersectsSphere(instance.cachedCullCenter, paddedRadius)) continue;
 
         // LOD 3 skip: models beyond 150 units use the lowest LOD mesh which has
         // no visible skeletal animation.  Keep their last-computed bone matrices
@@ -470,8 +481,10 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
 
         // Distance-based frame skipping: update distant bones less frequently
         uint32_t boneInterval = 1;
-        if (distSq > rendering::M2_BONE_SKIP_DIST_FAR * rendering::M2_BONE_SKIP_DIST_FAR) boneInterval = 4;
-        else if (distSq > rendering::M2_BONE_SKIP_DIST_MID * rendering::M2_BONE_SKIP_DIST_MID) boneInterval = 2;
+        if (!instance.cachedIsSkyBird) {
+            if (distSq > rendering::M2_BONE_SKIP_DIST_FAR * rendering::M2_BONE_SKIP_DIST_FAR) boneInterval = 4;
+            else if (distSq > rendering::M2_BONE_SKIP_DIST_MID * rendering::M2_BONE_SKIP_DIST_MID) boneInterval = 2;
+        }
         instance.frameSkipCounter++;
         if ((instance.frameSkipCounter % boneInterval) != 0) continue;
 
@@ -509,27 +522,33 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
                 const size_t chunkSize = animCount / numThreads;
                 const size_t remainder = animCount % numThreads;
 
+                auto processRange = [this](size_t begin, size_t end) {
+                    for (size_t j = begin; j < end; ++j) {
+                        size_t idx = boneWorkIndices_[j];
+                        if (idx >= instances.size()) continue;
+                        auto& inst = instances[idx];
+                        if (!inst.cachedModel) continue;
+                        computeBoneMatrices(*inst.cachedModel, inst);
+                    }
+                };
+
                 // Reuse persistent futures vector to avoid allocation
                 animFutures_.clear();
                 if (animFutures_.capacity() < numThreads) {
                     animFutures_.reserve(numThreads);
                 }
 
+                // Dispatch all but the last chunk to the shared pool; process the
+                // last chunk on this thread so this call always makes progress even
+                // when it itself runs on a pool worker (see ThreadPool docs).
                 size_t start = 0;
-                for (size_t t = 0; t < numThreads; ++t) {
+                for (size_t t = 0; t + 1 < numThreads; ++t) {
                     size_t end = start + chunkSize + (t < remainder ? 1 : 0);
-                    animFutures_.push_back(std::async(std::launch::async,
-                        [this, start, end]() {
-                            for (size_t j = start; j < end; ++j) {
-                                size_t idx = boneWorkIndices_[j];
-                                if (idx >= instances.size()) continue;
-                                auto& inst = instances[idx];
-                                if (!inst.cachedModel) continue;
-                                computeBoneMatrices(*inst.cachedModel, inst);
-                            }
-                        }));
+                    animFutures_.push_back(core::ThreadPool::frameWorkers().submit(
+                        [processRange, start, end]() { processRange(start, end); }));
                     start = end;
                 }
+                processRange(start, animCount);
 
                 for (auto& f : animFutures_) {
                     f.get();
@@ -580,31 +599,39 @@ void M2Renderer::prepareRender(uint32_t frameIndex, const Camera& camera) {
 
         instance.megaBoneOffset = nextSlot * MAX_BONES_PER_INSTANCE;
 
-        // Upload bone matrices to mega buffer
-        if (megaBoneMapped_[frameIndex]) {
+        // Upload bone matrices to mega buffer — only when they were recomputed
+        // since the last upload into this frame's buffer, or the instance's
+        // slot moved (animated set changed). Most animated instances are
+        // distance/frustum/frame-skip culled and keep their previous bones, so
+        // skipping their memcpy avoids megabytes of redundant writes per frame.
+        if (megaBoneMapped_[frameIndex] &&
+            (instance.bonesDirty[frameIndex] ||
+             instance.megaBoneUploadedSlot[frameIndex] != nextSlot)) {
             int numBones = std::min(static_cast<int>(instance.boneMatrices.size()),
                                     static_cast<int>(MAX_BONES_PER_INSTANCE));
             auto* dst = static_cast<glm::mat4*>(megaBoneMapped_[frameIndex]) + instance.megaBoneOffset;
             memcpy(dst, instance.boneMatrices.data(), numBones * sizeof(glm::mat4));
+            instance.bonesDirty[frameIndex] = false;
+            instance.megaBoneUploadedSlot[frameIndex] = nextSlot;
         }
 
         nextSlot++;
     }
 }
 
-// Dispatch GPU frustum culling compute shader.
-// Called on the primary command buffer BEFORE the render pass begins so that
-// compute dispatch and memory barrier complete before secondary command buffers
-// read the visibility output in render().
+// Dispatch GPU frustum culling compute shader into the primary frame command
+// buffer. render() consumes the completed output left in this frame slot from
+// its previous use; this dispatch produces results for the slot's next reuse.
 void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, const Camera& camera) {
     if (!cullPipeline_ || instances.empty()) return;
 
     const uint32_t numInstances = std::min(static_cast<uint32_t>(instances.size()), MAX_CULL_INSTANCES);
 
     // --- Compute per-instance adaptive distances (same formula as old CPU cull) ---
-    const float targetRenderDist = (instances.size() > 2000) ? 300.0f
-                                 : (instances.size() > 1000) ? 500.0f
-                                 : 1000.0f;
+    const float targetRenderDist = viewDistanceScale_ *
+        ((instances.size() > 2000) ? 300.0f
+         : (instances.size() > 1000) ? 500.0f
+                                     : 1000.0f);
     const float shrinkRate = 0.005f;
     const float growRate   = 0.05f;
     float blendRate = (targetRenderDist < smoothedRenderDist_) ? shrinkRate : growRate;
@@ -684,6 +711,12 @@ void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, c
         for (uint32_t i = 0; i < numInstances; i++) {
             const auto& inst = instances[i];
             float effectiveMaxDistSq = maxRenderDistanceSq * inst.cachedEffectiveMaxDistSqFactor;
+            if (inst.cachedIsSkyBird && inst.cachedHasAnimation && !inst.cachedDisableAnimation) {
+                constexpr float kBirdMaxDistSq =
+                    rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE *
+                    rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE;
+                effectiveMaxDistSq = std::min(effectiveMaxDistSq, kBirdMaxDistSq);
+            }
 
             uint32_t flags = 0;
             if (inst.cachedIsValid)          flags |= 1u;
@@ -696,7 +729,7 @@ void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, c
             if (i < prevFrameVisible_.size() && prevFrameVisible_[i] < 2)
                 flags |= 8u;
 
-            input[i].sphere = glm::vec4(inst.position, inst.cachedPaddedRadius);
+            input[i].sphere = glm::vec4(inst.cachedCullCenter, inst.cachedPaddedRadius);
             input[i].effectiveMaxDistSq = effectiveMaxDistSq;
             input[i].flags = flags;
         }
@@ -723,7 +756,8 @@ void M2Renderer::dispatchCullCompute(VkCommandBuffer cmd, uint32_t frameIndex, c
     const uint32_t groupCount = (numInstances + 63) / 64;
     vkCmdDispatch(cmd, groupCount, 1, 1);
 
-    // --- Memory barrier: compute writes → host reads ---
+    // Make writes available to the host after this frame's fence signals. The
+    // CPU invalidates and reads them when this frame slot is reused.
     VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
@@ -771,6 +805,8 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     glowSprites_.clear();
 
     lastDrawCallCount = 0;
+    const float lavaAnimSeconds = std::chrono::duration<float>(
+        std::chrono::steady_clock::now() - kLavaAnimStart).count();
 
     // GPU cull results — dispatchCullCompute() already updated smoothedRenderDist_.
     // Use the cached value (set by dispatchCullCompute or fallback below).
@@ -805,9 +841,10 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     // If GPU culling was not dispatched, fallback: compute distances on CPU
     float maxRenderDistanceSq;
     if (!gpuCullAvailable) {
-        const float targetRenderDist = (instances.size() > 2000) ? 300.0f
-                                     : (instances.size() > 1000) ? 500.0f
-                                     : 1000.0f;
+        const float targetRenderDist = viewDistanceScale_ *
+            ((instances.size() > 2000) ? 300.0f
+             : (instances.size() > 1000) ? 500.0f
+                                         : 1000.0f);
         const float shrinkRate = 0.005f;
         const float growRate = 0.05f;
         float blendRate = (targetRenderDist < smoothedRenderDist_) ? shrinkRate : growRate;
@@ -822,10 +859,13 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
 
     // Build sorted visible instance list
     sortedVisible_.clear();
+    transparentVisible_.clear();
     const size_t expectedVisible = std::min(instances.size() / 3, size_t(600));
     if (sortedVisible_.capacity() < expectedVisible) {
         sortedVisible_.reserve(expectedVisible);
     }
+    if (transparentVisible_.capacity() < expectedVisible / 4)
+        transparentVisible_.reserve(expectedVisible / 4);
 
     // GPU frustum culling — build frustum for CPU fallback path and overflow instances
     Frustum frustum;
@@ -836,41 +876,86 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     const float maxPossibleDistSq = maxRenderDistanceSq * 4.0f;
 
     const uint32_t totalInstances = static_cast<uint32_t>(instances.size());
-    for (uint32_t i = 0; i < totalInstances; ++i) {
-        const auto& instance = instances[i];
+    struct VisibleChunk {
+        std::vector<VisibleEntry> opaque;
+        std::vector<VisibleEntry> transparent;
+    };
 
-        float distSq;
-        float effectiveMaxDistSq;
+    // Visibility classification is independent per instance and was the
+    // remaining monolithic M2 CPU pass. Split dense scenes across a few pool
+    // workers; the caller handles the final chunk so nested use from the M2
+    // render worker cannot deadlock the shared pool.
+    const uint32_t chunkCount = totalInstances >= 2048
+        ? std::min<uint32_t>(4, (totalInstances + 1023) / 1024)
+        : 1;
+    std::vector<VisibleChunk> chunks(chunkCount);
+    auto classifyRange = [&](uint32_t chunk, uint32_t begin, uint32_t end) {
+        auto& out = chunks[chunk];
+        out.opaque.reserve((end - begin) / 3);
+        out.transparent.reserve((end - begin) / 12);
+        for (uint32_t i = begin; i < end; ++i) {
+            const auto& instance = instances[i];
+            float distSq;
+            float effectiveMaxDistSq;
 
-        // effectiveMaxDistSqFactor and paddedRadius are precomputed per-instance
-        // by recomputeCachedCullFactors(); per-frame work is just the dot product
-        // and a single multiply.
-        if (forceNoCull_) {
-            if (!instance.cachedIsValid) continue;
-            glm::vec3 toCam = instance.position - camPos;
-            distSq = glm::dot(toCam, toCam);
-            effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
-        } else if (gpuCullAvailable && i < numInstances) {
-            if (!visibility[i]) continue;
-            glm::vec3 toCam = instance.position - camPos;
-            distSq = glm::dot(toCam, toCam);
-            effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
-        } else {
-            // CPU fallback: distSq used twice (early-out + visibility), so compute once.
-            if (!instance.cachedIsValid || instance.cachedIsSmoke || instance.cachedIsInvisibleTrap) continue;
+            if (forceNoCull_) {
+                if (!instance.cachedIsValid) continue;
+                glm::vec3 toCam = instance.position - camPos;
+                distSq = glm::dot(toCam, toCam);
+                effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
+            } else if (gpuCullAvailable && i < numInstances) {
+                if (!visibility[i]) continue;
+                glm::vec3 toCam = instance.position - camPos;
+                distSq = glm::dot(toCam, toCam);
+                effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
+            } else {
+                if (!instance.cachedIsValid || instance.cachedIsSmoke || instance.cachedIsInvisibleTrap) continue;
+                glm::vec3 toCam = instance.position - camPos;
+                distSq = glm::dot(toCam, toCam);
+                if (distSq > maxPossibleDistSq) continue;
+                effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
+                if (distSq > effectiveMaxDistSq) continue;
+                float paddedRadius = instance.cachedPaddedRadius;
+                if (paddedRadius > 0.0f && !frustum.intersectsSphere(instance.cachedCullCenter, paddedRadius)) continue;
+            }
 
-            glm::vec3 toCam = instance.position - camPos;
-            distSq = glm::dot(toCam, toCam);
-            if (distSq > maxPossibleDistSq) continue;
+            if (instance.cachedIsSkyBird && instance.cachedHasAnimation && !instance.cachedDisableAnimation) {
+                constexpr float kBirdMaxDistSq =
+                    rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE *
+                    rendering::M2_SKY_BIRD_MAX_RENDER_DISTANCE;
+                effectiveMaxDistSq = std::min(effectiveMaxDistSq, kBirdMaxDistSq);
+                if (distSq > effectiveMaxDistSq) continue;
+            }
 
-            effectiveMaxDistSq = maxRenderDistanceSq * instance.cachedEffectiveMaxDistSqFactor;
-            if (distSq > effectiveMaxDistSq) continue;
-
-            float paddedRadius = instance.cachedPaddedRadius;
-            if (paddedRadius > 0.0f && !frustum.intersectsSphere(instance.position, paddedRadius)) continue;
+            VisibleEntry visible{i, instance.modelId, distSq, effectiveMaxDistSq};
+            out.opaque.push_back(visible);
+            if (instance.cachedModel &&
+                (instance.cachedModel->hasTransparentBatches || instance.cachedModel->isSpellEffect)) {
+                out.transparent.push_back(visible);
+            }
         }
+    };
 
-        sortedVisible_.push_back({i, instance.modelId, distSq, effectiveMaxDistSq});
+    std::vector<std::future<void>> visibilityFutures;
+    visibilityFutures.reserve(chunkCount > 0 ? chunkCount - 1 : 0);
+    const uint32_t chunkSize = (totalInstances + chunkCount - 1) / chunkCount;
+    for (uint32_t chunk = 0; chunk + 1 < chunkCount; ++chunk) {
+        const uint32_t begin = chunk * chunkSize;
+        const uint32_t end = std::min(totalInstances, begin + chunkSize);
+        visibilityFutures.push_back(core::ThreadPool::frameWorkers().submit(
+            [&, chunk, begin, end]() { classifyRange(chunk, begin, end); }));
+    }
+    const uint32_t lastChunk = chunkCount - 1;
+    classifyRange(lastChunk, lastChunk * chunkSize, totalInstances);
+    for (auto& future : visibilityFutures) future.get();
+
+    for (auto& chunk : chunks) {
+        sortedVisible_.insert(sortedVisible_.end(),
+                              std::make_move_iterator(chunk.opaque.begin()),
+                              std::make_move_iterator(chunk.opaque.end()));
+        transparentVisible_.insert(transparentVisible_.end(),
+                                   std::make_move_iterator(chunk.transparent.begin()),
+                                   std::make_move_iterator(chunk.transparent.end()));
     }
 
     // Two-pass rendering: opaque/alpha-test first (depth write ON), then transparent/additive
@@ -880,6 +965,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     // Pass 1: sort by modelId for minimum buffer rebinds (opaque batches)
     std::sort(sortedVisible_.begin(), sortedVisible_.end(),
               [](const VisibleEntry& a, const VisibleEntry& b) { return a.modelId < b.modelId; });
+
 
     uint32_t currentModelId = UINT32_MAX;
     const M2ModelGPU* currentModel = nullptr;
@@ -894,6 +980,21 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
         int32_t texCoordSet;        // UV set index (0 or 1)
         int32_t isFoliage;          // Foliage wind animation flag
         int32_t instanceDataOffset; // Base index into instance SSBO for this draw group
+    };
+
+    auto appendInstancePortalGlow = [&](const M2Instance& instance, float distSq) {
+        if (distSq >= 400.0f * 400.0f) return;
+        glm::vec3 center = glm::vec3(instance.modelMatrix * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
+        GlowSprite core;
+        core.worldPos = center;
+        core.color = glm::vec4(0.35f, 0.55f, 1.0f, 1.25f);
+        core.size = instance.scale * 7.0f;
+        glowSprites_.push_back(core);
+
+        GlowSprite halo = core;
+        halo.color.a *= 0.35f;
+        halo.size *= 2.4f;
+        glowSprites_.push_back(halo);
     };
 
     // Validate per-frame descriptor set before any Vulkan commands
@@ -964,6 +1065,15 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                 continue;
             }
             const M2ModelGPU& model = *instances[firstEntry.index].cachedModel;
+            if (model.isInstancePortal) {
+                for (size_t vi = visStart; vi < groupEnd; vi++) {
+                    const auto& entry = sortedVisible_[vi];
+                    if (entry.index >= instances.size()) continue;
+                    appendInstancePortalGlow(instances[entry.index], entry.distSq);
+                }
+                visStart = groupEnd;
+                continue;
+            }
             if (!model.vertexBuffer || !model.indexBuffer) {
                 visStart = groupEnd;
                 continue;
@@ -991,21 +1101,6 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                 }
                 float instanceFadeAlpha = fadeAlpha;
                 if (model.isGroundDetail) instanceFadeAlpha *= 0.82f;
-                if (model.isInstancePortal) {
-                    instanceFadeAlpha *= 0.12f;
-                    if (entry.distSq < 400.0f * 400.0f) {
-                        glm::vec3 center = glm::vec3(instance.modelMatrix * glm::vec4(0.0f, 0.0f, 0.0f, 1.0f));
-                        GlowSprite gs;
-                        gs.worldPos = center;
-                        gs.color = glm::vec4(0.35f, 0.5f, 1.0f, 1.1f);
-                        gs.size = instance.scale * 5.0f;
-                        glowSprites_.push_back(gs);
-                        GlowSprite halo = gs;
-                        halo.color.a *= 0.3f;
-                        halo.size *= 2.2f;
-                        glowSprites_.push_back(halo);
-                    }
-                }
 
                 // Bone readiness check
                 if (modelNeedsAnimation && instance.boneMatrices.empty()) continue;
@@ -1064,13 +1159,6 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     if (!model.isGroundDetail && batch.submeshLevel != lod) continue;
                     if (batch.batchOpacity < 0.01f) continue;
 
-                    // Opaque gate — skip transparent batches
-                    const bool rawTransparent = (batch.blendMode >= 2) || model.isSpellEffect;
-                    if (rawTransparent) continue;
-
-                    // Particle-dominant effects: emission geometry — skip opaque
-                    if (particleDominantEffect && batch.blendMode <= 1) continue;
-
                     // Glow sprite check (per model+batch, sprites generated per instance)
                     const bool koboldFlameCard = batch.colorKeyBlack && model.isKoboldFlame;
                     const bool smallCardLikeBatch =
@@ -1079,7 +1167,9 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     const bool batchUnlit = (batch.materialFlags & 0x01) != 0;
                     const bool shouldUseGlowSprite =
                         !koboldFlameCard &&
-                        (model.isElvenLike || (model.isLanternLike && batch.lanternGlowHint)) &&
+                        (model.isElvenLike ||
+                         ((model.isLanternLike || model.isTorch || model.isBrazierOrFire) &&
+                          batch.lanternGlowHint)) &&
                         !model.isSpellEffect &&
                         smallCardLikeBatch &&
                         (batch.lanternGlowHint ||
@@ -1089,33 +1179,75 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                         // Generate glow sprites for each instance in the group
                         for (size_t j = lodIdx; j < lodEnd; j++) {
                             auto& inst = instances[pending[j].instanceIdx];
-                            float distSq = sortedVisible_[visStart].distSq; // approximate with group
-                            if (distSq < 180.0f * 180.0f) {
-                                glm::vec3 worldPos = glm::vec3(inst.modelMatrix * glm::vec4(batch.center, 1.0f));
-                                GlowSprite gs;
-                                gs.worldPos = worldPos;
-                                if (batch.glowTint == 1 || model.isElvenLike)
-                                    gs.color = glm::vec4(0.48f, 0.72f, 1.0f, 1.05f);
-                                else if (batch.glowTint == 2)
-                                    gs.color = glm::vec4(1.0f, 0.28f, 0.22f, 1.10f);
-                                else
-                                    gs.color = glm::vec4(1.0f, 0.82f, 0.46f, 1.15f);
-                                gs.size = batch.glowSize * inst.scale * 1.45f;
-                                glowSprites_.push_back(gs);
-                                GlowSprite halo = gs;
-                                halo.color.a *= 0.42f;
-                                halo.size *= 1.8f;
-                                glowSprites_.push_back(halo);
+                            glm::vec3 worldPos;
+                            if (model.isGroundFire &&
+                                !model.particleEmitters.empty()) {
+                                worldPos = glm::vec3(std::numeric_limits<float>::max());
+                                for (const auto& emitter : model.particleEmitters) {
+                                    glm::mat4 boneXform(1.0f);
+                                    if (emitter.bone < inst.boneMatrices.size()) {
+                                        boneXform = inst.boneMatrices[emitter.bone];
+                                    }
+                                    const glm::vec3 emitterWorld = glm::vec3(
+                                        inst.modelMatrix * boneXform * glm::vec4(emitter.position, 1.0f));
+                                    if (emitterWorld.z < worldPos.z) worldPos = emitterWorld;
+                                }
+                            } else {
+                                worldPos = glm::vec3(inst.modelMatrix *
+                                                     glm::vec4(batch.center, 1.0f));
                             }
+                            // Preserved emissive glass writes opaque depth before
+                            // this additive point sprite. Move only the visual
+                            // halo just beyond the camera-facing glass surface so
+                            // depth testing does not reject it; the associated
+                            // local light remains at the true batch center.
+                            if (batch.preserveGlowMesh) {
+                                const glm::vec3 towardCamera = camPos - worldPos;
+                                const float lenSq = glm::dot(towardCamera, towardCamera);
+                                if (lenSq > 0.0001f) {
+                                    worldPos += towardCamera * glm::inversesqrt(lenSq) *
+                                        (batch.glowSize * inst.scale * 1.25f);
+                                }
+                            }
+                            GlowSprite gs;
+                            gs.worldPos = worldPos;
+                            if (batch.glowTint == 1 || model.isElvenLike)
+                                gs.color = glm::vec4(0.48f, 0.72f, 1.0f, 1.05f);
+                            else if (batch.glowTint == 2)
+                                gs.color = glm::vec4(1.0f, 0.28f, 0.22f, 1.10f);
+                            else
+                                gs.color = glm::vec4(1.0f, 0.82f, 0.46f, 1.15f);
+                            // Match the parent M2's distance fade instead of a separate
+                            // hard 180-unit cutoff, which made tunnel lights pop on.
+                            gs.color.a *= pending[j].fadeAlpha;
+                            gs.size = batch.glowSize * inst.scale *
+                                (batch.preserveGlowMesh ? 2.0f : 1.45f);
+                            if (batch.preserveGlowMesh) gs.color.a *= 1.25f;
+                            glowSprites_.push_back(gs);
+                            GlowSprite halo = gs;
+                            halo.color.a *= batch.preserveGlowMesh ? 0.34f : 0.42f;
+                            halo.size *= batch.preserveGlowMesh ? 2.2f : 1.8f;
+                            glowSprites_.push_back(halo);
                         }
                         const bool cardLikeSkipMesh =
-                            (batch.blendMode >= 3) || batch.colorKeyBlack || batchUnlit;
+                            !batch.preserveGlowMesh &&
+                            (batch.glowCardLike || (batch.blendMode >= 3) ||
+                             batch.colorKeyBlack || batchUnlit);
                         const bool lanternGlowCardSkip =
-                            model.isLanternLike && batch.lanternGlowHint &&
+                            (model.isLanternLike || model.isTorch || model.isBrazierOrFire) &&
+                            batch.lanternGlowHint &&
                             smallCardLikeBatch && cardLikeSkipMesh;
                         if (lanternGlowCardSkip || (cardLikeSkipMesh && !model.isLanternLike))
                             continue;
                     }
+
+                    // Opaque gate — transparent glow cards were handled above so their
+                    // sprites are generated before the mesh moves to pass 2.
+                    const bool rawTransparent = (batch.blendMode >= 2) || model.isSpellEffect;
+                    if (rawTransparent) continue;
+
+                    // Particle-dominant effects: emission geometry — skip opaque
+                    if (particleDominantEffect && batch.blendMode <= 1) continue;
 
                     // Handle texture animation: if this batch has per-instance uvOffset,
                     // write a separate SSBO range with the correct offsets.
@@ -1125,7 +1257,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     if (hasBatchTexAnim && instanceDataCount_ + groupSize <= MAX_INSTANCE_DATA) {
                         drawOffset = instanceDataCount_;
                         // Hoist per-batch lookups: the transform pointer is fixed for
-                        // every instance in this group; only the interpVec3 result
+                        // every instance in this group; only the sampled translation
                         // varies (per-instance animTime).
                         const pipeline::M2TextureTransform* tt = nullptr;
                         if (batch.textureAnimIndex != 0xFFFF && model.hasTextureAnimation) {
@@ -1138,22 +1270,31 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                             }
                         }
                         for (size_t j = lodIdx; j < lodEnd; j++) {
-                            auto& inst = instances[pending[j].instanceIdx];
+                            const auto& p = pending[j];
+                            auto& inst = instances[p.instanceIdx];
                             glm::vec2 uvOffset(0.0f);
                             if (tt) {
-                                glm::vec3 trans = interpVec3(tt->translation,
-                                    inst.currentSequenceIndex, inst.animTime,
-                                    glm::vec3(0.0f), model.globalSequenceDurations);
+                                glm::vec3 trans = m2_track::sampleVec3(
+                                    tt->translation, inst.currentSequenceIndex,
+                                    inst.animTime, inst.globalSequenceTime,
+                                    model.globalSequenceDurations, glm::vec3(0.0f));
                                 uvOffset = glm::vec2(trans.x, trans.y);
                             }
                             if (model.isLavaModel && uvOffset == glm::vec2(0.0f)) {
-                                float t = std::chrono::duration<float>(
-                                    std::chrono::steady_clock::now() - kLavaAnimStart).count();
-                                uvOffset = glm::vec2(t * 0.03f, -t * 0.08f);
+                                uvOffset = glm::vec2(lavaAnimSeconds * 0.03f,
+                                                     -lavaAnimSeconds * 0.08f);
                             }
-                            // Copy base entry and override uvOffset
-                            instSSBO[instanceDataCount_] = instSSBO[groupSSBOOffset + (j - lodIdx)];
-                            instSSBO[instanceDataCount_].uvOffset = uvOffset;
+                            // Rebuild the entry from CPU-side data rather than copying it
+                            // out of the base entry. instSSBO lives in write-combined
+                            // upload memory: writing it is cheap, but reading it back is
+                            // uncached and costs microseconds per instance.
+                            auto& e = instSSBO[instanceDataCount_];
+                            e.model = inst.modelMatrix;
+                            e.uvOffset = uvOffset;
+                            e.fadeAlpha = p.fadeAlpha;
+                            e.useBones = p.useBones ? 1 : 0;
+                            e.boneBase = p.useBones ? static_cast<int32_t>(inst.megaBoneOffset) : 0;
+                            std::memset(e._pad, 0, sizeof(e._pad));
                             instanceDataCount_++;
                         }
                     }
@@ -1216,7 +1357,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     // Push constants + instanced draw
                     M2PushConstants pc;
                     pc.texCoordSet = static_cast<int32_t>(batch.textureUnit);
-                    pc.isFoliage = model.shadowWindFoliage ? 1 : 0;
+                    pc.isFoliage = skyMode_ ? -1 : (model.shadowWindFoliage ? 1 : 0);
                     pc.instanceDataOffset = static_cast<int32_t>(drawOffset);
                     vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
                     vkCmdDrawIndexed(cmd, batch.indexCount, groupSize, batch.indexStart, 0, 0);
@@ -1236,7 +1377,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     // Transparent geometry must be drawn individually per instance in back-to-
     // front order for correct alpha compositing.  Each draw writes one
     // M2InstanceGPU entry and issues a single-instance indexed draw.
-    std::sort(sortedVisible_.begin(), sortedVisible_.end(),
+    std::sort(transparentVisible_.begin(), transparentVisible_.end(),
               [](const VisibleEntry& a, const VisibleEntry& b) { return a.distSq > b.distSq; });
 
     currentModelId = UINT32_MAX;
@@ -1245,7 +1386,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
     currentPipeline = opaquePipeline_;
     currentMaterialSet = VK_NULL_HANDLE;
 
-    for (const auto& entry : sortedVisible_) {
+    for (const auto& entry : transparentVisible_) {
         if (entry.index >= instances.size()) continue;
         auto& instance = instances[entry.index];
 
@@ -1257,6 +1398,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
             currentModelValid = false;
             currentModel = instance.cachedModel;
             if (!currentModel) continue;
+            if (currentModel->isInstancePortal) continue;
             if (!currentModel->hasTransparentBatches && !currentModel->isSpellEffect) continue;
             if (!currentModel->vertexBuffer || !currentModel->indexBuffer) continue;
             currentModelValid = true;
@@ -1278,7 +1420,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
         }
         float instanceFadeAlpha = fadeAlpha;
         if (model.isGroundDetail) instanceFadeAlpha *= 0.82f;
-        if (model.isInstancePortal) instanceFadeAlpha *= 0.12f;
+        if (model.isInstancePortal) instanceFadeAlpha *= 0.72f;
 
         bool modelNeedsAnimation = model.hasAnimation && !model.disableAnimation;
         if (modelNeedsAnimation && instance.boneMatrices.empty()) continue;
@@ -1314,15 +1456,19 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                 (batch.lanternGlowHint && batch.glowSize <= 6.0f);
             const bool shouldUseGlowSprite =
                 !koboldFlameCard &&
-                (model.isElvenLike || model.isLanternLike) &&
+                (model.isElvenLike ||
+                 ((model.isLanternLike || model.isTorch || model.isBrazierOrFire) &&
+                  batch.lanternGlowHint)) &&
                 !model.isSpellEffect &&
                 smallCardLikeBatch &&
                 (batch.lanternGlowHint || (batch.blendMode >= 3) ||
                  (batch.colorKeyBlack && batchUnlit && batch.blendMode >= 1));
             if (shouldUseGlowSprite) {
-                const bool cardLikeSkipMesh = (batch.blendMode >= 3) || batch.colorKeyBlack || batchUnlit;
+                const bool cardLikeSkipMesh = !batch.preserveGlowMesh &&
+                    (batch.glowCardLike || (batch.blendMode >= 3) ||
+                     batch.colorKeyBlack || batchUnlit);
                 const bool lanternGlowCardSkip =
-                    model.isLanternLike &&
+                    (model.isLanternLike || model.isTorch || model.isBrazierOrFire) &&
                     batch.lanternGlowHint &&
                     smallCardLikeBatch &&
                     cardLikeSkipMesh;
@@ -1340,16 +1486,17 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     uint16_t transformIdx = model.textureTransformLookup[lookupIdx];
                     if (transformIdx < model.textureTransforms.size()) {
                         const auto& tt = model.textureTransforms[transformIdx];
-                        glm::vec3 trans = interpVec3(tt.translation,
-                            instance.currentSequenceIndex, instance.animTime,
-                            glm::vec3(0.0f), model.globalSequenceDurations);
+                        glm::vec3 trans = m2_track::sampleVec3(
+                            tt.translation, instance.currentSequenceIndex,
+                            instance.animTime, instance.globalSequenceTime,
+                            model.globalSequenceDurations, glm::vec3(0.0f));
                         uvOffset = glm::vec2(trans.x, trans.y);
                     }
                 }
             }
             if (model.isLavaModel && uvOffset == glm::vec2(0.0f)) {
-                float t = std::chrono::duration<float>(std::chrono::steady_clock::now() - kLavaAnimStart).count();
-                uvOffset = glm::vec2(t * 0.03f, -t * 0.08f);
+                uvOffset = glm::vec2(lavaAnimSeconds * 0.03f,
+                                     -lavaAnimSeconds * 0.08f);
             }
 
             // Write single instance entry to SSBO
@@ -1398,7 +1545,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
             // Push constants + single-instance draw
             M2PushConstants pc;
             pc.texCoordSet = static_cast<int32_t>(batch.textureUnit);
-            pc.isFoliage = model.shadowWindFoliage ? 1 : 0;
+            pc.isFoliage = skyMode_ ? -1 : (model.shadowWindFoliage ? 1 : 0);
             pc.instanceDataOffset = static_cast<int32_t>(drawOffset);
             vkCmdPushConstants(cmd, pipelineLayout_, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(pc), &pc);
             vkCmdDrawIndexed(cmd, batch.indexCount, 1, batch.indexStart, 0, 0);
@@ -1625,8 +1772,6 @@ void M2Renderer::renderShadow(VkCommandBuffer cmd, const glm::mat4& lightSpaceMa
     if (!shadowPipeline_ || !shadowParamsSet_) return;
     if (instances.empty() || models.empty()) return;
 
-    const float shadowRadiusSq = shadowRadius * shadowRadius;
-
     // Reset this frame slot's texture descriptor pool (safe: fence was waited on in beginFrame)
     const uint32_t frameIdx = vkCtx_->getCurrentFrame();
     VkDescriptorPool curShadowTexPool = shadowTexPool_[frameIdx];
@@ -1705,12 +1850,24 @@ void M2Renderer::renderShadow(VkCommandBuffer cmd, const glm::mat4& lightSpaceMa
             // Use cached flags to skip early without hash lookup
             if (!instance.cachedIsValid || instance.cachedIsSmoke || instance.cachedIsInvisibleTrap) continue;
 
-            // Distance cull against shadow frustum
-            glm::vec3 diff = instance.position - shadowCenter;
-            if (glm::dot(diff, diff) > shadowRadiusSq) continue;
-
             if (!instance.cachedModel) continue;
             const M2ModelGPU& model = *instance.cachedModel;
+
+            // Cull casters against the light-space ortho footprint, not a
+            // world-space sphere around the player. The shadow frustum extends
+            // ~2000 units toward the sun, so a distant tree can legitimately
+            // cast across the whole view while sitting far outside any player
+            // sphere — sphere culling made such shadows pop on/off at the cull
+            // boundary as the player moved (large-area flicker at low sun).
+            {
+                const glm::vec4 clip = lightSpaceMatrix * glm::vec4(instance.position, 1.0f);
+                // Orthographic projection: w == 1, NDC directly comparable.
+                // Inflate by the model's bounding sphere converted to NDC
+                // (shadowRadius ≈ frustum half-extent; overshoot is harmless).
+                const float margin = (model.boundRadius * instance.scale) / shadowRadius * 1.5f;
+                if (std::abs(clip.x) > 1.0f + margin || std::abs(clip.y) > 1.0f + margin) continue;
+                if (clip.z < -margin || clip.z > 1.0f + margin) continue;
+            }
 
             // Filter: only draw foliage models in foliage pass, non-foliage in non-foliage pass
             if (model.shadowWindFoliage != foliagePass) continue;

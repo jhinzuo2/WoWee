@@ -159,9 +159,9 @@ private:
     void updateNonPlayerTransportAttachment(const UpdateBlock& block,
                                             const std::shared_ptr<Entity>& entity,
                                             ObjectType entityType);
-    // Rebuild playerAuras_ from UNIT_FIELD_AURAS (Classic/vanilla only).
+    // Rebuild playerAuras_ from UNIT_FIELD_AURAS (Classic/TBC-era clients).
     //     Consolidates identical logic from CREATE and VALUES handlers.
-    void syncClassicAurasFromFields(const std::shared_ptr<Entity>& entity);
+    void syncPreWotlkAurasFromFields(const std::shared_ptr<Entity>& entity);
     // Detect mount/dismount from UNIT_FIELD_MOUNTDISPLAYID changes (self-player only).
     //     Consolidates identical logic from CREATE and VALUES handlers.
     void detectPlayerMountChange(uint32_t newMountDisplayId,
@@ -173,7 +173,7 @@ private:
     // Cached field indices resolved once per handler call to avoid repeated lookups.
     struct UnitFieldIndices {
         uint16_t health, maxHealth, powerBase, maxPowerBase;
-        uint16_t level, faction, flags, dynFlags;
+        uint16_t level, faction, flags, dynFlags, auraState;
         uint16_t displayId, mountDisplayId, npcFlags, npcEmoteState;
         uint16_t bytes0, bytes1;
         static UnitFieldIndices resolve();
@@ -196,6 +196,9 @@ private:
         bool displayIdChanged = false;
         bool npcDeathNotified = false;
         bool npcRespawnNotified = false;
+        // Set when UNIT_DYNFLAG_LOOTABLE went away this update — the corpse has
+        // been looted empty. Acted on after the field loop, never inside it.
+        bool lootableCleared = false;
         uint32_t oldDisplayId = 0;
     };
 

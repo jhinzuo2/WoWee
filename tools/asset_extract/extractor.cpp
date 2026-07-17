@@ -122,7 +122,8 @@ static std::set<uint32_t> detectStringColumns(const DBCFile& dbc,
 
     auto boundaries = computeStringBoundaries(stringBlock);
 
-    for (uint32_t col = 0; col < fieldCount; ++col) {
+    // Field 0 is always the numeric record ID — skip it.
+    for (uint32_t col = 1; col < fieldCount; ++col) {
         bool allZeroOrValid = true;
         bool hasNonZero = false;
         std::set<std::string> distinctStrings;
@@ -135,17 +136,12 @@ static std::set<uint32_t> detectStringColumns(const DBCFile& dbc,
                 allZeroOrValid = false;
                 break;
             }
-            // Collect distinct non-empty strings for diversity check.
             const char* s = reinterpret_cast<const char*>(stringBlock.data() + val);
             if (*s != '\0') {
                 distinctStrings.insert(std::string(s, strnlen(s, 256)));
             }
         }
 
-        // Require at least 2 distinct non-empty string values.  Columns that
-        // only ever point to a single string (e.g. SexID=1 always resolves to
-        // the same path fragment at offset 1 in the block) are almost certainly
-        // integer fields whose small values accidentally land at a string boundary.
         if (allZeroOrValid && hasNonZero && distinctStrings.size() >= 2) {
             cols.insert(col);
         }
@@ -232,6 +228,8 @@ static std::vector<std::string> getUsedDbcNamesForExpansion(const std::string& e
         "CharSections",
         "CharHairGeosets",
         "CharacterFacialHairStyles",
+        "BarberShopStyle",
+        "gtBarberShopCostBase",
         "CreatureDisplayInfo",
         "CreatureDisplayInfoExtra",
         "CreatureModelData",
@@ -370,16 +368,41 @@ static const std::vector<std::string> kKnownLocales = {
     "ruRU", "koKR", "zhCN", "zhTW", "ptBR"
 };
 
+static bool hasFileCaseInsensitive(const fs::path& directory,
+                                   const std::string& expectedName) {
+    std::error_code ec;
+    if (!fs::is_directory(directory, ec)) return false;
+    const std::string expected = toLowerStr(expectedName);
+    for (const auto& entry : fs::directory_iterator(directory, ec)) {
+        if (ec) break;
+        if (entry.is_regular_file() &&
+            toLowerStr(entry.path().filename().string()) == expected) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::string Extractor::detectExpansion(const std::string& mpqDir) {
-    if (fs::exists(mpqDir + "/lichking.MPQ"))
+    if (hasFileCaseInsensitive(mpqDir, "lichking.mpq"))
         return "wotlk";
-    if (fs::exists(mpqDir + "/expansion.MPQ"))
+    if (hasFileCaseInsensitive(mpqDir, "expansion.mpq"))
         return "tbc";
-    // Turtle WoW typically uses vanilla-era base MPQs plus letter patch MPQs (patch-a.mpq ... patch-z.mpq).
-    if (fs::exists(mpqDir + "/dbc.MPQ") || fs::exists(mpqDir + "/terrain.MPQ")) {
+    // Turtle WoW uses vanilla-era base MPQs, so detect its executable and its
+    // custom high-numbered/letter patch archives before falling back to Classic.
+    if (hasFileCaseInsensitive(mpqDir, "dbc.mpq") ||
+        hasFileCaseInsensitive(mpqDir, "terrain.mpq")) {
+        const fs::path clientRoot = fs::path(mpqDir).parent_path();
+        if (hasFileCaseInsensitive(clientRoot, "TurtleWoW.exe")) return "turtle";
+        for (int patch = 8; patch <= 9; ++patch) {
+            if (hasFileCaseInsensitive(mpqDir,
+                                       "patch-" + std::to_string(patch) + ".mpq")) {
+                return "turtle";
+            }
+        }
         for (char c = 'a'; c <= 'z'; ++c) {
-            if (fs::exists(mpqDir + std::string("/patch-") + c + ".mpq") ||
-                fs::exists(mpqDir + std::string("/Patch-") + static_cast<char>(std::toupper(c)) + ".mpq")) {
+            if (hasFileCaseInsensitive(mpqDir,
+                                       std::string("patch-") + c + ".mpq")) {
                 return "turtle";
             }
         }
@@ -640,7 +663,9 @@ bool Extractor::enumerateFiles(const Options& opts,
 bool Extractor::run(const Options& opts) {
     auto startTime = std::chrono::steady_clock::now();
 
-    const std::string effectiveOutputDir = opts.outputDir;
+    const std::string effectiveOutputDir = opts.expansionSubdir
+        ? (fs::path(opts.outputDir) / "expansions" / opts.expansion).string()
+        : opts.outputDir;
 
     // Enumerate all unique files across all archives
     std::vector<std::string> files;
@@ -1024,11 +1049,29 @@ bool Extractor::run(const Options& opts) {
             for (const char* name : exeNames) {
                 auto src = fs::path(dir) / name;
                 if (fs::exists(src)) {
-                    auto dstDir = fs::path(opts.outputDir) / "misc";
+                    // Keep each client's executable beside its isolated manifest.
+                    // Warden integrity checks must never use a WoW.exe cached by a
+                    // later extraction from another expansion.
+                    auto dstDir = fs::path(effectiveOutputDir) / "misc";
                     fs::create_directories(dstDir);
-                    auto dst = dstDir / "WoW.exe";
+                    auto dst = dstDir / name;
                     fs::copy_file(src, dst, fs::copy_options::overwrite_existing);
                     std::cout << "Cached " << name << " -> " << dst.string() << "\n";
+
+                    // Legacy auth integrity hashes include companion DLLs. Keep
+                    // them with the executable so Classic and Turtle servers can
+                    // validate the exact distribution that was extracted.
+                    for (const char* companion : {
+                            "fmod.dll", "ijl15.dll", "dbghelp.dll", "unicows.dll",
+                            "twloader.dll", "twdiscord.dll"}) {
+                        const auto companionSrc = fs::path(dir) / companion;
+                        if (!fs::exists(companionSrc)) continue;
+                        const auto companionDst = dstDir / companion;
+                        fs::copy_file(companionSrc, companionDst,
+                                      fs::copy_options::overwrite_existing);
+                        std::cout << "Cached " << companion << " -> "
+                                  << companionDst.string() << "\n";
+                    }
                     found = true;
                     break;
                 }

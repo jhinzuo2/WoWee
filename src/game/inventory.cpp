@@ -73,6 +73,16 @@ void Inventory::setBagSize(int bagIndex, int size) {
     bags[bagIndex].size = std::min(size, MAX_BAG_SIZE);
 }
 
+bool Inventory::isBagSpecial(int bagIndex) const {
+    if (bagIndex < 0 || bagIndex >= NUM_BAG_SLOTS) return false;
+    return bags[bagIndex].special;
+}
+
+void Inventory::setBagSpecial(int bagIndex, bool special) {
+    if (bagIndex < 0 || bagIndex >= NUM_BAG_SLOTS) return;
+    bags[bagIndex].special = special;
+}
+
 const ItemSlot& Inventory::getBagSlot(int bagIndex, int slotIndex) const {
     if (bagIndex < 0 || bagIndex >= NUM_BAG_SLOTS) return EMPTY_SLOT;
     if (slotIndex < 0 || slotIndex >= bags[bagIndex].size) return EMPTY_SLOT;
@@ -196,6 +206,7 @@ void Inventory::sortBags() {
             items.push_back(backpack[i].item);
     }
     for (int b = 0; b < NUM_BAG_SLOTS; ++b) {
+        if (bags[b].special) continue;  // Quivers etc. keep their contents in place
         for (int s = 0; s < bags[b].size; ++s) {
             if (!bags[b].slots[s].empty())
                 items.push_back(bags[b].slots[s].item);
@@ -219,6 +230,7 @@ void Inventory::sortBags() {
         backpack[i].item = (idx < n) ? items[idx++] : ItemDef{};
 
     for (int b = 0; b < NUM_BAG_SLOTS; ++b) {
+        if (bags[b].special) continue;
         for (int s = 0; s < bags[b].size; ++s)
             bags[b].slots[s].item = (idx < n) ? items[idx++] : ItemDef{};
     }
@@ -244,6 +256,7 @@ std::vector<Inventory::SwapOp> Inventory::computeSortSwaps() const {
                            backpack[i].item.stackCount});
     }
     for (int b = 0; b < NUM_BAG_SLOTS; ++b) {
+        if (bags[b].special) continue;  // must match sortBags(): never touch restricted bags
         for (int s = 0; s < bags[b].size; ++s) {
             entries.push_back({static_cast<uint8_t>(FIRST_BAG_EQUIP_SLOT + b), static_cast<uint8_t>(s),
                                bags[b].slots[s].item.itemId, bags[b].slots[s].item.quality,

@@ -22,6 +22,7 @@
 #include <imgui.h>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace wowee {
 namespace core { class AppearanceComposer; }
@@ -59,6 +60,8 @@ public:
     void setServices(const UIServices& services);
 
 private:
+    void applyCameraControlSettings();
+
     // Injected UI services (Section 3.5 Phase B - replaces getInstance() calls)
     UIServices services_;
     // Legacy pointer for Phase A compatibility (will be removed when all callsites migrate)
@@ -111,6 +114,8 @@ private:
     ImVec2 questTrackerSize_ = ImVec2(220.0f, 200.0f); // saved size
     float questTrackerRightOffset_ = -1.0f;            // pixels from right edge; <0 = use default
     bool questTrackerPosInit_ = false;
+    int questTrackerFilter_ = 0;                        // 0=All, 1=Active, 2=Done
+    bool questTrackerCollapsed_ = false;                // collapsed to floating bubble
 
 
 
@@ -161,6 +166,8 @@ private:
     void renderUIErrors(game::GameHandler& gameHandler, float deltaTime);
     void renderQuestMarkers(game::GameHandler& gameHandler);
     void renderMinimapMarkers(game::GameHandler& gameHandler);
+    void refreshQuestObjectiveCache(game::GameHandler& gameHandler);
+    void renderMicroMenu(game::GameHandler& gameHandler);
     void renderQuestObjectiveTracker(game::GameHandler& gameHandler);
     void renderNameplates(game::GameHandler& gameHandler);
     void renderDurabilityWarning(game::GameHandler& gameHandler);
@@ -182,10 +189,15 @@ private:
     std::unordered_map<uint32_t, VkDescriptorSet> spellIconCache_;
     // SpellIconID -> icon path (from SpellIcon.dbc)
     std::unordered_map<uint32_t, std::string> spellIconPaths_;
-    // SpellID -> SpellIconID (from Spell.dbc field 133)
+    // SpellID -> SpellIconID (from the active expansion's Spell.dbc layout)
     std::unordered_map<uint32_t, uint32_t> spellIconIds_;
     bool spellIconDbLoaded_ = false;
     VkDescriptorSet getSpellIcon(uint32_t spellId, pipeline::AssetManager* am);
+
+    // Minimap quest-objective cache, rebuilt only when tracked quest progress changes.
+    uint64_t minimapQuestCacheSignature_ = 0;
+    std::unordered_set<uint32_t> minimapQuestCreatureEntries_;
+    std::unordered_set<uint32_t> minimapQuestGameObjectEntries_;
 
     // Death Knight rune bar: client-predicted fill (0.0=depleted, 1.0=ready) for smooth animation
     float runeClientFill_[6] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};

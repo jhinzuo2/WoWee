@@ -49,27 +49,15 @@
 #include <cctype>
 #include <chrono>
 #include <ctime>
+#include <limits>
 
 #include <unordered_set>
 
 namespace {
     using namespace wowee::ui::colors;
     using namespace wowee::ui::helpers;
-    constexpr auto& kColorRed        = kRed;
     constexpr auto& kColorGreen      = kGreen;
-    constexpr auto& kColorBrightGreen= kBrightGreen;
-    constexpr auto& kColorYellow     = kYellow;
     constexpr auto& kColorGray       = kGray;
-    constexpr auto& kColorDarkGray   = kDarkGray;
-
-    // Abbreviated month names (indexed 0-11)
-    constexpr const char* kMonthAbbrev[12] = {
-        "Jan","Feb","Mar","Apr","May","Jun",
-        "Jul","Aug","Sep","Oct","Nov","Dec"
-    };
-
-    // Common ImGui window flags for popup dialogs
-    const ImGuiWindowFlags kDialogFlags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize;
 
     bool raySphereIntersect(const wowee::rendering::Ray& ray, const glm::vec3& center, float radius, float& tOut) {
         glm::vec3 oc = ray.origin - center;
@@ -120,14 +108,16 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
     if (assetManager) {
         displayInfoDbc = assetManager->loadDBC("ItemDisplayInfo.dbc");
     }
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    const uint32_t geosetGroup1Field = idiL ? (*idiL)["GeosetGroup1"] : 7;
+    const uint32_t geosetGroup3Field = idiL ? (*idiL)["GeosetGroup3"] : 9;
 
-    // Helper: get geosetGroup field for an equipped item's displayInfoId
-    // DBC binary fields: 7=geosetGroup_1, 8=geosetGroup_2, 9=geosetGroup_3
-    auto getGeosetGroup = [&](uint32_t displayInfoId, int groupField) -> uint32_t {
+    auto getGeosetGroup = [&](uint32_t displayInfoId, uint32_t fieldIdx) -> uint32_t {
         if (!displayInfoDbc || displayInfoId == 0) return 0;
         int32_t recIdx = displayInfoDbc->findRecordById(displayInfoId);
         if (recIdx < 0) return 0;
-        return displayInfoDbc->getUInt32(static_cast<uint32_t>(recIdx), 7 + groupField);
+        return displayInfoDbc->getUInt32(static_cast<uint32_t>(recIdx), fieldIdx);
     };
 
     // Helper: find first equipped item matching inventoryType, return its displayInfoId
@@ -157,27 +147,64 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
         return false;
     };
 
-    // Base geosets always present (group 0: IDs 0-99, some models use up to 27)
     std::unordered_set<uint16_t> geosets;
-    for (uint16_t i = 0; i <= 99; i++) {
-        geosets.insert(i);
-    }
-    // Hair/facial geosets must match the active character's appearance, otherwise
-    // we end up forcing a default hair mesh (often perceived as "wrong hair").
-    {
-        uint8_t hairStyleId = 0;
-        uint8_t facialId = 0;
+    if (appearanceComposer_) {
         if (auto* gh = app.getGameHandler()) {
             if (const auto* ch = gh->getActiveCharacter()) {
-                hairStyleId = static_cast<uint8_t>((ch->appearanceBytes >> 16) & 0xFF);
-                facialId = ch->facialFeatures;
+                const uint8_t raceId = static_cast<uint8_t>(ch->race);
+                const uint8_t sexId = static_cast<uint8_t>(ch->gender);
+                const uint8_t hairStyleId = static_cast<uint8_t>((ch->appearanceBytes >> 16) & 0xFF);
+                const uint8_t facialId = ch->facialFeatures;
+                geosets = appearanceComposer_->buildDefaultPlayerGeosets(raceId, sexId, hairStyleId, facialId);
             }
         }
-        geosets.insert(static_cast<uint16_t>(100 + hairStyleId + 1)); // Group 1 hair
-        geosets.insert(static_cast<uint16_t>(200 + facialId + 1));    // Group 2 facial
     }
-    geosets.insert(702);  // Ears: visible (default)
-    geosets.insert(2002); // Bare feet mesh (group 20 = CG_FEET, always on)
+    if (geosets.empty()) {
+        geosets.insert(0);
+        geosets.insert(101);
+        geosets.insert(201);
+        geosets.insert(301);
+        geosets.insert(702);
+        geosets.insert(2002);
+    }
+
+    auto eraseGroup = [&](uint16_t group) {
+        for (auto it = geosets.begin(); it != geosets.end();) {
+            if ((*it / 100) == group) it = geosets.erase(it);
+            else ++it;
+        }
+    };
+
+    // Build set of geoset IDs present in the model for validation.
+    // Races like Gnome (no 501) and Tauren (only 505) need fallback.
+    std::unordered_set<uint16_t> modelGeosets;
+    if (const auto* modelData = charRenderer->getInstanceModelData(instanceId)) {
+        for (const auto& batch : modelData->batches) {
+            modelGeosets.insert(batch.submeshId);
+        }
+    }
+
+    auto pickGeoset = [&](uint16_t preferred, uint16_t fallback) -> uint16_t {
+        if (modelGeosets.empty()) return preferred;
+        if (preferred != 0 && modelGeosets.count(preferred) > 0) return preferred;
+        if (fallback != 0 && modelGeosets.count(fallback) > 0) return fallback;
+        return preferred;
+    };
+
+    auto lowestInGroup = [&](uint16_t group) -> uint16_t {
+        uint16_t best = 0;
+        for (uint16_t g : modelGeosets) {
+            if (g / 100 == group && (best == 0 || g < best)) best = g;
+        }
+        return best;
+    };
+
+    eraseGroup(4);
+    eraseGroup(5);
+    eraseGroup(8);
+    eraseGroup(13);
+    eraseGroup(15);
+    eraseGroup(12);
 
     // CharGeosets mapping (verified via vertex bounding boxes):
     //   Group 4 (401+) = GLOVES (forearm area, Z~1.1-1.4)
@@ -189,20 +216,18 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
     //   Group 20 (2002) = FEET
 
     // Gloves: inventoryType 10 → group 4 (forearms)
-    // 401=bare forearms, 402+=glove styles covering forearm
     {
         uint32_t did = findEquippedDisplayId({10});
-        uint32_t gg = getGeosetGroup(did, 0);
-        geosets.insert(static_cast<uint16_t>(gg > 0 ? 401 + gg : 401));
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        geosets.insert(pickGeoset(static_cast<uint16_t>(gg > 0 ? 401 + gg : 401), lowestInGroup(4)));
     }
 
     // Boots: inventoryType 8 → group 5 (shins/lower legs)
-    // 501=narrow bare shin, 502=wider (matches thigh width better). Use 502 as bare default.
-    // When boots equipped, gg selects boot style: 501+gg (gg=1→502, gg=2→503, etc.)
     {
         uint32_t did = findEquippedDisplayId({8});
-        uint32_t gg = getGeosetGroup(did, 0);
-        geosets.insert(static_cast<uint16_t>(gg > 0 ? 501 + gg : 502));
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        uint16_t selectedShin = pickGeoset(static_cast<uint16_t>(gg > 0 ? 501 + gg : core::kGeosetBareShins), lowestInGroup(5));
+        geosets.insert(selectedShin);
     }
 
     // Chest/Shirt: inventoryType 4 (shirt), 5 (chest), 20 (robe)
@@ -210,10 +235,9 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
     // Also controls group 13 (trousers) via GeosetGroup[2] for robes
     {
         uint32_t did = findEquippedDisplayId({4, 5, 20});
-        uint32_t gg = getGeosetGroup(did, 0);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
         geosets.insert(static_cast<uint16_t>(gg > 0 ? 801 + gg : 801));
-        // Robe kilt: GeosetGroup[2] > 0 → show kilt legs (1302+)
-        uint32_t gg3 = getGeosetGroup(did, 2);
+        uint32_t gg3 = getGeosetGroup(did, geosetGroup3Field);
         if (gg3 > 0) {
             geosets.insert(static_cast<uint16_t>(1301 + gg3));
         }
@@ -226,7 +250,7 @@ void GameScreen::updateCharacterGeosets(game::Inventory& inventory) {
     // 1301=bare legs, 1302+=pant/kilt styles
     {
         uint32_t did = findEquippedDisplayId({7});
-        uint32_t gg = getGeosetGroup(did, 0);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
         // Only add if robe hasn't already set a kilt geoset
         if (geosets.count(1302) == 0 && geosets.count(1303) == 0) {
             geosets.insert(static_cast<uint16_t>(gg > 0 ? 1301 + gg : 1301));
@@ -436,14 +460,80 @@ void GameScreen::renderWorldMap(game::GameHandler& gameHandler) {
         wm->setTaxiNodes(std::move(taxiNodes));
     }
 
-    // Quest POI markers on world map (from SMSG_QUEST_POI_QUERY_RESPONSE / gossip POIs)
+    // Quest objective and quest-giver markers on the world map.
     {
         std::vector<rendering::WorldMap::QuestPoi> qpois;
+        const auto& questStatuses = gameHandler.getNpcQuestStatuses();
+        // Add authoritative NPC statuses first. Some servers also emit a
+        // generic POI at the NPC's position; that duplicate is filtered below
+        // so it cannot leave a teal objective circle on a quest giver.
+        for (const auto& [guid, status] : questStatuses) {
+            auto entity = gameHandler.getEntityManager().getEntity(guid);
+            if (!entity || entity->getType() != game::ObjectType::UNIT) continue;
+
+            rendering::WorldMap::QuestPoi qp;
+            qp.wowX = entity->getX();
+            qp.wowY = entity->getY();
+            qp.name = std::static_pointer_cast<game::Unit>(entity)->getName();
+            switch (status) {
+                case game::QuestGiverStatus::AVAILABLE:
+                    qp.kind = rendering::WorldMap::QuestPoi::Kind::AVAILABLE;
+                    break;
+                case game::QuestGiverStatus::AVAILABLE_LOW:
+                    qp.kind = rendering::WorldMap::QuestPoi::Kind::AVAILABLE_LOW;
+                    break;
+                case game::QuestGiverStatus::REWARD:
+                case game::QuestGiverStatus::REWARD_REP:
+                    qp.kind = rendering::WorldMap::QuestPoi::Kind::REWARD;
+                    break;
+                case game::QuestGiverStatus::INCOMPLETE:
+                    qp.kind = rendering::WorldMap::QuestPoi::Kind::INCOMPLETE;
+                    break;
+                default:
+                    continue;
+            }
+            qpois.push_back(std::move(qp));
+        }
+
+        constexpr float kQuestGiverPoiMergeDistance = 15.0f;
+        constexpr float kQuestGiverPoiMergeDistanceSq =
+            kQuestGiverPoiMergeDistance * kQuestGiverPoiMergeDistance;
         for (const auto& poi : gameHandler.getGossipPois()) {
+            // Keep ordinary gossip navigation POIs, but only include quest
+            // objectives/endpoints explicitly enabled from the tracker.
+            if (poi.questObjectiveIndex != -2 &&
+                !gameHandler.isQuestShownOnMap(poi.data)) {
+                continue;
+            }
+            bool duplicatesQuestGiver = false;
+            for (const auto& existing : qpois) {
+                if (existing.kind == rendering::WorldMap::QuestPoi::Kind::OBJECTIVE) continue;
+                const float dx = existing.wowX - poi.x;
+                const float dy = existing.wowY - poi.y;
+                if (dx * dx + dy * dy <= kQuestGiverPoiMergeDistanceSq) {
+                    duplicatesQuestGiver = true;
+                    break;
+                }
+            }
+            if (duplicatesQuestGiver) continue;
+
             rendering::WorldMap::QuestPoi qp;
             qp.wowX = poi.x;
             qp.wowY = poi.y;
             qp.name = poi.name;
+            if (poi.questObjectiveIndex == -1) {
+                // A quest POI with no objective index is the quest endpoint,
+                // not an objective area. Completed quests use a yellow ?,
+                // while in-progress endpoints use a gray ?.
+                qp.kind = rendering::WorldMap::QuestPoi::Kind::INCOMPLETE;
+                for (const auto& quest : gameHandler.getQuestLog()) {
+                    if (quest.questId != poi.data) continue;
+                    if (quest.complete) {
+                        qp.kind = rendering::WorldMap::QuestPoi::Kind::REWARD;
+                    }
+                    break;
+                }
+            }
             qpois.push_back(std::move(qp));
         }
         wm->setQuestPois(std::move(qpois));
@@ -517,21 +607,21 @@ VkDescriptorSet GameScreen::getSpellIcon(uint32_t spellId, pipeline::AssetManage
                 }
             };
 
-            // Use expansion-aware layout if available AND the DBC field count
-            // matches the expansion's expected format.  Classic=173, TBC=216,
-            // WotLK=234 fields.  When Classic is active but the base WotLK DBC
-            // is loaded (234 fields), field 117 is NOT IconID — we must use
-            // the WotLK field 133 instead.
+            // Use the active expansion layout when its fields are present in
+            // the loaded DBC. TBC/WotLK/Classic place IconID in different
+            // columns, so reading the WotLK default for every client leaves
+            // action bars and spell UI without icons.
             uint32_t iconField = 133; // WotLK default
             uint32_t idField = 0;
             if (spellL) {
-                uint32_t layoutIcon = (*spellL)["IconID"];
-                // Only trust the expansion layout if the DBC has a compatible
-                // field count (within ~20 of the layout's icon field).
-                if (layoutIcon < fieldCount && fieldCount <= layoutIcon + 20) {
-                    iconField = layoutIcon;
-                    idField = (*spellL)["ID"];
-                }
+                try {
+                    uint32_t layoutId = (*spellL)["ID"];
+                    uint32_t layoutIcon = (*spellL)["IconID"];
+                    if (layoutId < fieldCount && layoutIcon < fieldCount) {
+                        iconField = layoutIcon;
+                        idField = layoutId;
+                    }
+                } catch (...) {}
             }
             tryLoadIcons(idField, iconField);
         }
@@ -655,17 +745,15 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
 
     constexpr float TRACKER_W = 220.0f;
     constexpr float RIGHT_MARGIN = 10.0f;
-    constexpr int   MAX_QUESTS = 5;
-
     // Build display list: tracked quests only, or all quests if none tracked
     const auto& trackedIds = gameHandler.getTrackedQuestIds();
+    const bool anyTracked = !trackedIds.empty();
     std::vector<const game::GameHandler::QuestLogEntry*> toShow;
-    toShow.reserve(MAX_QUESTS);
-    if (!trackedIds.empty()) {
+    toShow.reserve(questLog.size());
+    if (anyTracked) {
         for (const auto& q : questLog) {
             if (q.questId == 0) continue;
             if (trackedIds.count(q.questId)) toShow.push_back(&q);
-            if (static_cast<int>(toShow.size()) >= MAX_QUESTS) break;
         }
     }
     // Fallback: show all quests if nothing is tracked
@@ -673,10 +761,28 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
         for (const auto& q : questLog) {
             if (q.questId == 0) continue;
             toShow.push_back(&q);
-            if (static_cast<int>(toShow.size()) >= MAX_QUESTS) break;
         }
     }
     if (toShow.empty()) return;
+
+    // Apply completion filter (0=All, 1=Active, 2=Done). Keep the window open
+    // even when the filter hides everything so the user can cycle it back.
+    if (questTrackerFilter_ != 0) {
+        std::erase_if(toShow, [this](const game::GameHandler::QuestLogEntry* q) {
+            return questTrackerFilter_ == 1 ? q->complete : !q->complete;
+        });
+    }
+
+    // Sort lowest level first so stale quests surface at the top;
+    // unknown level (0) and player-scaling (-1) sort last
+    std::stable_sort(toShow.begin(), toShow.end(),
+                     [](const game::GameHandler::QuestLogEntry* a,
+                        const game::GameHandler::QuestLogEntry* b) {
+        const int la = a->level > 0 ? a->level : std::numeric_limits<int>::max();
+        const int lb = b->level > 0 ? b->level : std::numeric_limits<int>::max();
+        if (la != lb) return la < lb;
+        return a->title < b->title;
+    });
 
     float screenH = ImGui::GetIO().DisplaySize.y > 0.0f ? ImGui::GetIO().DisplaySize.y : 720.0f;
 
@@ -691,11 +797,51 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
     // Recompute X from right offset every frame (handles window resize)
     questTrackerPos_.x = screenW - questTrackerRightOffset_;
 
+    // Collapsed: draw a small draggable bubble at the tracker anchor instead;
+    // click (without dragging) to expand back to the full tracker
+    if (questTrackerCollapsed_) {
+        ImGui::SetNextWindowPos(questTrackerPos_, ImGuiCond_Always);
+        ImGuiWindowFlags bubbleFlags = ImGuiWindowFlags_NoTitleBar |
+                                       ImGuiWindowFlags_NoCollapse |
+                                       ImGuiWindowFlags_NoNav |
+                                       ImGuiWindowFlags_NoBringToFrontOnFocus |
+                                       ImGuiWindowFlags_AlwaysAutoResize |
+                                       ImGuiWindowFlags_NoScrollbar;
+        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.55f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(9.0f, 5.0f));
+        if (ImGui::Begin("##QuestTrackerBubble", nullptr, bubbleFlags)) {
+            ImGui::TextColored(colors::kWarmGold, "! %d", static_cast<int>(toShow.size()));
+            if (ImGui::IsWindowHovered()) {
+                ImGui::SetTooltip("Quest tracker — click to expand, drag to move");
+                // Expand on click, but not when the press was a drag
+                if (ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+                    ImGui::GetIO().MouseDragMaxDistanceSqr[ImGuiMouseButton_Left] < 9.0f) {
+                    questTrackerCollapsed_ = false;
+                    saveSettings();
+                }
+            }
+            // Capture drag so the bubble and tracker share one anchor
+            ImVec2 newPos = ImGui::GetWindowPos();
+            newPos.x = std::clamp(newPos.x, 0.0f, screenW - ImGui::GetWindowSize().x);
+            newPos.y = std::clamp(newPos.y, 0.0f, screenH - 40.0f);
+            if (std::abs(newPos.x - questTrackerPos_.x) > 0.5f ||
+                std::abs(newPos.y - questTrackerPos_.y) > 0.5f) {
+                questTrackerPos_ = newPos;
+                questTrackerRightOffset_ = screenW - newPos.x;
+                saveSettings();
+            }
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(2);
+        ImGui::PopStyleColor();
+        return;
+    }
+
     ImGui::SetNextWindowPos(questTrackerPos_, ImGuiCond_Always);
     ImGui::SetNextWindowSize(questTrackerSize_, ImGuiCond_FirstUseEver);
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar |
-                             ImGuiWindowFlags_NoScrollbar |
                              ImGuiWindowFlags_NoCollapse |
                              ImGuiWindowFlags_NoNav |
                              ImGuiWindowFlags_NoBringToFrontOnFocus;
@@ -705,16 +851,63 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
     ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4.0f, 2.0f));
 
     if (ImGui::Begin("##QuestTracker", nullptr, flags)) {
+        // Header row: quest count + completion filter (click to cycle) + hide
+        static const char* kFilterNames[] = {"All", "Active", "Done"};
+        ImGui::TextDisabled("Quests (%d)", static_cast<int>(toShow.size()));
+        {
+            const ImGuiStyle& style = ImGui::GetStyle();
+            float filterW = ImGui::CalcTextSize("Active").x + style.FramePadding.x * 2.0f;
+            float hideW = ImGui::CalcTextSize("-").x + style.FramePadding.x * 2.0f;
+            ImGui::SameLine();
+            float off = ImGui::GetContentRegionAvail().x -
+                        (filterW + style.ItemSpacing.x + hideW);
+            if (off > 0.0f) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + off);
+            if (ImGui::SmallButton(kFilterNames[questTrackerFilter_])) {
+                questTrackerFilter_ = (questTrackerFilter_ + 1) % 3;
+                saveSettings();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Filter: All / Active / Done (click to cycle)");
+            }
+            ImGui::SameLine();
+            if (ImGui::SmallButton("-")) {
+                questTrackerCollapsed_ = true;
+                saveSettings();
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Hide (collapse to bubble)");
+            }
+        }
+        ImGui::Separator();
+        if (toShow.empty()) {
+            ImGui::TextDisabled("%s", questTrackerFilter_ == 1 ? "No active quests"
+                                                               : "No completed quests");
+        }
+
         for (int i = 0; i < static_cast<int>(toShow.size()); ++i) {
             const auto& q = *toShow[i];
 
-            // Clickable quest title — opens quest log
+            // Per-quest map checkbox + clickable title + small [x] untrack button.
             ImGui::PushID(q.questId);
+            bool shownOnMap = gameHandler.isQuestShownOnMap(q.questId);
+            if (ImGui::Checkbox("##ShowOnMap", &shownOnMap)) {
+                gameHandler.setQuestShownOnMap(q.questId, shownOnMap);
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Show this quest's objectives on the minimap and world map");
+            }
+            ImGui::SameLine();
+            float untrackW = ImGui::CalcTextSize("x").x + ImGui::GetStyle().FramePadding.x * 2.0f;
+            float titleW = ImGui::GetContentRegionAvail().x - untrackW -
+                           ImGui::GetStyle().ItemSpacing.x;
             ImVec4 titleCol = q.complete ? colors::kWarmGold
                                          : ImVec4(1.0f, 1.0f, 0.85f, 1.0f);
+            std::string titleLabel = q.level > 0
+                ? "[" + std::to_string(q.level) + "] " + q.title
+                : q.title;
             ImGui::PushStyleColor(ImGuiCol_Text, titleCol);
-            if (ImGui::Selectable(q.title.c_str(), false,
-                                   ImGuiSelectableFlags_DontClosePopups, ImVec2(ImGui::GetContentRegionAvail().x, 0))) {
+            if (ImGui::Selectable(titleLabel.c_str(), false,
+                                   ImGuiSelectableFlags_DontClosePopups, ImVec2(titleW, 0))) {
                 questLogScreen.openAndSelectQuest(q.questId);
             }
             if (ImGui::IsItemHovered() && !ImGui::IsPopupOpen("##QTCtx")) {
@@ -722,12 +915,17 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
             }
             ImGui::PopStyleColor();
 
-            // Right-click context menu for quest tracker entry
+            // Right-click context menu for quest tracker entry (attaches to the
+            // title Selectable — must come before the untrack button below)
             if (ImGui::BeginPopupContextItem("##QTCtx")) {
                 ImGui::TextDisabled("%s", q.title.c_str());
                 ImGui::Separator();
                 if (ImGui::MenuItem("Open in Quest Log")) {
                     questLogScreen.openAndSelectQuest(q.questId);
+                }
+                bool mapVisible = gameHandler.isQuestShownOnMap(q.questId);
+                if (ImGui::MenuItem("Show on Map", nullptr, mapVisible)) {
+                    gameHandler.setQuestShownOnMap(q.questId, !mapVisible);
                 }
                 bool tracked = gameHandler.isQuestTracked(q.questId);
                 if (tracked) {
@@ -748,48 +946,79 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
                     ImGui::Separator();
                     if (ImGui::MenuItem("Abandon Quest")) {
                         gameHandler.abandonQuest(q.questId);
-                        gameHandler.setQuestTracked(q.questId, false);
                     }
                 }
                 ImGui::EndPopup();
             }
+
+            // Untrack button at the end of the title row
+            ImGui::SameLine();
+            if (ImGui::SmallButton("x")) {
+                if (anyTracked) {
+                    gameHandler.setQuestTracked(q.questId, false);
+                } else {
+                    // Nothing explicitly tracked (tracker shows all quests):
+                    // hide this one by tracking every other quest instead
+                    for (const auto& other : questLog) {
+                        if (other.questId != 0 && other.questId != q.questId) {
+                            gameHandler.setQuestTracked(other.questId, true);
+                        }
+                    }
+                }
+            }
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Untrack (remove from tracker)");
+            }
             ImGui::PopID();
 
-            // Objectives line (condensed)
+            // Objectives — every required objective with progress, done ones marked
             if (q.complete) {
-                ImGui::TextColored(colors::kActiveGreen, "  (Complete)");
+                ImGui::TextColored(colors::kActiveGreen, "  Ready to turn in");
             } else {
-                // Kill counts — green when complete, gray when in progress
-                for (const auto& [entry, progress] : q.killCounts) {
-                    bool objDone = (progress.first >= progress.second && progress.second > 0);
-                    ImVec4 objColor = objDone ? kColorGreen
-                                              : ImVec4(0.75f, 0.75f, 0.75f, 1.0f);
+                constexpr ImVec4 kPendingGray(0.75f, 0.75f, 0.75f, 1.0f);
+
+                // Kill/interact objective line — green + "(done)" when finished
+                auto renderKillLine = [&](uint32_t entry, uint32_t count, uint32_t required) {
+                    bool objDone = (required > 0 && count >= required);
+                    ImVec4 objColor = objDone ? kColorGreen : kPendingGray;
                     std::string name = gameHandler.getCachedCreatureName(entry);
                     if (name.empty()) {
                         const auto* goInfo = gameHandler.getCachedGameObjectInfo(entry);
                         if (goInfo && !goInfo->name.empty()) name = goInfo->name;
                     }
                     if (!name.empty()) {
-                        ImGui::TextColored(objColor,
-                                           "  %s: %u/%u", name.c_str(),
-                                           progress.first, progress.second);
+                        ImGui::TextColored(objColor, "  - %s: %u/%u%s", name.c_str(),
+                                           count, required, objDone ? " (done)" : "");
                     } else {
-                        ImGui::TextColored(objColor,
-                                           "  %u/%u", progress.first, progress.second);
+                        ImGui::TextColored(objColor, "  - %u/%u%s",
+                                           count, required, objDone ? " (done)" : "");
                     }
+                };
+                // Quest query data first (covers objectives with no progress yet),
+                // then any progress entries the query didn't know about
+                std::unordered_set<uint32_t> shownKills;
+                for (const auto& obj : q.killObjectives) {
+                    if (obj.npcOrGoId == 0 || obj.required == 0) continue;
+                    uint32_t entry = static_cast<uint32_t>(
+                        obj.npcOrGoId > 0 ? obj.npcOrGoId : -obj.npcOrGoId);
+                    uint32_t count = 0;
+                    auto it = q.killCounts.find(entry);
+                    if (it != q.killCounts.end()) count = it->second.first;
+                    renderKillLine(entry, count, obj.required);
+                    shownKills.insert(entry);
                 }
-                // Item counts — green when complete, gray when in progress
-                for (const auto& [itemId, count] : q.itemCounts) {
-                    uint32_t required = 1;
-                    auto reqIt = q.requiredItemCounts.find(itemId);
-                    if (reqIt != q.requiredItemCounts.end()) required = reqIt->second;
-                    bool objDone = (count >= required);
-                    ImVec4 objColor = objDone ? kColorGreen
-                                              : ImVec4(0.75f, 0.75f, 0.75f, 1.0f);
+                for (const auto& [entry, progress] : q.killCounts) {
+                    if (shownKills.count(entry)) continue;
+                    renderKillLine(entry, progress.first, progress.second);
+                }
+
+                // Item objective line — small icon + name, green + "(done)" when finished
+                auto renderItemLine = [&](uint32_t itemId, uint32_t count, uint32_t required) {
+                    bool objDone = (required > 0 && count >= required);
+                    ImVec4 objColor = objDone ? kColorGreen : kPendingGray;
                     const auto* info = gameHandler.getItemInfo(itemId);
                     const char* itemName = (info && !info->name.empty()) ? info->name.c_str() : nullptr;
 
-                    // Show small icon if available
                     uint32_t dispId = (info && info->displayInfoId) ? info->displayInfoId : 0;
                     VkDescriptorSet iconTex = dispId ? inventoryScreen.getItemIcon(dispId) : VK_NULL_HANDLE;
                     if (iconTex) {
@@ -800,27 +1029,52 @@ void GameScreen::renderQuestObjectiveTracker(game::GameHandler& gameHandler) {
                             ImGui::EndTooltip();
                         }
                         ImGui::SameLine(0, 3);
-                        ImGui::TextColored(objColor,
-                                           "%s: %u/%u", itemName ? itemName : "Item", count, required);
-                        if (info && info->valid && ImGui::IsItemHovered()) {
-                            ImGui::BeginTooltip();
-                            inventoryScreen.renderItemTooltip(*info);
-                            ImGui::EndTooltip();
-                        }
-                    } else if (itemName) {
-                        ImGui::TextColored(objColor,
-                                           "  %s: %u/%u", itemName, count, required);
+                        ImGui::TextColored(objColor, "%s: %u/%u%s",
+                                           itemName ? itemName : "Item",
+                                           count, required, objDone ? " (done)" : "");
                         if (info && info->valid && ImGui::IsItemHovered()) {
                             ImGui::BeginTooltip();
                             inventoryScreen.renderItemTooltip(*info);
                             ImGui::EndTooltip();
                         }
                     } else {
-                        ImGui::TextColored(objColor,
-                                           "  Item: %u/%u", count, required);
+                        ImGui::TextColored(objColor, "  - %s: %u/%u%s",
+                                           itemName ? itemName : "Item",
+                                           count, required, objDone ? " (done)" : "");
+                        if (info && info->valid && ImGui::IsItemHovered()) {
+                            ImGui::BeginTooltip();
+                            inventoryScreen.renderItemTooltip(*info);
+                            ImGui::EndTooltip();
+                        }
                     }
+                };
+                // requiredItemCounts is the authoritative required list (includes
+                // 0-progress items); then show stray progress entries not in it
+                std::unordered_set<uint32_t> shownItems;
+                for (const auto& obj : q.itemObjectives) {
+                    if (obj.itemId == 0 || obj.required == 0) continue;
+                    uint32_t count = 0;
+                    auto it = q.itemCounts.find(obj.itemId);
+                    if (it != q.itemCounts.end()) count = it->second;
+                    renderItemLine(obj.itemId, count, obj.required);
+                    shownItems.insert(obj.itemId);
                 }
-                if (q.killCounts.empty() && q.itemCounts.empty() && !q.objectives.empty()) {
+                for (const auto& [itemId, required] : q.requiredItemCounts) {
+                    if (shownItems.count(itemId)) continue;
+                    uint32_t count = 0;
+                    auto it = q.itemCounts.find(itemId);
+                    if (it != q.itemCounts.end()) count = it->second;
+                    renderItemLine(itemId, count, required);
+                    shownItems.insert(itemId);
+                }
+                for (const auto& [itemId, count] : q.itemCounts) {
+                    if (shownItems.count(itemId)) continue;
+                    renderItemLine(itemId, count, 1);
+                }
+
+                bool hasCounted = !shownKills.empty() || !shownItems.empty() ||
+                                  !q.killCounts.empty() || !q.itemCounts.empty();
+                if (!hasCounted && !q.objectives.empty()) {
                     const std::string& obj = q.objectives;
                     if (obj.size() > 40) {
                         ImGui::TextColored(ImVec4(0.75f, 0.75f, 0.75f, 1.0f),
@@ -891,30 +1145,20 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
     const uint64_t  playerGuid = gameHandler.getPlayerGuid();
     const uint64_t  targetGuid = gameHandler.getTargetGuid();
 
-    // Build set of creature entries that are kill objectives in active (incomplete) quests.
-    std::unordered_set<uint32_t> questKillEntries;
-    {
-        const auto& questLog = gameHandler.getQuestLog();
-        const auto& trackedIds = gameHandler.getTrackedQuestIds();
-        for (const auto& q : questLog) {
-            if (q.complete || q.questId == 0) continue;
-            // Only highlight for tracked quests (or all if nothing tracked).
-            if (!trackedIds.empty() && !trackedIds.count(q.questId)) continue;
-            for (const auto& obj : q.killObjectives) {
-                if (obj.npcOrGoId > 0 && obj.required > 0) {
-                    // Check if not already completed.
-                    auto it = q.killCounts.find(static_cast<uint32_t>(obj.npcOrGoId));
-                    if (it == q.killCounts.end() || it->second.first < it->second.second) {
-                        questKillEntries.insert(static_cast<uint32_t>(obj.npcOrGoId));
-                    }
-                }
-            }
-        }
-    }
+    refreshQuestObjectiveCache(gameHandler);
+    const auto& questKillEntries = minimapQuestCreatureEntries_;
 
     ImDrawList* drawList = ImGui::GetBackgroundDrawList();
+    static thread_local std::vector<std::shared_ptr<game::Entity>> nameplateEntities;
+    glm::vec3 playerCanonical(0.0f);
+    if (auto player = gameHandler.getEntityManager().getEntity(playerGuid))
+        playerCanonical = glm::vec3(player->getX(), player->getY(), player->getZ());
+    gameHandler.getEntityManager().getEntitiesNear(
+        playerCanonical.x, playerCanonical.y, 150.0f, nameplateEntities);
 
-    for (const auto& [guid, entityPtr] : gameHandler.getEntityManager().getEntities()) {
+    for (const auto& entityPtr : nameplateEntities) {
+        if (!entityPtr) continue;
+        const uint64_t guid = entityPtr->getGuid();
         if (!entityPtr || guid == playerGuid) continue;
 
         if (!entityPtr->isUnit()) continue;
@@ -924,9 +1168,11 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
         bool isPlayer = (entityPtr->getType() == game::ObjectType::PLAYER);
         bool isTarget = (guid == targetGuid);
 
-        // Player nameplates use Shift+V toggle; NPC/enemy nameplates use V toggle
-        if (isPlayer && !settingsPanel_.showFriendlyNameplates_) continue;
-        if (!isPlayer && !showNameplates_) continue;
+        // Player nameplates use Shift+V toggle; NPC/enemy nameplates use V toggle.
+        // The current target ALWAYS gets a nameplate so it's clear what is
+        // selected even with nameplates toggled off.
+        if (isPlayer && !settingsPanel_.showFriendlyNameplates_ && !isTarget) continue;
+        if (!isPlayer && !showNameplates_ && !isTarget) continue;
 
         // For corpses (dead units), only show a minimal grey nameplate if selected
         bool isCorpse = (unit->getHealth() == 0);
@@ -941,10 +1187,11 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
         }
         renderPos.z += 2.3f;
 
-        // Cull distance: target or other players up to 40 units; NPC others up to 20 units
+        // Cull distance: the current target stays visible to 60 units so its
+        // bar doesn't vanish at combat range; players 40; other NPCs 20.
         glm::vec3 nameDelta = renderPos - camPos;
         float distSq = glm::dot(nameDelta, nameDelta);
-        float cullDist = (isTarget || isPlayer) ? 40.0f : 20.0f;
+        float cullDist = isTarget ? 60.0f : (isPlayer ? 40.0f : 20.0f);
         if (distSq > cullDist * cullDist) continue;
 
         // Project to clip space
@@ -1315,6 +1562,21 @@ void GameScreen::renderNameplates(game::GameHandler& gameHandler) {
 
         drawList->AddText(ImVec2(nameX + 1.0f, nameY + 1.0f), IM_COL32(0, 0, 0, A(160)), labelBuf);
         drawList->AddText(ImVec2(nameX,         nameY),         nameColor, labelBuf);
+
+        // Gold chevron above the current target's plate — a gently bobbing
+        // down-arrow so the selected enemy is unmistakable at a glance.
+        if (isTarget) {
+            float bob = 2.0f * std::sin(static_cast<float>(ImGui::GetTime()) * 5.0f);
+            float tipY  = nameY - 5.0f + bob;
+            float baseY = tipY - 8.0f;
+            float halfW = 6.0f;
+            drawList->AddTriangleFilled(
+                ImVec2(sx - halfW + 1.0f, baseY + 1.0f), ImVec2(sx + halfW + 1.0f, baseY + 1.0f),
+                ImVec2(sx + 1.0f, tipY + 1.0f), IM_COL32(0, 0, 0, A(140)));
+            drawList->AddTriangleFilled(
+                ImVec2(sx - halfW, baseY), ImVec2(sx + halfW, baseY),
+                ImVec2(sx, tipY), IM_COL32(255, 215, 0, A(240)));
+        }
 
         // Sub-label below the name (WoW-style <Guild Name> or <NPC Title> in lighter color)
         if (!subLabel.empty()) {

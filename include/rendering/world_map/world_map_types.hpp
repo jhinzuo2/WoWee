@@ -123,8 +123,17 @@ struct POI {
 // ── Quest POI marker (from SMSG_QUEST_POI_QUERY_RESPONSE) ────
 
 struct QuestPOI {
+    enum class Kind : uint8_t {
+        OBJECTIVE,
+        AVAILABLE,
+        AVAILABLE_LOW,
+        REWARD,
+        INCOMPLETE,
+    };
+
     float wowX = 0, wowY = 0;  ///< Canonical WoW coordinates (centroid)
     std::string name;           ///< Quest title
+    Kind kind = Kind::OBJECTIVE;
 };
 
 } // namespace world_map

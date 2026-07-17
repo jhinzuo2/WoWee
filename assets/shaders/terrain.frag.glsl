@@ -11,6 +11,9 @@ layout(set = 0, binding = 0) uniform PerFrame {
     vec4 fogColor;
     vec4 fogParams;
     vec4 shadowParams;
+    vec4 localLightPosRadius[64];
+    vec4 localLightColorIntensity[64];
+    ivec4 localLightMeta;
 };
 
 layout(set = 1, binding = 0) uniform sampler2D uBaseTexture;
@@ -47,6 +50,22 @@ float sampleShadowPCF(sampler2DShadow smap, vec3 coords) {
         }
     }
     return shadow / 9.0;
+}
+
+vec3 localLightContribution(vec3 pos, vec3 normal, vec3 albedo) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < min(localLightMeta.x, 64); ++i) {
+        vec3 toLight = localLightPosRadius[i].xyz - pos;
+        float dist = length(toLight);
+        float radius = localLightPosRadius[i].w;
+        if (dist >= radius || radius <= 0.0) continue;
+        float attenuation = 1.0 - dist / radius;
+        attenuation *= attenuation;
+        float wrappedDiffuse = 0.22 + 0.78 * max(dot(normal, toLight / max(dist, 0.001)), 0.0);
+        sum += albedo * localLightColorIntensity[i].rgb *
+               (localLightColorIntensity[i].w * attenuation * wrappedDiffuse);
+    }
+    return sum;
 }
 
 float sampleAlpha(sampler2D tex, vec2 uv) {
@@ -136,6 +155,7 @@ void main() {
     }
 
     vec3 result = ambient + shadow * diffuse;
+    result += localLightContribution(FragPos, norm, finalColor.rgb);
 
     float fogFactor = clamp((fogParams.y - fragDist) / (fogParams.y - fogParams.x), 0.0, 1.0);
     result = mix(fogColor.rgb, result, fogFactor);

@@ -1,6 +1,6 @@
 # Project Status
 
-**Last updated**: 2026-05-14
+**Last updated**: 2026-07-09
 
 ## What This Repo Is
 
@@ -45,6 +45,14 @@ Recent refactors (PRs #59-63, April 2026):
 - Entity movement improvements: multi-segment path interpolation, terrain height clamping, walk/run animation fix
 - 31 unit-test suites (up from 8), covering chat, world map, spline math, transport, and animation systems
 - Code quality fix pass: 7 issues resolved across hover detection, null safety, buffer bounds, and coordinate validation
+
+Recent fixes (July 2026):
+
+- Login pipeline hardened: login-critical opcodes have hardcoded fallback when opcode table lookup fails; OpcodeTable::loadFromJson() is now safe against failed reloads (issue #87)
+- Integrity hash is build-aware: Classic-era DLLs only required for builds <=6005 or Turtle; TBC/WotLK hash only the .exe
+- Strafing reworked: torso-twist via SpineLow bone rotation instead of dedicated strafe animations
+- Camera smoothing snaps 1:1 during active drag/keyboard turn to reduce input lag
+- Mount strafing uses MOUNT_RUN_LEFT/RIGHT when available
 
 In progress / known gaps:
 

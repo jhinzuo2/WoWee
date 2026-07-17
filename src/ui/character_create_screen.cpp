@@ -32,6 +32,30 @@ static constexpr game::Class kAllClasses[] = {
     game::Class::DRUID,
 };
 
+namespace {
+
+uint8_t selectedAppearanceId(const std::vector<uint8_t>& ids, int index) {
+    if (!ids.empty() && index >= 0 && index < static_cast<int>(ids.size())) {
+        return ids[static_cast<size_t>(index)];
+    }
+    return static_cast<uint8_t>(std::max(index, 0));
+}
+
+void sortUnique(std::vector<uint8_t>& ids) {
+    std::sort(ids.begin(), ids.end());
+    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
+}
+
+void useFallbackRange(std::vector<uint8_t>& ids, int maxId) {
+    if (!ids.empty()) return;
+    ids.reserve(static_cast<size_t>(maxId + 1));
+    for (int id = 0; id <= maxId; ++id) {
+        ids.push_back(static_cast<uint8_t>(id));
+    }
+}
+
+} // namespace
+
 
 CharacterCreateScreen::CharacterCreateScreen() {
     reset();
@@ -90,6 +114,7 @@ void CharacterCreateScreen::reset() {
     raceIndex = 0;
     classIndex = 0;
     genderIndex = 0;
+    bodyTypeIndex = 0;
     skin = 0;
     face = 0;
     hairStyle = 0;
@@ -103,7 +128,11 @@ void CharacterCreateScreen::reset() {
     statusMessage.clear();
     statusIsError = false;
     createTimer_ = -1.0f;
+    skinIds_.clear();
+    faceIds_.clear();
+    hairStyleIds_.clear();
     hairColorIds_.clear();
+    facialHairIds_.clear();
 
     // Populate default races if not yet set by setExpansionConstraints
     if (availableRaces_.empty()) {
@@ -116,6 +145,7 @@ void CharacterCreateScreen::reset() {
     // Reset preview tracking to force model reload on next render
     prevRaceIndex_ = -1;
     prevGenderIndex_ = -1;
+    prevBodyTypeIndex_ = -1;
     prevSkin_ = -1;
     prevFace_ = -1;
     prevHairStyle_ = -1;
@@ -123,6 +153,7 @@ void CharacterCreateScreen::reset() {
     prevFacialHair_ = -1;
     prevRangeRace_ = -1;
     prevRangeGender_ = -1;
+    prevRangeBodyType_ = -1;
     prevRangeSkin_ = -1;
     prevRangeHairStyle_ = -1;
 }
@@ -136,6 +167,7 @@ void CharacterCreateScreen::initializePreview(pipeline::AssetManager* am) {
             if (renderer) renderer->registerPreview(preview_.get());
         }
     }
+    if (preview_) preview_->resetView();
     // Force model reload
     prevRaceIndex_ = -1;
 }
@@ -195,20 +227,14 @@ void CharacterCreateScreen::updatePreviewIfNeeded() {
 
     if (changed) {
         bool useFemaleModel = (genderIndex == 2 && bodyTypeIndex == 1);  // Nonbinary + Feminine
-        uint8_t hairColorId = 0;
-        if (!hairColorIds_.empty() && hairColor >= 0 && hairColor < static_cast<int>(hairColorIds_.size())) {
-            hairColorId = hairColorIds_[hairColor];
-        } else {
-            hairColorId = static_cast<uint8_t>(hairColor);
-        }
         preview_->loadCharacter(
             availableRaces_[raceIndex],
             static_cast<game::Gender>(genderIndex),
-            static_cast<uint8_t>(skin),
-            static_cast<uint8_t>(face),
-            static_cast<uint8_t>(hairStyle),
-            hairColorId,
-            static_cast<uint8_t>(facialHair),
+            selectedAppearanceId(skinIds_, skin),
+            selectedAppearanceId(faceIds_, face),
+            selectedAppearanceId(hairStyleIds_, hairStyle),
+            selectedAppearanceId(hairColorIds_, hairColor),
+            selectedAppearanceId(facialHairIds_, facialHair),
             useFemaleModel);
 
         prevRaceIndex_ = raceIndex;
@@ -225,34 +251,33 @@ void CharacterCreateScreen::updatePreviewIfNeeded() {
 void CharacterCreateScreen::updateAppearanceRanges() {
     if (raceIndex == prevRangeRace_ &&
         genderIndex == prevRangeGender_ &&
+        bodyTypeIndex == prevRangeBodyType_ &&
         skin == prevRangeSkin_ &&
         hairStyle == prevRangeHairStyle_) {
         return;
     }
-
-    prevRangeRace_ = raceIndex;
-    prevRangeGender_ = genderIndex;
-    prevRangeSkin_ = skin;
-    prevRangeHairStyle_ = hairStyle;
 
     maxSkin = 9;
     maxFace = 9;
     maxHairStyle = 11;
     maxHairColor = 9;
     maxFacialHair = 8;
+    skinIds_.clear();
+    faceIds_.clear();
+    hairStyleIds_.clear();
     hairColorIds_.clear();
+    facialHairIds_.clear();
 
-    if (!assetManager_) return;
+    if (!assetManager_ || availableRaces_.empty()) return;
     auto dbc = assetManager_->loadDBC("CharSections.dbc");
     if (!dbc) return;
 
     uint32_t targetRaceId = static_cast<uint32_t>(availableRaces_[raceIndex]);
-    uint32_t targetSexId = (genderIndex == 1) ? 1u : 0u;
+    const bool useFemaleModel = genderIndex == 1 || (genderIndex == 2 && bodyTypeIndex == 1);
+    uint32_t targetSexId = useFemaleModel ? 1u : 0u;
 
     const auto* csL = pipeline::getActiveDBCLayout() ? pipeline::getActiveDBCLayout()->getLayout("CharSections") : nullptr;
     auto csF = pipeline::detectCharSectionsFields(dbc.get(), csL);
-    int skinMax = -1;
-    int hairStyleMax = -1;
     for (uint32_t r = 0; r < dbc->getRecordCount(); r++) {
         uint32_t raceId = dbc->getUInt32(r, csF.raceId);
         uint32_t sexId = dbc->getUInt32(r, csF.sexId);
@@ -262,24 +287,25 @@ void CharacterCreateScreen::updateAppearanceRanges() {
         uint32_t variationIndex = dbc->getUInt32(r, csF.variationIndex);
         uint32_t colorIndex = dbc->getUInt32(r, csF.colorIndex);
 
-        if (baseSection == 0 && variationIndex == 0) {
-            skinMax = std::max(skinMax, static_cast<int>(colorIndex));
-        } else if (baseSection == 3) {
-            hairStyleMax = std::max(hairStyleMax, static_cast<int>(variationIndex));
+        if (baseSection == 0 && variationIndex == 0 && colorIndex <= 255) {
+            skinIds_.push_back(static_cast<uint8_t>(colorIndex));
+        } else if (baseSection == 3 && variationIndex <= 255) {
+            hairStyleIds_.push_back(static_cast<uint8_t>(variationIndex));
         }
     }
 
-    if (skinMax >= 0) {
-        maxSkin = skinMax;
-        if (skin > maxSkin) skin = maxSkin;
-    }
-    if (hairStyleMax >= 0) {
-        maxHairStyle = hairStyleMax;
-        if (hairStyle > maxHairStyle) hairStyle = maxHairStyle;
-    }
+    sortUnique(skinIds_);
+    sortUnique(hairStyleIds_);
+    useFallbackRange(skinIds_, maxSkin);
+    useFallbackRange(hairStyleIds_, maxHairStyle);
+    maxSkin = static_cast<int>(skinIds_.size()) - 1;
+    maxHairStyle = static_cast<int>(hairStyleIds_.size()) - 1;
+    skin = std::clamp(skin, 0, maxSkin);
+    hairStyle = std::clamp(hairStyle, 0, maxHairStyle);
 
-    int faceMax = -1;
-    std::vector<uint8_t> hairColorIds;
+    const uint8_t skinId = selectedAppearanceId(skinIds_, skin);
+    const uint8_t hairStyleId = selectedAppearanceId(hairStyleIds_, hairStyle);
+
     for (uint32_t r = 0; r < dbc->getRecordCount(); r++) {
         uint32_t raceId = dbc->getUInt32(r, csF.raceId);
         uint32_t sexId = dbc->getUInt32(r, csF.sexId);
@@ -289,30 +315,24 @@ void CharacterCreateScreen::updateAppearanceRanges() {
         uint32_t variationIndex = dbc->getUInt32(r, csF.variationIndex);
         uint32_t colorIndex = dbc->getUInt32(r, csF.colorIndex);
 
-        if (baseSection == 1 && colorIndex == static_cast<uint32_t>(skin)) {
-            faceMax = std::max(faceMax, static_cast<int>(variationIndex));
-        } else if (baseSection == 3 && variationIndex == static_cast<uint32_t>(hairStyle)) {
+        if (baseSection == 1 && colorIndex == skinId && variationIndex <= 255) {
+            faceIds_.push_back(static_cast<uint8_t>(variationIndex));
+        } else if (baseSection == 3 && variationIndex == hairStyleId) {
             if (colorIndex <= 255) {
-                hairColorIds.push_back(static_cast<uint8_t>(colorIndex));
+                hairColorIds_.push_back(static_cast<uint8_t>(colorIndex));
             }
         }
     }
 
-    if (faceMax >= 0) {
-        maxFace = faceMax;
-        if (face > maxFace) face = maxFace;
-    }
+    sortUnique(faceIds_);
+    sortUnique(hairColorIds_);
+    useFallbackRange(faceIds_, maxFace);
+    useFallbackRange(hairColorIds_, maxHairColor);
+    maxFace = static_cast<int>(faceIds_.size()) - 1;
+    maxHairColor = static_cast<int>(hairColorIds_.size()) - 1;
+    face = std::clamp(face, 0, maxFace);
+    hairColor = std::clamp(hairColor, 0, maxHairColor);
 
-    // Hair colors: use actual available DBC IDs (not "0..maxId"), since IDs may be sparse.
-    if (!hairColorIds.empty()) {
-        std::sort(hairColorIds.begin(), hairColorIds.end());
-        hairColorIds.erase(std::unique(hairColorIds.begin(), hairColorIds.end()), hairColorIds.end());
-        hairColorIds_ = std::move(hairColorIds);
-        maxHairColor = std::max(0, static_cast<int>(hairColorIds_.size()) - 1);
-        if (hairColor > maxHairColor) hairColor = maxHairColor;
-        if (hairColor < 0) hairColor = 0;
-    }
-    int facialMax = -1;
     auto facialDbc = assetManager_->loadDBC("CharacterFacialHairStyles.dbc");
     const auto* fhL = pipeline::getActiveDBCLayout() ? pipeline::getActiveDBCLayout()->getLayout("CharacterFacialHairStyles") : nullptr;
     if (facialDbc) {
@@ -321,20 +341,28 @@ void CharacterCreateScreen::updateAppearanceRanges() {
             uint32_t sexId = facialDbc->getUInt32(r, fhL ? (*fhL)["SexID"] : 1);
             if (raceId != targetRaceId || sexId != targetSexId) continue;
             uint32_t variation = facialDbc->getUInt32(r, fhL ? (*fhL)["Variation"] : 2);
-            facialMax = std::max(facialMax, static_cast<int>(variation));
+            if (variation <= 255) {
+                facialHairIds_.push_back(static_cast<uint8_t>(variation));
+            }
         }
     }
-    if (facialMax >= 0) {
-        maxFacialHair = facialMax;
-    } else if (targetSexId == 1) {
-        maxFacialHair = 0;
-    }
-    if (facialHair > maxFacialHair) {
-        facialHair = maxFacialHair;
-    }
+    sortUnique(facialHairIds_);
+    useFallbackRange(facialHairIds_, targetSexId == 1 ? 0 : maxFacialHair);
+    maxFacialHair = static_cast<int>(facialHairIds_.size()) - 1;
+    facialHair = std::clamp(facialHair, 0, maxFacialHair);
+
+    prevRangeRace_ = raceIndex;
+    prevRangeGender_ = genderIndex;
+    prevRangeBodyType_ = bodyTypeIndex;
+    prevRangeSkin_ = skin;
+    prevRangeHairStyle_ = hairStyle;
 }
 
 void CharacterCreateScreen::render(game::GameHandler& /*gameHandler*/) {
+    // Resolve valid DBC option IDs before loading the preview. Doing this after
+    // loadCharacter left race/style changes using the previous option mapping.
+    updateAppearanceRanges();
+
     // Render the preview to FBO before the ImGui frame
     if (preview_) {
         updatePreviewIfNeeded();
@@ -377,13 +405,18 @@ void CharacterCreateScreen::render(game::GameHandler& /*gameHandler*/) {
                     ImVec2(imgW, imgH));
             }
 
-            // Mouse drag rotation on the preview image
-            if (ImGui::IsItemHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
+            const bool previewHovered = ImGui::IsItemHovered();
+
+            // Mouse drag rotation and hover-only wheel zoom on the preview image.
+            if (previewHovered && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
                 float deltaX = ImGui::GetIO().MouseDelta.x;
                 preview_->rotate(deltaX * 0.2f);
             }
+            if (previewHovered && ImGui::GetIO().MouseWheel != 0.0f) {
+                preview_->zoom(ImGui::GetIO().MouseWheel);
+            }
 
-            ImGui::TextColored(ui::colors::kDarkGray, "Drag to rotate");
+            ImGui::TextColored(ui::colors::kDarkGray, "Drag to rotate - Scroll to zoom");
         }
         ImGui::EndChild();
 
@@ -471,23 +504,27 @@ void CharacterCreateScreen::render(game::GameHandler& /*gameHandler*/) {
     ImGui::RadioButton("Male", &genderIndex, 0);
     ImGui::SameLine();
     ImGui::RadioButton("Female", &genderIndex, 1);
-    ImGui::SameLine();
-    ImGui::RadioButton("Nonbinary", &genderIndex, 2);
 
-    // Body type selection for nonbinary
-    if (genderIndex == 2) {  // Nonbinary
-        ImGui::Text("Body Type:");
-        ImGui::SameLine(80);
-        ImGui::RadioButton("Masculine", &bodyTypeIndex, 0);
-        ImGui::SameLine();
-        ImGui::RadioButton("Feminine", &bodyTypeIndex, 1);
-    }
+    // TODO(server): Re-enable the nonbinary radio button and body-type controls
+    // once character creation accepts gender=2 plus the selected model body.
+    // The renderer/data plumbing remains in place so server support can enable it.
+    // ImGui::SameLine();
+    // ImGui::RadioButton("Nonbinary", &genderIndex, 2);
+    // if (genderIndex == 2) {
+    //     ImGui::Text("Body Type:");
+    //     ImGui::SameLine(80);
+    //     ImGui::RadioButton("Masculine", &bodyTypeIndex, 0);
+    //     ImGui::SameLine();
+    //     ImGui::RadioButton("Feminine", &bodyTypeIndex, 1);
+    // }
 
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
     // Appearance sliders
+    // Race/body controls above may have changed this frame; refresh their option
+    // lists before presenting customization controls.
     updateAppearanceRanges();
     game::Gender currentGender = static_cast<game::Gender>(genderIndex);
 
@@ -511,6 +548,10 @@ void CharacterCreateScreen::render(game::GameHandler& /*gameHandler*/) {
     slider("Hair Style",     &hairStyle, maxHairStyle);
     slider("Hair Color",     &hairColor, maxHairColor);
     slider("Facial Feature", &facialHair, maxFacialHair);
+
+    // Skin and hairstyle choose the valid face/color subsets. Refresh now so a
+    // Create click in this same frame sends IDs from the newly selected subset.
+    updateAppearanceRanges();
 
     ImGui::Spacing();
 
@@ -553,15 +594,11 @@ void CharacterCreateScreen::render(game::GameHandler& /*gameHandler*/) {
             data.characterClass = availableClasses[classIndex];
             data.gender = currentGender;
             data.useFemaleModel = (genderIndex == 2 && bodyTypeIndex == 1);  // Nonbinary + Feminine
-            data.skin = static_cast<uint8_t>(skin);
-            data.face = static_cast<uint8_t>(face);
-            data.hairStyle = static_cast<uint8_t>(hairStyle);
-            if (!hairColorIds_.empty() && hairColor >= 0 && hairColor < static_cast<int>(hairColorIds_.size())) {
-                data.hairColor = hairColorIds_[hairColor];
-            } else {
-                data.hairColor = static_cast<uint8_t>(hairColor);
-            }
-            data.facialHair = static_cast<uint8_t>(facialHair);
+            data.skin = selectedAppearanceId(skinIds_, skin);
+            data.face = selectedAppearanceId(faceIds_, face);
+            data.hairStyle = selectedAppearanceId(hairStyleIds_, hairStyle);
+            data.hairColor = selectedAppearanceId(hairColorIds_, hairColor);
+            data.facialHair = selectedAppearanceId(facialHairIds_, facialHair);
             if (onCreate) {
                 onCreate(data);
             }

@@ -15,6 +15,7 @@ void MountFSM::configure(const MountAnimSet& anims, bool taxiFlight) {
     state_ = MountState::IDLE;
     action_ = MountAction::None;
     actionPhase_ = 0;
+    actionAnimId_ = 0;
     fidgetTimer_ = 0.0f;
     activeFidget_ = 0;
     idleSoundTimer_ = 0.0f;
@@ -34,6 +35,7 @@ void MountFSM::clear() {
     state_ = MountState::IDLE;
     action_ = MountAction::None;
     actionPhase_ = 0;
+    actionAnimId_ = 0;
     taxiFlight_ = false;
     anims_ = {};
     fidgetTimer_ = 0.0f;
@@ -61,7 +63,14 @@ void MountFSM::onEvent(AnimEvent event) {
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 bool MountFSM::actionAnimComplete(const Input& in) const {
-    return in.haveMountState && in.curMountDuration > 0.1f &&
+    if (!in.haveMountState) return false;
+    // The renderer auto-switches finished one-shot animations to STAND. When
+    // that happens before this poll runs, the timeline we read belongs to
+    // STAND and never reports completion, stranding the action forever (horse
+    // frozen in stand pose after a jump). Playing something other than the
+    // requested action anim therefore also means the action anim finished.
+    if (actionAnimId_ != 0 && in.curMountAnim != actionAnimId_) return true;
+    return in.curMountDuration > 0.1f &&
            (in.curMountTime >= in.curMountDuration - 0.05f);
 }
 
@@ -90,9 +99,9 @@ uint32_t MountFSM::resolveGroundOrFlyAnim(const Input& in) const {
             // (the original code used pickMountAnim with mount-specific swim IDs)
             return anims_.run ? anims_.run : anim::RUN;
         } else if (anyStrafeLeft) {
-            return anims_.run ? anims_.run : anim::RUN;
+            return anims_.runLeft ? anims_.runLeft : (anims_.run ? anims_.run : anim::RUN);
         } else if (anyStrafeRight) {
-            return anims_.run ? anims_.run : anim::RUN;
+            return anims_.runRight ? anims_.runRight : (anims_.run ? anims_.run : anim::RUN);
         } else if (in.movingBackward) {
             return anims_.run ? anims_.run : anim::RUN;
         } else {
@@ -171,6 +180,7 @@ MountFSM::Output MountFSM::evaluate(const Input& in) {
         if (in.moving && anims_.jumpLoop > 0) {
             action_ = MountAction::Jump;
             actionPhase_ = 1; // Start with loop directly (matching original)
+            actionAnimId_ = anims_.jumpLoop;
             out.mountAnimId = anims_.jumpLoop;
             out.mountAnimLoop = true;
             out.mountAnimChanged = true;
@@ -189,6 +199,7 @@ MountFSM::Output MountFSM::evaluate(const Input& in) {
         } else if (!in.moving && anims_.rearUp > 0) {
             action_ = MountAction::RearUp;
             actionPhase_ = 0;
+            actionAnimId_ = anims_.rearUp;
             out.mountAnimId = anims_.rearUp;
             out.mountAnimLoop = false;
             out.mountAnimChanged = true;
@@ -205,25 +216,30 @@ MountFSM::Output MountFSM::evaluate(const Input& in) {
         if (action_ == MountAction::Jump) {
             if (actionPhase_ == 0 && animFinished && anims_.jumpLoop > 0) {
                 actionPhase_ = 1;
+                actionAnimId_ = anims_.jumpLoop;
                 out.mountAnimId = anims_.jumpLoop;
                 out.mountAnimLoop = true;
                 out.mountAnimChanged = true;
             } else if (actionPhase_ == 0 && animFinished) {
                 actionPhase_ = 1;
+                actionAnimId_ = 0;
                 out.mountAnimId = in.curMountAnim;
             } else if (actionPhase_ == 1 && in.grounded && anims_.jumpEnd > 0) {
                 actionPhase_ = 2;
+                actionAnimId_ = anims_.jumpEnd;
                 out.mountAnimId = anims_.jumpEnd;
                 out.mountAnimLoop = false;
                 out.mountAnimChanged = true;
                 out.playLandSound = true;
             } else if (actionPhase_ == 1 && in.grounded) {
                 action_ = MountAction::None;
+                actionAnimId_ = 0;
                 out.mountAnimId = in.moving ? anims_.run : anims_.stand;
                 out.mountAnimLoop = true;
                 out.mountAnimChanged = true;
             } else if (actionPhase_ == 2 && animFinished) {
                 action_ = MountAction::None;
+                actionAnimId_ = 0;
                 out.mountAnimId = in.moving ? anims_.run : anims_.stand;
                 out.mountAnimLoop = true;
                 out.mountAnimChanged = true;
@@ -233,6 +249,7 @@ MountFSM::Output MountFSM::evaluate(const Input& in) {
         } else if (action_ == MountAction::RearUp) {
             if (animFinished) {
                 action_ = MountAction::None;
+                actionAnimId_ = 0;
                 out.mountAnimId = in.moving ? anims_.run : anims_.stand;
                 out.mountAnimLoop = true;
                 out.mountAnimChanged = true;

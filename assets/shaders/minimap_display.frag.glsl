@@ -39,8 +39,9 @@ void main() {
 
     float cs = cos(push.rotation);
     float sn = sin(push.rotation);
-    vec2 rotated = vec2(center.x * cs - center.y * sn, center.x * sn + center.y * cs);
-    vec2 mapUV = push.playerUV + vec2(rotated.x, rotated.y) * push.zoomRadius * 2.0;
+    vec2 mapCenter = vec2(-center.x, center.y);
+    vec2 rotated = vec2(mapCenter.x * cs - mapCenter.y * sn, mapCenter.x * sn + mapCenter.y * cs);
+    vec2 mapUV = push.playerUV + vec2(rotated.y, -rotated.x) * push.zoomRadius * 2.0;
 
     vec4 mapColor = texture(uComposite, mapUV);
 

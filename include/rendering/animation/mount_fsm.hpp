@@ -28,6 +28,8 @@ public:
         uint32_t jumpEnd = 0;
         uint32_t rearUp = 0;
         uint32_t run = 0;
+        uint32_t runLeft = 0;
+        uint32_t runRight = 0;
         uint32_t stand = 0;
         // Flight animations
         uint32_t flyIdle = 0;
@@ -110,6 +112,10 @@ private:
     MountState state_ = MountState::IDLE;
     MountAction action_ = MountAction::None;
     uint32_t actionPhase_ = 0;
+    // Animation the current action asked the renderer to play. One-shot anims
+    // are auto-switched to STAND by the renderer when they finish, so seeing a
+    // different anim than requested also means the action anim completed.
+    uint32_t actionAnimId_ = 0;
 
     MountAnimSet anims_;
     bool taxiFlight_ = false;

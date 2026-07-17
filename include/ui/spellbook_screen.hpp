@@ -26,6 +26,8 @@ struct SpellInfo {
     uint32_t powerType = 0;      // 0=mana, 1=rage, 2=focus, 3=energy
     uint32_t rangeIndex = 0;     // Range index from SpellRange.dbc
     uint32_t schoolMask = 0;     // School bitmask (1=phys,2=holy,4=fire,8=nature,16=frost,32=shadow,64=arcane)
+    uint32_t casterAuraState = 0;     // Required 1-based UNIT_FIELD_AURASTATE bit
+    uint32_t casterAuraStateNot = 0;  // Forbidden 1-based UNIT_FIELD_AURASTATE bit
     bool isPassive() const { return (attributes & 0x40) != 0; }
 };
 
@@ -63,6 +65,10 @@ public:
     /// Triggers DBC load if needed. Used by the action bar for insufficient-power tinting.
     void getSpellPowerInfo(uint32_t spellId, pipeline::AssetManager* assetManager,
                            uint32_t& outCost, uint32_t& outPowerType);
+
+    /// Returns the required and forbidden caster aura-state IDs (0 means none).
+    void getSpellAuraStateInfo(uint32_t spellId, pipeline::AssetManager* assetManager,
+                               uint32_t& outRequired, uint32_t& outForbidden);
 
     /// Returns a WoW spell link string if the user shift-clicked a spell, then clears it.
     std::string getAndClearPendingChatLink() {

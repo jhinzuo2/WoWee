@@ -27,9 +27,21 @@ void EntitySpawnCallbackHandler::setupCallbacks() {
     // Creature spawn callback (online mode) - spawn creature models
     gameHandler_.setCreatureSpawnCallback([this](uint64_t guid, uint32_t displayId, float x, float y, float z, float orientation, float scale) {
         // Queue spawns to avoid hanging when many creatures appear at once.
-        // Deduplicate so repeated updates don't flood pending queue.
-        if (entitySpawner_.isCreatureSpawned(guid)) return;
-        if (entitySpawner_.isCreaturePending(guid)) return;
+        // A VALUES update can change a creature's display in place (Westfall
+        // lumberjacks alternate between the normal and log-carrying models).
+        // Replace the old render instance instead of retaining stale geometry.
+        if (entitySpawner_.isCreatureSpawned(guid)) {
+            const auto& displayIds = entitySpawner_.getCreatureDisplayIds();
+            auto it = displayIds.find(guid);
+            if (it != displayIds.end() && it->second == displayId) return;
+            uint32_t retainedEmote = 0;
+            auto& activeEmotes = entitySpawner_.getCreatureActiveEmotes();
+            if (auto emoteIt = activeEmotes.find(guid); emoteIt != activeEmotes.end()) {
+                retainedEmote = emoteIt->second;
+            }
+            entitySpawner_.despawnCreature(guid);
+            if (retainedEmote != 0) activeEmotes[guid] = retainedEmote;
+        }
         entitySpawner_.queueCreatureSpawn(guid, displayId, x, y, z, orientation, scale);
     });
 
@@ -107,8 +119,8 @@ void EntitySpawnCallbackHandler::setupCallbacks() {
         auto* m2r = renderer_.getM2Renderer();
         if (!m2r) return;
         uint32_t instId = info.instanceId;
-        // GO states: 0=READY(closed), 1=OPEN, 2=DESTROYED/ACTIVE
-        if (goState == 1) {
+        // Canonical GOState: 0=ACTIVE/open, 1=READY/closed, 2=ACTIVE_ALTERNATIVE.
+        if (goState == 0) {
             // Opening: play OPEN(148) one-shot, fall back to unfreezing
             if (m2r->hasAnimation(instId, 148))
                 m2r->setInstanceAnimation(instId, 148, false);
@@ -138,10 +150,18 @@ void EntitySpawnCallbackHandler::setupCallbacks() {
             instanceId = entitySpawner_.getCreatureInstanceId(guid);
         }
         if (instanceId != 0) {
-            glm::vec3 renderPos = core::coords::canonicalToRender(glm::vec3(x, y, z));
-            float durationSec = static_cast<float>(durationMs) / 1000.0f;
-            renderer_.getCharacterRenderer()->moveInstanceTo(instanceId, renderPos, durationSec);
-            // Play Run animation (anim 5) for the duration of the spline move.
+            // Nearby NPC position is evaluated from Entity's server spline in
+            // Application::update. Starting a second renderer interpolation here
+            // makes the two owners chase each other and produces jerky movement.
+            // Online players retain their existing interpolation path.
+            if (isPlayer) {
+                glm::vec3 renderPos = core::coords::canonicalToRender(glm::vec3(x, y, z));
+                float durationSec = static_cast<float>(durationMs) / 1000.0f;
+                renderer_.getCharacterRenderer()->moveInstanceTo(instanceId, renderPos, durationSec);
+            }
+            // Play the server-selected ground locomotion animation for the
+            // duration of the spline move. Monster patrols report Walk through
+            // SMSG_MONSTER_MOVE's spline flags before this callback runs.
             // WoW M2 animation IDs: 4=Walk, 5=Run.
             // Don't override Death animation (1). The per-frame sync loop will return to
             // Stand when movement stops.
@@ -153,9 +173,11 @@ void EntitySpawnCallbackHandler::setupCallbacks() {
                     uint32_t curAnimId = 0; float curT = 0.0f, curDur = 0.0f;
                     auto* cr = renderer_.getCharacterRenderer();
                     bool gotState = cr->getAnimationState(instanceId, curAnimId, curT, curDur);
-                    // Only start Run if not already running and not in Death animation.
-                    if (!gotState || (curAnimId != rendering::anim::DEATH && curAnimId != rendering::anim::RUN)) {
-                        cr->playAnimation(instanceId, rendering::anim::RUN, /*loop=*/true);
+                    const bool walking = entitySpawner_.getCreatureWalkingState().count(guid) > 0;
+                    const uint32_t targetAnim = walking ? rendering::anim::WALK : rendering::anim::RUN;
+                    // Only restart when the selected locomotion animation changed.
+                    if (!gotState || (curAnimId != rendering::anim::DEATH && curAnimId != targetAnim)) {
+                        cr->playAnimation(instanceId, targetAnim, /*loop=*/true);
                     }
                     entitySpawner_.getCreatureWasMoving()[guid] = true;
                 }

@@ -426,17 +426,37 @@ network::Packet ClassicPacketParsers::buildCastSpell(uint32_t spellId, uint64_t 
     return packet;
 }
 
+network::Packet ClassicPacketParsers::buildCastGameObjectSpell(uint32_t spellId, uint64_t targetGuid, uint8_t /*castCount*/) {
+    network::Packet packet(wireOpcode(LogicalOpcode::CMSG_CAST_SPELL));
+    packet.writeUInt32(spellId);
+    packet.writeUInt16(0x0800); // TARGET_FLAG_GAMEOBJECT
+    packet.writePackedGuid(targetGuid);
+    LOG_DEBUG("[Classic] Built CMSG_CAST_SPELL: spell=", spellId, " gameObject=0x",
+              std::hex, targetGuid, std::dec, " size=", packet.getSize());
+    return packet;
+}
+
 // ============================================================================
 // Classic CMSG_USE_ITEM
 // Vanilla 1.12.x: bag(u8) + slot(u8) + spellIndex(u8) + SpellCastTargets(u16)
 // NO spellId, itemGuid, glyphIndex, or castFlags fields (those are WotLK)
 // ============================================================================
-network::Packet ClassicPacketParsers::buildUseItem(uint8_t bagIndex, uint8_t slotIndex, uint64_t /*itemGuid*/, uint32_t /*spellId*/) {
+network::Packet ClassicPacketParsers::buildUseItem(uint8_t bagIndex, uint8_t slotIndex,
+                                                   uint64_t /*itemGuid*/, uint32_t /*spellId*/,
+                                                   uint64_t targetGuid, uint64_t itemTargetGuid) {
     network::Packet packet(wireOpcode(LogicalOpcode::CMSG_USE_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
     packet.writeUInt8(0);       // spell_index (which item spell to trigger, usually 0)
-    packet.writeUInt16(0x0000); // SpellCastTargets: TARGET_FLAG_SELF
+    if (itemTargetGuid != 0) {
+        packet.writeUInt16(0x0010); // TARGET_FLAG_ITEM
+        packet.writePackedGuid(itemTargetGuid);
+    } else if (targetGuid != 0) {
+        packet.writeUInt16(0x0002); // TARGET_FLAG_UNIT
+        packet.writePackedGuid(targetGuid);
+    } else {
+        packet.writeUInt16(0x0000); // TARGET_FLAG_SELF
+    }
     return packet;
 }
 
@@ -979,6 +999,8 @@ bool ClassicPacketParsers::parseCastFailed(network::Packet& packet, CastFailedDa
     // WotLK enum starts at 0=SUCCESS, 1=AFFECTING_COMBAT.
     // Shift +1 to align with WotLK result strings.
     data.result = vanillaResult + 1;
+    // Spell-focus and totem failures append ids naming the missing station/tool
+    readCastResultArgs(packet, data.result, data.miscArg, data.miscArg2);
     LOG_DEBUG("[Classic] Cast failed: spell=", data.spellId, " vanillaResult=", static_cast<int>(vanillaResult));
     return true;
 }
@@ -989,12 +1011,15 @@ bool ClassicPacketParsers::parseCastFailed(network::Packet& packet, CastFailedDa
 // Apply the same +1 shift used in parseCastFailed so the result codes
 // align with WotLK's getSpellCastResultString table.
 // ============================================================================
-bool ClassicPacketParsers::parseCastResult(network::Packet& packet, uint32_t& spellId, uint8_t& result) {
+bool ClassicPacketParsers::parseCastResult(network::Packet& packet, uint32_t& spellId, uint8_t& result,
+                                           uint32_t& miscArg, uint32_t& miscArg2) {
     if (!packet.hasRemaining(5)) return false;
     spellId = packet.readUInt32();
     uint8_t vanillaResult = packet.readUInt8();
     // Shift +1: Vanilla result 0=AFFECTING_COMBAT maps to WotLK result 1=AFFECTING_COMBAT
     result = vanillaResult + 1;
+    // Spell-focus and totem failures append ids naming the missing station/tool
+    readCastResultArgs(packet, result, miscArg, miscArg2);
     LOG_DEBUG("[Classic] Cast result: spell=", spellId, " vanillaResult=", static_cast<int>(vanillaResult));
     return true;
 }
@@ -1655,38 +1680,7 @@ bool ClassicPacketParsers::parseItemQueryResponse(network::Packet& packet, ItemQ
 
     data.itemClass = itemClass;
     data.subClass = subClass;
-    data.subclassName = "";
-    if (itemClass == 2) { // Weapon
-        switch (subClass) {
-            case 0: data.subclassName = "Axe"; break;
-            case 1: data.subclassName = "Axe"; break;
-            case 2: data.subclassName = "Bow"; break;
-            case 3: data.subclassName = "Gun"; break;
-            case 4: data.subclassName = "Mace"; break;
-            case 5: data.subclassName = "Mace"; break;
-            case 6: data.subclassName = "Polearm"; break;
-            case 7: data.subclassName = "Sword"; break;
-            case 8: data.subclassName = "Sword"; break;
-            case 10: data.subclassName = "Staff"; break;
-            case 13: data.subclassName = "Fist Weapon"; break;
-            case 15: data.subclassName = "Dagger"; break;
-            case 16: data.subclassName = "Thrown"; break;
-            case 18: data.subclassName = "Crossbow"; break;
-            case 19: data.subclassName = "Wand"; break;
-            case 20: data.subclassName = "Fishing Pole"; break;
-            default: data.subclassName = "Weapon"; break;
-        }
-    } else if (itemClass == 4) { // Armor
-        switch (subClass) {
-            case 0: data.subclassName = "Miscellaneous"; break;
-            case 1: data.subclassName = "Cloth"; break;
-            case 2: data.subclassName = "Leather"; break;
-            case 3: data.subclassName = "Mail"; break;
-            case 4: data.subclassName = "Plate"; break;
-            case 6: data.subclassName = "Shield"; break;
-            default: data.subclassName = "Armor"; break;
-        }
-    }
+    data.subclassName = getItemSubclassName(itemClass, subClass);
 
     // 4 name strings
     data.name = packet.readString();
@@ -1827,7 +1821,7 @@ bool ClassicPacketParsers::parseItemQueryResponse(network::Packet& packet, ItemQ
 
     // Post-description: PageText, LanguageID, PageMaterial, StartQuest
     if (packet.hasRemaining(16)) {
-        packet.readUInt32(); // PageText
+        data.pageTextId = packet.readUInt32(); // PageText
         packet.readUInt32(); // LanguageID
         packet.readUInt32(); // PageMaterial
         data.startQuestId = packet.readUInt32(); // StartQuest

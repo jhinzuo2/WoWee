@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
+#include <algorithm>
 
 namespace wowee {
 
@@ -136,6 +137,7 @@ public:
     void setFrustumCulling(bool enabled) { frustumCullingEnabled = enabled; }
     void setFogEnabled(bool enabled) { fogEnabled = enabled; }
     bool isFogEnabled() const { return fogEnabled; }
+    void setViewDistance(float distance) { maxViewDistance_ = std::clamp(distance, 400.0f, 2400.0f); }
 
     void setShadowMap(VkDescriptorImageInfo /*depthInfo*/, const glm::mat4& /*lightSpaceMat*/) {}
     void clearShadowMap() {}
@@ -203,6 +205,7 @@ private:
     bool wireframe = false;
     bool frustumCullingEnabled = true;
     bool fogEnabled = true;
+    float maxViewDistance_ = 1200.0f;
     int renderedChunks = 0;
     int culledChunks = 0;
 

@@ -11,6 +11,7 @@
 #include "pipeline/m2_loader.hpp"
 #include "pipeline/wmo_loader.hpp"
 #include "rendering/animation/animation_ids.hpp"
+#include "rendering/animation/emote_registry.hpp"
 #include "pipeline/dbc_loader.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/dbc_layout.hpp"
@@ -32,7 +33,7 @@ namespace {
 // Each group's base is groupNumber * 100; variant 01 is typically bare/default.
 constexpr uint16_t kGeosetDefaultConnector = 101;   // Group  1: default hair connector
 constexpr uint16_t kGeosetBareForearms     = 401;   // Group  4: no gloves
-constexpr uint16_t kGeosetBareShins        = 503;   // Group  5: no boots
+constexpr uint16_t kGeosetBareShins        = 501;   // Group  5: no boots
 constexpr uint16_t kGeosetDefaultEars      = 702;   // Group  7: ears
 constexpr uint16_t kGeosetBareSleeves      = 801;   // Group  8: no chest armor sleeves
 constexpr uint16_t kGeosetDefaultKneepads  = 902;   // Group  9: kneepads
@@ -77,6 +78,43 @@ void EntitySpawner::update() {
     processPendingTransportRegistrations();
     processPendingTransportDoodads();
     processPendingMount();
+    syncCreatureStealthVisuals();
+}
+
+void EntitySpawner::syncCreatureStealthVisuals() {
+    if (!renderer_ || !gameHandler_) return;
+    auto* characterRenderer = renderer_->getCharacterRenderer();
+    if (!characterRenderer) return;
+
+    // Stealth flags flip rarely, but this scan visits every spawned creature.
+    // Doing that each frame with the mutex-locked getEntity() plus a
+    // dynamic_pointer_cast per creature was a measurable main-thread cost in
+    // crowded areas — a few sweeps per second is visually indistinguishable.
+    if (++stealthSyncFrameCounter_ % 15 != 0) return;
+
+    // EntitySpawner::update() runs on the main thread, so the unlocked
+    // getEntities() reference is safe and avoids a mutex acquire per creature.
+    const auto& entities = gameHandler_->getEntityManager().getEntities();
+
+    // Undetected stealth is culled by the server. Units that are sent with the
+    // CREEP visibility flag use the translucent detected-stealth presentation.
+    constexpr float kDetectedStealthOpacity = 0.35f;
+    for (const auto& [guid, instanceId] : creatureInstances_) {
+        auto entIt = entities.find(guid);
+        if (entIt == entities.end() || !entIt->second) continue;
+        const game::Entity* entity = entIt->second.get();
+        if (entity->getType() != game::ObjectType::UNIT &&
+            entity->getType() != game::ObjectType::PLAYER) continue;
+        const auto* unit = static_cast<const game::Unit*>(entity);
+
+        const bool stealthed = unit->hasCreepVisibility();
+        auto [it, inserted] = creatureWasStealthed_.try_emplace(guid, stealthed);
+        if (!inserted && it->second == stealthed) continue;
+
+        it->second = stealthed;
+        characterRenderer->setInstanceOpacity(
+            instanceId, stealthed ? kDetectedStealthOpacity : 1.0f);
+    }
 }
 
 void EntitySpawner::shutdown() {
@@ -84,6 +122,8 @@ void EntitySpawner::shutdown() {
     // Clear all instances
     creatureInstances_.clear();
     creatureModelIds_.clear();
+    creatureDisplayIds_.clear();
+    requestedCreatureDisplayIds_.clear();
     creatureRenderPosCache_.clear();
     creatureWasMoving_.clear();
     creatureWasSwimming_.clear();
@@ -92,6 +132,8 @@ void EntitySpawner::shutdown() {
     creatureSwimmingState_.clear();
     creatureWalkingState_.clear();
     creatureFlyingState_.clear();
+    creatureActiveEmotes_.clear();
+    creatureWasStealthed_.clear();
     creatureWeaponsAttached_.clear();
     creatureWeaponAttachAttempts_.clear();
     playerInstances_.clear();
@@ -117,6 +159,8 @@ void EntitySpawner::resetAllState() {
     // Clear all instance tracking
     creatureInstances_.clear();
     creatureModelIds_.clear();
+    creatureDisplayIds_.clear();
+    requestedCreatureDisplayIds_.clear();
     creatureRenderPosCache_.clear();
     playerInstances_.clear();
     onlinePlayerAppearance_.clear();
@@ -130,6 +174,7 @@ void EntitySpawner::resetAllState() {
     creatureSwimmingState_.clear();
     creatureWalkingState_.clear();
     creatureFlyingState_.clear();
+    creatureActiveEmotes_.clear();
     creatureWeaponsAttached_.clear();
     creatureWeaponAttachAttempts_.clear();
     modelIdIsWolfLike_.clear();
@@ -205,7 +250,17 @@ void EntitySpawner::updateTransportRegistration(uint64_t guid, uint32_t displayI
 void EntitySpawner::queueCreatureSpawn(uint64_t guid, uint32_t displayId,
                                         float x, float y, float z, float orientation, float scale) {
     if (creatureInstances_.count(guid)) return;
-    if (pendingCreatureSpawnGuids_.count(guid)) return;
+    requestedCreatureDisplayIds_[guid] = displayId;
+    if (pendingCreatureSpawnGuids_.count(guid)) {
+        // Replace any not-yet-started request. An older async result can still
+        // finish later; processAsyncCreatureResults rejects it against the map.
+        pendingCreatureSpawns_.erase(
+            std::remove_if(pendingCreatureSpawns_.begin(), pendingCreatureSpawns_.end(),
+                           [guid](const PendingCreatureSpawn& spawn) {
+                               return spawn.guid == guid;
+                           }),
+            pendingCreatureSpawns_.end());
+    }
     pendingCreatureSpawns_.push_back({guid, displayId, x, y, z, orientation, scale});
     pendingCreatureSpawnGuids_.insert(guid);
 }
@@ -235,7 +290,8 @@ void EntitySpawner::queuePlayerEquipment(uint64_t guid,
 void EntitySpawner::clearAllQueues() {
     pendingCreatureSpawns_.clear();
     pendingCreatureSpawnGuids_.clear();
-    creatureSpawnRetryCounts_.clear();
+    requestedCreatureDisplayIds_.clear();
+    creatureSpawnRetryDeadlines_.clear();
     creaturePermanentFailureGuids_.clear();
     deadCreatureGuids_.clear();
     pendingPlayerSpawns_.clear();
@@ -429,6 +485,23 @@ bool EntitySpawner::tryAttachCreatureVirtualWeapons(uint64_t guid, uint32_t inst
     return hadWeaponCandidate && attachedMain;
 }
 
+bool EntitySpawner::retryCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId,
+                                                uint8_t maxAttempts) {
+    if (creatureWeaponsAttached_.count(guid)) return false;
+    const auto attemptIt = creatureWeaponAttachAttempts_.find(guid);
+    const uint8_t attempts = attemptIt != creatureWeaponAttachAttempts_.end()
+        ? attemptIt->second : 0;
+    if (attempts >= maxAttempts) return false;
+
+    if (tryAttachCreatureVirtualWeapons(guid, instanceId)) {
+        creatureWeaponsAttached_.insert(guid);
+        creatureWeaponAttachAttempts_.erase(guid);
+    } else {
+        creatureWeaponAttachAttempts_[guid] = static_cast<uint8_t>(attempts + 1);
+    }
+    return true;
+}
+
 
 void EntitySpawner::buildCharSectionsCache() {
     if (charSectionsCacheBuilt_ || !assetManager_ || !assetManager_->isInitialized()) return;
@@ -620,8 +693,12 @@ void EntitySpawner::buildCreatureDisplayLookups() {
             uint32_t sexId = chg->getUInt32(i, chgL ? (*chgL)["SexID"] : 2);
             uint32_t variation = chg->getUInt32(i, chgL ? (*chgL)["Variation"] : 3);
             uint32_t geosetId = chg->getUInt32(i, chgL ? (*chgL)["GeosetID"] : 4);
+            // Showscalp/Bald means this style uses the default scalp instead
+            // of the extra hair-cap mesh. Ignoring it makes the cap physically
+            // poke through hair authored to expose the normal scalp.
+            const bool useDefaultScalp = chg->getFieldCount() > 5 && chg->getUInt32(i, 5) != 0;
             uint32_t key = (raceId << 16) | (sexId << 8) | variation;
-            hairGeosetMap_[key] = static_cast<uint16_t>(geosetId);
+            hairGeosetMap_[key] = static_cast<uint16_t>(useDefaultScalp ? 1 : geosetId);
         }
         LOG_INFO("Loaded ", hairGeosetMap_.size(), " hair geoset mappings from CharHairGeosets.dbc");
     }
@@ -845,46 +922,52 @@ bool EntitySpawner::getRenderPositionForGuid(uint64_t guid, glm::vec3& outPos) c
     return renderer_->getCharacterRenderer()->getInstancePosition(instanceId, outPos);
 }
 
-
-pipeline::M2Model EntitySpawner::loadCreatureM2Sync(const std::string& m2Path) {
-    auto m2Data = assetManager_->readFile(m2Path);
-    if (m2Data.empty()) {
-        LOG_WARNING("Failed to read creature M2: ", m2Path);
-        return {};
-    }
-
-    pipeline::M2Model model = pipeline::M2Loader::load(m2Data);
-    if (model.vertices.empty()) {
-        LOG_WARNING("Failed to parse creature M2: ", m2Path);
-        return {};
-    }
-
-    // Load skin file (only for WotLK M2s - vanilla has embedded skin)
-    if (model.version >= 264) {
-        std::string skinPath = m2Path.substr(0, m2Path.size() - 3) + "00.skin";
-        auto skinData = assetManager_->readFile(skinPath);
-        if (!skinData.empty()) {
-            pipeline::M2Loader::loadSkin(skinData, model);
-        } else {
-            LOG_WARNING("Missing skin file for WotLK creature M2: ", skinPath);
+EntitySpawner::CachedAttachmentModel
+EntitySpawner::getOrLoadAttachmentModel(const std::vector<std::string>& candidatePaths,
+                                        const std::string& texturePath) {
+    // 1) Geometry: first candidate that yields a valid model wins, parsed at most once.
+    std::shared_ptr<pipeline::M2Model> model;
+    std::string resolvedPath;
+    for (const auto& path : candidatePaths) {
+        auto it = attachmentModelData_.find(path);
+        if (it != attachmentModelData_.end()) {
+            if (!it->second) continue;  // known missing — try the next candidate
+            model = it->second;
+            resolvedPath = path;
+            break;
         }
-    }
 
-    // Load external .anim files for sequences without flag 0x20
-    std::string basePath = m2Path.substr(0, m2Path.size() - 3);
-    for (uint32_t si = 0; si < model.sequences.size(); si++) {
-        if (!(model.sequences[si].flags & 0x20)) {
-            char animFileName[256];
-            snprintf(animFileName, sizeof(animFileName), "%s%04u-%02u.anim",
-                basePath.c_str(), model.sequences[si].id, model.sequences[si].variationIndex);
-            auto animData = assetManager_->readFileOptional(animFileName);
-            if (!animData.empty()) {
-                pipeline::M2Loader::loadAnimFile(m2Data, animData, si, model);
-            }
+        auto data = assetManager_->readFile(path);
+        if (data.empty()) {
+            attachmentModelData_[path] = nullptr;
+            continue;
         }
+        auto parsed = std::make_shared<pipeline::M2Model>(pipeline::M2Loader::load(data));
+        if (parsed->name.empty()) parsed->name = path;
+        // Skin is a sidecar file for WotLK M2s; vanilla embeds it.
+        if (parsed->version >= 264) {
+            std::string skinPath = path.substr(0, path.size() - 3) + "00.skin";
+            auto skinData = assetManager_->readFile(skinPath);
+            if (!skinData.empty()) pipeline::M2Loader::loadSkin(skinData, *parsed);
+        }
+        if (!parsed->isValid()) {
+            attachmentModelData_[path] = nullptr;
+            continue;
+        }
+        attachmentModelData_[path] = parsed;
+        model = std::move(parsed);
+        resolvedPath = path;
+        break;
     }
+    if (!model) return {};
 
-    return model;
+    // 2) Model id is per (geometry, texture) — see attachmentModelIds_.
+    const std::string key = resolvedPath + '|' + texturePath;
+    auto idIt = attachmentModelIds_.find(key);
+    if (idIt == attachmentModelIds_.end()) {
+        idIt = attachmentModelIds_.emplace(key, nextCreatureModelId_++).first;
+    }
+    return CachedAttachmentModel{idIt->second, std::move(model)};
 }
 
 void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float x, float y, float z, float orientation, float scale) {
@@ -922,31 +1005,17 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
 
     auto* charRenderer = renderer_->getCharacterRenderer();
 
-    // Check model cache - reuse if same displayId was already loaded
-    uint32_t modelId = 0;
+    // The model must already be in the cache: callers spawn only once the async load
+    // has published it. Reading and parsing the M2 here instead would put file I/O on
+    // the main thread mid-frame, so treat a miss as "not ready" and let the caller
+    // re-queue the spawn through the async path.
     auto cacheIt = displayIdModelCache_.find(displayId);
-    if (cacheIt != displayIdModelCache_.end()) {
-        modelId = cacheIt->second;
-    } else {
-        // Load model from disk (only once per displayId)
-        modelId = nextCreatureModelId_++;
-
-        pipeline::M2Model model = loadCreatureM2Sync(m2Path);
-        if (!model.isValid()) {
-            nonRenderableCreatureDisplayIds_.insert(displayId);
-            creaturePermanentFailureGuids_.insert(guid);
-            return;
-        }
-
-        if (!charRenderer->loadModel(model, modelId)) {
-            LOG_WARNING("Failed to load creature model: ", m2Path);
-            nonRenderableCreatureDisplayIds_.insert(displayId);
-            creaturePermanentFailureGuids_.insert(guid);
-            return;
-        }
-
-        displayIdModelCache_[displayId] = modelId;
+    if (cacheIt == displayIdModelCache_.end()) {
+        LOG_WARNING("spawnOnlineCreature: model not loaded yet for displayId=", displayId,
+                    " — deferring to async load");
+        return;
     }
+    const uint32_t modelId = cacheIt->second;
 
     // Apply skin textures from CreatureDisplayInfo.dbc (only once per displayId model).
     // Track separately from model cache because async loading may upload the model
@@ -1773,51 +1842,38 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                         }
 
                         // Try race/gender-specific variant first, then base name
-                        std::string helmPath;
-                        std::vector<uint8_t> helmData;
+                        std::vector<std::string> helmCandidates;
                         if (!raceSuffix.empty()) {
-                            helmPath = "Item\\ObjectComponents\\Head\\" + helmModelName + raceSuffix + ".m2";
-                            helmData = assetManager_->readFile(helmPath);
+                            helmCandidates.push_back("Item\\ObjectComponents\\Head\\" + helmModelName + raceSuffix + ".m2");
                         }
-                        if (helmData.empty()) {
-                            helmPath = "Item\\ObjectComponents\\Head\\" + helmModelName + ".m2";
-                            helmData = assetManager_->readFile(helmPath);
-                        }
+                        helmCandidates.push_back("Item\\ObjectComponents\\Head\\" + helmModelName + ".m2");
 
-                        if (!helmData.empty()) {
-                            auto helmModel = pipeline::M2Loader::load(helmData);
-                            // Load skin (only for WotLK M2s)
-                            std::string skinPath = helmPath.substr(0, helmPath.size() - 3) + "00.skin";
-                            auto skinData = assetManager_->readFile(skinPath);
-                            if (!skinData.empty() && helmModel.version >= 264) {
-                                pipeline::M2Loader::loadSkin(skinData, helmModel);
+                        // Texture first: the cached model id is keyed by (geometry, texture).
+                        std::string helmTexName = itemDisplayDbc->getString(static_cast<uint32_t>(helmIdx), idiL ? (*idiL)["LeftModelTexture"] : 3);
+                        std::string helmTexPath;
+                        if (!helmTexName.empty()) {
+                            // Try race/gender suffixed texture first
+                            if (!raceSuffix.empty()) {
+                                std::string suffixedTex = "Item\\ObjectComponents\\Head\\" + helmTexName + raceSuffix + ".blp";
+                                if (assetManager_->fileExists(suffixedTex)) {
+                                    helmTexPath = suffixedTex;
+                                }
                             }
+                            if (helmTexPath.empty()) {
+                                helmTexPath = "Item\\ObjectComponents\\Head\\" + helmTexName + ".blp";
+                            }
+                        }
 
-                            if (helmModel.isValid()) {
-                                // Attachment point 11 = Head
-                                uint32_t helmModelId = nextCreatureModelId_++;
-                                // Get texture from ItemDisplayInfo (LeftModelTexture)
-                                std::string helmTexName = itemDisplayDbc->getString(static_cast<uint32_t>(helmIdx), idiL ? (*idiL)["LeftModelTexture"] : 3);
-                                std::string helmTexPath;
-                                if (!helmTexName.empty()) {
-                                    // Try race/gender suffixed texture first
-                                    if (!raceSuffix.empty()) {
-                                        std::string suffixedTex = "Item\\ObjectComponents\\Head\\" + helmTexName + raceSuffix + ".blp";
-                                        if (assetManager_->fileExists(suffixedTex)) {
-                                            helmTexPath = suffixedTex;
-                                        }
-                                    }
-                                    if (helmTexPath.empty()) {
-                                        helmTexPath = "Item\\ObjectComponents\\Head\\" + helmTexName + ".blp";
-                                    }
-                                }
-                                bool attached = charRenderer->attachWeapon(instanceId, 0, helmModel, helmModelId, helmTexPath);
-                                if (!attached) {
-                                    attached = charRenderer->attachWeapon(instanceId, 11, helmModel, helmModelId, helmTexPath);
-                                }
-                                if (attached) {
-                                    LOG_DEBUG("Attached helmet model: ", helmPath, " tex: ", helmTexPath);
-                                }
+                        auto helm = getOrLoadAttachmentModel(helmCandidates, helmTexPath);
+                        if (helm.modelId != 0) {
+                            const auto& helmModel = *helm.model;
+                            // Attachment point 11 = Head
+                            bool attached = charRenderer->attachWeapon(instanceId, 0, helmModel, helm.modelId, helmTexPath);
+                            if (!attached) {
+                                attached = charRenderer->attachWeapon(instanceId, 11, helmModel, helm.modelId, helmTexPath);
+                            }
+                            if (attached) {
+                                LOG_DEBUG("Attached helmet model: ", helmModel.name, " tex: ", helmTexPath);
                             }
                         }
                     }
@@ -1853,39 +1909,32 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                         size_t dotPos = leftModelName.rfind('.');
                         if (dotPos != std::string::npos) leftModelName = leftModelName.substr(0, dotPos);
 
-                        std::string leftPath;
-                        std::vector<uint8_t> leftData;
+                        std::vector<std::string> leftCandidates;
                         if (!raceSuffix.empty()) {
-                            leftPath = "Item\\ObjectComponents\\Shoulder\\" + leftModelName + raceSuffix + ".m2";
-                            leftData = assetManager_->readFile(leftPath);
+                            leftCandidates.push_back("Item\\ObjectComponents\\Shoulder\\" + leftModelName + raceSuffix + ".m2");
                         }
-                        if (leftData.empty()) {
-                            leftPath = "Item\\ObjectComponents\\Shoulder\\" + leftModelName + ".m2";
-                            leftData = assetManager_->readFile(leftPath);
-                        }
-                        if (!leftData.empty()) {
-                            auto leftModel = pipeline::M2Loader::load(leftData);
-                            std::string skinPath = leftPath.substr(0, leftPath.size() - 3) + "00.skin";
-                            auto skinData = assetManager_->readFile(skinPath);
-                            if (!skinData.empty() && leftModel.version >= 264) {
-                                pipeline::M2Loader::loadSkin(skinData, leftModel);
+                        leftCandidates.push_back("Item\\ObjectComponents\\Shoulder\\" + leftModelName + ".m2");
+
+                        // Texture first: the cached model id is keyed by (geometry, texture).
+                        std::string leftTexName = itemDisplayDbc->getString(static_cast<uint32_t>(shoulderIdx), leftTexFieldS);
+                        std::string leftTexPath;
+                        if (!leftTexName.empty()) {
+                            if (!raceSuffix.empty()) {
+                                std::string suffixedTex = "Item\\ObjectComponents\\Shoulder\\" + leftTexName + raceSuffix + ".blp";
+                                if (assetManager_->fileExists(suffixedTex)) leftTexPath = suffixedTex;
                             }
-                            if (leftModel.isValid()) {
-                                uint32_t leftModelId = nextCreatureModelId_++;
-                                std::string leftTexName = itemDisplayDbc->getString(static_cast<uint32_t>(shoulderIdx), leftTexFieldS);
-                                std::string leftTexPath;
-                                if (!leftTexName.empty()) {
-                                    if (!raceSuffix.empty()) {
-                                        std::string suffixedTex = "Item\\ObjectComponents\\Shoulder\\" + leftTexName + raceSuffix + ".blp";
-                                        if (assetManager_->fileExists(suffixedTex)) leftTexPath = suffixedTex;
-                                    }
-                                    if (leftTexPath.empty()) {
-                                        leftTexPath = "Item\\ObjectComponents\\Shoulder\\" + leftTexName + ".blp";
-                                    }
-                                }
-                                bool attached = charRenderer->attachWeapon(instanceId, 5, leftModel, leftModelId, leftTexPath);
+                            if (leftTexPath.empty()) {
+                                leftTexPath = "Item\\ObjectComponents\\Shoulder\\" + leftTexName + ".blp";
+                            }
+                        }
+
+                        auto leftAtt = getOrLoadAttachmentModel(leftCandidates, leftTexPath);
+                        if (leftAtt.modelId != 0) {
+                            const auto& leftModel = *leftAtt.model;
+                            {
+                                bool attached = charRenderer->attachWeapon(instanceId, 5, leftModel, leftAtt.modelId, leftTexPath);
                                 if (attached) {
-                                    LOG_DEBUG("NPC attached left shoulder: ", leftPath, " tex: ", leftTexPath);
+                                    LOG_DEBUG("NPC attached left shoulder: ", leftModel.name, " tex: ", leftTexPath);
                                 }
                             }
                         }
@@ -1897,39 +1946,32 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                         size_t dotPos = rightModelName.rfind('.');
                         if (dotPos != std::string::npos) rightModelName = rightModelName.substr(0, dotPos);
 
-                        std::string rightPath;
-                        std::vector<uint8_t> rightData;
+                        std::vector<std::string> rightCandidates;
                         if (!raceSuffix.empty()) {
-                            rightPath = "Item\\ObjectComponents\\Shoulder\\" + rightModelName + raceSuffix + ".m2";
-                            rightData = assetManager_->readFile(rightPath);
+                            rightCandidates.push_back("Item\\ObjectComponents\\Shoulder\\" + rightModelName + raceSuffix + ".m2");
                         }
-                        if (rightData.empty()) {
-                            rightPath = "Item\\ObjectComponents\\Shoulder\\" + rightModelName + ".m2";
-                            rightData = assetManager_->readFile(rightPath);
-                        }
-                        if (!rightData.empty()) {
-                            auto rightModel = pipeline::M2Loader::load(rightData);
-                            std::string skinPath = rightPath.substr(0, rightPath.size() - 3) + "00.skin";
-                            auto skinData = assetManager_->readFile(skinPath);
-                            if (!skinData.empty() && rightModel.version >= 264) {
-                                pipeline::M2Loader::loadSkin(skinData, rightModel);
+                        rightCandidates.push_back("Item\\ObjectComponents\\Shoulder\\" + rightModelName + ".m2");
+
+                        // Texture first: the cached model id is keyed by (geometry, texture).
+                        std::string rightTexName = itemDisplayDbc->getString(static_cast<uint32_t>(shoulderIdx), rightTexFieldS);
+                        std::string rightTexPath;
+                        if (!rightTexName.empty()) {
+                            if (!raceSuffix.empty()) {
+                                std::string suffixedTex = "Item\\ObjectComponents\\Shoulder\\" + rightTexName + raceSuffix + ".blp";
+                                if (assetManager_->fileExists(suffixedTex)) rightTexPath = suffixedTex;
                             }
-                            if (rightModel.isValid()) {
-                                uint32_t rightModelId = nextCreatureModelId_++;
-                                std::string rightTexName = itemDisplayDbc->getString(static_cast<uint32_t>(shoulderIdx), rightTexFieldS);
-                                std::string rightTexPath;
-                                if (!rightTexName.empty()) {
-                                    if (!raceSuffix.empty()) {
-                                        std::string suffixedTex = "Item\\ObjectComponents\\Shoulder\\" + rightTexName + raceSuffix + ".blp";
-                                        if (assetManager_->fileExists(suffixedTex)) rightTexPath = suffixedTex;
-                                    }
-                                    if (rightTexPath.empty()) {
-                                        rightTexPath = "Item\\ObjectComponents\\Shoulder\\" + rightTexName + ".blp";
-                                    }
-                                }
-                                bool attached = charRenderer->attachWeapon(instanceId, 6, rightModel, rightModelId, rightTexPath);
+                            if (rightTexPath.empty()) {
+                                rightTexPath = "Item\\ObjectComponents\\Shoulder\\" + rightTexName + ".blp";
+                            }
+                        }
+
+                        auto rightAtt = getOrLoadAttachmentModel(rightCandidates, rightTexPath);
+                        if (rightAtt.modelId != 0) {
+                            const auto& rightModel = *rightAtt.model;
+                            {
+                                bool attached = charRenderer->attachWeapon(instanceId, 6, rightModel, rightAtt.modelId, rightTexPath);
                                 if (attached) {
-                                    LOG_DEBUG("NPC attached right shoulder: ", rightPath, " tex: ", rightTexPath);
+                                    LOG_DEBUG("NPC attached right shoulder: ", rightModel.name, " tex: ", rightTexPath);
                                 }
                             }
                         }
@@ -1976,12 +2018,10 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
             uint8_t extraRaceId = 0;
             uint8_t extraSexId = 0;
             uint16_t selectedHairScalp = 1;
+            uint16_t selectedFacial100 = 100;
             uint16_t selectedFacial200 = 200;
             uint16_t selectedFacial300 = 300;
-            uint16_t selectedFacial300Alt = 300;
-            bool wantsFacialHair = false;
             uint32_t equipChestGG = 0, equipLegsGG = 0, equipFeetGG = 0;
-            std::unordered_set<uint16_t> hairScalpGeosetsForRaceSex;
             if (itDisplayData != displayDataMap_.end() &&
                 itDisplayData->second.extraDisplayId != 0) {
                 auto itExtra = humanoidExtraMap_.find(itDisplayData->second.extraDisplayId);
@@ -2000,19 +2040,11 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                     uint32_t facialKey = (static_cast<uint32_t>(extraRaceId) << 16) |
                                          (static_cast<uint32_t>(extraSexId) << 8) |
                                          static_cast<uint32_t>(itExtra->second.facialHairId);
-                    wantsFacialHair = (itExtra->second.facialHairId != 0);
                     auto itFacial = facialHairGeosetMap_.find(facialKey);
                     if (itFacial != facialHairGeosetMap_.end()) {
-                        selectedFacial200 = static_cast<uint16_t>(200 + itFacial->second.geoset200);
-                        selectedFacial300 = static_cast<uint16_t>(300 + itFacial->second.geoset300);
-                        selectedFacial300Alt = static_cast<uint16_t>(300 + itFacial->second.geoset200);
-                    }
-                    for (const auto& [k, v] : hairGeosetMap_) {
-                        uint8_t race = static_cast<uint8_t>((k >> 16) & 0xFF);
-                        uint8_t sex = static_cast<uint8_t>((k >> 8) & 0xFF);
-                        if (race == extraRaceId && sex == extraSexId && v > 0 && v < 100) {
-                            hairScalpGeosetsForRaceSex.insert(v);
-                        }
+                        selectedFacial100 = static_cast<uint16_t>(100 + std::max<uint16_t>(itFacial->second.geoset100, 1));
+                        selectedFacial200 = static_cast<uint16_t>(200 + std::max<uint16_t>(itFacial->second.geoset200, 1));
+                        selectedFacial300 = static_cast<uint16_t>(300 + std::max<uint16_t>(itFacial->second.geoset300, 1));
                     }
                     auto itemDisplayDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
                     const auto* idiL = pipeline::getActiveDBCLayout()
@@ -2115,32 +2147,28 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                 if (!hasRenderableCape && group == 16) continue;
                 // Group 0 can contain multiple scalp/hair meshes. Keep only the selected
                 // race/sex/style scalp to avoid overlapping broken hair.
-                if (hasHumanoidExtra && sid < 100 && hairScalpGeosetsForRaceSex.count(sid) > 0 && sid != selectedHairScalp) {
+                if (hasHumanoidExtra && sid < 100 && sid != 0 && sid != selectedHairScalp) {
                     continue;
                 }
-                // Group 1 contains connector variants that mirror scalp style.
+                // Group 1 is the first CharacterFacialHairStyles channel.
                 if (hasHumanoidExtra && group == 1) {
-                    const uint16_t selectedConnector = static_cast<uint16_t>(100 + std::max<uint16_t>(selectedHairScalp, 1));
-                    if (sid != selectedConnector) {
-                        // Keep fallback connector only when selected one does not exist on this model.
-                        if (sid != 101 || allGeosets.count(selectedConnector) > 0) {
-                            continue;
-                        }
-                    }
+                    uint16_t resolvedFacial100 = selectedFacial100;
+                    if (allGeosets.count(resolvedFacial100) == 0)
+                        resolvedFacial100 = allGeosets.count(101) > 0 ? 101 : firstByGroup[1];
+                    if (sid != resolvedFacial100) continue;
                 }
                 // Group 2 facial variants: keep selected variant; fallback only if missing.
                 if (hasHumanoidExtra && group == 2) {
-                    if (!wantsFacialHair) {
-                        continue;
-                    }
-                    if (sid != selectedFacial200) {
-                        if (sid != 200 && sid != 201) {
-                            continue;
-                        }
-                        if (allGeosets.count(selectedFacial200) > 0) {
-                            continue;
+                    uint16_t resolvedFacial200 = selectedFacial200;
+                    if (allGeosets.count(resolvedFacial200) == 0) {
+                        if (allGeosets.count(201) > 0) resolvedFacial200 = 201;
+                        else if (allGeosets.count(200) > 0) resolvedFacial200 = 200;
+                        else {
+                            auto itFirst = firstByGroup.find(2);
+                            resolvedFacial200 = (itFirst != firstByGroup.end()) ? itFirst->second : 0;
                         }
                     }
+                    if (sid != resolvedFacial200) continue;
                 }
                 normalizedGeosets.insert(sid);
             }
@@ -2203,15 +2231,21 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
 
             // Some mustache/goatee variants are authored in facial group 3xx.
             // Re-add selected facial 3xx plus low-index facial fallbacks.
-            if (hasHumanoidExtra && wantsFacialHair) {
-                // Prefer alt channel first (often chin-beard), then primary.
-                uint16_t facial300Sid = pickFromGroup(selectedFacial300Alt, 3);
-                if (facial300Sid == 0) facial300Sid = pickFromGroup(selectedFacial300, 3);
+            if (hasHumanoidExtra) {
+                uint16_t facial300Sid = pickFromGroup(selectedFacial300, 3);
                 if (facial300Sid != 0) normalizedGeosets.insert(facial300Sid);
                 if (facial300Sid == 0) {
                     if (allGeosets.count(300) > 0) normalizedGeosets.insert(300);
                     else if (allGeosets.count(301) > 0) normalizedGeosets.insert(301);
                 }
+            }
+
+            // Night Elf NPC eyes require the model's eye overlay. Continue to
+            // strip it from other humanoids, but restore exactly one variant
+            // for the race that actually uses it.
+            if (hasHumanoidExtra && extraRaceId == 4) {
+                uint16_t eyeGlowSid = pickFromGroup(1701, 17);
+                if (eyeGlowSid != 0) normalizedGeosets.insert(eyeGlowSid);
             }
 
             // Prefer trousers geoset; use covered variant when legs armor exists.
@@ -2273,8 +2307,25 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
                 npcEmote = std::static_pointer_cast<game::Unit>(entity)->getNpcEmoteState();
             }
         }
-        if (npcEmote != 0 && charRenderer->hasAnimation(instanceId, npcEmote)) {
-            charRenderer->playAnimation(instanceId, npcEmote, true);
+        uint32_t npcEmoteAnim = npcEmote != 0
+            ? rendering::AnimationController::getEmoteAnimByEmotesId(npcEmote)
+            : 0;
+        if (npcEmoteAnim == 0) {
+            auto activeIt = creatureActiveEmotes_.find(guid);
+            if (activeIt != creatureActiveEmotes_.end()) {
+                npcEmoteAnim = activeIt->second;
+            }
+        }
+        if (npcEmoteAnim != 0) {
+            const uint32_t stateAnim =
+                rendering::EmoteRegistry::instance().getStateVariant(npcEmoteAnim);
+            if (stateAnim != 0 && charRenderer->hasAnimation(instanceId, stateAnim)) {
+                npcEmoteAnim = stateAnim;
+            }
+        }
+        if (npcEmoteAnim != 0 && charRenderer->hasAnimation(instanceId, npcEmoteAnim)) {
+            creatureActiveEmotes_[guid] = npcEmoteAnim;
+            charRenderer->playAnimation(instanceId, npcEmoteAnim, true);
         } else if (charRenderer->hasAnimation(instanceId, rendering::anim::BIRTH)) {
             // Play birth animation (one-shot) — will return to STAND after
             charRenderer->playAnimation(instanceId, rendering::anim::BIRTH, false);
@@ -2289,6 +2340,7 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
     // Track instance
     creatureInstances_[guid] = instanceId;
     creatureModelIds_[guid] = modelId;
+    creatureDisplayIds_[guid] = displayId;
     creatureRenderPosCache_[guid] = renderPos;
     if (weaponsAttachedNow) {
         creatureWeaponsAttached_.insert(guid);

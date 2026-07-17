@@ -1,6 +1,7 @@
 // DBC binary parsing tests with synthetic data
 #include <catch_amalgamated.hpp>
 #include "pipeline/dbc_loader.hpp"
+#include "pipeline/dbc_layout.hpp"
 #include <cstring>
 
 using wowee::pipeline::DBCFile;
@@ -317,4 +318,109 @@ TEST_CASE("DBCFile::load rejects absurd fieldCount header", "[dbc][hardening]") 
 
     DBCFile dbc;
     REQUIRE_FALSE(dbc.load(data));
+}
+
+// SpellItemEnchantment.dbc moved its name column across expansions
+// (Vanilla=10, TBC=13, WotLK=14). Picking the wrong one reads an integer column
+// as a string-block offset, which silently yields a name missing its first
+// characters ("Rockbiter 3" → "ockbiter 3") rather than an empty string.
+TEST_CASE("detectEnchantmentNameField picks the name column per record width", "[dbc][enchant]") {
+    using namespace wowee::pipeline;
+
+    // "\0Rockbiter 3\0" → offset 1 is the real name; offset 2 is the garbled read.
+    std::string strings;
+    strings += '\0';
+    strings += "Rockbiter 3";
+    strings += '\0';
+
+    auto buildRecord = [](uint32_t numFields, uint32_t nameField) {
+        std::vector<uint32_t> rec(numFields, 0);
+        rec[0] = 1;            // ID
+        rec[nameField] = 1;    // real name offset
+        rec[8] = 2;            // the column the old code read → "ockbiter 3"
+        return rec;
+    };
+
+    struct Case { uint32_t fieldCount; uint32_t expectedNameField; };
+    auto c = GENERATE(Case{21, 10}, Case{34, 13}, Case{38, 14});
+
+    auto data = buildSyntheticDBC(1, c.fieldCount,
+                                  {buildRecord(c.fieldCount, c.expectedNameField)}, strings);
+    DBCFile dbc;
+    REQUIRE(dbc.load(data));
+
+    // No layout: the record width alone must resolve the column.
+    uint32_t field = detectEnchantmentNameField(&dbc, nullptr);
+    REQUIRE(field == c.expectedNameField);
+    REQUIRE(dbc.getString(0, field) == "Rockbiter 3");
+    REQUIRE(dbc.getString(0, 8) == "ockbiter 3");  // what the bug produced
+}
+
+// An out-of-range layout override must not win — a stale index garbles every name.
+TEST_CASE("detectEnchantmentNameField ignores an out-of-range layout override", "[dbc][enchant]") {
+    using namespace wowee::pipeline;
+
+    std::string strings;
+    strings += '\0';
+    strings += "Sharpened (+2 Damage)";
+    strings += '\0';
+
+    std::vector<uint32_t> rec(38, 0);
+    rec[0] = 40;
+    rec[14] = 1;
+    auto data = buildSyntheticDBC(1, 38, {rec}, strings);
+    DBCFile dbc;
+    REQUIRE(dbc.load(data));
+
+    DBCFieldMap layout;
+    layout.fields["Name"] = 999;  // out of range
+    REQUIRE(detectEnchantmentNameField(&dbc, &layout) == 14);
+    REQUIRE(dbc.getString(0, 14) == "Sharpened (+2 Damage)");
+}
+
+// Enchant → ItemVisuals → ItemVisualEffects is what puts the glint on a freshly
+// sharpened blade. The ItemVisual column moves with the record like the name does
+// (Vanilla 19, TBC 30, WotLK 31).
+TEST_CASE("resolveEnchantItemVisuals walks enchant to effect model paths", "[dbc][enchant]") {
+    using namespace wowee::pipeline;
+
+    std::string strings;
+    strings += '\0';
+    const uint32_t sparkleOffset = static_cast<uint32_t>(strings.size());
+    strings += "Spells\\Enchantments\\Sparkle_A.mdx";
+    strings += '\0';
+
+    // WotLK SpellItemEnchantment: enchant 40 (Rough Sharpening Stone) → ItemVisual 28.
+    std::vector<uint32_t> enchantRec(38, 0);
+    enchantRec[0] = 40;
+    enchantRec[31] = 28;
+    auto enchantData = buildSyntheticDBC(1, 38, {enchantRec}, std::string(1, '\0'));
+    DBCFile sie;
+    REQUIRE(sie.load(enchantData));
+
+    // ItemVisuals: ID + 5 effect slots. Slot 0 used, rest empty.
+    std::vector<uint32_t> visualRec(6, 0);
+    visualRec[0] = 28;
+    visualRec[1] = 777;
+    auto visualData = buildSyntheticDBC(1, 6, {visualRec}, std::string(1, '\0'));
+    DBCFile visuals;
+    REQUIRE(visuals.load(visualData));
+
+    // ItemVisualEffects: ID + model path.
+    auto effectData = buildSyntheticDBC(1, 2, {{777, sparkleOffset}}, strings);
+    DBCFile effects;
+    REQUIRE(effects.load(effectData));
+
+    auto models = resolveEnchantItemVisuals(40, &sie, &visuals, &effects, nullptr);
+    REQUIRE(models[0] == "Spells\\Enchantments\\Sparkle_A.mdx");
+    for (size_t i = 1; i < models.size(); ++i) REQUIRE(models[i].empty());
+
+    // An enchant with no visual (ItemVisual 0) yields nothing rather than slot 0's model.
+    std::vector<uint32_t> plainRec(38, 0);
+    plainRec[0] = 2629;   // Brilliant Mana Oil — no item visual
+    auto plainData = buildSyntheticDBC(1, 38, {plainRec}, std::string(1, '\0'));
+    DBCFile plain;
+    REQUIRE(plain.load(plainData));
+    auto none = resolveEnchantItemVisuals(2629, &plain, &visuals, &effects, nullptr);
+    for (const auto& m : none) REQUIRE(m.empty());
 }

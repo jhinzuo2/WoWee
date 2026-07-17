@@ -20,7 +20,7 @@ class EntitySpawner;
 // Each group's base is groupNumber * 100; variant 01 is typically bare/default.
 constexpr uint16_t kGeosetDefaultConnector = 101;   // Group  1: default hair connector
 constexpr uint16_t kGeosetBareForearms     = 401;   // Group  4: no gloves
-constexpr uint16_t kGeosetBareShins        = 503;   // Group  5: no boots
+constexpr uint16_t kGeosetBareShins        = 501;   // Group  5: no boots
 constexpr uint16_t kGeosetDefaultEars      = 702;   // Group  7: ears
 constexpr uint16_t kGeosetBareSleeves      = 801;   // Group  8: no chest armor sleeves
 constexpr uint16_t kGeosetDefaultKneepads  = 902;   // Group  9: kneepads
@@ -78,6 +78,13 @@ public:
     void showRangedWeapon(bool show);
     bool isShowingRanged() const { return showingRanged_; }
 
+    // Mining casts temporarily replace the held main-hand model with a pickaxe.
+    void showMiningPick(bool show);
+
+    // Fishing casts temporarily replace the held main-hand model with a pole
+    // found in the player's equipped slots or bags.
+    void showFishingPole(bool show);
+
     // Saved skin state accessors (used by game_screen.cpp for equipment re-compositing)
     const std::string& getBodySkinPath() const { return bodySkinPath_; }
     const std::vector<std::string>& getUnderwearPaths() const { return underwearPaths_; }
@@ -86,6 +93,10 @@ public:
 
 private:
     bool loadWeaponM2(const std::string& m2Path, pipeline::M2Model& outModel);
+
+    // Attach the enchant visual (sharpening-stone glint, weapon glow) of the item in
+    // the given equipment slot to the weapon already attached at attachmentId.
+    void applyEnchantVisuals(uint32_t charInstanceId, int equipSlotIndex, uint32_t attachmentId);
 
     rendering::Renderer* renderer_;
     pipeline::AssetManager* assetManager_;
@@ -101,6 +112,9 @@ private:
 
     bool weaponsSheathed_ = false;
     bool showingRanged_ = false;
+    bool showingMiningPick_ = false;
+    uint32_t miningPickInstanceId_ = 0;
+    bool showingFishingPole_ = false;
 };
 
 } // namespace core

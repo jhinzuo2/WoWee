@@ -3,8 +3,8 @@
 namespace wowee {
 namespace auth {
 
-void VanillaCrypt::init(const std::vector<uint8_t>& sessionKey) {
-    key_ = sessionKey;
+void VanillaCrypt::init(const std::vector<uint8_t>& key) {
+    key_ = key;
     sendIndex_ = 0;
     sendPrev_ = 0;
     recvIndex_ = 0;

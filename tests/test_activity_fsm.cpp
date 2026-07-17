@@ -88,6 +88,26 @@ TEST_CASE("ActivityFSM: sit stand state triggers sit down", "[activity]") {
     REQUIRE(out.valid);
 }
 
+TEST_CASE("ActivityFSM: consumption loop preserves sit-down transition", "[activity]") {
+    ActivityFSM fsm;
+    auto caps = makeActivityCaps();
+    fsm.setSeatedLoopAnimation(anim::EATING_LOOP);
+    fsm.setStandState(ActivityFSM::STAND_STATE_SIT);
+
+    auto in = idleInput();
+    in.sitting = true;
+    auto down = fsm.resolve(in, caps);
+    REQUIRE(down.valid);
+    CHECK(down.animId == anim::SIT_GROUND_DOWN);
+    CHECK_FALSE(down.loop);
+
+    fsm.setState(ActivityFSM::State::SITTING);
+    auto eating = fsm.resolve(in, caps);
+    REQUIRE(eating.valid);
+    CHECK(eating.animId == anim::EATING_LOOP);
+    CHECK(eating.loop);
+}
+
 TEST_CASE("ActivityFSM: cancel emote explicitly", "[activity]") {
     ActivityFSM fsm;
     auto caps = makeActivityCaps();

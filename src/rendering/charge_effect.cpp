@@ -387,6 +387,7 @@ void ChargeEffect::tryLoadM2Models(M2Renderer* m2Renderer, pipeline::AssetManage
         auto m2Data = assets->readFile(path);
         if (m2Data.empty()) continue;
         pipeline::M2Model model = pipeline::M2Loader::load(m2Data);
+        if (model.name.empty()) model.name = path;
         if (model.vertices.empty() && model.particleEmitters.empty()) continue;
         std::string skinPath = std::string(path);
         auto dotPos = skinPath.rfind('.');
@@ -412,6 +413,7 @@ void ChargeEffect::tryLoadM2Models(M2Renderer* m2Renderer, pipeline::AssetManage
         auto m2Data = assets->readFile(path);
         if (m2Data.empty()) continue;
         pipeline::M2Model model = pipeline::M2Loader::load(m2Data);
+        if (model.name.empty()) model.name = path;
         if (model.vertices.empty() && model.particleEmitters.empty()) continue;
         std::string skinPath = std::string(path);
         auto dotPos = skinPath.rfind('.');

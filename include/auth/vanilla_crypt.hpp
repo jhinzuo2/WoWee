@@ -9,9 +9,10 @@ namespace auth {
 /**
  * Vanilla/TBC WoW Header Cipher
  *
- * Used for encrypting/decrypting World of Warcraft packet headers
- * in vanilla (1.x) and TBC (2.x) clients. This is a simple XOR+addition
- * chaining cipher that uses the raw 40-byte SRP session key directly.
+ * Used for encrypting/decrypting World of Warcraft packet headers with the
+ * legacy XOR+addition chaining cipher. Vanilla/classic uses the raw 40-byte
+ * SRP session key; CMaNGOS TBC uses the same cipher with a 20-byte
+ * HMAC-derived key.
  *
  * Algorithm (encrypt):
  *   encrypted = (plaintext ^ key[index]) + previousEncrypted
@@ -27,10 +28,9 @@ public:
     ~VanillaCrypt() = default;
 
     /**
-     * Initialize the cipher with the raw session key
-     * @param sessionKey 40-byte session key from SRP auth
+     * Initialize the cipher with the packet-header key.
      */
-    void init(const std::vector<uint8_t>& sessionKey);
+    void init(const std::vector<uint8_t>& key);
 
     /**
      * Encrypt outgoing header bytes (CMSG: 6 bytes)

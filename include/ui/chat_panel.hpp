@@ -14,6 +14,7 @@
 #include <vulkan/vulkan.h>
 #include <imgui.h>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <functional>
 
@@ -114,6 +115,10 @@ public:
     /** Spell icon lookup callback — set by GameScreen each frame before render(). */
     std::function<VkDescriptorSet(uint32_t, pipeline::AssetManager*)> getSpellIcon;
 
+    /** Persist-settings callback — set once by GameScreen so the in-window
+     *  quick menu can save appearance changes immediately. */
+    std::function<void()> saveSettingsFn;
+
     /** Render the "Chat" tab inside the Settings window (delegates to settings). */
     void renderSettingsTab(std::function<void()> saveSettingsFn) {
         settings.renderSettingsTab(std::move(saveSettingsFn));
@@ -163,6 +168,24 @@ private:
     std::vector<std::string> chatSentHistory_;
     int chatHistoryIdx_ = -1;
 
+    // ---- History search filter ----
+    bool chatFilterActive_ = false;
+    char chatFilterBuffer_[128] = "";
+    int  chatFilterMatches_ = 0;   // result count from the previous frame
+    bool refocusFilterInput_ = false;
+
+    // Programmatic tab switch (Ctrl+wheel / quick menu); applied next frame
+    // via ImGuiTabItemFlags_SetSelected, -1 = none pending.
+    int pendingChatTab_ = -1;
+
+    /** Sync the input chat type to a newly activated tab (Guild tab → guild
+     *  chat, Whispers tab → whisper with last sender, Trade/LFG → channel). */
+    void onTabActivated(int tab, game::GameHandler& gameHandler);
+
+    /** Tab key with an empty input: cycle Say → Party → Guild → Whisper →
+     *  Channel through the types currently available to the player. */
+    void cycleChatType(bool backwards);
+
     // Macro stop flag
     bool macroStopped_ = false;
 
@@ -176,6 +199,20 @@ private:
     // Markup parser + renderer (Phase 2)
     ChatMarkupParser markupParser_;
     ChatMarkupRenderer markupRenderer_;
+
+    // Per-message render cache. A chat line's formatted text and parsed
+    // segments are immutable once built (modulo sender-name resolution and
+    // the timestamp toggle), so formatting + markup parsing runs once per
+    // message instead of once per message per frame.
+    struct CachedChatLine {
+        std::string senderNameUsed;  // rebuild when a name query resolves
+        bool tsEnabled = false;      // rebuild when timestamp toggle flips
+        bool isMention = false;
+        std::string fullMsg;         // plain text (for Copy Message)
+        std::vector<ChatSegment> segments;
+    };
+    std::unordered_map<uint64_t, CachedChatLine> chatLineCache_;
+    std::string chatCacheSelfName_;  // cache cleared when this changes
 
     // Tab-completion (Phase 5 — delegated to ChatTabCompleter)
     ChatTabCompleter tabCompleter_;

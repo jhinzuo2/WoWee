@@ -10,6 +10,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -103,9 +104,14 @@ public:
         uint64_t itemGuid = 0;
         ItemDef item;
         uint32_t count = 1;
+        // Inventory slot sent in CMSG_BUYBACK_ITEM (74..85).  This is server
+        // identity, not the item's current row in the buyback UI.
+        uint32_t wireSlot = 0;
     };
     void openVendor(uint64_t npcGuid);
     void closeVendor();
+    // Drop the session-persistent buyback mirror (fresh character world entry).
+    void clearBuybackState();
     void buyItem(uint64_t vendorGuid, uint32_t itemId, uint32_t slot, uint32_t count);
     void sellItem(uint64_t vendorGuid, uint64_t itemGuid, uint32_t count);
     void sellItemBySlot(int backpackIndex);
@@ -119,8 +125,20 @@ public:
     void autoEquipItemInBag(int bagIndex, int slotIndex);
     void useItemBySlot(int backpackIndex);
     void useItemInBag(int bagIndex, int slotIndex);
+
+    // ---- Item-targeted item use (sharpening stones, weightstones, weapon oils) ----
+    /// True while a used item is waiting for the player to pick the item it applies to.
+    bool isAwaitingItemTarget() const;
+    /// Entry of the item awaiting a target (0 if none) — drives the targeting cursor.
+    uint32_t getPendingItemTargetSourceItemId() const;
+    void cancelItemTargeting();
+    /// Sends the parked CMSG_USE_ITEM with TARGET_FLAG_ITEM against targetItemGuid.
+    void completeItemUseOnItem(uint64_t targetItemGuid);
+
     void openItemBySlot(int backpackIndex);
     void openItemInBag(int bagIndex, int slotIndex);
+    void readItemBySlot(int backpackIndex);
+    void readItemInBag(int bagIndex, int slotIndex);
     void destroyItem(uint8_t bag, uint8_t slot, uint8_t count = 1);
     void splitItem(uint8_t srcBag, uint8_t srcSlot, uint8_t count);
     void swapContainerItems(uint8_t srcBag, uint8_t srcSlot, uint8_t dstBag, uint8_t dstSlot);
@@ -211,6 +229,15 @@ public:
     int getAuctionActiveTab() const { return auctionActiveTab_; }
     void setAuctionActiveTab(int tab) { auctionActiveTab_ = tab; }
     float getAuctionSearchDelay() const { return auctionSearchDelayTimer_; }
+    // Ticked from GameHandler::update — this member is the authoritative
+    // timer (GameHandler used to decrement its own never-set copy, leaving
+    // the search button disabled forever after the first search).
+    void tickAuctionSearchDelay(float deltaTime) {
+        if (auctionSearchDelayTimer_ > 0.0f) {
+            auctionSearchDelayTimer_ -= deltaTime;
+            if (auctionSearchDelayTimer_ < 0.0f) auctionSearchDelayTimer_ = 0.0f;
+        }
+    }
 
     // ---- Trainer ----
     struct TrainerTab {
@@ -239,6 +266,7 @@ public:
     void rebuildOnlineInventory();
     void maybeDetectVisibleItemLayout();
     void updateOtherPlayerVisibleItems(uint64_t guid, const FlatFieldMap& fields);
+    void cacheInspectedPlayerEquipment(uint64_t guid, const std::array<uint32_t, 19>& itemEntries);
     void emitOtherPlayerEquipment(uint64_t guid);
     void emitAllOtherPlayerEquipment();
     void handleItemQueryResponse(network::Packet& packet);
@@ -274,7 +302,29 @@ private:
     void handleTrainerBuySucceeded(network::Packet& packet);
     void handleTrainerBuyFailed(network::Packet& packet);
 
+    // Resolves the item's on-use spell, then either parks the use for item
+    // targeting or sends it immediately.
+    void dispatchUseItem(uint8_t wowBag, uint8_t wowSlot, uint64_t itemGuid, const ItemDef& item);
+    void sendUseItem(uint8_t wowBag, uint8_t wowSlot, uint64_t itemGuid, uint32_t spellId,
+                     uint64_t targetGuid, uint64_t itemTargetGuid);
+
     GameHandler& owner_;
+
+    // ---- Item-targeted item use ----
+    struct PendingItemTarget {
+        uint8_t  bag = 0xFF;
+        uint8_t  slot = 0;
+        uint64_t itemGuid = 0;
+        uint32_t spellId = 0;
+        uint32_t itemId = 0;
+        std::string itemName;
+    };
+    // mutable: isAwaitingItemTarget() drops the pending use when out of world.
+    mutable std::optional<PendingItemTarget> pendingItemTarget_;
+
+    // Per-equip-slot (permanentEnchant << 32 | temporaryEnchant), so an enchant
+    // change marks equipment dirty even though the displayInfoId is unchanged.
+    std::array<uint64_t, 19> lastEquipEnchantIds_{};
 
     // ---- Item text state ----
     bool        itemTextOpen_   = false;
@@ -306,19 +356,6 @@ private:
         bool itemAutoLootSent = false;
     };
     std::unordered_map<uint64_t, LocalLootState> localLootState_;
-    struct PendingLootRetry {
-        uint64_t guid = 0;
-        float timer = 0.0f;
-        uint8_t remainingRetries = 0;
-        bool sendLoot = false;
-    };
-    std::vector<PendingLootRetry> pendingGameObjectLootRetries_;
-    struct PendingLootOpen {
-        uint64_t guid = 0;
-        float timer = 0.0f;
-    };
-    std::vector<PendingLootOpen> pendingGameObjectLootOpens_;
-    uint64_t lastInteractedGoGuid_ = 0;
     uint64_t pendingLootMoneyGuid_ = 0;
     uint32_t pendingLootMoneyAmount_ = 0;
     float pendingLootMoneyNotifyTimer_ = 0.0f;
@@ -329,10 +366,13 @@ private:
     ListInventoryData currentVendorItems_;
     std::deque<BuybackItem> buybackItems_;
     std::unordered_map<uint64_t, BuybackItem> pendingSellToBuyback_;
+    std::array<uint64_t, 12> buybackSlotGuids_{};
     int pendingBuybackSlot_ = -1;
     uint32_t pendingBuybackWireSlot_ = 0;
     uint32_t pendingBuyItemId_ = 0;
     uint32_t pendingBuyItemSlot_ = 0;
+
+    void reconcileBuybackSlots();
 
     // ---- Mail state ----
     bool mailboxOpen_ = false;

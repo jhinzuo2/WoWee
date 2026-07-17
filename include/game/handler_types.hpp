@@ -88,6 +88,9 @@ struct InspectResult {
     std::string playerName;
     uint32_t    totalTalents   = 0;
     uint32_t    unspentTalents = 0;
+    bool        hasTalentData  = false;
+    bool        hasTalentTreePoints = false;
+    std::array<uint32_t, 3> talentTreePoints{};
     uint8_t     talentGroups   = 0;
     uint8_t     activeTalentGroup = 0;
     std::array<uint32_t, 19> itemEntries{};
@@ -202,6 +205,9 @@ struct GossipPoi {
     float    y     = 0.0f;
     uint32_t icon  = 0;
     uint32_t data  = 0;
+    // SMSG_QUEST_POI objective index. -2 means this is a normal
+    // SMSG_GOSSIP_POI; -1 identifies the quest endpoint/turn-in POI.
+    int32_t  questObjectiveIndex = -2;
     std::string name;
 };
 

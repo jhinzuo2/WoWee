@@ -7,11 +7,19 @@
 #include "pipeline/m2_loader.hpp"
 #include "pipeline/wmo_loader.hpp"
 #include "pipeline/adt_loader.hpp"
+#include "core/logger.hpp"
 
 #include <nlohmann/json.hpp>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
 #include "stb_image_write.h"
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -124,6 +132,16 @@ bool emitWomFromM2(const std::string& m2Path, const std::string& womBase) {
 // in the editor but stripped to the bytes the runtime needs (no PNG
 // previews, no normal map). Keeps the asset extractor independent of
 // the editor target.
+static std::string sanitizeUtf8(const std::string& s) {
+    // Replace bytes >= 0x80 with '?' to guarantee valid ASCII output.
+    // ADT texture/doodad/WMO names from localized MPQs may contain
+    // Latin-1 high bytes that cause nlohmann::json to throw.
+    std::string out = s;
+    for (char& c : out)
+        if (static_cast<unsigned char>(c) >= 0x80) c = '?';
+    return out;
+}
+
 static bool writeWhmWot(const pipeline::ADTTerrain& terrain,
                          const std::string& outBase, int tileX, int tileY) {
     namespace fs = std::filesystem;
@@ -142,10 +160,12 @@ static bool writeWhmWot(const pipeline::ADTTerrain& terrain,
             const auto& chunk = terrain.chunks[ci];
             float base = std::isfinite(chunk.position[2]) ? chunk.position[2] : 0.0f;
             f.write(reinterpret_cast<const char*>(&base), 4);
-            float clean[145];
-            for (int v = 0; v < 145; v++) {
-                clean[v] = chunk.heightMap.heights[v];
-                if (!std::isfinite(clean[v])) clean[v] = 0.0f;
+            float clean[145] = {0.0f};
+            if (chunk.hasHeightMap()) {
+                for (int v = 0; v < 145; v++) {
+                    clean[v] = chunk.heightMap.heights[v];
+                    if (!std::isfinite(clean[v])) clean[v] = 0.0f;
+                }
             }
             f.write(reinterpret_cast<const char*>(clean), 145 * 4);
             uint32_t alphaSize = std::min<uint32_t>(
@@ -168,7 +188,7 @@ static bool writeWhmWot(const pipeline::ADTTerrain& terrain,
         j["heightmapFile"] = fs::path(outBase + ".whm").filename().string();
 
         nlohmann::json texArr = nlohmann::json::array();
-        for (const auto& tex : terrain.textures) texArr.push_back(tex);
+        for (const auto& tex : terrain.textures) texArr.push_back(sanitizeUtf8(tex));
         j["textures"] = texArr;
 
         nlohmann::json chunkArr = nlohmann::json::array();
@@ -199,7 +219,7 @@ static bool writeWhmWot(const pipeline::ADTTerrain& terrain,
 
         auto san = [](float x) { return std::isfinite(x) ? x : 0.0f; };
         nlohmann::json doodadNames = nlohmann::json::array();
-        for (const auto& n : terrain.doodadNames) doodadNames.push_back(n);
+        for (const auto& n : terrain.doodadNames) doodadNames.push_back(sanitizeUtf8(n));
         j["doodadNames"] = doodadNames;
         nlohmann::json doodads = nlohmann::json::array();
         for (const auto& dp : terrain.doodadPlacements) {
@@ -213,7 +233,7 @@ static bool writeWhmWot(const pipeline::ADTTerrain& terrain,
         j["doodads"] = doodads;
 
         nlohmann::json wmoNames = nlohmann::json::array();
-        for (const auto& n : terrain.wmoNames) wmoNames.push_back(n);
+        for (const auto& n : terrain.wmoNames) wmoNames.push_back(sanitizeUtf8(n));
         j["wmoNames"] = wmoNames;
         nlohmann::json wmos = nlohmann::json::array();
         for (const auto& wp : terrain.wmoPlacements) {
@@ -256,13 +276,18 @@ bool emitTerrainFromAdt(const std::string& adtPath, const std::string& outBase) 
     terrain.coord.x = tileX;
     terrain.coord.y = tileY;
 
-    if (!writeWhmWot(terrain, outBase, tileX, tileY)) return false;
+    try {
+        if (!writeWhmWot(terrain, outBase, tileX, tileY)) return false;
 
-    // Also build a terrain-only WOC (collision mesh) so the runtime can
-    // do walkability queries without re-deriving from the heightmap.
-    auto col = pipeline::WoweeCollisionBuilder::fromTerrain(terrain);
-    pipeline::WoweeCollisionBuilder::save(col, outBase + ".woc");
-    return true;
+        // Also build a terrain-only WOC (collision mesh) so the runtime can
+        // do walkability queries without re-deriving from the heightmap.
+        auto col = pipeline::WoweeCollisionBuilder::fromTerrain(terrain);
+        pipeline::WoweeCollisionBuilder::save(col, outBase + ".woc");
+        return true;
+    } catch (const std::exception& e) {
+        LOG_ERROR("Terrain emission failed for ", adtPath, ": ", e.what());
+        return false;
+    }
 }
 
 bool emitWobFromWmo(const std::string& wmoPath, const std::string& wobBase) {
@@ -374,27 +399,38 @@ void emitOpenFormats(const std::string& rootDir,
             size_t i = nextIdx.fetch_add(1);
             if (i >= jobs.size()) break;
             const auto& job = jobs[i];
-            switch (job.kind) {
-                case Kind::Png:
-                    if (emitPngFromBlp(job.path, job.base + ".png")) pngOk++;
-                    else pngFail++;
-                    break;
-                case Kind::JsonDbc:
-                    if (emitJsonFromDbc(job.path, job.base + ".json")) jsonOk++;
-                    else jsonFail++;
-                    break;
-                case Kind::Wom:
-                    if (emitWomFromM2(job.path, job.base)) womOk++;
-                    else womFail++;
-                    break;
-                case Kind::Wob:
-                    if (emitWobFromWmo(job.path, job.base)) wobOk++;
-                    else wobFail++;
-                    break;
-                case Kind::Terrain:
-                    if (emitTerrainFromAdt(job.path, job.base)) whmOk++;
-                    else whmFail++;
-                    break;
+            try {
+                switch (job.kind) {
+                    case Kind::Png:
+                        if (emitPngFromBlp(job.path, job.base + ".png")) pngOk++;
+                        else pngFail++;
+                        break;
+                    case Kind::JsonDbc:
+                        if (emitJsonFromDbc(job.path, job.base + ".json")) jsonOk++;
+                        else jsonFail++;
+                        break;
+                    case Kind::Wom:
+                        if (emitWomFromM2(job.path, job.base)) womOk++;
+                        else womFail++;
+                        break;
+                    case Kind::Wob:
+                        if (emitWobFromWmo(job.path, job.base)) wobOk++;
+                        else wobFail++;
+                        break;
+                    case Kind::Terrain:
+                        if (emitTerrainFromAdt(job.path, job.base)) whmOk++;
+                        else whmFail++;
+                        break;
+                }
+            } catch (const std::exception& e) {
+                LOG_ERROR("Unhandled exception in worker: ", e.what());
+                switch (job.kind) {
+                    case Kind::Png: pngFail++; break;
+                    case Kind::JsonDbc: jsonFail++; break;
+                    case Kind::Wom: womFail++; break;
+                    case Kind::Wob: wobFail++; break;
+                    case Kind::Terrain: whmFail++; break;
+                }
             }
         }
     };

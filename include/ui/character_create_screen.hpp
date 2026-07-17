@@ -43,9 +43,14 @@ private:
     std::string statusMessage;
     bool statusIsError = false;
 
-    // For many races/styles, CharSections hair color IDs are not guaranteed to be contiguous.
-    // We expose an index (hairColor) in the UI and map it to the actual DBC hairColorId here.
+    // Character customization IDs are DBC keys, not guaranteed contiguous ranges.
+    // The sliders hold indices into these vectors; preview and create packets use
+    // the corresponding real IDs.
+    std::vector<uint8_t> skinIds_;
+    std::vector<uint8_t> faceIds_;
+    std::vector<uint8_t> hairStyleIds_;
     std::vector<uint8_t> hairColorIds_;
+    std::vector<uint8_t> facialHairIds_;
 
     std::vector<game::Class> availableClasses;
     void updateAvailableClasses();
@@ -71,6 +76,7 @@ private:
     int prevFacialHair_ = -1;
     int prevRangeRace_ = -1;
     int prevRangeGender_ = -1;
+    int prevRangeBodyType_ = -1;
     int prevRangeSkin_ = -1;
     int prevRangeHairStyle_ = -1;
     float createTimer_ = -1.0f;  // >=0 while waiting for SMSG_CHAR_CREATE response

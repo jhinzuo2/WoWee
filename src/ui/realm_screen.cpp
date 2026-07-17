@@ -231,8 +231,11 @@ void RealmScreen::setStatus(const std::string& message) {
 }
 
 const char* RealmScreen::getRealmStatus(uint8_t flags) const {
-    if (flags & 0x01) return "Invalid";
     if (flags & 0x02) return "Offline";
+    if (flags & 0x01) return "Invalid";
+    if (flags & 0x80) return "Full";
+    if (flags & 0x40) return "New";
+    if (flags & 0x20) return "Recommended";
     return "Online";
 }
 

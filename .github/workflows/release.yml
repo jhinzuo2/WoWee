@@ -25,7 +25,7 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: true
 
@@ -110,15 +110,14 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: true
 
     - name: Install dependencies
       run: |
         brew install cmake pkg-config sdl2 glm openssl@3 zlib ffmpeg unicorn \
-          stormlib vulkan-loader vulkan-headers shaderc dylibbundler || true
-        brew install dylibbundler 2>/dev/null || true
+          stormlib vulkan-loader vulkan-headers molten-vk shaderc
 
     - name: Configure
       run: |
@@ -126,6 +125,7 @@ jobs:
         export PKG_CONFIG_PATH="$BREW/lib/pkgconfig:$(brew --prefix ffmpeg)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix vulkan-loader)/lib/pkgconfig:$(brew --prefix shaderc)/lib/pkgconfig"
         cmake -S . -B build \
           -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
           -DCMAKE_PREFIX_PATH="$BREW" \
           -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
 
@@ -136,23 +136,49 @@ jobs:
     - name: Build
       run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
 
+    - name: Configure Developer ID signing
+      env:
+        APPLE_CERT_P12: ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_BASE64 }}
+        APPLE_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+        APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID_IDENTITY }}
+      run: |
+        if [ -z "${APPLE_CERT_P12}" ] || [ -z "${APPLE_CERT_PASSWORD}" ] || \
+           [ -z "${APPLE_SIGNING_IDENTITY}" ]; then
+          echo "MACOS_SIGNING_ENABLED=false" >> "${GITHUB_ENV}"
+          echo "::warning::Apple Developer ID secrets are absent; using ad-hoc signing."
+          exit 0
+        fi
+
+        KEYCHAIN_PATH="${RUNNER_TEMP}/wowee-signing.keychain-db"
+        KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+        printf '%s' "${APPLE_CERT_P12}" | base64 -D \
+          > "${RUNNER_TEMP}/developer-id.p12"
+        security create-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security set-keychain-settings -lut 21600 "${KEYCHAIN_PATH}"
+        security unlock-keychain -p "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security import "${RUNNER_TEMP}/developer-id.p12" \
+          -k "${KEYCHAIN_PATH}" -P "${APPLE_CERT_PASSWORD}" -A -t cert -f pkcs12
+        security set-key-partition-list -S apple-tool:,apple: -s \
+          -k "${KEYCHAIN_PASSWORD}" "${KEYCHAIN_PATH}"
+        security list-keychain -d user -s "${KEYCHAIN_PATH}"
+        echo "MACOS_SIGNING_ENABLED=true" >> "${GITHUB_ENV}"
+        echo "APPLE_SIGNING_IDENTITY=${APPLE_SIGNING_IDENTITY}" >> "${GITHUB_ENV}"
+
     - name: Create .app bundle
       run: |
         TAG="${GITHUB_REF_NAME}"
+        VERSION="${TAG#v}"
+        VERSION="${VERSION%%-*}"
         mkdir -p Wowee.app/Contents/{MacOS,Frameworks,Resources}
-
-        # Wrapper launch script
-        printf '#!/bin/bash\ncd "$(dirname "$0")"\nexec ./wowee_bin "$@"\n' \
-          > Wowee.app/Contents/MacOS/wowee
-        chmod +x Wowee.app/Contents/MacOS/wowee
+        bash tools/macos/create_icns.sh assets/Wowee.png \
+          Wowee.app/Contents/Resources/Wowee.icns
 
         # Actual binary
         cp build/bin/wowee Wowee.app/Contents/MacOS/wowee_bin
 
-        # Asset extraction tool (if built — requires StormLib)
-        if [ -f build/bin/asset_extract ]; then
-          cp build/bin/asset_extract Wowee.app/Contents/MacOS/
-        fi
+        # Asset extraction is a required part of the macOS distribution.
+        test -x build/bin/asset_extract
+        cp build/bin/asset_extract Wowee.app/Contents/MacOS/
 
         # Extraction scripts and GUI
         cp extract_assets.sh Wowee.app/Contents/MacOS/
@@ -168,76 +194,44 @@ jobs:
           cp "$f" "Wowee.app/Contents/MacOS/$f"
         done
 
-        # Bundle dylibs
-        if command -v dylibbundler &>/dev/null; then
-          dylibbundler -od -b \
-            -x Wowee.app/Contents/MacOS/wowee_bin \
-            -d Wowee.app/Contents/Frameworks/ \
-            -p @executable_path/../Frameworks/
-          if [ -f Wowee.app/Contents/MacOS/asset_extract ]; then
-            dylibbundler -od -b \
-              -x Wowee.app/Contents/MacOS/asset_extract \
-              -d Wowee.app/Contents/Frameworks/ \
-              -p @executable_path/../Frameworks/
-          fi
+        # The Vulkan loader is not a graphics driver. Bundle MoltenVK and its
+        # ICD manifest so the app works on a clean Mac without Homebrew or the
+        # LunarG SDK installed.
+        MOLTENVK_PREFIX="$(brew --prefix molten-vk)"
+        cp -L "${MOLTENVK_PREFIX}/lib/libMoltenVK.dylib" \
+          Wowee.app/Contents/Frameworks/libMoltenVK.dylib
+        mkdir -p Wowee.app/Contents/Resources/vulkan/icd.d
+        python3 - \
+          "${MOLTENVK_PREFIX}/etc/vulkan/icd.d/MoltenVK_icd.json" \
+          Wowee.app/Contents/Resources/vulkan/icd.d/MoltenVK_icd.json <<'PY'
+        import json
+        import pathlib
+        import sys
+
+        source, destination = map(pathlib.Path, sys.argv[1:])
+        manifest = json.loads(source.read_text(encoding="utf-8"))
+        manifest["ICD"]["library_path"] = "../../../Frameworks/libMoltenVK.dylib"
+        manifest["ICD"]["is_portability_driver"] = True
+        destination.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+        PY
+
+        # Traverse every non-system dependency from the original Mach-O files,
+        # copy only the referenced install names, and rewrite the whole graph.
+        BUNDLE_ROOTS=(Wowee.app/Contents/MacOS/wowee_bin)
+        if [ -f Wowee.app/Contents/MacOS/asset_extract ]; then
+          BUNDLE_ROOTS+=(Wowee.app/Contents/MacOS/asset_extract)
         fi
-
-        # dylibbundler may miss Homebrew's Vulkan loader on some runner images.
-        # Copy all vulkan-loader dylib names so wowee_bin can resolve whichever
-        # install_name it was linked against (e.g. libvulkan.1.4.341.dylib).
-        VULKAN_LIB_DIR="$(brew --prefix vulkan-loader)/lib"
-        for lib in "${VULKAN_LIB_DIR}"/libvulkan*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
-
-        if ! ls Wowee.app/Contents/Frameworks/libvulkan*.dylib >/dev/null 2>&1; then
-          echo "Missing Vulkan loader dylib(s) in app bundle Frameworks/" >&2
-          exit 1
-        fi
-
-        # dylibbundler may miss Homebrew's OpenSSL on some runner images.
-        # Copy libssl and libcrypto so wowee_bin can resolve them at runtime.
-        OPENSSL_LIB_DIR="$(brew --prefix openssl@3)/lib"
-        for lib in "${OPENSSL_LIB_DIR}"/libssl*.dylib "${OPENSSL_LIB_DIR}"/libcrypto*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
-
-        if ! ls Wowee.app/Contents/Frameworks/libssl*.dylib >/dev/null 2>&1; then
-          echo "Missing OpenSSL libssl dylib(s) in app bundle Frameworks/" >&2
-          exit 1
-        fi
-
-        # dylibbundler may miss Homebrew's FFmpeg libraries.
-        # Copy libavformat, libavcodec, libavutil, and libswscale.
-        FFMPEG_LIB_DIR="$(brew --prefix ffmpeg)/lib"
-        for lib in "${FFMPEG_LIB_DIR}"/libavformat*.dylib \
-                   "${FFMPEG_LIB_DIR}"/libavcodec*.dylib \
-                   "${FFMPEG_LIB_DIR}"/libavutil*.dylib \
-                   "${FFMPEG_LIB_DIR}"/libswscale*.dylib \
-                   "${FFMPEG_LIB_DIR}"/libswresample*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
-
-        if ! ls Wowee.app/Contents/Frameworks/libavformat*.dylib >/dev/null 2>&1; then
-          echo "Missing FFmpeg libavformat dylib(s) in app bundle Frameworks/" >&2
-          exit 1
-        fi
-
-        # dylibbundler may miss Homebrew's Unicorn engine library.
-        # Copy libunicorn so wowee_bin can resolve it at runtime.
-        UNICORN_LIB_DIR="$(brew --prefix unicorn)/lib"
-        for lib in "${UNICORN_LIB_DIR}"/libunicorn*.dylib; do
-          [ -e "${lib}" ] || continue
-          cp -f "${lib}" Wowee.app/Contents/Frameworks/
-        done
-
-        if ! ls Wowee.app/Contents/Frameworks/libunicorn*.dylib >/dev/null 2>&1; then
-          echo "Missing Unicorn dylib(s) in app bundle Frameworks/" >&2
-          exit 1
-        fi
+        BUNDLE_ROOTS+=(Wowee.app/Contents/Frameworks/libMoltenVK.dylib)
+        python3 tools/macos/bundle_dependencies.py \
+          --app Wowee.app \
+          --search-dir "$(brew --prefix sdl2)/lib" \
+          --search-dir "$(brew --prefix vulkan-loader)/lib" \
+          --search-dir "$(brew --prefix openssl@3)/lib" \
+          --search-dir "$(brew --prefix ffmpeg)/lib" \
+          --search-dir "$(brew --prefix unicorn)/lib" \
+          --search-dir "$(brew --prefix stormlib)/lib" \
+          --search-dir "$(brew --prefix glm)/lib" \
+          "${BUNDLE_ROOTS[@]}"
 
         # Info.plist
         cat > Wowee.app/Contents/Info.plist << EOF
@@ -245,52 +239,70 @@ jobs:
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
           "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0"><dict>
-          <key>CFBundleExecutable</key><string>wowee</string>
+          <key>CFBundleExecutable</key><string>wowee_bin</string>
           <key>CFBundleIdentifier</key><string>com.wowee.app</string>
           <key>CFBundleName</key><string>Wowee</string>
-          <key>CFBundleVersion</key><string>${TAG}</string>
-          <key>CFBundleShortVersionString</key><string>${TAG}</string>
+          <key>CFBundleIconFile</key><string>Wowee</string>
+          <key>CFBundleVersion</key><string>${GITHUB_RUN_NUMBER}</string>
+          <key>CFBundleShortVersionString</key><string>${VERSION}</string>
           <key>CFBundlePackageType</key><string>APPL</string>
+          <key>LSMinimumSystemVersion</key><string>13.0</string>
         </dict></plist>
         EOF
 
-        # Ad-hoc codesign
-        codesign --force --deep --sign - Wowee.app
+        # Build a visible, independently signed extraction launcher.
+        bash tools/macos/create_asset_extractor_app.sh \
+          "Wowee Asset Extractor.app" "${VERSION}" \
+          Wowee.app/Contents/Resources/Wowee.icns
+
+        IDENTITY="-"
+        if [ "${MACOS_SIGNING_ENABLED}" = "true" ]; then
+          IDENTITY="${APPLE_SIGNING_IDENTITY}"
+        fi
+        bash tools/macos/sign_app.sh Wowee.app "${IDENTITY}"
+        bash tools/macos/sign_app.sh "Wowee Asset Extractor.app" "${IDENTITY}"
 
     - name: Verify bundled dylibs
       run: |
-        set -euo pipefail
-        echo "=== dylib references for wowee_bin ==="
-        otool -L Wowee.app/Contents/MacOS/wowee_bin
-
-        missing=0
-        while IFS= read -r dep; do
-          path=$(echo "$dep" | sed 's/^[[:space:]]*//;s/ (compat.*//')
-          case "$path" in
-            /usr/lib/*|/System/*|@executable_path/*|@rpath/*) continue ;;
-          esac
-          resolved="${path/#@loader_path/Wowee.app/Contents/MacOS}"
-          if [ ! -f "$resolved" ]; then
-            basename=$(basename "$path")
-            if [ ! -f "Wowee.app/Contents/Frameworks/$basename" ]; then
-              echo "ERROR: unbundled dylib: $path" >&2
-              missing=$((missing + 1))
-            fi
-          fi
-        done < <(otool -L Wowee.app/Contents/MacOS/wowee_bin | tail -n +2)
-
-        if [ "$missing" -gt 0 ]; then
-          ls -la Wowee.app/Contents/Frameworks/
-          echo "FAIL: $missing dylib(s) missing from app bundle" >&2
-          exit 1
-        fi
-        echo "All non-system dylibs are bundled."
+        bash tools/macos/verify_bundle.sh Wowee.app arm64
+        codesign --verify --deep --strict --verbose=2 "Wowee Asset Extractor.app"
 
     - name: Create DMG
       run: |
         TAG="${GITHUB_REF_NAME}"
-        hdiutil create -volname Wowee -srcfolder Wowee.app -ov -format UDZO \
+        rm -rf dmg-root
+        mkdir dmg-root
+        mv Wowee.app dmg-root/
+        mv "Wowee Asset Extractor.app" dmg-root/
+        cp tools/macos/ASSET_EXTRACTION_README.txt \
+          "dmg-root/README - Asset Extraction.txt"
+        ln -s /Applications dmg-root/Applications
+        hdiutil create -volname Wowee -srcfolder dmg-root -ov -format UDZO \
           "wowee-${TAG}-macos-arm64.dmg"
+
+    - name: Notarize and staple DMG
+      env:
+        APPLE_NOTARY_KEY: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+        APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+        APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      run: |
+        if [ "${MACOS_SIGNING_ENABLED}" != "true" ] || \
+           [ -z "${APPLE_NOTARY_KEY}" ] || [ -z "${APPLE_NOTARY_KEY_ID}" ] || \
+           [ -z "${APPLE_NOTARY_ISSUER_ID}" ]; then
+          echo "::warning::Notarization credentials are absent; DMG cannot be stapled."
+          exit 0
+        fi
+
+        DMG="wowee-${GITHUB_REF_NAME}-macos-arm64.dmg"
+        printf '%s' "${APPLE_NOTARY_KEY}" | base64 -D \
+          > "${RUNNER_TEMP}/AuthKey.p8"
+        xcrun notarytool submit "${DMG}" \
+          --key "${RUNNER_TEMP}/AuthKey.p8" \
+          --key-id "${APPLE_NOTARY_KEY_ID}" \
+          --issuer "${APPLE_NOTARY_ISSUER_ID}" \
+          --wait --timeout 30m
+        xcrun stapler staple "${DMG}"
+        xcrun stapler validate "${DMG}"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
@@ -317,7 +329,7 @@ jobs:
 
     steps:
     - name: Checkout
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6
       with:
         submodules: true
 
@@ -330,13 +342,29 @@ jobs:
         # whose signatures the older cached keyring rejects ("unknown trust"),
         # breaking setup after MSYS2 rotates signing keys.
         cache: false
-        install: >-
-          ${{ matrix.prefix }}-cmake ${{ matrix.arch == 'x86-64' && format('{0}-gcc', matrix.prefix) || format('{0}-clang', matrix.prefix) }} ${{ matrix.prefix }}-ninja ${{ matrix.prefix }}-pkgconf ${{ matrix.prefix }}-SDL2 ${{ matrix.prefix }}-glm ${{ matrix.prefix }}-openssl ${{ matrix.prefix }}-zlib ${{ matrix.prefix }}-ffmpeg ${{ matrix.prefix }}-unicorn ${{ matrix.prefix }}-vulkan-loader ${{ matrix.prefix }}-vulkan-headers ${{ matrix.prefix }}-shaderc git
 
-    - name: Install optional packages
+    - name: Install dependencies with mirror retry
       shell: msys2 {0}
+      env:
+        PREFIX: ${{ matrix.prefix }}
+        COMPILER_PACKAGE: ${{ matrix.arch == 'x86-64' && format('{0}-gcc', matrix.prefix) || format('{0}-clang', matrix.prefix) }}
       run: |
-        pacman -S --noconfirm --needed zip
+        packages=(
+          "${PREFIX}-cmake" "${COMPILER_PACKAGE}" "${PREFIX}-ninja"
+          "${PREFIX}-pkgconf" "${PREFIX}-SDL2" "${PREFIX}-glm"
+          "${PREFIX}-openssl" "${PREFIX}-zlib" "${PREFIX}-ffmpeg"
+          "${PREFIX}-unicorn" "${PREFIX}-vulkan-loader"
+          "${PREFIX}-vulkan-headers" "${PREFIX}-shaderc"
+          "${PREFIX}-libtommath" "${PREFIX}-libtomcrypt" git zip
+        )
+        for attempt in 1 2 3; do
+          if pacman -S --noconfirm --needed "${packages[@]}"; then
+            exit 0
+          fi
+          echo "MSYS2 package download failed on attempt ${attempt}; retrying..."
+          sleep $((attempt * 10))
+        done
+        exit 1
 
     - name: Build StormLib from source
       shell: msys2 {0}

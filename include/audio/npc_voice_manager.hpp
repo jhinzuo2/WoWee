@@ -60,7 +60,10 @@ public:
     void playPissed(uint64_t npcGuid, VoiceType voiceType, const glm::vec3& position);
 
     // Play NPC combat sounds
-    void playAggro(uint64_t npcGuid, VoiceType voiceType, const glm::vec3& position);
+    void playAggro(uint64_t npcGuid, uint32_t displayId, VoiceType voiceType,
+                   const glm::vec3& position);
+    void playCombatAttack(uint64_t npcGuid, uint32_t displayId,
+                          const glm::vec3& position);
     void playFlee(uint64_t npcGuid, VoiceType voiceType, const glm::vec3& position);
 
     void setVolumeScale(float scale) { volumeScale_ = scale; }
@@ -77,7 +80,9 @@ private:
     };
 
     void loadVoiceSounds();
+    void loadCreatureAggroSounds();
     bool loadSound(const std::string& path, VoiceSample& sample);
+    bool playSoundEntry(uint32_t soundId, const glm::vec3& position);
     void playSound(uint64_t npcGuid, VoiceType voiceType, SoundCategory category, const glm::vec3& position);
 
     pipeline::AssetManager* assetManager_ = nullptr;
@@ -91,10 +96,21 @@ private:
     std::unordered_map<VoiceType, std::vector<VoiceSample>> aggroLibrary_;
     std::unordered_map<VoiceType, std::vector<VoiceSample>> fleeLibrary_;
 
+    // CreatureDisplayInfo/CreatureModelData sound set ->
+    // CreatureSoundData.SoundAggroID. These are the model-specific combat
+    // barks used by hostile creatures; the race voice library above is only
+    // a fallback for incomplete DBC rows.
+    std::unordered_map<uint32_t, uint32_t> creatureAggroSoundByDisplay_;
+    std::unordered_map<uint32_t, uint32_t> creatureAttackSoundByDisplay_;
+
     // Cooldown tracking (prevent spam clicking same NPC)
     std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> lastPlayTime_;
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> lastAggroTime_;
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> lastCombatVocalTime_;
     std::unordered_map<uint64_t, int> clickCount_;  // Track clicks for pissed sounds
     static constexpr float GREETING_COOLDOWN = 2.0f;  // seconds
+    static constexpr float AGGRO_COOLDOWN = 5.0f;     // duplicate AI_REACTION/ATTACKSTART guard
+    static constexpr float COMBAT_VOCAL_COOLDOWN = 1.25f;
     static constexpr int PISSED_CLICK_THRESHOLD = 5;  // clicks before pissed
 
     std::mt19937 rng_;

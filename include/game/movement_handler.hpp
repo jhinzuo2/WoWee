@@ -37,6 +37,14 @@ public:
     // Follow target (moved from GameHandler)
     void followTarget();
     void cancelFollow();
+    // Per-frame movement toward the followed target's live position, called
+    // from GameHandler::update() alongside the existing followRenderPos_
+    // refresh. A no-op when no follow target is set. Recomputes the target
+    // position fresh every call (from the live entity, not a stored point),
+    // so it doesn't need the long-distance Z-interpolation guard the
+    // headless client's single-shot /movement/goto needs - there's never a
+    // large stale remaining distance to interpolate across.
+    void updateFollowMovement(float deltaTime);
 
     // Area trigger detection
     void loadAreaTriggerDbc();
@@ -137,6 +145,19 @@ public:
     }
 
     void updateClientTaxi(float deltaTime);
+    // Ends the active client-simulated taxi flight. See the definition in
+    // movement_handler.cpp for what snapToFinalWaypoint means - callers outside
+    // MovementHandler (SMSG_DISMOUNT / UNIT_FIELD_MOUNTDISPLAYID handlers reacting
+    // to an authoritative server completion signal) should pass false.
+    void finishClientTaxiFlight(bool snapToFinalWaypoint);
+    // Remember an early server-side dismount/flag clear. Some cores send the
+    // completion signal well before our local spline endpoint and do not repeat
+    // it, so updateClientTaxi() consumes it once the player reaches the landing
+    // zone instead of waiting for the exact final waypoint.
+    void deferServerTaxiCompletion();
+    // Server cores can clear taxi flags/dismount before the client spline reaches
+    // its final waypoint. Only treat those signals as authoritative near arrival.
+    bool isNearTaxiDestination(float maxDistance = 24.0f) const;
     uint32_t nextMovementTimestampMs();
     void sanitizeMovementForTaxi();
 
@@ -201,6 +222,16 @@ private:
     // --- Private helpers ---
     void buildTaxiCostMap();
     void startClientTaxiPath(const std::vector<uint32_t>& pathNodes);
+    // Evaluates the same uniform Catmull-Rom curve used to render/pace taxi
+    // flight motion, shared between the per-segment arc-length precomputation
+    // in startClientTaxiPath() and the per-frame position update.
+    static glm::vec3 evalTaxiCatmullRom(const glm::vec3& p0, const glm::vec3& p1,
+                                         const glm::vec3& p2, const glm::vec3& p3, float t);
+    // Commits a taxi flight already built by startClientTaxiPath(): snaps the player
+    // to the path start and sets taxiClientActive_. Only called once
+    // SMSG_ACTIVATETAXIREPLY confirms success - see activateTaxi()'s comment.
+    void beginTaxiFlightMotion();
+    bool restoreWorldTransferFallbackIfNearOrigin(const char* context);
 
     GameHandler& owner_;
 
@@ -219,6 +250,24 @@ private:
 
     // Heartbeat timing
     int heartbeatLogCount_ = 0;  // periodic position audit counter
+    uint32_t lastAreaTriggerId_ = 0;
+    uint32_t postTransferReturnAreaTriggerId_ = 0;
+    // Previous checkAreaTriggers() sample for swept-path testing (canonical
+    // coords). Mounted speed covers ~3 yd per 0.25s check, enough to straddle
+    // small portal boxes when only the instantaneous position is tested.
+    glm::vec3 lastAreaTriggerCheckPos_{0.0f};
+    uint32_t lastAreaTriggerCheckMapId_ = 0xFFFFFFFFu;
+    bool lastAreaTriggerCheckValid_ = false;
+    bool postTransferReturnAreaTriggerSawNear_ = false;
+    bool pendingAreaTriggerDestinationValid_ = false;
+    uint32_t pendingAreaTriggerDestinationMapId_ = 0;
+    glm::vec3 pendingAreaTriggerDestinationServerPos_{0.0f};
+    float pendingAreaTriggerDestinationServerO_ = 0.0f;
+    bool worldTransferFallbackValid_ = false;
+    uint32_t worldTransferFallbackMapId_ = 0;
+    uint32_t worldTransferFallbackTriggerId_ = 0;
+    glm::vec3 worldTransferFallbackCanonicalPos_{0.0f};
+    float worldTransferFallbackCanonicalO_ = 0.0f;
     float timeSinceLastMoveHeartbeat_ = 0.0f;
     float moveHeartbeatInterval_ = 0.5f;
     uint32_t lastHeartbeatSendTimeMs_ = 0;
@@ -257,23 +306,51 @@ private:
     uint64_t taxiNpcGuid_ = 0;
     bool onTaxiFlight_ = false;
     std::string taxiDestName_;
+    // Set in activateTaxi(); used by finishClientTaxiFlight() to snap to the
+    // destination TaxiNodes.dbc entry's own registered position rather than
+    // taxiClientPath_'s last waypoint (from the separate TaxiPathNode.dbc
+    // table) - live-confirmed the two can disagree by 100+ yards, since a
+    // taxi path's own waypoint trace doesn't necessarily terminate exactly on
+    // the node's registered coordinate the way GM teleports/.gps do.
+    uint32_t taxiDestNodeId_ = 0;
     bool taxiMountActive_ = false;
     uint32_t taxiMountDisplayId_ = 0;
     bool taxiActivatePending_ = false;
     float taxiActivateTimer_ = 0.0f;
+    // How long to wait for SMSG_ACTIVATETAXIREPLY before giving up - see
+    // updateClientTaxi()'s comment on why a dropped reply needs this now.
+    static constexpr float kTaxiActivateReplyTimeoutSeconds = 8.0f;
     bool taxiClientActive_ = false;
     float taxiLandingCooldown_ = 0.0f;
     float taxiStartGrace_ = 0.0f;
     size_t taxiClientIndex_ = 0;
     std::vector<glm::vec3> taxiClientPath_;
+    // Arc length of the smooth Catmull-Rom curve actually rendered through each
+    // consecutive pair of taxiClientPath_ points - one entry per segment, same
+    // indexing as taxiClientIndex_. Pacing (how long each segment takes to
+    // traverse at taxiClientSpeed_) uses this instead of the straight-line
+    // chord distance between waypoints: the server's own flight spline paces
+    // by the curve's real length too, and a smooth curve through a series of
+    // waypoints is essentially always shorter than the straight-line polyline
+    // connecting the same points (the curve "cuts" corners at turns). Using
+    // chord length there made our total flight duration systematically longer
+    // than the server's identical-speed (32.0f) spline - unnoticeable on a
+    // short hop but live-confirmed to drift ~90 yards short of the true
+    // destination on a long multi-waypoint flight (Booty Bay -> Stormwind),
+    // by the time the server's own flight ends and clears UNIT_FLAG_TAXI_FLIGHT.
+    // Computed once per segment when the path is built (see startClientTaxiPath()).
+    std::vector<float> taxiClientSegmentArcLengths_;
     float taxiClientSpeed_ = 32.0f;
     float taxiClientSegmentProgress_ = 0.0f;
+    bool taxiServerCompletionPending_ = false;
     bool taxiRecoverPending_ = false;
     uint32_t taxiRecoverMapId_ = 0;
     glm::vec3 taxiRecoverPos_{0.0f};
     uint32_t knownTaxiMask_[12] = {};
     bool taxiMaskInitialized_ = false;
     std::unordered_map<uint32_t, uint32_t> taxiCostMap_;
+
+    bool followMoveMoving_ = false;  // whether MSG_MOVE_START_FORWARD has been sent for the current follow
 };
 
 } // namespace game

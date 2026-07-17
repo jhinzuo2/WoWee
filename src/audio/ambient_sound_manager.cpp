@@ -5,8 +5,6 @@
 #include <random>
 #include <algorithm>
 #include <cmath>
-#include <chrono>
-#include <ctime>
 
 namespace wowee {
 namespace audio {
@@ -20,7 +18,6 @@ namespace {
     // Volume settings
     constexpr float FIRE_VOLUME = 0.7f;
     constexpr float WATER_VOLUME = 0.5f;
-    constexpr float WIND_VOLUME = 0.35f;
     constexpr float BIRD_VOLUME = 0.6f;
     constexpr float CRICKET_VOLUME = 0.5f;
 
@@ -438,7 +435,7 @@ void AmbientSoundManager::updatePeriodicSounds(float deltaTime, bool isIndoor, b
     if (isIndoor || isSwimming) return;
 
     // Bird sounds during daytime
-    if (isDaytime()) {
+    if (isDaytime() && currentZoneId_ != 10) {
         birdTimer_ += deltaTime;
         if (birdTimer_ >= randomFloat(BIRD_MIN_INTERVAL, BIRD_MAX_INTERVAL)) {
             birdTimer_ = 0.0f;
@@ -526,6 +523,12 @@ void AmbientSoundManager::updateWindAmbience(float deltaTime, bool isIndoor) {
     }
     // Outdoor wind ambience
     else {
+        // This generic loop is ForestNormalDay.wav and contains prominent
+        // birdsong. Duskwood already has its authored night forest ambience.
+        if (currentZoneId_ == 10) {
+            windLoopTime_ = 0.0f;
+            return;
+        }
         if (!windSounds_.empty() && windSounds_[0].loaded) {
             windLoopTime_ += deltaTime;
             if (windLoopTime_ >= 30.0f) {
@@ -591,6 +594,8 @@ void AmbientSoundManager::setZoneType(ZoneType type) {
 }
 
 void AmbientSoundManager::setZoneId(uint32_t zoneId) {
+    currentZoneId_ = zoneId;
+
     // Map WoW zone ID to ZoneType + CityType.
     // City zones: set CityType and clear ZoneType.
     // Outdoor zones: set ZoneType and clear CityType.
@@ -618,6 +623,7 @@ void AmbientSoundManager::setZoneId(uint32_t zoneId) {
         case 267:  // Hillsbrad Foothills
         case 36:   // Alterac Mountains
         case 45:   // Arathi Highlands
+        case 10:   // Duskwood (forced to the night library by its visual clock)
             zone = ZoneType::FOREST_NORMAL; break;
 
         case 1:    // Dun Morogh
@@ -634,7 +640,6 @@ void AmbientSoundManager::setZoneId(uint32_t zoneId) {
         case 40:   // Westfall
         case 215:  // Mulgore
         case 44:   // Redridge Mountains
-        case 10:   // Duskwood (counts as grassland night)
         case 38:   // Loch Modan
             zone = ZoneType::GRASSLANDS; break;
 
@@ -685,10 +690,7 @@ void AmbientSoundManager::setCityType(CityType type) {
         currentCity_ = type;
         cityLoopTime_ = 12.0f;  // Play city ambience soon after entering
 
-        // Reset bell toll tracking when entering a new city
-        lastHourTolled_ = -1;
-        remainingTolls_ = 0;
-        bellTollDelay_ = 0.0f;
+        bellTollTime_ = randomFloat(60.0f, 90.0f);  // First bell after 1-1.5 minutes
     }
 }
 
@@ -869,10 +871,9 @@ void AmbientSoundManager::updateCityAmbience(float deltaTime) {
 
 void AmbientSoundManager::updateBellTolls(float deltaTime) {
     // Only play bells when in a city
-    if (currentCity_ == CityType::NONE) {
-        remainingTolls_ = 0;
-        return;
-    }
+    if (currentCity_ == CityType::NONE) return;
+
+    bellTollTime_ += deltaTime;
 
     // Select appropriate bell sound based on city faction
     const std::vector<AmbientSample>* bellLibrary = nullptr;
@@ -896,44 +897,16 @@ void AmbientSoundManager::updateBellTolls(float deltaTime) {
             return;
     }
 
-    if (!bellLibrary || bellLibrary->empty() || !(*bellLibrary)[0].loaded) {
-        return;
-    }
-
-    // Get current system time
-    auto now = std::chrono::system_clock::now();
-    std::time_t currentTime = std::chrono::system_clock::to_time_t(now);
-    std::tm* localTime = std::localtime(&currentTime);
-    int currentHour = localTime->tm_hour;
-    int currentMinute = localTime->tm_min;
-
-    // Check if we're at the top of a new hour (within first minute)
-    if (currentMinute == 0 && currentHour != lastHourTolled_) {
-        // New hour! Calculate number of tolls (1-12 for 12-hour format)
-        int hour12 = currentHour % 12;
-        if (hour12 == 0) hour12 = 12;  // 0 and 12 both become 12
-
-        remainingTolls_ = hour12;
-        lastHourTolled_ = currentHour;
-        bellTollDelay_ = 0.0f;
-
-        LOG_INFO("Bell tower marking hour ", currentHour, " (", hour12, " tolls) in city: type ",
-                 static_cast<int>(currentCity_));
-    }
-
-    // Play remaining tolls with 1.5s spacing — matches retail WoW bell cadence
-    // (long enough for each toll to ring out before the next begins)
-    if (remainingTolls_ > 0) {
-        bellTollDelay_ += deltaTime;
-
-        if (bellTollDelay_ >= 1.5f) {
-            float volume = 0.6f * volumeScale_;  // Bell tolls at moderate-high volume
+    // The authored sample already contains its complete bell phrase. Play it
+    // once at a sparse ambient interval instead of replaying the whole sample
+    // once per clock hour count.
+    const float bellInterval = randomFloat(120.0f, 180.0f);
+    if (bellLibrary && !bellLibrary->empty() && (*bellLibrary)[0].loaded) {
+        if (bellTollTime_ >= bellInterval) {
+            float volume = 0.5f * volumeScale_;
             AudioEngine::instance().playSound2D((*bellLibrary)[0].data, volume, 1.0f);
-            remainingTolls_--;
-            bellTollDelay_ = 0.0f;
-
-            LOG_INFO("Bell toll (", (lastHourTolled_ % 12 == 0 ? 12 : lastHourTolled_ % 12) - remainingTolls_,
-                     " of ", (lastHourTolled_ % 12 == 0 ? 12 : lastHourTolled_ % 12), ")");
+            LOG_INFO("Bell toll ringing in city: type ", static_cast<int>(currentCity_));
+            bellTollTime_ = 0.0f;
         }
     }
 }

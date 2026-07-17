@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace wowee {
 
@@ -40,6 +41,7 @@ private:
     SetStateFn setState_;
 
     std::string pendingCreatedCharacterName_;  // Auto-select after character creation
+    std::vector<uint8_t> authenticatedSessionKey_;
 };
 
 } // namespace core

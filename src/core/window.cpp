@@ -5,10 +5,35 @@
 #include <cstdlib>
 #ifdef __APPLE__
 #include <filesystem>
+#include <mach-o/dyld.h>
+#include <vector>
 #endif
 
 namespace wowee {
 namespace core {
+
+#ifdef __APPLE__
+namespace {
+
+std::string bundledMoltenVkManifest() {
+    uint32_t pathSize = 0;
+    _NSGetExecutablePath(nullptr, &pathSize);
+    if (pathSize == 0) return {};
+
+    std::vector<char> executablePath(pathSize + 1, '\0');
+    if (_NSGetExecutablePath(executablePath.data(), &pathSize) != 0) return {};
+
+    std::error_code ec;
+    auto executable = std::filesystem::weakly_canonical(executablePath.data(), ec);
+    if (ec) return {};
+
+    auto candidate = executable.parent_path().parent_path()
+        / "Resources" / "vulkan" / "icd.d" / "MoltenVK_icd.json";
+    return std::filesystem::exists(candidate) ? candidate.string() : std::string{};
+}
+
+} // namespace
+#endif
 
 Window::Window(const WindowConfig& config)
     : config(config)
@@ -53,10 +78,14 @@ bool Window::initialize() {
     // LunarG SDK without sourcing setup-env.sh first.  Check $VULKAN_SDK
     // (LunarG SDK) before falling back to the two common Homebrew prefixes.
     if (!std::getenv("VK_ICD_FILENAMES")) {
-        std::string foundIcd;
+        // Prefer the app-bundled driver so a redistributed build never depends
+        // on a developer's Homebrew or LunarG SDK installation.
+        std::string foundIcd = bundledMoltenVkManifest();
         if (const char* sdk = std::getenv("VULKAN_SDK"); sdk && *sdk) {
-            std::string candidate = std::string(sdk) + "/share/vulkan/icd.d/MoltenVK_icd.json";
-            if (std::filesystem::exists(candidate)) foundIcd = candidate;
+            if (foundIcd.empty()) {
+                std::string candidate = std::string(sdk) + "/share/vulkan/icd.d/MoltenVK_icd.json";
+                if (std::filesystem::exists(candidate)) foundIcd = candidate;
+            }
         }
         if (foundIcd.empty()) {
             for (const char* p : {
@@ -87,7 +116,7 @@ bool Window::initialize() {
     if (!vulkanLoaded) {
         LOG_ERROR("Failed to load Vulkan library: ", SDL_GetError());
 #ifdef __APPLE__
-        LOG_ERROR("On macOS, install the Vulkan loader via Homebrew:  brew install vulkan-loader");
+        LOG_ERROR("On macOS, install Vulkan via Homebrew:  brew install vulkan-loader molten-vk");
         LOG_ERROR("Or source the LunarG SDK setup script before running:  source $VULKAN_SDK/setup-env.sh");
 #else
         LOG_ERROR("Ensure the Vulkan runtime (vulkan-1.dll) is installed. "
@@ -210,13 +239,43 @@ void Window::applyResolution(int w, int h) {
     if (!window) return;
     if (w <= 0 || h <= 0) return;
     if (fullscreen) {
-        windowedWidth = w;
-        windowedHeight = h;
+        const int displayIndex = SDL_GetWindowDisplayIndex(window);
+        if (displayIndex < 0) {
+            LOG_WARNING("Could not determine display for fullscreen resolution ",
+                        w, "x", h, ": ", SDL_GetError());
+            return;
+        }
+
+        SDL_DisplayMode requested{};
+        requested.w = w;
+        requested.h = h;
+        SDL_DisplayMode closest{};
+        if (!SDL_GetClosestDisplayMode(displayIndex, &requested, &closest)) {
+            LOG_WARNING("No fullscreen display mode available near ", w, "x", h,
+                        ": ", SDL_GetError());
+            return;
+        }
+        if (SDL_SetWindowDisplayMode(window, &closest) != 0) {
+            LOG_WARNING("Failed to select fullscreen display mode ", closest.w,
+                        "x", closest.h, ": ", SDL_GetError());
+            return;
+        }
+        // FULLSCREEN_DESKTOP always uses the desktop mode and was silently
+        // ignoring the resolution selector (especially visible on macOS).
+        if (SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN) != 0) {
+            LOG_WARNING("Failed to apply fullscreen resolution ", closest.w,
+                        "x", closest.h, ": ", SDL_GetError());
+            return;
+        }
+        SDL_GetWindowSize(window, &width, &height);
+        if (vkContext) {
+            vkContext->markSwapchainDirty();
+        }
+        LOG_INFO("Fullscreen resolution applied: ", width, "x", height);
         return;
     }
     SDL_SetWindowSize(window, w, h);
-    width = w;
-    height = h;
+    SDL_GetWindowSize(window, &width, &height);
     windowedWidth = w;
     windowedHeight = h;
     if (vkContext) {

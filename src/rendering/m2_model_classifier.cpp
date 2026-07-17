@@ -69,7 +69,9 @@ M2ClassificationResult classifyM2Model(
     r.isWaterfall       = has(n, "waterfall");
 
     r.isElvenLike   = has(n, "elf")     || has(n, "elven") || has(n, "quel");
-    r.isLanternLike = has(n, "lantern") || has(n, "lamp")  || has(n, "light");
+    r.isLanternLike = has(n, "lantern") || has(n, "lamp")  || has(n, "light") ||
+                      has(n, "sconce")  || has(n, "candle") ||
+                      has(n, "candelabra") || has(n, "chandelier");
     r.isKoboldFlame = has(n, "kobold")
                     && (has(n, "candle") || has(n, "torch") || has(n, "mine"));
 
@@ -79,6 +81,10 @@ M2ClassificationResult classifyM2Model(
     const bool forgeName   = has(n, "forge") && !has(n, "forgelava");
     const bool torchName   = has(n, "torch") && !r.isKoboldFlame;
     r.isBrazierOrFire = fireName || brazierName;
+    // TaurenLampPost is the small ground-level path fire used around Camp
+    // Narache, despite its misleading model name. Its decorative halo must
+    // follow the lowest flame emitter rather than the mesh/card center.
+    r.isGroundFire    = (fireName && !brazierName) || has(n, "taurenlamppost");
     r.isTorch         = torchName;
 
     // ---------------------------------------------------------------
@@ -122,21 +128,26 @@ M2ClassificationResult classifyM2Model(
     // Foliage token table (sorted alphabetically)
     // ---------------------------------------------------------------
     static constexpr auto kFoliageTokens = std::to_array<std::string_view>({
-        "algae",      "bamboo",     "banana",     "barley",     "bracken",
-        "branch",     "briars",     "brush",      "bush",
-        "cactus",     "canopy",     "cattail",    "clover",     "coconut",
-        "coral",      "corn",       "crop",
+        "algae",      "bamboo",     "banana",     "barley",     "bean",
+        "bracken",    "bramble",    "branch",     "briar",      "brush",
+        "bush",
+        "cactus",     "canopy",     "carrot",     "cattail",    "clover",
+        "clump",      "coconut",    "coral",      "corn",       "crop",
         "dead-grass", "dead_grass", "deadgrass",
         "dry-grass",  "dry_grass",  "drygrass",
         "fern",       "fernleaf",   "fireflies",  "firefly",    "fireflys",
         "flower",     "frond",      "fungus",     "gourd",      "grapes",
         "grass",
-        "hay",        "hedge",      "hops",       "ivy",
-        "kelp",       "leaf",       "leaves",     "lichen",     "lily",
+        "hay",        "hedge",      "herb",       "hops",       "ivy",
+        "kelp",       "leaf",       "leaves",     "lettuce",    "lichen",
+        "lily",
         "melon",      "moss",       "mushroom",   "nettle",
-        "palm",       "pinecone",   "pumpkin",    "reed",       "root",
-        "sapling",    "seaweed",    "seedling",   "shrub",      "squash",
-        "stalk",      "thorn",      "thistle",    "toadstool",
+        "okra",       "onion",
+        "palm",       "pepper",     "pinecone",   "potato",     "pumpkin",
+        "reed",       "root",
+        "sapling",    "seaweed",    "seedling",   "shrub",      "sprout",
+        "squash",     "stalk",      "thorn",      "thistle",    "toadstool",
+        "tomato",     "turnip",
         "underbrush", "vine",       "watermelon", "weed",       "wheat",
     });
 
@@ -175,6 +186,16 @@ M2ClassificationResult classifyM2Model(
     r.collisionNoBlock        = (foliageName || softTree || carpetOrRug) && !forceSolidCurb;
     // Ground-clutter detail cards are always non-blocking.
     if (r.isGroundDetail) r.collisionNoBlock = true;
+    // Small doodads that aren't explicitly solid should not block movement.
+    // In WoW, only named solid objects (crates, barrels, anvils, etc.) and
+    // large structural doodads have collision — small decorative models are
+    // always walkthrough regardless of their name.
+    if (!r.collisionNoBlock && !smallSolid && !forceSolidCurb
+        && !r.collisionSteppedFountain && !r.collisionTreeTrunk
+        && !r.collisionNarrowVerticalProp && !r.collisionStatue
+        && horiz < 2.0f && vert < 2.0f) {
+        r.collisionNoBlock = true;
+    }
 
     // ---------------------------------------------------------------
     // Ambient creatures: fireflies, dragonflies, moths, butterflies
@@ -184,6 +205,18 @@ M2ClassificationResult classifyM2Model(
         "fireflies", "firefly",     "fireflys", "moth",
     });
     const bool ambientCreature = hasAny(n, kAmbientTokens);
+
+    // ---------------------------------------------------------------
+    // Sky birds / bats: animated flying doodads that look frozen beyond bone range
+    // ---------------------------------------------------------------
+    static constexpr auto kSkyBirdTokens = std::to_array<std::string_view>({
+        "albatross", "carrionbird", "crane", "crow",
+        "eagle",     "gull",        "hawk",  "osprey",
+        "owl",       "parrot",      "pelican",
+        "raven",     "seagull",     "vulture",
+    });
+    r.isSkyBird = hasAny(n, kSkyBirdTokens) || has(n, "\\bird")
+                || has(n, "\\bat\\") || has(n, "\\bat.");
 
     // ---------------------------------------------------------------
     // Animation / foliage rendering flags
@@ -280,8 +313,14 @@ M2BatchTexClassification classifyBatchTexture(const std::string& lowerTexKey)
     r.hasGlowToken     = hasAny(lowerTexKey, kGlowTokens);
     r.hasFlameToken    = hasAny(lowerTexKey, kFlameTokens);
     r.hasGlowCardToken = hasAny(lowerTexKey, kGlowCardTokens);
+    if (r.exactLanternGlowTex) r.hasGlowCardToken = true;
     r.likelyFlame      = hasAny(lowerTexKey, kLikelyFlameTokens);
     r.lanternFamily    = hasAny(lowerTexKey, kLanternFamilyTokens);
+    // Stormwind street lamps use an opaque unlit glass texture rather than a
+    // named glow card or particle emitter. Preserve that glass mesh and layer
+    // a soft halo over it in the renderer.
+    r.softGlowSurface  = lowerTexKey ==
+        "dungeons\\textures\\doodads\\stormwindlampglass.blp";
     r.glowTint         = hasAny(lowerTexKey, kCoolTintTokens) ? 1
                        : hasAny(lowerTexKey, kRedTintTokens)  ? 2
                        : 0;

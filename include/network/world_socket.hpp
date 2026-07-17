@@ -23,7 +23,7 @@ namespace network {
  * World Server Socket
  *
  * Handles WoW world server protocol with header encryption.
- * Supports both vanilla/TBC (XOR+addition cipher) and WotLK (RC4).
+ * Supports vanilla/classic raw XOR, CMaNGOS TBC HMAC-derived XOR, and WotLK RC4.
  *
  * Key Differences from Auth Server:
  * - Outgoing: 6-byte header (2 bytes size + 4 bytes opcode, big-endian)
@@ -53,7 +53,7 @@ public:
      * Update socket - receive data and parse packets
      * Should be called regularly (e.g., each frame)
      */
-    void update();
+    void update() override;
 
     /**
      * Set callback for complete packets
@@ -69,7 +69,7 @@ public:
      * Must be called after CMSG_AUTH_SESSION before further communication
      *
      * @param sessionKey 40-byte session key from auth server
-     * @param build Client build number (determines cipher: <= 8606 = XOR, > 8606 = RC4)
+     * @param build Client build number (determines cipher family)
      */
     void initEncryption(const std::vector<uint8_t>& sessionKey, uint32_t build = 12340);
 
@@ -95,14 +95,17 @@ private:
     void dumpRecentPacketHistoryLocked(const char* reason, size_t bufferedBytes);
 
     socket_t sockfd = INVALID_SOCK;           // THREAD-SAFE: protected by ioMutex_
-    bool connected = false;                    // THREAD-SAFE: protected by ioMutex_
+    // Read every frame by GameHandler while the async receive pump may hold
+    // ioMutex_ for a packet burst. Atomic state avoids turning that harmless
+    // status check into a 50ms main-thread mutex stall.
+    std::atomic<bool> connected{false};
     bool encryptionEnabled = false;            // THREAD-SAFE: protected by ioMutex_
     bool useVanillaCrypt = false;  // true = XOR cipher, false = RC4
     bool useAsyncPump_ = true;
     std::thread asyncPumpThread_;
     std::atomic<bool> asyncPumpStop_{false};   // THREAD-SAFE: atomic
     std::atomic<bool> asyncPumpRunning_{false}; // THREAD-SAFE: atomic
-    // Guards sockfd, connected, encryptionEnabled, receiveBuffer, cipher state,
+    // Guards sockfd, encryptionEnabled, receiveBuffer, cipher state,
     // headerBytesDecrypted, and recentPacketHistory_.
     mutable std::mutex ioMutex_;
     // Guards pendingPacketCallbacks_ (asyncPumpThread_ produces, main thread consumes).

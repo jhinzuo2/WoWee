@@ -45,6 +45,7 @@ public:
         bool moving = false;
         bool sprinting = false;
         bool lowHealth = false;
+        bool rangedWeaponActive = false;
         float meleeSwingTimer = 0.0f;   // >0 = melee active
         float rangedShootTimer = 0.0f;  // >0 = ranged active
         uint32_t specialAttackAnimId = 0;

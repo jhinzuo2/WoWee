@@ -26,6 +26,14 @@ class Camera;
 class VkContext;
 class VkTexture;
 
+// Enchant visual (glint, glow) attached to a weapon at one of the weapon model's
+// own item-visual attachment points.
+struct WeaponEffectAttachment {
+    uint32_t effectModelId;
+    uint32_t effectInstanceId;
+    glm::vec3 offset;          // attachment position on the weapon model
+};
+
 // Weapon attached to a character instance at a bone attachment point
 struct WeaponAttachment {
     uint32_t weaponModelId;
@@ -33,6 +41,9 @@ struct WeaponAttachment {
     uint32_t attachmentId;     // 1=RightHand, 2=LeftHand
     uint16_t boneIndex;
     glm::vec3 offset;
+    glm::mat4 localTransform{1.0f}; // sheath/hand orientation after attachment point
+    float sheathPush = 0.0f;   // smoothed outward push when the arm swings into the blade
+    std::vector<WeaponEffectAttachment> effects;
 };
 
 /**
@@ -63,7 +74,11 @@ public:
                            const glm::vec3& rotation = glm::vec3(0.0f),
                            float scale = 1.0f);
 
-    void playAnimation(uint32_t instanceId, uint32_t animationId, bool loop = true);
+    // oneShotReturnAnim: animation to resume (looping) when a non-looping
+    // animation finishes; 0 = Stand. Lets NPC one-shot emotes return to their
+    // persistent work/state loop instead of idling.
+    void playAnimation(uint32_t instanceId, uint32_t animationId, bool loop = true,
+                       uint32_t oneShotReturnAnim = 0);
 
     void update(float deltaTime, const glm::vec3& cameraPos = glm::vec3(0.0f));
 
@@ -77,10 +92,12 @@ public:
 
     void setInstancePosition(uint32_t instanceId, const glm::vec3& position);
     void setInstanceRotation(uint32_t instanceId, const glm::vec3& rotation);
+    void setInstanceTorsoYaw(uint32_t instanceId, float deltaYawRad);
     void moveInstanceTo(uint32_t instanceId, const glm::vec3& destination, float durationSeconds);
     void startFadeIn(uint32_t instanceId, float durationSeconds);
     void setInstanceOpacity(uint32_t instanceId, float opacity);
     const pipeline::M2Model* getModelData(uint32_t modelId) const;
+    const pipeline::M2Model* getInstanceModelData(uint32_t instanceId) const;
     void setActiveGeosets(uint32_t instanceId, const std::unordered_set<uint16_t>& geosets);
     void setGroupTextureOverride(uint32_t instanceId, uint16_t geosetGroup, VkTexture* texture);
     void setTextureSlotOverride(uint32_t instanceId, uint16_t textureSlot, VkTexture* texture);
@@ -101,10 +118,40 @@ public:
     /** Attach a weapon model to a character instance at the given attachment point. */
     bool attachWeapon(uint32_t charInstanceId, uint32_t attachmentId,
                       const pipeline::M2Model& weaponModel, uint32_t weaponModelId,
-                      const std::string& texturePath);
+                      const std::string& texturePath,
+                      const glm::mat4& localTransform = glm::mat4(1.0f));
 
-    /** Detach a weapon from the given attachment point. */
+    /** Detach a weapon from the given attachment point (drops its enchant effects too). */
     void detachWeapon(uint32_t charInstanceId, uint32_t attachmentId);
+
+    // Free a model's GPU buffers and map entry once no instance references it.
+    // For per-instance model ids (weapons/effects/player composites, which get
+    // a fresh id per attach or spawn) — without this every reload or despawn
+    // leaked the model. Do NOT call for displayId-keyed NPC models; those are
+    // cached across despawn/respawn on purpose. Buffers are destroyed via the
+    // frame-fence deferral path; shared textures stay in the cache.
+    void unloadModelIfUnused(uint32_t modelId);
+
+    // Model id an instance renders with (0 if the instance doesn't exist).
+    uint32_t getInstanceModelId(uint32_t instanceId) const {
+        auto it = instances.find(instanceId);
+        return it != instances.end() ? it->second.modelId : 0;
+    }
+
+    /**
+     * Attach an enchant visual to the weapon at the given attachment point.
+     * visualSlot is the ItemVisuals.dbc slot (0-4), which selects the attachment
+     * point on the weapon model the effect hangs from.
+     */
+    bool attachWeaponEffect(uint32_t charInstanceId, uint32_t attachmentId, uint32_t visualSlot,
+                            const pipeline::M2Model& effectModel, uint32_t effectModelId);
+
+    /** Remove all enchant visuals from the weapon at the given attachment point. */
+    void detachWeaponEffects(uint32_t charInstanceId, uint32_t attachmentId);
+
+    /** Mark an instance as a scene backdrop: no culling, no character material heuristics. */
+    void setInstanceSceneModel(uint32_t instanceId, bool isScene);
+
 
     /** Get the world-space transform of an attachment point on an instance. */
     bool getAttachmentTransform(uint32_t instanceId, uint32_t attachmentId, glm::mat4& outTransform);
@@ -148,6 +195,10 @@ private:
         // batch metadata, so doing it per-instance per-frame in render() was
         // pure overhead.
         std::vector<size_t> sortedBatchIndices;
+
+        // Pre-classified at load time to avoid per-batch string ops in render loop
+        bool isKoboldFlame = false;
+        bool isSkyBird = false;
     };
 
     // Character instance
@@ -159,6 +210,7 @@ private:
         glm::vec3 rotation;
         float scale;
         bool visible = true;  // For first-person camera hiding
+        float torsoYawOverrideRad = 0.0f;
 
         // Animation state
         uint32_t currentAnimationId = 0;
@@ -166,6 +218,7 @@ private:
         float animationTime = 0.0f;
         float globalSequenceTime = 0.0f; // Separate timer for global sequences (accumulates without wrapping at sequence duration)
         bool animationLoop = true;
+        uint32_t oneShotReturnAnim = 0; // Anim to resume when a one-shot ends (0 = Stand)
         bool isDead = false;  // Prevents movement while in death state
         std::vector<glm::mat4> boneMatrices;  // Current bone transforms
 
@@ -198,7 +251,21 @@ private:
         bool hasOverrideModelMatrix = false;
         glm::mat4 overrideModelMatrix{1.0f};
 
-        // Bone update throttling (skip frames for distant characters)
+        // Enchant visual attached to a weapon. Such a model is nothing but the
+        // additive FX batches that attached weapons otherwise drop, and it still
+        // needs its animation advanced even though its transform comes from the parent.
+        bool isEffectModel = false;
+
+        // A scene rather than a character: the glue-screen backdrops. Two things
+        // follow. Their origin can sit hundreds of units from their geometry, so
+        // culling on it would drop them. And the material heuristics below exist to
+        // rescue character textures — applied to a scene they erase it, because
+        // Stormwind's walls are DXT5 with an unused alpha channel that the opaque
+        // batches must ignore, exactly as the blend mode says.
+        bool isSceneModel = false;
+
+
+        // Bone update throttling for characters outside normal gameplay range.
         uint32_t boneUpdateCounter = 0;
         const M2ModelGPU* cachedModel = nullptr;  // Avoid per-frame hash lookups
 
@@ -218,13 +285,6 @@ private:
     glm::mat4 getModelMatrix(const CharacterInstance& instance) const;
     void destroyModelGPU(M2ModelGPU& gpuModel, bool defer = false);
     void destroyInstanceBones(CharacterInstance& inst, bool defer = false);
-
-    // Keyframe interpolation helpers
-    static int findKeyframeIndex(const std::vector<uint32_t>& timestamps, float time);
-    static glm::vec3 interpolateVec3(const pipeline::M2AnimationTrack& track,
-                                      int seqIdx, float time, const glm::vec3& defaultVal);
-    static glm::quat interpolateQuat(const pipeline::M2AnimationTrack& track,
-                                      int seqIdx, float time);
 
     // Attachment point lookup helper — shared by attachWeapon() and getAttachmentTransform()
     bool findAttachmentBone(uint32_t modelId, uint32_t attachmentId,
@@ -273,6 +333,10 @@ private:
     VkPipeline alphaTestPipeline_ = VK_NULL_HANDLE;
     VkPipeline alphaPipeline_ = VK_NULL_HANDLE;
     VkPipeline additivePipeline_ = VK_NULL_HANDLE;
+    // Whole-instance fades (ghost form, spawn fade-in): alpha blend with depth
+    // write kept on, so the faded model still self-occludes instead of showing
+    // backfaces and under-armor skin through the body.
+    VkPipeline translucentPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout_ = VK_NULL_HANDLE;
 
     // Descriptor set layouts
@@ -282,7 +346,27 @@ private:
 
     // Descriptor pool
     VkDescriptorPool materialDescPools_[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
+    struct MaterialDescriptorKey {
+        VkImageView diffuse = VK_NULL_HANDLE;
+        VkImageView normal = VK_NULL_HANDLE;
+        VkSampler diffuseSampler = VK_NULL_HANDLE;
+        VkSampler normalSampler = VK_NULL_HANDLE;
+        bool operator==(const MaterialDescriptorKey&) const = default;
+    };
+    struct MaterialDescriptorKeyHash {
+        size_t operator()(const MaterialDescriptorKey& key) const {
+            const size_t a = std::hash<VkImageView>{}(key.diffuse);
+            const size_t b = std::hash<VkImageView>{}(key.normal);
+            const size_t c = std::hash<VkSampler>{}(key.diffuseSampler);
+            const size_t d = std::hash<VkSampler>{}(key.normalSampler);
+            return a ^ (b << 1) ^ (c << 2) ^ (d << 3);
+        }
+    };
+    std::unordered_map<MaterialDescriptorKey, VkDescriptorSet, MaterialDescriptorKeyHash>
+        materialDescriptorCache_[2];
     VkDescriptorPool boneDescPool_ = VK_NULL_HANDLE;
+    std::shared_ptr<std::atomic<uint64_t>> boneDescPoolGeneration_ =
+        std::make_shared<std::atomic<uint64_t>>(0);
     uint32_t lastMaterialPoolResetFrame_ = 0xFFFFFFFFu;
 
     // Material UBO ring buffer — pre-allocated per frame slot, sub-allocated each draw
@@ -305,6 +389,11 @@ private:
         bool normalMapPending = false;  // deferred normal map generation
     };
     std::unordered_map<std::string, TextureCacheEntry> textureCache;
+    struct NormalMapInfo {
+        VkTexture* normalMap = nullptr;
+        float heightMapVariance = 0.0f;
+    };
+    std::unordered_map<VkTexture*, NormalMapInfo> normalMapByTexPtr_;
     struct TextureProperties {
         bool hasAlpha = false;
         bool colorKeyBlack = false;
@@ -362,6 +451,7 @@ private:
     static constexpr int MAX_BONES = 240;
     uint32_t numAnimThreads_ = 1;
     std::vector<std::future<void>> animFutures_;
+    std::vector<std::reference_wrapper<CharacterInstance>> toUpdate_;  // reused across frames
 
     // Shadow pipeline resources
     VkPipeline shadowPipeline_ = VK_NULL_HANDLE;

@@ -15,6 +15,7 @@
 #include "rendering/lightning.hpp"
 #include "rendering/lighting_manager.hpp"
 #include "core/profiler.hpp"
+#include "core/thread_pool.hpp"
 #include "rendering/sky_system.hpp"
 #include "rendering/swim_effects.hpp"
 #include "rendering/mount_dust.hpp"
@@ -49,6 +50,7 @@
 #include "audio/activity_sound_manager.hpp"
 #include "audio/mount_sound_manager.hpp"
 #include "audio/npc_voice_manager.hpp"
+#include "audio/player_voice_manager.hpp"
 #include "audio/ambient_sound_manager.hpp"
 #include "audio/ui_sound_manager.hpp"
 #include "audio/combat_sound_manager.hpp"
@@ -67,6 +69,7 @@
 #include "rendering/overlay_system.hpp"
 #include <imgui.h>
 #include <imgui_impl_vulkan.h>
+#include <glm/gtc/constants.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/euler_angles.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -472,6 +475,18 @@ void Renderer::updatePerFrameUBO() {
     float shadowBias = glm::clamp(0.8f * (shadowDistance_ / 300.0f), 0.0f, 1.0f);
     currentFrameData.shadowParams = glm::vec4(shadowsEnabled ? 1.0f : 0.0f, shadowBias, 0.0f, 0.0f);
 
+    for (uint32_t i = 0; i < MAX_LOCAL_LIGHTS; ++i) {
+        currentFrameData.localLightPosRadius[i] = glm::vec4(0.0f);
+        currentFrameData.localLightColorIntensity[i] = glm::vec4(0.0f);
+    }
+    const uint32_t localLightCount = m2Renderer
+        ? m2Renderer->gatherLocalLights(camera->getPosition(),
+              currentFrameData.localLightPosRadius,
+              currentFrameData.localLightColorIntensity,
+              MAX_LOCAL_LIGHTS)
+        : 0;
+    currentFrameData.localLightMeta = glm::ivec4(static_cast<int32_t>(localLightCount), 0, 0, 0);
+
     // Player water ripple data: pack player XY into shadowParams.zw, ripple strength into fogParams.w
     if (cameraController) {
         currentFrameData.shadowParams.z = characterPosition.x;
@@ -559,7 +574,7 @@ bool Renderer::initialize(core::Window* win) {
 
     // LightingManager doesn't use GL — initialize for data-only use
     lightingManager = std::make_unique<LightingManager>();
-    [[maybe_unused]] auto* assetManager = core::Application::getInstance().getAssetManager();
+    auto* assetManager = core::Application::getInstance().getAssetManager();
 
     // Create zone manager; enrich music paths from DBC if available
     zoneManager = std::make_unique<game::ZoneManager>();
@@ -686,6 +701,12 @@ void Renderer::shutdown() {
         m2Renderer->shutdown();
         m2Renderer.reset();
     }
+    if (outlandSkyRenderer_) {
+        outlandSkyRenderer_->shutdown();
+        outlandSkyRenderer_.reset();
+        outlandSkyInstanceId_ = 0;
+        outlandSkyPath_.clear();
+    }
 
     // Audio shutdown is handled by AudioCoordinator (owned by Application).
     audioCoordinator_ = nullptr;
@@ -789,6 +810,7 @@ void Renderer::applyMsaaChange() {
     }
     if (wmoRenderer) wmoRenderer->recreatePipelines();
     if (m2Renderer) m2Renderer->recreatePipelines();
+    if (outlandSkyRenderer_) outlandSkyRenderer_->recreatePipelines();
     if (characterRenderer) characterRenderer->recreatePipelines();
     if (questMarkerRenderer) questMarkerRenderer->recreatePipelines();
     if (weather) weather->recreatePipelines();
@@ -898,20 +920,16 @@ void Renderer::beginFrame() {
     updatePerFrameUBO();
 
     // ── Early compute: M2 frustum culling ──
-    // GPU frustum cull keeps draw call counts low.  The HiZ occlusion pyramid
-    // is skipped for now — building ~11 mip levels with per-level barriers
-    // behind a blocking fence was the main frame-rate bottleneck.  Frustum-
-    // only culling is fast enough that the fence wait is negligible.
+    // beginFrame() has already waited for this frame slot's previous fence, so
+    // its mapped visibility output is complete and safe for the CPU to reuse.
+    // Read/invalidate that completed output, then record the next cull dispatch
+    // directly into the normal frame command buffer. The old path submitted a
+    // separate command buffer and synchronously waited on a fence every frame,
+    // serializing CPU and GPU work solely to obtain same-frame cull results.
     if (m2Renderer && camera && vkCtx) {
-        VkCommandBuffer computeCmd = vkCtx->beginSingleTimeCommands();
         uint32_t frame = vkCtx->getCurrentFrame();
-
-        // Dispatch GPU frustum culling (HiZ disabled → frustum-only pipeline)
-        m2Renderer->dispatchCullCompute(computeCmd, frame, *camera);
-
-        vkCtx->endSingleTimeCommands(computeCmd);
-
         m2Renderer->invalidateCullOutput(frame);
+        m2Renderer->dispatchCullCompute(currentCmd, frame, *camera);
     }
 
     // --- Off-screen pre-passes ---
@@ -1150,8 +1168,93 @@ const std::string& Renderer::getCurrentZoneName() const {
     return audioCoordinator_ ? audioCoordinator_->getCurrentZoneName() : empty;
 }
 
+bool Renderer::ensureOutlandSkybox() {
+    const auto* gh = core::Application::getInstance().getGameHandler();
+    if (!gh || gh->getCurrentMapId() != 530 || !outlandSkyRenderer_ ||
+        !lightingManager || !cachedAssetManager || !camera) {
+        return false;
+    }
+
+    std::string path = lightingManager->getActiveSkyboxPath();
+    if (path.empty()) return false;
+    std::replace(path.begin(), path.end(), '/', '\\');
+    if (path == outlandSkyPath_) return outlandSkyInstanceId_ != 0;
+
+    outlandSkyRenderer_->clear();
+    outlandSkyPath_ = path;
+    outlandSkyInstanceId_ = 0;
+
+    std::vector<std::string> candidates{path};
+    const size_t dot = path.find_last_of('.');
+    if (dot == std::string::npos) {
+        candidates.push_back(path + ".m2");
+    } else {
+        std::string ext = path.substr(dot);
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (ext == ".mdx" || ext == ".mdl") candidates.push_back(path.substr(0, dot) + ".m2");
+    }
+
+    std::vector<uint8_t> modelData;
+    std::string resolvedPath;
+    for (const auto& candidate : candidates) {
+        modelData = cachedAssetManager->readFileOptional(candidate);
+        if (!modelData.empty()) {
+            resolvedPath = candidate;
+            break;
+        }
+    }
+    if (modelData.empty()) {
+        LOG_WARNING("Outland original skybox unavailable: ", path);
+        return false;
+    }
+
+    pipeline::M2Model model = pipeline::M2Loader::load(modelData);
+    model.name = resolvedPath + "#original-sky";
+    const size_t resolvedDot = resolvedPath.find_last_of('.');
+    const std::string skinPath = (resolvedDot == std::string::npos
+        ? resolvedPath : resolvedPath.substr(0, resolvedDot)) + "00.skin";
+    auto skinData = cachedAssetManager->readFileOptional(skinPath);
+    if (!skinData.empty() && model.version >= 264) {
+        pipeline::M2Loader::loadSkin(skinData, model);
+    }
+    if (!model.isValid()) {
+        LOG_WARNING("Outland original skybox model is invalid: ", resolvedPath);
+        return false;
+    }
+
+    const uint32_t modelId = static_cast<uint32_t>(std::hash<std::string>{}(model.name));
+    if (!outlandSkyRenderer_->loadModel(model, modelId)) {
+        LOG_WARNING("Failed to upload Outland original skybox: ", resolvedPath);
+        return false;
+    }
+    outlandSkyInstanceId_ = outlandSkyRenderer_->createInstance(
+        modelId, camera->getPosition(), glm::vec3(0.0f), 1.0f);
+    if (!outlandSkyInstanceId_) return false;
+    outlandSkyRenderer_->setSkipCollision(outlandSkyInstanceId_, true);
+    LOG_INFO("Outland original skybox active: ", resolvedPath);
+    return true;
+}
+
 uint32_t Renderer::getCurrentZoneId() const {
-    return audioCoordinator_ ? audioCoordinator_->getCurrentZoneId() : 0;
+    uint32_t tileZoneId = 0;
+    if (zoneManager && terrainManager) {
+        if (const auto areaId = terrainManager->getAreaIdAt(
+                characterPosition.x, characterPosition.y)) {
+            return zoneManager->resolveAreaZoneId(*areaId);
+        }
+        const auto tile = terrainManager->getCurrentTile();
+        tileZoneId = zoneManager->getZoneId(tile.x, tile.y);
+    }
+
+    const auto* gh = core::Application::getInstance().getGameHandler();
+    if (gh && gh->getWorldStateZoneId() != 0) {
+        const uint32_t areaId = gh->getWorldStateZoneId();
+        return zoneManager ? zoneManager->resolveAreaZoneId(areaId) : areaId;
+    }
+    if (audioCoordinator_ && audioCoordinator_->getCurrentZoneId() != 0)
+        return audioCoordinator_->getCurrentZoneId();
+    return tileZoneId;
 }
 
 void Renderer::update(float deltaTime) {
@@ -1209,14 +1312,22 @@ void Renderer::update(float deltaTime) {
         float gameTime    = gh ? gh->getGameTime() : -1.0f;
         bool isRaining    = gh ? gh->isRaining() : false;
         bool isUnderwater = cameraController ? cameraController->isSwimming() : false;
+        const uint32_t resolvedZoneId = getCurrentZoneId();
 
-        lightingManager->update(characterPosition, mapId, gameTime, isRaining, isUnderwater);
+        lightingManager->update(characterPosition, mapId, resolvedZoneId,
+                                gameTime, isRaining, isUnderwater);
 
         // Sync weather visual renderer with game state
         if (weather && gh) {
             uint32_t wType = gh->getWeatherType();
             float wInt = gh->getWeatherIntensity();
-            if (wType != 0) {
+            if (resolvedZoneId == 10) {
+                // Duskwood's defining effect is persistent ground fog. Some
+                // realms continuously report rain here; suppress those streak
+                // particles so they cannot replace the authored fog ambience.
+                weather->setWeatherType(Weather::Type::NONE);
+                weather->setIntensity(0.0f);
+            } else if (wType != 0) {
                 // Server-driven weather (SMSG_WEATHER) — authoritative
                 if (wType == 1)      weather->setWeatherType(Weather::Type::RAIN);
                 else if (wType == 2) weather->setWeatherType(Weather::Type::SNOW);
@@ -1246,9 +1357,16 @@ void Renderer::update(float deltaTime) {
 
         // Movement-facing comes from camera controller and is decoupled from LMB orbit.
         bool taxiFlight = animationController_ && animationController_->isTaxiFlight();
+        bool activeStrafe = (cameraController->isStrafingLeft() || cameraController->isStrafingRight())
+                             && !cameraController->isMovingBackward();
+        float torsoYawDeltaDeg = 0.0f;
         if (taxiFlight) {
             characterYaw = cameraController->getFacingYaw();
-        } else if (cameraController->isMoving() || cameraController->isRightMouseHeld()) {
+        } else if (cameraController->isMoving() && activeStrafe) {
+            characterYaw = cameraController->getTravelYaw();
+            torsoYawDeltaDeg = cameraController->getFacingYaw() - characterYaw;
+        } else if (cameraController->isMoving() || cameraController->isRightMouseHeld() ||
+                   cameraController->isTurningLeft() || cameraController->isTurningRight()) {
             characterYaw = cameraController->getFacingYaw();
         } else if (animationController_ && animationController_->isInCombat() &&
                    animationController_->getTargetPosition() && !animationController_->isEmoteActive() && !(animationController_ && animationController_->isMounted())) {
@@ -1268,6 +1386,10 @@ void Renderer::update(float deltaTime) {
         }
         float yawRad = glm::radians(characterYaw);
         characterRenderer->setInstanceRotation(characterInstanceId, glm::vec3(0.0f, 0.0f, yawRad));
+
+        while (torsoYawDeltaDeg > 180.0f) torsoYawDeltaDeg -= 360.0f;
+        while (torsoYawDeltaDeg < -180.0f) torsoYawDeltaDeg += 360.0f;
+        characterRenderer->setInstanceTorsoYaw(characterInstanceId, glm::radians(torsoYawDeltaDeg));
 
         // Update animation based on movement state (delegated to AnimationController §4.2)
         if (animationController_) {
@@ -1291,6 +1413,11 @@ void Renderer::update(float deltaTime) {
     // Update sky system (skybox time, star twinkle, clouds, celestial moon phases)
     if (skySystem) {
         skySystem->update(deltaTime);
+    }
+    if (ensureOutlandSkybox() && outlandSkyRenderer_ && camera) {
+        outlandSkyRenderer_->setInstancePosition(outlandSkyInstanceId_, camera->getPosition());
+        outlandSkyRenderer_->update(deltaTime, camera->getPosition(),
+            camera->getProjectionMatrix() * camera->getViewMatrix());
     }
 
     // Update weather particles
@@ -1350,7 +1477,7 @@ void Renderer::update(float deltaTime) {
         float m2DeltaTime = deltaTime;
         glm::vec3 m2CamPos = camera->getPosition();
         glm::mat4 m2ViewProj = camera->getProjectionMatrix() * camera->getViewMatrix();
-        m2AnimFuture = std::async(std::launch::async,
+        m2AnimFuture = core::ThreadPool::frameWorkers().submit(
             [this, m2DeltaTime, m2CamPos, m2ViewProj]() {
                 m2Renderer->update(m2DeltaTime, m2CamPos, m2ViewProj);
             });
@@ -1393,14 +1520,18 @@ void Renderer::update(float deltaTime) {
             else if (wt == Weather::Type::STORM) zctx.weatherType = 3;
             zctx.weatherIntensity = weather->getIntensity();
         }
+        if (lightingManager) {
+            zctx.gameTimeHours = lightingManager->getVisualTimeOfDayHours();
+        }
         if (terrainManager) {
             auto tile = terrainManager->getCurrentTile();
             zctx.tileX = tile.x;
             zctx.tileY = tile.y;
             zctx.hasTile = true;
         }
-        const auto* gh2 = core::Application::getInstance().getGameHandler();
-        zctx.serverZoneId = gh2 ? gh2->getWorldStateZoneId() : 0;
+        // Use the precise MCNK area classification when available; this avoids
+        // stale server world-state zones and whole-ADT ambiguity at river banks.
+        zctx.serverZoneId = getCurrentZoneId();
         zctx.zoneManager = zoneManager.get();
         audioCoordinator_->updateZoneAudio(zctx);
     }
@@ -1542,7 +1673,11 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
 
     // Get time of day for sky-related rendering
     auto* skybox = skySystem ? skySystem->getSkybox() : nullptr;
-    float timeOfDay = skybox ? skybox->getTimeOfDay() : 12.0f;
+    float timeOfDay = lightingManager
+        ? lightingManager->getVisualTimeOfDayHours()
+        : (skybox ? skybox->getTimeOfDay() : 12.0f);
+    const bool useOutlandOriginalSky = gameHandler && gameHandler->getCurrentMapId() == 530 &&
+        outlandSkyRenderer_ && outlandSkyInstanceId_ != 0;
 
     // ── Multithreaded secondary command buffer recording ──
     // Terrain, WMO, and M2 record on worker threads while main thread handles
@@ -1556,15 +1691,24 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             m2Renderer->setInsideInterior(cameraController->isInsideInteriorWMO());
             m2Renderer->setOnTaxi(cameraController->isOnTaxi());
         }
+        auto prepStart = std::chrono::steady_clock::now();
         if (wmoRenderer) wmoRenderer->prepareRender();
+        auto prepWmoEnd = std::chrono::steady_clock::now();
         if (m2Renderer && camera) m2Renderer->prepareRender(frameIdx, *camera);
+        if (useOutlandOriginalSky && camera)
+            outlandSkyRenderer_->prepareRender(frameIdx, *camera);
+        auto prepM2End = std::chrono::steady_clock::now();
         if (characterRenderer) characterRenderer->prepareRender(frameIdx);
+        auto prepEnd = std::chrono::steady_clock::now();
+        const double prepWmoMs  = std::chrono::duration<double, std::milli>(prepWmoEnd - prepStart).count();
+        const double prepM2Ms   = std::chrono::duration<double, std::milli>(prepM2End - prepWmoEnd).count();
+        const double prepCharMs = std::chrono::duration<double, std::milli>(prepEnd - prepM2End).count();
 
         // --- Dispatch worker threads (terrain + WMO + M2) ---
-        std::future<double> terrainFuture, wmoFuture, m2Future;
+        std::future<double> terrainFuture, wmoFuture, charFuture, m2Future, postFuture;
 
         if (terrainRenderer && camera && terrainEnabled && !skipTerrain) {
-            terrainFuture = std::async(std::launch::async, [&]() -> double {
+            terrainFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
                 auto t0 = std::chrono::steady_clock::now();
                 VkCommandBuffer cmd = beginSecondary(SEC_TERRAIN);
                 setSecondaryViewportScissor(cmd);
@@ -1576,7 +1720,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
         }
 
         if (wmoRenderer && camera && !skipWMO) {
-            wmoFuture = std::async(std::launch::async, [&]() -> double {
+            wmoFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
                 auto t0 = std::chrono::steady_clock::now();
                 VkCommandBuffer cmd = beginSecondary(SEC_WMO);
                 setSecondaryViewportScissor(cmd);
@@ -1588,7 +1732,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
         }
 
         if (m2Renderer && camera && !skipM2) {
-            m2Future = std::async(std::launch::async, [&]() -> double {
+            m2Future = core::ThreadPool::frameWorkers().submit([&]() -> double {
                 auto t0 = std::chrono::steady_clock::now();
                 VkCommandBuffer cmd = beginSecondary(SEC_M2);
                 setSecondaryViewportScissor(cmd);
@@ -1624,15 +1768,19 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                 }
                 if (gameHandler) skyParams.weatherIntensity = gameHandler->getWeatherIntensity();
                 skyParams.skyboxModelId = 0;
-                skyParams.skyboxHasStars = false;
+                skyParams.skyboxHasStars = useOutlandOriginalSky;
+                skyParams.useOriginalSkybox = useOutlandOriginalSky;
                 skySystem->render(cmd, perFrameSet, *camera, skyParams);
+                if (useOutlandOriginalSky) {
+                    outlandSkyRenderer_->render(cmd, perFrameSet, *camera);
+                }
             }
             vkEndCommandBuffer(cmd);
         }
 
-        // --- Main thread: record characters + selection circle (SEC_CHARS) ---
+        // --- Main thread: record selection circle before overlay state is used by post ---
         {
-            VkCommandBuffer cmd = beginSecondary(SEC_CHARS);
+            VkCommandBuffer cmd = beginSecondary(SEC_SELECTION);
             setSecondaryViewportScissor(cmd);
             if (overlaySystem_) {
                 overlaySystem_->renderSelectionCircle(view, projection, cmd,
@@ -1640,25 +1788,28 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                     wmoRenderer ? OverlaySystem::HeightQuery3D([&](float x, float y, float z) { return wmoRenderer->getFloorHeight(x, y, z); }) : OverlaySystem::HeightQuery3D{},
                     m2Renderer ? OverlaySystem::HeightQuery3D([&](float x, float y, float z) { return m2Renderer->getFloorHeight(x, y, z); }) : OverlaySystem::HeightQuery3D{});
             }
+            vkEndCommandBuffer(cmd);
+        }
+
+        // Character recording is independent after prepareRender() and no
+        // longer shares the selection-circle overlay command buffer.
+        charFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
+            auto t0 = std::chrono::steady_clock::now();
+            VkCommandBuffer cmd = beginSecondary(SEC_CHARS);
+            setSecondaryViewportScissor(cmd);
             if (characterRenderer && camera && !skipChars) {
                 characterRenderer->render(cmd, perFrameSet, *camera);
             }
             vkEndCommandBuffer(cmd);
-        }
+            return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        });
 
-        // --- Wait for workers ---
-        // Guard with try-catch: future::get() re-throws any exception from the
-        // async task. Without this, a single bad_alloc in a render worker would
-        // propagate as an unhandled exception and terminate the process.
-        try { if (terrainFuture.valid()) lastTerrainRenderMs = terrainFuture.get(); }
-        catch (const std::exception& e) { LOG_ERROR("Terrain render worker: ", e.what()); }
-        try { if (wmoFuture.valid()) lastWMORenderMs = wmoFuture.get(); }
-        catch (const std::exception& e) { LOG_ERROR("WMO render worker: ", e.what()); }
-        try { if (m2Future.valid()) lastM2RenderMs = m2Future.get(); }
-        catch (const std::exception& e) { LOG_ERROR("M2 render worker: ", e.what()); }
-
-        // --- Main thread: record post-opaque (SEC_POST) ---
-        {
+        // Post-world systems are disjoint from terrain/WMO/M2/characters. Start
+        // this after selection recording so OverlaySystem is never used from
+        // two threads at once.
+        postFuture = core::ThreadPool::frameWorkers().submit([&]() -> double {
+            auto t0 = std::chrono::steady_clock::now();
             VkCommandBuffer cmd = beginSecondary(SEC_POST);
             setSecondaryViewportScissor(cmd);
             if (waterRenderer && camera)
@@ -1670,7 +1821,6 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             if (chargeEffect && camera) chargeEffect->render(cmd, perFrameSet);
             if (questMarkerRenderer && camera) questMarkerRenderer->render(cmd, perFrameSet, *camera);
 
-            // Underwater overlay + minimap
             if (overlaySystem_ && waterRenderer && camera) {
                 glm::vec3 camPos = camera->getPosition();
                 auto waterH = waterRenderer->getNearestWaterHeightAt(camPos.x, camPos.y, camPos.z);
@@ -1686,14 +1836,12 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                     glm::vec4 tint = canal
                         ? glm::vec4(0.01f, 0.04f, 0.10f, fogStrength)
                         : glm::vec4(0.03f, 0.09f, 0.18f, fogStrength);
-                    if (overlaySystem_) overlaySystem_->renderOverlay(tint, cmd);
+                    overlaySystem_->renderOverlay(tint, cmd);
                 }
             }
-            // Ghost mode desaturation: cold blue-grey overlay when dead/ghost
             if (ghostMode_ && overlaySystem_) {
                 overlaySystem_->renderOverlay(glm::vec4(0.30f, 0.35f, 0.42f, 0.45f), cmd);
             }
-            // Brightness overlay (applied before minimap so it doesn't affect UI)
             if (overlaySystem_) {
                 float br = postProcessPipeline_ ? postProcessPipeline_->getBrightness() : 1.0f;
                 if (br < 0.99f) {
@@ -1710,16 +1858,10 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                 float minimapPlayerOrientation = 0.0f;
                 bool hasMinimapPlayerOrientation = false;
                 if (cameraController) {
-                    float facingRad = glm::radians(characterYaw);
-                    glm::vec3 facingFwd(std::cos(facingRad), std::sin(facingRad), 0.0f);
-                    // atan2(-x,y) = canonical yaw (0=North); negate for shader convention.
-                    minimapPlayerOrientation = -std::atan2(-facingFwd.x, facingFwd.y);
+                    minimapPlayerOrientation = glm::radians(characterYaw);
                     hasMinimapPlayerOrientation = true;
                 } else if (gameHandler) {
-                    // movementInfo.orientation is canonical yaw: 0=North, π/2=East.
-                    // Minimap shader: arrowRotation=0 points up (North), positive rotates CW
-                    // (π/2=West, -π/2=East). Correct mapping: arrowRotation = -canonical_yaw.
-                    minimapPlayerOrientation = -gameHandler->getMovementInfo().orientation;
+                    minimapPlayerOrientation = glm::pi<float>() - gameHandler->getMovementInfo().orientation;
                     hasMinimapPlayerOrientation = true;
                 }
                 minimap->render(cmd, *camera, minimapCenter,
@@ -1727,6 +1869,35 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
                                 minimapPlayerOrientation, hasMinimapPlayerOrientation);
             }
             vkEndCommandBuffer(cmd);
+            return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        });
+
+        // --- Wait for workers ---
+        // Guard with try-catch: future::get() re-throws any exception from the
+        // async task. Without this, a single bad_alloc in a render worker would
+        // propagate as an unhandled exception and terminate the process.
+        try { if (terrainFuture.valid()) lastTerrainRenderMs = terrainFuture.get(); }
+        catch (const std::exception& e) { LOG_ERROR("Terrain render worker: ", e.what()); }
+        try { if (wmoFuture.valid()) lastWMORenderMs = wmoFuture.get(); }
+        catch (const std::exception& e) { LOG_ERROR("WMO render worker: ", e.what()); }
+        try { if (m2Future.valid()) lastM2RenderMs = m2Future.get(); }
+        catch (const std::exception& e) { LOG_ERROR("M2 render worker: ", e.what()); }
+        try { if (charFuture.valid()) (void)charFuture.get(); }
+        catch (const std::exception& e) { LOG_ERROR("Character render worker: ", e.what()); }
+        try { if (postFuture.valid()) (void)postFuture.get(); }
+        catch (const std::exception& e) { LOG_ERROR("Post render worker: ", e.what()); }
+
+        // prepareRender() does the GPU allocations that are not thread-safe, so it runs
+        // on the main thread and is not covered by the worker timings. Name the culprit
+        // when a frame runs long instead of leaving renderWorld as one opaque number.
+        const double prepTotalMs = prepWmoMs + prepM2Ms + prepCharMs;
+        const double worstWorkerMs = std::max({lastTerrainRenderMs, lastWMORenderMs, lastM2RenderMs});
+        if (prepTotalMs + worstWorkerMs > 40.0) {
+            LOG_WARNING("SLOW renderWorld breakdown: prepare=", prepTotalMs,
+                        "ms (wmo=", prepWmoMs, " m2=", prepM2Ms, " char=", prepCharMs,
+                        ") workers: terrain=", lastTerrainRenderMs,
+                        " wmo=", lastWMORenderMs, " m2=", lastM2RenderMs);
         }
 
         // --- Execute all secondary buffers in correct draw order ---
@@ -1737,6 +1908,7 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             validCmds[numCmds++] = secondaryCmds_[SEC_TERRAIN][frameIdx];
         if (wmoRenderer && camera && !skipWMO)
             validCmds[numCmds++] = secondaryCmds_[SEC_WMO][frameIdx];
+        validCmds[numCmds++] = secondaryCmds_[SEC_SELECTION][frameIdx];
         validCmds[numCmds++] = secondaryCmds_[SEC_CHARS][frameIdx];
         if (m2Renderer && camera && !skipM2)
             validCmds[numCmds++] = secondaryCmds_[SEC_M2][frameIdx];
@@ -1765,8 +1937,13 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             }
             if (gameHandler) skyParams.weatherIntensity = gameHandler->getWeatherIntensity();
             skyParams.skyboxModelId = 0;
-            skyParams.skyboxHasStars = false;
+            skyParams.skyboxHasStars = useOutlandOriginalSky;
+            skyParams.useOriginalSkybox = useOutlandOriginalSky;
             skySystem->render(currentCmd, perFrameSet, *camera, skyParams);
+            if (useOutlandOriginalSky) {
+                outlandSkyRenderer_->prepareRender(frameIdx, *camera);
+                outlandSkyRenderer_->render(currentCmd, perFrameSet, *camera);
+            }
         }
 
         if (terrainRenderer && camera && terrainEnabled && !skipTerrain) {
@@ -1864,16 +2041,16 @@ void Renderer::renderWorld(game::World* world, game::GameHandler* gameHandler) {
             float minimapPlayerOrientation = 0.0f;
             bool hasMinimapPlayerOrientation = false;
             if (cameraController) {
-                float facingRad = glm::radians(characterYaw);
-                glm::vec3 facingFwd(std::cos(facingRad), std::sin(facingRad), 0.0f);
-                // atan2(-x,y) = canonical yaw (0=North); negate for shader convention.
-                minimapPlayerOrientation = -std::atan2(-facingFwd.x, facingFwd.y);
+                // Render-space character yaw faces north at 180 degrees; the
+                // minimap shader arrow faces north at 0. Match the mirrored
+                // minimap texture by flipping the visual arrow vertically.
+                minimapPlayerOrientation = glm::radians(characterYaw);
                 hasMinimapPlayerOrientation = true;
             } else if (gameHandler) {
-                // movementInfo.orientation is canonical yaw: 0=North, π/2=East.
-                // Minimap shader: arrowRotation=0 points up (North), positive rotates CW
-                // (π/2=West, -π/2=East). Correct mapping: arrowRotation = -canonical_yaw.
-                minimapPlayerOrientation = -gameHandler->getMovementInfo().orientation;
+                // movementInfo.orientation is canonical yaw: north is 0, east is +pi/2.
+                // Match the mirrored minimap texture by flipping the visual
+                // arrow vertically.
+                minimapPlayerOrientation = glm::pi<float>() - gameHandler->getMovementInfo().orientation;
                 hasMinimapPlayerOrientation = true;
             }
             minimap->render(currentCmd, *camera, minimapCenter,
@@ -1968,6 +2145,18 @@ bool Renderer::initializeRenderers(pipeline::AssetManager* assetManager, const s
         }
     }
 
+    // Outland's original client skies are camera-centered M2 models selected
+    // through LightParams/LightSkybox. Keep them in a dedicated no-depth
+    // renderer so they draw behind terrain and never enter world collision.
+    if (mapName == "Outland" && !outlandSkyRenderer_) {
+        outlandSkyRenderer_ = std::make_unique<M2Renderer>();
+        outlandSkyRenderer_->setSkyMode(true);
+        if (!outlandSkyRenderer_->initialize(vkCtx, perFrameSetLayout, assetManager)) {
+            LOG_WARNING("Outland sky M2 renderer initialization failed");
+            outlandSkyRenderer_.reset();
+        }
+    }
+
     // HiZ occlusion culling disabled — the pyramid build + blocking fence was
     // the main frame-rate bottleneck.  GPU frustum culling alone provides good
     // draw-call reduction without the per-frame GPU stall.  HiZ can be re-
@@ -1981,6 +2170,10 @@ bool Renderer::initializeRenderers(pipeline::AssetManager* assetManager, const s
                 LOG_WARNING("WMO shadow pipeline initialization failed");
         }
     }
+
+    // Renderer components can be recreated during map transitions. Restore the
+    // configured view distance instead of falling back to their defaults.
+    setViewDistance(viewDistance_);
 
     // Initialize shadow pipelines for M2 if not yet done
     if (m2Renderer && shadowRenderPass != VK_NULL_HANDLE && !m2Renderer->hasShadowPipeline()) {
@@ -2070,6 +2263,9 @@ bool Renderer::initializeRenderers(pipeline::AssetManager* assetManager, const s
         }
         if (audioCoordinator_->getNpcVoiceManager()) {
             audioCoordinator_->getNpcVoiceManager()->initialize(assetManager);
+        }
+        if (audioCoordinator_->getPlayerVoiceManager()) {
+            audioCoordinator_->getPlayerVoiceManager()->initialize(assetManager);
         }
         if (!deferredWorldInitEnabled_) {
             if (audioCoordinator_->getAmbientSoundManager()) {
@@ -2202,6 +2398,23 @@ void Renderer::setWireframeMode(bool enabled) {
     }
 }
 
+void Renderer::setViewDistance(float distance) {
+    viewDistance_ = glm::clamp(distance, 400.0f, 2400.0f);
+
+    if (terrainRenderer) terrainRenderer->setViewDistance(viewDistance_);
+    if (wmoRenderer) wmoRenderer->setViewDistance(viewDistance_);
+    if (m2Renderer) m2Renderer->setViewDistance(viewDistance_);
+    if (terrainManager) {
+        terrainManager->setLoadRadius(getTerrainLoadRadius());
+        terrainManager->setUnloadRadius(getTerrainUnloadRadius());
+    }
+}
+
+int Renderer::getTerrainLoadRadius() const {
+    constexpr float kAdtTileSize = 533.33333f;
+    return glm::clamp(static_cast<int>(std::ceil(viewDistance_ / kAdtTileSize)) + 1, 2, 6);
+}
+
 bool Renderer::loadTerrainArea(const std::string& mapName, int centerX, int centerY, int radius) {
     // Create terrain renderer if not already created
     if (!terrainRenderer) {
@@ -2264,6 +2477,9 @@ bool Renderer::loadTerrainArea(const std::string& mapName, int centerX, int cent
     }
     if (audioCoordinator_->getNpcVoiceManager() && cachedAssetManager) {
         audioCoordinator_->getNpcVoiceManager()->initialize(cachedAssetManager);
+    }
+    if (audioCoordinator_->getPlayerVoiceManager() && cachedAssetManager) {
+        audioCoordinator_->getPlayerVoiceManager()->initialize(cachedAssetManager);
     }
     if (!deferredWorldInitEnabled_) {
         if (audioCoordinator_->getAmbientSoundManager() && cachedAssetManager) {
@@ -2366,8 +2582,21 @@ glm::mat4 Renderer::computeLightSpaceMatrix() {
         sunDir = glm::normalize(sunDir);
     }
 
-    // Shadow center follows the player directly; texel snapping below
-    // prevents shimmer without needing to freeze the projection.
+    // Lighting transitions are deliberately smoothed every frame. Feeding that
+    // continuously rotating direction straight into the shadow camera rotates
+    // the entire shadow texel grid and makes otherwise stationary shadows
+    // shimmer. Hold the projection direction until the lighting has moved by a
+    // visible amount; diffuse lighting can continue to transition smoothly.
+    constexpr float kShadowDirectionUpdateCos = 0.9999619f; // cos(0.5 degrees)
+    if (!shadowLightDirectionInitialized_ ||
+        glm::dot(shadowLightDirection_, sunDir) < kShadowDirectionUpdateCos) {
+        shadowLightDirection_ = sunDir;
+        shadowLightDirectionInitialized_ = true;
+    }
+    sunDir = shadowLightDirection_;
+
+    // Shadow center follows the player directly; texel snapping below keeps
+    // translation aligned with the now-stable projection axes.
     glm::vec3 desiredCenter = characterPosition;
     if (!shadowCenterInitialized) {
         if (glm::dot(desiredCenter, desiredCenter) < 1.0f) {
@@ -2456,8 +2685,8 @@ bool Renderer::createSecondaryCommandResources() {
     allocInfo.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
     allocInfo.commandBufferCount = 1;
 
-    // Worker secondaries: SEC_TERRAIN=1, SEC_WMO=2, SEC_M2=4 → worker pools 0,1,2
-    const uint32_t workerSecondaries[] = { SEC_TERRAIN, SEC_WMO, SEC_M2 };
+    // Each concurrently recorded worker secondary owns a dedicated command pool.
+    const uint32_t workerSecondaries[] = { SEC_TERRAIN, SEC_WMO, SEC_CHARS, SEC_M2, SEC_POST };
     for (uint32_t w = 0; w < NUM_WORKERS; ++w) {
         allocInfo.commandPool = workerCmdPools_[w];
         for (uint32_t f = 0; f < MAX_FRAMES; ++f) {
@@ -2468,8 +2697,7 @@ bool Renderer::createSecondaryCommandResources() {
         }
     }
 
-    // Main-thread secondaries: SEC_SKY=0, SEC_CHARS=3, SEC_POST=5, SEC_IMGUI=6
-    const uint32_t mainSecondaries[] = { SEC_SKY, SEC_CHARS, SEC_POST, SEC_IMGUI };
+    const uint32_t mainSecondaries[] = { SEC_SKY, SEC_SELECTION, SEC_IMGUI };
     for (uint32_t idx : mainSecondaries) {
         allocInfo.commandPool = mainSecondaryCmdPool_;
         for (uint32_t f = 0; f < MAX_FRAMES; ++f) {
@@ -2595,7 +2823,9 @@ void Renderer::renderReflectionPass() {
         if (skySystem) {
             rendering::SkyParams skyParams;
             auto* reflSkybox = skySystem->getSkybox();
-            skyParams.timeOfDay = reflSkybox ? reflSkybox->getTimeOfDay() : 12.0f;
+            skyParams.timeOfDay = lightingManager
+                ? lightingManager->getVisualTimeOfDayHours()
+                : (reflSkybox ? reflSkybox->getTimeOfDay() : 12.0f);
             if (lightingManager) {
                 const auto& lp = lightingManager->getLightingParams();
                 skyParams.directionalDir = lp.directionalDir;

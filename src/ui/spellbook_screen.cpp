@@ -103,6 +103,7 @@ void SpellbookScreen::loadSpellDBC(pipeline::AssetManager* assetManager) {
                        uint32_t nameField, uint32_t rankField, uint32_t tooltipField,
                        uint32_t powerTypeField, uint32_t manaCostField,
                        uint32_t castTimeIndexField, uint32_t rangeIndexField,
+                       uint32_t casterAuraStateField, uint32_t casterAuraStateNotField,
                        const char* label) {
         spellData.clear();
         uint32_t count = dbc->getRecordCount();
@@ -121,6 +122,10 @@ void SpellbookScreen::loadSpellDBC(pipeline::AssetManager* assetManager) {
             // Optional fields: only read if field index is valid for this DBC version
             if (powerTypeField < fc)   info.powerType = dbc->getUInt32(i, powerTypeField);
             if (manaCostField  < fc)   info.manaCost  = dbc->getUInt32(i, manaCostField);
+            if (casterAuraStateField < fc)
+                info.casterAuraState = dbc->getUInt32(i, casterAuraStateField);
+            if (casterAuraStateNotField < fc)
+                info.casterAuraStateNot = dbc->getUInt32(i, casterAuraStateNotField);
             if (castTimeIndexField < fc) {
                 uint32_t ctIdx = dbc->getUInt32(i, castTimeIndexField);
                 if (ctIdx > 0) {
@@ -157,11 +162,15 @@ void SpellbookScreen::loadSpellDBC(pipeline::AssetManager* assetManager) {
         uint32_t manaCostField     = UINT32_MAX;
         uint32_t castTimeIdxField  = UINT32_MAX;
         uint32_t rangeIdxField     = UINT32_MAX;
+        uint32_t casterAuraStateField = UINT32_MAX;
+        uint32_t casterAuraStateNotField = UINT32_MAX;
         try { tooltipField     = (*spellL)["Tooltip"]; } catch (...) {}
         try { powerTypeField   = (*spellL)["PowerType"]; } catch (...) {}
         try { manaCostField    = (*spellL)["ManaCost"]; } catch (...) {}
         try { castTimeIdxField = (*spellL)["CastingTimeIndex"]; } catch (...) {}
         try { rangeIdxField    = (*spellL)["RangeIndex"]; } catch (...) {}
+        try { casterAuraStateField = (*spellL)["CasterAuraState"]; } catch (...) {}
+        try { casterAuraStateNotField = (*spellL)["CasterAuraStateNot"]; } catch (...) {}
         // Try SchoolMask (TBC/WotLK bitmask) then SchoolEnum (Classic/Turtle 0-6 value)
         schoolField_  = UINT32_MAX;
         isSchoolEnum_ = false;
@@ -172,6 +181,7 @@ void SpellbookScreen::loadSpellDBC(pipeline::AssetManager* assetManager) {
         tryLoad((*spellL)["ID"], (*spellL)["Attributes"], (*spellL)["IconID"],
                 (*spellL)["Name"], (*spellL)["Rank"], tooltipField,
                 powerTypeField, manaCostField, castTimeIdxField, rangeIdxField,
+                casterAuraStateField, casterAuraStateNotField,
                 "expansion layout");
     }
 
@@ -182,7 +192,7 @@ void SpellbookScreen::loadSpellDBC(pipeline::AssetManager* assetManager) {
         LOG_INFO("Spellbook: Retrying with WotLK field indices (DBC has ", fieldCount, " fields)");
         schoolField_  = 225;
         isSchoolEnum_ = false;
-        tryLoad(0, 4, 133, 136, 153, 139, 14, 39, 47, 49, "WotLK fallback");
+        tryLoad(0, 4, 133, 136, 153, 139, 41, 42, 28, 46, 20, 22, "WotLK fallback");
     }
 
     dbcLoaded = !spellData.empty();
@@ -226,6 +236,20 @@ void SpellbookScreen::getSpellPowerInfo(uint32_t spellId, pipeline::AssetManager
     if (it != spellData.end()) {
         outCost = it->second.manaCost;
         outPowerType = it->second.powerType;
+    }
+}
+
+void SpellbookScreen::getSpellAuraStateInfo(uint32_t spellId, pipeline::AssetManager* assetManager,
+                                             uint32_t& outRequired, uint32_t& outForbidden) {
+    outRequired = 0;
+    outForbidden = 0;
+    if (!dbcLoadAttempted) {
+        loadSpellDBC(assetManager);
+    }
+    auto it = spellData.find(spellId);
+    if (it != spellData.end()) {
+        outRequired = it->second.casterAuraState;
+        outForbidden = it->second.casterAuraStateNot;
     }
 }
 

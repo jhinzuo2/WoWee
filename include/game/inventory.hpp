@@ -87,10 +87,14 @@ struct ItemDef {
     uint32_t requiredLevel = 0;
     uint32_t bindType = 0;      // 0=none, 1=BoP, 2=BoE, 3=BoU, 4=BoQ
     std::string description;    // Flavor/lore text shown in tooltip (italic yellow)
+    uint32_t pageTextId = 0;     // Non-zero: item opens readable page text
     // Generic stat pairs for non-primary stats (hit, crit, haste, AP, SP, etc.)
     struct ExtraStat { uint32_t statType = 0; int32_t statValue = 0; };
     std::vector<ExtraStat> extraStats;
     uint32_t startQuestId = 0;  // Non-zero: item begins a quest
+    // Exact server object identity for this displayed inventory slot. Item IDs
+    // are not unique and must never be used to guess destructive operations.
+    uint64_t guid = 0;
 };
 
 struct ItemSlot {
@@ -135,6 +139,10 @@ public:
     // Extra bags
     int getBagSize(int bagIndex) const;
     void setBagSize(int bagIndex, int size);
+    // Special containers (quivers, ammo pouches, profession bags) only accept
+    // their own item type: sorting skips them and the UI marks their slots.
+    bool isBagSpecial(int bagIndex) const;
+    void setBagSpecial(int bagIndex, bool special);
     const ItemSlot& getBagSlot(int bagIndex, int slotIndex) const;
     bool setBagSlot(int bagIndex, int slotIndex, const ItemDef& item);
     bool clearBagSlot(int bagIndex, int slotIndex);
@@ -188,6 +196,7 @@ private:
 
     struct BagData {
         int size = 0;
+        bool special = false;  // Quiver/ammo pouch/profession bag — restricted contents
         ItemSlot bagItem;  // The bag item itself (for icon/name/tooltip)
         std::array<ItemSlot, MAX_BAG_SIZE> slots{};
     };

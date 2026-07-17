@@ -11,6 +11,9 @@ layout(set = 0, binding = 0) uniform PerFrame {
     vec4 fogColor;
     vec4 fogParams;
     vec4 shadowParams;
+    vec4 localLightPosRadius[64];
+    vec4 localLightColorIntensity[64];
+    ivec4 localLightMeta;
 };
 
 layout(set = 1, binding = 0) uniform sampler2D uTexture;
@@ -32,6 +35,10 @@ layout(set = 1, binding = 1) uniform WMOMaterial {
     float wmoAmbientR;
     float wmoAmbientG;
     float wmoAmbientB;
+    int emissive;
+    int padding0;
+    int padding1;
+    int padding2;
 };
 
 layout(set = 1, binding = 2) uniform sampler2D uNormalHeightMap;
@@ -57,6 +64,23 @@ float sampleShadowPCF(sampler2DShadow smap, vec3 coords) {
         }
     }
     return shadow / 9.0;
+}
+
+vec3 localLightContribution(vec3 pos, vec3 normal, vec3 albedo) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < min(localLightMeta.x, 64); ++i) {
+        vec3 toLight = localLightPosRadius[i].xyz - pos;
+        float dist = length(toLight);
+        float radius = localLightPosRadius[i].w;
+        if (dist >= radius || radius <= 0.0) continue;
+        vec3 lightVector = toLight / max(dist, 0.001);
+        float attenuation = 1.0 - dist / radius;
+        attenuation *= attenuation;
+        float wrappedDiffuse = 0.22 + 0.78 * max(dot(normal, lightVector), 0.0);
+        sum += albedo * localLightColorIntensity[i].rgb *
+               (localLightColorIntensity[i].w * attenuation * wrappedDiffuse);
+    }
+    return sum;
 }
 
 // LOD factor from screen-space UV derivatives
@@ -183,7 +207,11 @@ void main() {
         shadow = mix(1.0, shadow, shadowParams.y);
     }
 
-    if (isLava != 0) {
+    if (emissive != 0) {
+        // Authored luminous glass must remain bright in direct sun and shadow.
+        // A small warm bias keeps low-valued texels from reading as dark glass.
+        result = texColor.rgb * 2.0 + vec3(0.16, 0.07, 0.015);
+    } else if (isLava != 0) {
         // Lava is self-luminous — bright emissive, no shadows
         result = texColor.rgb * 1.5;
     } else if (isInterior != 0) {
@@ -212,6 +240,9 @@ void main() {
 
         result *= max(VertColor.rgb, vec3(0.5));
     }
+
+    if (isWindow == 0 && isLava == 0)
+        result += localLightContribution(FragPos, norm, texColor.rgb);
 
     float dist = length(viewPos.xyz - FragPos);
     float fogFactor = clamp((fogParams.y - dist) / (fogParams.y - fogParams.x), 0.0, 1.0);

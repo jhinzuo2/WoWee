@@ -9,6 +9,12 @@ A native C++ World of Warcraft client with a custom Vulkan renderer.
 [![Sponsor](https://img.shields.io/github/sponsors/Kelsidavis?label=Sponsor&logo=GitHub)](https://github.com/sponsors/Kelsidavis)
 [![Discord](https://img.shields.io/discord/1?label=Discord&logo=discord)](https://discord.gg/PSdMPS8uje)
 
+## Latest Demonstration
+
+[![Watch the latest WoWee demonstration](https://img.youtube.com/vi/1Ax1jeNV_GU/maxresdefault.jpg)](https://youtu.be/1Ax1jeNV_GU?si=a6yT7C51Np-NP7IQ)
+
+### Previous Demonstrations
+
 [![Watch the video](https://img.youtube.com/vi/B-jtpPmiXGM/maxresdefault.jpg)](https://youtu.be/B-jtpPmiXGM)
 
 [![Watch the video](https://img.youtube.com/vi/Pd9JuYYxu0o/maxresdefault.jpg)](https://youtu.be/Pd9JuYYxu0o)
@@ -19,15 +25,15 @@ Protocol Compatible with **Vanilla (Classic) 1.12 + TBC 2.4.3 + WotLK 3.3.5a**.
 
 > **Legal Disclaimer**: This is an educational/research project. It does not include any Blizzard Entertainment assets, data files, or proprietary code. World of Warcraft and all related assets are the property of Blizzard Entertainment, Inc. This project is not affiliated with or endorsed by Blizzard Entertainment. Users are responsible for supplying their own legally obtained game data files and for ensuring compliance with all applicable laws in their jurisdiction.
 
-## Status & Direction (2026-05-13)
+## Status & Direction (2026-07-12)
 
 - **Compatibility**: **Vanilla (Classic) 1.12 + TBC 2.4.3 + WotLK 3.3.5a** are all supported via expansion profiles and per-expansion packet parsers. All three expansions are roughly on par.
 - **Tested against**: AzerothCore/ChromieCraft, TrinityCore, Mangos, and Turtle WoW (1.18).
 - **Current focus**: stability hardening after a large god-object decomposition pass — chasing down behavioral regressions that crept in during the refactor (NPC/UI hitboxes, packet handlers, periodic-spam guards, optimistic-state syncs).
 - **Warden**: Full module execution via Unicorn Engine CPU emulation. Decrypts (RC4→RSA→zlib), parses and relocates the PE module, executes via x86 emulation with Windows API interception. Module cache at `~/.local/share/wowee/warden_cache/`.
-- **CI**: GitHub Actions builds for Linux (x86-64, ARM64), Windows (MSYS2 x86-64 + ARM64), and macOS (ARM64). Security scans via CodeQL, Semgrep, and sanitizers. 31 unit-test suites covering protocol parsers, animation FSMs, world-map state, chat markup, macro evaluator, and editor units.
+- **CI**: GitHub Actions builds for Linux (x86-64, ARM64), Windows (MSYS2 x86-64 + ARM64), and macOS (ARM64). Security scans via CodeQL, Semgrep, and sanitizers. 32 unit-test suites covering protocol parsers, packet builders, DBC layouts, animation FSMs, world-map state, chat markup, macro evaluator, and editor units.
 - **Container builds**: Multi-platform Docker build system for Linux, macOS (arm64/x86_64 via osxcross), and Windows (LLVM-MinGW) cross-compilation.
-- **Release**: v1.9.1-preview — 530+ WoW API functions, 140+ events, broad opcode coverage across Classic / TBC / WotLK / Turtle.
+- **Release**: v2.0.7-preview — 530+ WoW API functions, 140+ events, broad opcode coverage across Classic / TBC / WotLK / Turtle. The running client reports its version (last tag + build date) on the login screen and in the settings window.
 
 ## World Editor
 
@@ -58,7 +64,7 @@ Exported zones auto-load in the wowee client from `custom_zones/` or `output/` d
 ### Rendering Engine
 - **Terrain** -- Multi-tile streaming with async loading, texture splatting (4 layers), frustum culling, expanded load radius during taxi flights
 - **Atmosphere** -- Procedural clouds (FBM noise), lens flare with chromatic aberration, cloud/fog star occlusion
-- **Characters** -- Skeletal animation with GPU vertex skinning (256 bones), race-aware textures, per-instance NPC hair/skin textures
+- **Characters** -- Skeletal animation with GPU vertex skinning (256 bones), per-bone torso twist for strafing, race-aware textures, per-instance NPC hair/skin textures
 - **Buildings** -- WMO renderer with multi-material batches, frustum culling, collision (wall/floor classification, slope sliding), interior glass transparency
 - **Instances** -- WDT parser for WMO-only dungeon maps, area trigger portals with glow/spin effects, seamless zone transitions
 - **Water & Lava** -- Terrain and WMO water with refraction/reflection, magma/slime rendering with multi-octave FBM noise flow, Beer-Lambert absorption, M2 lava waterfalls with UV scroll
@@ -74,11 +80,12 @@ Exported zones auto-load in the wowee client from `custom_zones/` or `output/` d
 
 ### Gameplay Systems
 - **Authentication** -- Full SRP6a implementation with RC4 header encryption
-- **Character System** -- Creation (with nonbinary gender option), selection, 3D preview, stats panel, race/class support
-- **Movement** -- WASD movement, camera orbit, spline path following, transport riding (trams, ships, zeppelins), movement ACK responses
+- **Character System** -- Creation (with nonbinary gender option), selection, stats panel, race/class support; character-select preview shows equipped weapons and the racial glue scene (Stormwind, Durotar, Mulgore, ...) behind the character
+- **Movement** -- WASD movement, camera orbit, torso-twist strafing (SpineLow bone rotation), spline path following, transport riding (trams, ships, zeppelins), movement ACK responses
 - **Combat** -- Auto-attack, spell casting with cooldowns, damage calculation, death handling, spirit healer resurrection
 - **Targeting** -- Tab-cycling with hostility filtering, click-to-target, faction-based hostility (using Faction.dbc)
 - **Inventory** -- 23 equipment slots, 16 backpack slots, drag-drop, auto-equip, item tooltips with weapon damage/speed, server-synced bag sort (quality/type/stack), independent bag windows
+- **Item Enhancements** -- Sharpening stones, weightstones and weapon oils apply to another item: using one arms a targeting cursor, and the resulting enchant shows its name in the tooltip and its visual effect (the glint) on the weapon model
 - **Bank** -- Full bank support for all expansions, bag slots, drag-drop, right-click deposit (non-equippable items)
 - **Spells** -- Spellbook with specialty, general, profession, mount, and companion tabs; drag-drop to action bar; item use support
 - **Talents** -- Talent tree UI with proper visuals and functionality
@@ -96,7 +103,7 @@ Exported zones auto-load in the wowee client from `custom_zones/` or `output/` d
 - **Map Exploration** -- Subzone-level fog-of-war reveal, world map with continent/zone views, quest POI markers, taxi node markers, party member dots
 - **NPC Voices** -- Race/gender-specific NPC greeting, farewell, vendor, pissed, aggro, and flee sounds for all playable races including Blood Elf and Draenei
 - **Warden** -- Warden anti-cheat module execution via Unicorn Engine x86 emulation (cross-platform, no Wine)
-- **UI** -- Loading screens with progress bar, settings window with graphics quality presets (LOW/MEDIUM/HIGH/ULTRA), shadow distance slider, minimap with zoom/rotation/square mode, top-right minimap mute speaker, separate bag windows with compact-empty mode (aggregate view)
+- **UI** -- Loading screens with progress bar, settings window with graphics quality presets (LOW/MEDIUM/HIGH/ULTRA), shadow distance slider, minimap with zoom/rotation/square mode, top-right minimap mute speaker, separate bag windows with compact-empty mode (aggregate view), build version and date on the login screen and in settings
 
 ## Graphics & Performance
 
@@ -187,17 +194,28 @@ For a cross-platform GUI workflow (extraction + texture pack management + active
 
 ```
 Data/
-  manifest.json
-  interface/
-  sound/
-  world/
   expansions/
+    classic/
+      manifest.json
+    turtle/
+      manifest.json
+    tbc/
+      manifest.json
+    wotlk/
+      manifest.json
 ```
 
 Notes:
 
 - `StormLib` is required to build/run the extractor (`asset_extract`), but the main client does not require StormLib at runtime.
 - `extract_assets.sh` / `extract_assets.ps1` support `classic`, `turtle`, `tbc`, `wotlk` targets.
+- Wrapper extractions are isolated under `Data/expansions/<target>/`. You can safely
+  extract all four clients without later runs overwriting shared asset paths.
+- The login screen's **Assets** selector follows the selected server expansion by
+  default. It can be overridden per saved server profile when testing compatible
+  asset variants; cross-expansion DBC and model formats may not be interchangeable.
+- Turtle defaults to 1.18.1 authentication build 7272. For an older Turtle-derived
+  server, set `WOWEE_TURTLE_AUTH_BUILD=7234` before launching WoWee.
 
 #### 2) Point wowee at the extracted data
 
@@ -205,6 +223,14 @@ By default, wowee looks for `./Data/`. You can override with:
 
 ```bash
 export WOW_DATA_PATH=/path/to/extracted/Data
+```
+
+If a MaNGOS realm advertises a public world address that is unreachable from your
+LAN, set `WOWEE_REALM_HOST_OVERRIDE` to the server's local IP. The advertised world
+port is preserved:
+
+```bash
+export WOWEE_REALM_HOST_OVERRIDE=192.168.1.50
 ```
 
 ### Compile & Run
@@ -373,7 +399,7 @@ This project does not include any Blizzard Entertainment proprietary data, asset
 ## Known Issues
 
 This is a work in progress and the bug list is non-trivial. Current known
-gaps (as of v1.9.1-preview):
+gaps (as of v1.9.7-preview):
 
 - **Warden RSA modulus** is a placeholder; full anti-cheat parity needs
   the modulus extracted from a real WoW.exe. Module execution itself

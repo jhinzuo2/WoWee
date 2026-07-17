@@ -8,7 +8,7 @@ namespace wowee {
 
 namespace rendering { class Renderer; }
 namespace game { class GameHandler; }
-namespace core { class EntitySpawner; class WorldLoader; }
+namespace core { class EntitySpawner; class WorldLoader; class AppearanceComposer; }
 
 namespace core {
 
@@ -18,7 +18,8 @@ public:
     TransportCallbackHandler(EntitySpawner& entitySpawner,
                              rendering::Renderer& renderer,
                              game::GameHandler& gameHandler,
-                             WorldLoader* worldLoader);
+                             WorldLoader* worldLoader,
+                             AppearanceComposer* appearanceComposer);
 
     void setupCallbacks();
 
@@ -27,6 +28,7 @@ private:
     rendering::Renderer& renderer_;
     game::GameHandler& gameHandler_;
     WorldLoader* worldLoader_;
+    AppearanceComposer* appearanceComposer_;
 };
 
 } // namespace core

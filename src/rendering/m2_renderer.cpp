@@ -61,7 +61,35 @@ void M2Instance::updateModelMatrix() {
 }
 
 void M2Instance::recomputeCachedCullFactors() {
-    float worldRadius = cachedBoundRadius * scale;
+    // Matrix instances (notably ADT tree doodads) can have an offset pivot and
+    // arbitrary scale. A sphere centered at the placement origin with the M2
+    // header radius can therefore exclude much of the visible canopy. Derive
+    // the render-cull sphere from transformed vertex bounds instead. The
+    // separate worldBounds fields intentionally remain collision bounds.
+    if (cachedModel) {
+        glm::vec3 visualMin(std::numeric_limits<float>::max());
+        glm::vec3 visualMax(std::numeric_limits<float>::lowest());
+        for (int x = 0; x < 2; ++x) {
+            for (int y = 0; y < 2; ++y) {
+                for (int z = 0; z < 2; ++z) {
+                    const glm::vec3 local(
+                        x ? cachedModel->boundMax.x : cachedModel->boundMin.x,
+                        y ? cachedModel->boundMax.y : cachedModel->boundMin.y,
+                        z ? cachedModel->boundMax.z : cachedModel->boundMin.z);
+                    const glm::vec3 world = glm::vec3(modelMatrix * glm::vec4(local, 1.0f));
+                    visualMin = glm::min(visualMin, world);
+                    visualMax = glm::max(visualMax, world);
+                }
+            }
+        }
+        cachedCullCenter = (visualMin + visualMax) * 0.5f;
+        cachedVisualRadius = glm::length(visualMax - visualMin) * 0.5f;
+    } else {
+        cachedCullCenter = position;
+        cachedVisualRadius = cachedBoundRadius * scale;
+    }
+
+    float worldRadius = cachedVisualRadius;
     float cullRadius = worldRadius;
     if (cachedDisableAnimation) cullRadius = std::max(cullRadius, 3.0f);
     float factor = std::max(1.0f, cullRadius / rendering::M2_CULL_RADIUS_SCALE_DIVISOR);
@@ -77,6 +105,107 @@ M2Renderer::M2Renderer() {
 
 M2Renderer::~M2Renderer() {
     shutdown();
+}
+
+uint32_t M2Renderer::gatherLocalLights(const glm::vec3& cameraPos,
+                                       glm::vec4* outPosRadius,
+                                       glm::vec4* outColorIntensity,
+                                       uint32_t maxLights) const {
+    if (!outPosRadius || !outColorIntensity || maxLights == 0) return 0;
+
+    struct Candidate {
+        float distSq;
+        glm::vec4 posRadius;
+        glm::vec4 colorIntensity;
+    };
+    std::vector<Candidate> candidates;
+
+    for (const auto& instance : instances) {
+        const M2ModelGPU* model = instance.cachedModel;
+        if (!model || (!model->isLanternLike && !model->isTorch &&
+                       !model->isBrazierOrFire)) continue;
+
+        bool hasBatchLight = false;
+        for (const auto& batch : model->batches) {
+            if (!batch.glowCardLike || !batch.lanternGlowHint) continue;
+
+            glm::vec3 worldPos;
+            if (model->isGroundFire &&
+                !model->particleEmitters.empty()) {
+                worldPos = glm::vec3(std::numeric_limits<float>::max());
+                for (const auto& emitter : model->particleEmitters) {
+                    glm::mat4 boneXform(1.0f);
+                    if (emitter.bone < instance.boneMatrices.size()) {
+                        boneXform = instance.boneMatrices[emitter.bone];
+                    }
+                    const glm::vec3 emitterWorld = glm::vec3(
+                        instance.modelMatrix * boneXform * glm::vec4(emitter.position, 1.0f));
+                    if (emitterWorld.z < worldPos.z) worldPos = emitterWorld;
+                }
+            } else {
+                worldPos = glm::vec3(
+                    instance.modelMatrix * glm::vec4(batch.center, 1.0f));
+            }
+            const glm::vec3 delta = worldPos - cameraPos;
+            const float distSq = glm::dot(delta, delta);
+            // Keep tunnel/interior fixtures resident well before their lit
+            // surfaces enter view; the shader's radius still bounds the work.
+            if (distSq > 300.0f * 300.0f) continue;
+
+            const float radius = std::clamp(batch.glowSize * instance.scale * 8.0f,
+                                            5.0f, 12.0f);
+            glm::vec3 color(1.0f, 0.58f, 0.22f);
+            if (batch.glowTint == 1) color = glm::vec3(0.42f, 0.68f, 1.0f);
+            else if (batch.glowTint == 2) color = glm::vec3(1.0f, 0.24f, 0.14f);
+            candidates.push_back({distSq, glm::vec4(worldPos, radius),
+                                  glm::vec4(color, 1.35f)});
+            hasBatchLight = true;
+        }
+
+        // Standalone candles expose their flame/glow only through particle
+        // emitters, so they have no glow-card batch for the path above. Use a
+        // single light at the emitter centroid; chandeliers with an authored
+        // glow batch remain represented by that batch rather than five lights.
+        if (!hasBatchLight && model->isLanternLike &&
+            !model->particleEmitters.empty()) {
+            glm::vec3 worldPos(0.0f);
+            uint32_t emitterCount = 0;
+            for (const auto& emitter : model->particleEmitters) {
+                glm::mat4 boneXform(1.0f);
+                if (emitter.bone < instance.boneMatrices.size()) {
+                    boneXform = instance.boneMatrices[emitter.bone];
+                }
+                worldPos += glm::vec3(instance.modelMatrix * boneXform *
+                                      glm::vec4(emitter.position, 1.0f));
+                emitterCount++;
+            }
+            if (emitterCount > 0) {
+                worldPos /= static_cast<float>(emitterCount);
+                const glm::vec3 delta = worldPos - cameraPos;
+                const float distSq = glm::dot(delta, delta);
+                if (distSq <= 300.0f * 300.0f) {
+                    const bool chandelier =
+                        model->name.find("Chandelier") != std::string::npos ||
+                        model->name.find("chandelier") != std::string::npos;
+                    candidates.push_back({distSq,
+                        glm::vec4(worldPos, chandelier ? 10.0f : 5.0f),
+                        glm::vec4(1.0f, 0.58f, 0.22f,
+                                  chandelier ? 1.25f : 0.85f)});
+                }
+            }
+        }
+    }
+
+    const uint32_t count = std::min<uint32_t>(maxLights,
+        static_cast<uint32_t>(candidates.size()));
+    if (count == 0) return 0;
+    std::partial_sort(candidates.begin(), candidates.begin() + count, candidates.end(),
+        [](const Candidate& a, const Candidate& b) { return a.distSq < b.distSq; });
+    for (uint32_t i = 0; i < count; ++i) {
+        outPosRadius[i] = candidates[i].posRadius;
+        outColorIntensity[i] = candidates[i].colorIntensity;
+    }
+    return count;
 }
 
 bool M2Renderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFrameLayout,
@@ -254,6 +383,13 @@ bool M2Renderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFrameLayout
                 write.pBufferInfo = &bufInfo;
                 vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
             }
+        }
+
+        // Fresh buffers hold no bone data — invalidate any per-instance upload
+        // tracking so prepareRender() re-uploads everything (defensive: instances
+        // are normally empty when this runs, but re-init must not skip uploads).
+        for (auto& inst : instances) {
+            inst.megaBoneUploadedSlot[0] = inst.megaBoneUploadedSlot[1] = 0;
         }
     }
 
@@ -590,7 +726,8 @@ bool M2Renderer::initialize(VkContext* ctx, VkDescriptorSetLayout perFrameLayout
             .setVertexInput({m2Binding}, m2Attrs)
             .setTopology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST)
             .setRasterization(VK_POLYGON_MODE_FILL, VK_CULL_MODE_NONE)
-            .setDepthTest(true, depthWrite, VK_COMPARE_OP_LESS_OR_EQUAL)
+            .setDepthTest(!skyMode_, skyMode_ ? false : depthWrite,
+                          skyMode_ ? VK_COMPARE_OP_ALWAYS : VK_COMPARE_OP_LESS_OR_EQUAL)
             .setColorBlendAttachment(blendState)
             .setMultisample(vkCtx_->getMsaaSamples())
             .setLayout(pipelineLayout_)
@@ -896,7 +1033,11 @@ void M2Renderer::shutdown() {
         megaBoneSet_[i] = VK_NULL_HANDLE;
     }
     if (materialDescPool_) { vkDestroyDescriptorPool(device, materialDescPool_, nullptr); materialDescPool_ = VK_NULL_HANDLE; }
-    if (boneDescPool_) { vkDestroyDescriptorPool(device, boneDescPool_, nullptr); boneDescPool_ = VK_NULL_HANDLE; }
+    if (boneDescPool_) {
+        if (boneDescPoolGeneration_) boneDescPoolGeneration_->fetch_add(1, std::memory_order_relaxed);
+        vkDestroyDescriptorPool(device, boneDescPool_, nullptr);
+        boneDescPool_ = VK_NULL_HANDLE;
+    }
     // Instance data SSBO cleanup (sets freed with instanceDescPool_)
     for (int i = 0; i < 2; i++) {
         if (instanceBuffer_[i]) { vmaDestroyBuffer(alloc, instanceBuffer_[i], instanceAlloc_[i]); instanceBuffer_[i] = VK_NULL_HANDLE; }
@@ -985,8 +1126,12 @@ void M2Renderer::destroyInstanceBones(M2Instance& inst, bool defer) {
             // slots, so the other slot's command buffer may still be in flight.
             // Must wait for all fences, not just the current frame's.
             VkDescriptorPool pool = boneDescPool_;
-            vkCtx_->deferAfterAllFrameFences([device, alloc, pool, boneSet, boneBuf, boneAlloc]() {
-                if (boneSet != VK_NULL_HANDLE) {
+            auto poolGeneration = boneDescPoolGeneration_;
+            uint64_t generation = poolGeneration ? poolGeneration->load(std::memory_order_relaxed) : 0;
+            vkCtx_->deferAfterAllFrameFences([device, alloc, pool, poolGeneration, generation, boneSet, boneBuf, boneAlloc]() {
+                const bool poolStillValid =
+                    poolGeneration && poolGeneration->load(std::memory_order_relaxed) == generation;
+                if (boneSet != VK_NULL_HANDLE && pool != VK_NULL_HANDLE && poolStillValid) {
                     VkDescriptorSet s = boneSet;
                     vkFreeDescriptorSets(device, pool, 1, &s);
                 }
@@ -1168,7 +1313,8 @@ bool M2Renderer::loadModel(const pipeline::M2Model& model, uint32_t modelId) {
     bool hasParticles = !model.particleEmitters.empty();
     bool hasRibbons   = !model.ribbonEmitters.empty();
     if (!hasGeometry && !hasParticles && !hasRibbons) {
-        LOG_WARNING("M2 model has no renderable content: ", model.name);
+        LOG_WARNING("M2 model has no renderable content: id=", modelId,
+                    " name=", model.name.empty() ? "<unnamed>" : model.name);
         return false;
     }
 
@@ -1235,7 +1381,9 @@ bool M2Renderer::loadModel(const pipeline::M2Model& model, uint32_t modelId) {
     gpuModel.isKoboldFlame               = cls.isKoboldFlame;
     gpuModel.isWaterfall                 = cls.isWaterfall;
     gpuModel.isBrazierOrFire             = cls.isBrazierOrFire;
+    gpuModel.isGroundFire                = cls.isGroundFire;
     gpuModel.isTorch                     = cls.isTorch;
+    gpuModel.isSkyBird                   = cls.isSkyBird;
     gpuModel.ambientEmitterType          = cls.ambientEmitterType;
     gpuModel.boundMin = tightMin;
     gpuModel.boundMax = tightMax;
@@ -1554,12 +1702,25 @@ bool M2Renderer::loadModel(const pipeline::M2Model& model, uint32_t modelId) {
             bgpu.texture = tex;
             const auto tcls = classifyBatchTexture(batchTexKeyLower);
             const bool modelLanternFamily = gpuModel.isLanternLike;
+            const bool torchGlowCard = gpuModel.isTorch &&
+                tcls.hasGlowToken && tcls.hasGlowCardToken;
+            // Fire pits and braziers commonly pair an authored flame mesh
+            // (for example FLAMELICKSMALL) with a separate flat GLOW32 card.
+            // Replace only that glow-textured card; retaining the flame mesh
+            // preserves the intended animated fire shape.
+            const bool fireGlowCard = gpuModel.isBrazierOrFire &&
+                tcls.hasGlowToken && tcls.hasGlowCardToken;
             bgpu.lanternGlowHint =
+                tcls.softGlowSurface ||
                 tcls.exactLanternGlowTex ||
+                torchGlowCard ||
+                fireGlowCard ||
                 ((tcls.hasGlowToken || (modelLanternFamily && tcls.hasFlameToken)) &&
                  (tcls.lanternFamily || modelLanternFamily) &&
                  (!tcls.likelyFlame || modelLanternFamily));
-            bgpu.glowCardLike = bgpu.lanternGlowHint && tcls.hasGlowCardToken;
+            bgpu.glowCardLike = bgpu.lanternGlowHint &&
+                (tcls.hasGlowCardToken || tcls.softGlowSurface);
+            bgpu.preserveGlowMesh = tcls.softGlowSurface;
             bgpu.glowTint = tcls.glowTint;
             if (tex != nullptr && tex != whiteTexture_.get()) {
                 auto pit = texturePropsByPtr_.find(tex);
@@ -1594,7 +1755,7 @@ bool M2Renderer::loadModel(const pipeline::M2Model& model, uint32_t modelId) {
             }
 
             // Compute batch center and radius for glow sprite positioning
-            if ((bgpu.blendMode >= 3 || bgpu.colorKeyBlack) && batch.indexCount > 0) {
+            if ((bgpu.blendMode >= 3 || bgpu.colorKeyBlack || bgpu.glowCardLike) && batch.indexCount > 0) {
                 glm::vec3 sum(0.0f);
                 uint32_t counted = 0;
                 for (uint32_t j = batch.indexStart; j < batch.indexStart + batch.indexCount; j++) {
@@ -1619,6 +1780,15 @@ bool M2Renderer::loadModel(const pipeline::M2Model& model, uint32_t modelId) {
                         }
                     }
                     bgpu.glowSize = std::max(maxDist, 0.5f);
+                    // Upright fire glow cards are deliberately tall, so their
+                    // geometric center floats above a small ground fire. Keep
+                    // the radial halo near the fuel/flame base instead.
+                    if (fireGlowCard && gpuModel.isGroundFire) {
+                        // Ground-fire sprites follow a particle emitter and its
+                        // animated bone at render time. Origin is the fallback
+                        // for unusual fire models without an emitter.
+                        bgpu.center = glm::vec3(0.0f);
+                    }
                 }
             }
 
@@ -1695,6 +1865,7 @@ bool M2Renderer::loadModel(const pipeline::M2Model& model, uint32_t modelId) {
             mat.fadeAlpha = 1.0f;
             mat.interiorDarken = 0.0f;
             mat.specularIntensity = 0.5f;
+            mat.emissiveBoost = bgpu.preserveGlowMesh ? 2.4f : 1.0f;
             memcpy(matAllocInfo.pMappedData, &mat, sizeof(mat));
             bgpu.materialUBOMapped = matAllocInfo.pMappedData;
         }

@@ -43,6 +43,7 @@ struct SkyParams {
     // Skybox selection (future: from LightSkybox.dbc)
     uint32_t skyboxModelId = 0;
     bool skyboxHasStars = false;  // Does loaded skybox include baked stars?
+    bool useOriginalSkybox = false; // Original camera-centered client M2 is active
 };
 
 /**

@@ -6,6 +6,7 @@
 #include "rendering/renderer.hpp"
 #include "audio/audio_coordinator.hpp"
 #include "audio/ui_sound_manager.hpp"
+#include "audio/player_voice_manager.hpp"
 #include "core/application.hpp"
 #include "core/logger.hpp"
 #include "network/world_socket.hpp"
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <cstdlib>
 #include <sstream>
 
 namespace wowee {
@@ -25,6 +27,107 @@ std::string formatCopperAmount(uint32_t amount);
 
 InventoryHandler::InventoryHandler(GameHandler& owner)
     : owner_(owner) {}
+
+namespace {
+constexpr uint32_t kItemClassConsumable = 0;
+constexpr uint32_t kConsumableSubclassBandage = 7;
+constexpr uint32_t kConsumableSubclassItemEnhancement = 6;
+// SpellCastTargetFlags bit set by Spell.dbc for spells cast onto another item.
+constexpr uint32_t kSpellTargetFlagItem = 0x10;
+constexpr uint32_t kBuybackWireSlotStart = 74;
+constexpr uint32_t kBuybackWireSlotCount = 12;
+constexpr uint32_t kBuybackWireSlotEnd =
+    kBuybackWireSlotStart + kBuybackWireSlotCount;
+
+bool isBandageItem(const ItemQueryResponseData* info) {
+    return info && info->valid &&
+           info->itemClass == kItemClassConsumable &&
+           info->subClass == kConsumableSubclassBandage;
+}
+
+void synchronizeStationaryBandageCast(GameHandler& owner) {
+    // Bandages are cast through CMSG_USE_ITEM and therefore bypass
+    // SpellHandler::castSpell(), which normally sends a stop before a timed cast.
+    // Explicitly synchronize the stationary state so the server cannot retain a
+    // stale start-forward/strafe/turn state after the character has visually stopped.
+    auto& movement = owner.movementInfoRef();
+    const uint32_t horizontalMask =
+        static_cast<uint32_t>(MovementFlags::FORWARD) |
+        static_cast<uint32_t>(MovementFlags::BACKWARD) |
+        static_cast<uint32_t>(MovementFlags::STRAFE_LEFT) |
+        static_cast<uint32_t>(MovementFlags::STRAFE_RIGHT);
+    const uint32_t turnMask =
+        static_cast<uint32_t>(MovementFlags::TURN_LEFT) |
+        static_cast<uint32_t>(MovementFlags::TURN_RIGHT);
+    movement.flags &= ~(horizontalMask | turnMask);
+
+    owner.sendMovement(Opcode::MSG_MOVE_STOP);
+    owner.sendMovement(Opcode::MSG_MOVE_STOP_STRAFE);
+    owner.sendMovement(Opcode::MSG_MOVE_STOP_TURN);
+    owner.sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
+}
+
+bool usesVisibleItemDisplayIds() {
+    return false;
+}
+
+constexpr int kTbcVisibleItemStride = 16;
+
+int tbcVisibleItemBaseFallback() {
+    const uint16_t invSlotHead = fieldIndex(UF::PLAYER_FIELD_INV_SLOT_HEAD);
+    constexpr int kVisibleSlots = 19;
+    const int visibleBytes = kVisibleSlots * kTbcVisibleItemStride;
+    if (invSlotHead != 0xFFFF && invSlotHead >= visibleBytes) {
+        return static_cast<int>(invSlotHead) - visibleBytes;
+    }
+    return 346;
+}
+
+bool visibleEquipmentFieldDiagEnabled() {
+    static const bool enabled = [] {
+        const char* raw = std::getenv("WOWEE_VISIBLE_EQUIP_FIELD_DIAG");
+        if (!raw || raw[0] == '\0') return false;
+        std::string value(raw);
+        std::transform(value.begin(), value.end(), value.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return value != "0" && value != "false" && value != "off";
+    }();
+    return enabled;
+}
+
+std::array<uint8_t, 19> inferredVisibleInventoryTypes() {
+    return {
+        InvType::HEAD,
+        InvType::NECK,
+        InvType::SHOULDERS,
+        InvType::SHIRT,
+        InvType::CHEST,
+        InvType::WAIST,
+        InvType::LEGS,
+        InvType::FEET,
+        InvType::WRISTS,
+        InvType::HANDS,
+        InvType::FINGER,
+        InvType::FINGER,
+        InvType::TRINKET,
+        InvType::TRINKET,
+        InvType::BACK,
+        InvType::MAIN_HAND,
+        InvType::SHIELD,
+        InvType::RANGED_BOW,
+        InvType::TABARD,
+    };
+}
+
+uint64_t targetGuidForUseItem(GameHandler& owner, const ItemQueryResponseData* info) {
+    if (!info || !info->valid || info->itemClass != kItemClassConsumable) return 0;
+    if (isBandageItem(info)) {
+        return owner.getPlayerGuid();
+    }
+    if (info->subClass == kConsumableSubclassItemEnhancement) return 0;
+    return owner.getPlayerGuid();
+}
+} // namespace
 
 // ============================================================
 // Opcode Registration
@@ -88,8 +191,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
     table[Opcode::SMSG_LOOT_CLEAR_MONEY] = [](network::Packet& /*packet*/) {};
 
     // ---- Read item (books) (moved from GameHandler) ----
-    table[Opcode::SMSG_READ_ITEM_OK] = [this](network::Packet& packet) {
-        owner_.bookPagesRef().clear();  // fresh book for this item read
+    table[Opcode::SMSG_READ_ITEM_OK] = [](network::Packet& packet) {
         packet.skipAll();
     };
     table[Opcode::SMSG_READ_ITEM_FAILED] = [this](network::Packet& packet) {
@@ -110,7 +212,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
         uint32_t lootSlot = packet.readUInt32();
         uint32_t itemId   = packet.readUInt32();
         /*uint32_t randSuffix =*/ packet.readUInt32();
-        /*int32_t  randProp   =*/ static_cast<int32_t>(packet.readUInt32());
+        (void)packet.readUInt32(); // random property
         uint32_t countdown = packet.readUInt32();
         uint8_t  voteMask  = packet.readUInt8();
 
@@ -143,7 +245,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
         /*uint32_t lootSlot   =*/ packet.readUInt32();
         uint32_t itemId     = packet.readUInt32();
         /*uint32_t randSuffix =*/ packet.readUInt32();
-        /*int32_t  randProp   =*/ static_cast<int32_t>(packet.readUInt32());
+        (void)packet.readUInt32(); // random property
         owner_.ensureItemInfo(itemId);
         auto* allPassInfo = owner_.getItemInfo(itemId);
         std::string allPassName = (allPassInfo && !allPassInfo->name.empty())
@@ -182,7 +284,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
         }
     };
 
-    table[Opcode::SMSG_LOOT_SLOT_CHANGED] = [this](network::Packet& packet) {
+    table[Opcode::SMSG_LOOT_SLOT_CHANGED] = [](network::Packet& packet) {
         if (packet.hasRemaining(1)) {
             uint8_t slotIdx = packet.readUInt8();
             LOG_DEBUG("SMSG_LOOT_SLOT_CHANGED: slot=", (int)slotIdx);
@@ -238,7 +340,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
     };
 
     // ---- Open container ----
-    table[Opcode::SMSG_OPEN_CONTAINER] = [this](network::Packet& packet) {
+    table[Opcode::SMSG_OPEN_CONTAINER] = [](network::Packet& packet) {
         if (packet.hasRemaining(8)) {
             uint64_t containerGuid = packet.readUInt64();
             LOG_DEBUG("SMSG_OPEN_CONTAINER: guid=0x", std::hex, containerGuid, std::dec);
@@ -255,7 +357,14 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                      " itemGuid=0x", itemGuid, std::dec,
                      " result=", static_cast<int>(result));
             if (result == 0) {
-                pendingSellToBuyback_.erase(itemGuid);
+                auto pending = pendingSellToBuyback_.find(itemGuid);
+                if (pending != pendingSellToBuyback_.end()) {
+                    pendingSellToBuyback_.erase(pending);
+                    reconcileBuybackSlots();
+                } else {
+                    LOG_WARNING("Successful sale had no pending buyback entry: itemGuid=0x",
+                                std::hex, itemGuid, std::dec);
+                }
                 if (auto* ac = owner_.services().audioCoordinator) {
                     if (auto* sfx = ac->getUiSoundManager())
                         sfx->playDropOnGround();
@@ -265,31 +374,16 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                     owner_.addonEventCallbackRef()("PLAYER_MONEY", {});
                 }
             } else {
-                bool removedPending = false;
                 auto it = pendingSellToBuyback_.find(itemGuid);
                 if (it != pendingSellToBuyback_.end()) {
-                    for (auto bit = buybackItems_.begin(); bit != buybackItems_.end(); ++bit) {
-                        if (bit->itemGuid == itemGuid) {
-                            buybackItems_.erase(bit);
-                            return;
-                        }
-                    }
                     pendingSellToBuyback_.erase(it);
-                    removedPending = true;
                 }
-                if (!removedPending) {
-                    if (!buybackItems_.empty()) {
-                        uint64_t frontGuid = buybackItems_.front().itemGuid;
-                        if (pendingSellToBuyback_.erase(frontGuid) > 0) {
-                            buybackItems_.pop_front();
-                            removedPending = true;
-                        }
-                    }
-                }
-                if (!removedPending && !pendingSellToBuyback_.empty()) {
-                    pendingSellToBuyback_.clear();
-                    buybackItems_.clear();
-                }
+                const auto rejected = std::find_if(
+                    buybackItems_.begin(), buybackItems_.end(),
+                    [itemGuid](const BuybackItem& item) {
+                        return item.itemGuid == itemGuid;
+                    });
+                if (rejected != buybackItems_.end()) buybackItems_.erase(rejected);
                 static const char* sellErrors[] = {
                     "OK", "Can't find item", "Can't sell item",
                     "Can't find vendor", "You don't own that item",
@@ -302,7 +396,9 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                     if (auto* sfx = ac->getUiSoundManager())
                         sfx->playError();
                 }
-                LOG_WARNING("SMSG_SELL_ITEM error: ", (int)result, " (", msg, ")");
+                LOG_WARNING("SMSG_SELL_ITEM error: ", (int)result, " (", msg,
+                            ") itemGuid=0x", std::hex, itemGuid,
+                            " vendorGuid=0x", vendorGuid, std::dec);
             }
         }
     };
@@ -334,6 +430,7 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
             }
             owner_.addUIError(levelBuf);
             owner_.addSystemChatMessage(levelBuf);
+            owner_.playErrorSpeech(audio::PlayerErrorSpeech::CANT_EQUIP_LEVEL);
             return;
         }
 
@@ -397,11 +494,34 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                     default: break;
                 }
         std::string msg = errMsg ? errMsg : "Inventory error (" + std::to_string(error) + ").";
+        if (error == 50 && currentLoot_.lootGuid != 0) {
+            msg = "Cannot loot item: Inventory is full.";
+        }
         owner_.addUIError(msg);
         owner_.addSystemChatMessage(msg);
         if (auto* ac = owner_.services().audioCoordinator) {
             if (auto* sfx = ac->getUiSoundManager())
                 sfx->playError();
+        }
+
+        // Character speech response for errors with a matching voice line
+        using audio::PlayerErrorSpeech;
+        switch (error) {
+            case 4:  owner_.playErrorSpeech(PlayerErrorSpeech::BAG_FULL); break;
+            case 7:  owner_.playErrorSpeech(PlayerErrorSpeech::AMMO_ONLY); break;
+            case 8:  owner_.playErrorSpeech(PlayerErrorSpeech::CANT_USE_ITEM); break;
+            case 10:
+            case 11: owner_.playErrorSpeech(PlayerErrorSpeech::CANT_EQUIP_EVER); break;
+            case 17: owner_.playErrorSpeech(PlayerErrorSpeech::ITEM_MAX_COUNT); break;
+            case 20: owner_.playErrorSpeech(PlayerErrorSpeech::NOT_EQUIPPABLE); break;
+            case 24: owner_.playErrorSpeech(PlayerErrorSpeech::CANT_DROP_SOULBOUND); break;
+            case 25: owner_.playErrorSpeech(PlayerErrorSpeech::OUT_OF_RANGE); break;
+            case 29: owner_.playErrorSpeech(PlayerErrorSpeech::NOT_ENOUGH_MONEY); break;
+            case 30: owner_.playErrorSpeech(PlayerErrorSpeech::NOT_A_BAG); break;
+            case 36: owner_.playErrorSpeech(PlayerErrorSpeech::ITEM_LOCKED); break;
+            case 50:
+            case 51: owner_.playErrorSpeech(PlayerErrorSpeech::INVENTORY_FULL); break;
+            default: break;
         }
     };
 
@@ -419,26 +539,21 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                      " pendingBuyItemSlot=", pendingBuyItemSlot_);
             if (pendingBuybackSlot_ >= 0) {
                 if (errCode == 0) {
-                    constexpr uint32_t kBuybackSlotEnd = 85;
-                    if (pendingBuybackWireSlot_ >= 74 && pendingBuybackWireSlot_ < kBuybackSlotEnd &&
-                        owner_.getSocket() && owner_.getState() == WorldState::IN_WORLD && currentVendorItems_.vendorGuid != 0) {
-                        ++pendingBuybackWireSlot_;
-                        LOG_INFO("Buyback retry: vendorGuid=0x", std::hex, currentVendorItems_.vendorGuid,
-                                 std::dec, " uiSlot=", pendingBuybackSlot_,
-                                 " wireSlot=", pendingBuybackWireSlot_);
-                        owner_.getSocket()->send(BuybackItemPacket::build(
-                            currentVendorItems_.vendorGuid, pendingBuybackWireSlot_));
-                        return;
-                    }
-                    if (pendingBuybackSlot_ < static_cast<int>(buybackItems_.size())) {
-                        buybackItems_.erase(buybackItems_.begin() + pendingBuybackSlot_);
-                    }
+                    // A missing slot is stale local state.  Never scan adjacent
+                    // slots: another item may legitimately occupy them.
+                    const auto stale = std::find_if(
+                        buybackItems_.begin(), buybackItems_.end(),
+                        [this](const BuybackItem& item) {
+                            return item.wireSlot == pendingBuybackWireSlot_;
+                        });
+                    if (stale != buybackItems_.end()) buybackItems_.erase(stale);
                     pendingBuybackSlot_ = -1;
                     pendingBuybackWireSlot_ = 0;
                     if (currentVendorItems_.vendorGuid != 0 && owner_.getSocket() && owner_.getState() == WorldState::IN_WORLD) {
                         auto pkt = ListInventoryPacket::build(currentVendorItems_.vendorGuid);
                         owner_.getSocket()->send(pkt);
                     }
+                    owner_.addUIError("That buyback item is no longer available.");
                     return;
                 }
                 pendingBuybackSlot_ = -1;
@@ -459,6 +574,10 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
                 if (auto* sfx = ac->getUiSoundManager())
                     sfx->playError();
             }
+            if (errCode == 2)
+                owner_.playErrorSpeech(audio::PlayerErrorSpeech::NOT_ENOUGH_MONEY);
+            else if (errCode == 6)
+                owner_.playErrorSpeech(audio::PlayerErrorSpeech::INVENTORY_FULL);
         }
     };
 
@@ -466,8 +585,38 @@ void InventoryHandler::registerOpcodes(DispatchTable& table) {
         if (packet.hasRemaining(20)) {
             /*uint64_t vendorGuid =*/ packet.readUInt64();
             /*uint32_t vendorSlot =*/ packet.readUInt32();
-            /*int32_t  newCount   =*/ static_cast<int32_t>(packet.readUInt32());
+            (void)packet.readUInt32(); // new count
             uint32_t itemCount  = packet.readUInt32();
+            // Successful buyback: remove the entry from the local buyback list.
+            // Without this the pending slot lingered and a later unrelated
+            // SMSG_BUY_FAILED could misread it as a buyback retry.
+            if (pendingBuybackSlot_ >= 0) {
+                const auto bought = std::find_if(
+                    buybackItems_.begin(), buybackItems_.end(),
+                    [this](const BuybackItem& item) {
+                        return item.wireSlot == pendingBuybackWireSlot_;
+                    });
+                if (bought != buybackItems_.end()) {
+                    const auto& entry = *bought;
+                    std::string label = entry.item.name.empty()
+                        ? "item #" + std::to_string(entry.item.itemId) : entry.item.name;
+                    owner_.addSystemChatMessage("Bought back: " +
+                        buildItemLink(entry.item.itemId,
+                                      static_cast<uint32_t>(entry.item.quality), label));
+                    buybackItems_.erase(bought);
+                }
+                pendingBuybackSlot_ = -1;
+                pendingBuybackWireSlot_ = 0;
+                if (auto* ac = owner_.services().audioCoordinator) {
+                    if (auto* sfx = ac->getUiSoundManager())
+                        sfx->playPickupBag();
+                }
+                if (owner_.addonEventCallbackRef()) {
+                    owner_.addonEventCallbackRef()("MERCHANT_UPDATE", {});
+                    owner_.addonEventCallbackRef()("BAG_UPDATE", {});
+                }
+                return;
+            }
             if (pendingBuyItemId_ != 0) {
                 std::string itemLabel;
                 uint32_t buyQuality = 1;
@@ -678,13 +827,16 @@ void InventoryHandler::lootItem(uint8_t slotIndex) {
 
 void InventoryHandler::closeLoot() {
     if (!lootWindowOpen_) return;
+    const uint64_t lootGuid = currentLoot_.lootGuid;
+    const bool despawnGatherNode = owner_.isGatherGameObject(lootGuid);
     if (owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
-        auto packet = LootReleasePacket::build(currentLoot_.lootGuid);
+        auto packet = LootReleasePacket::build(lootGuid);
         owner_.getSocket()->send(packet);
     }
     lootWindowOpen_ = false;
     if (owner_.lootWindowCallbackRef()) owner_.lootWindowCallbackRef()(false);
     if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("LOOT_CLOSED", {});
+    if (despawnGatherNode) owner_.despawnGameObjectLocally(lootGuid);
     currentLoot_ = LootResponseData{};
 }
 
@@ -701,10 +853,15 @@ void InventoryHandler::handleLootResponse(network::Packet& packet) {
     const bool wotlkLoot = isActiveExpansion("wotlk");
     if (!LootResponseParser::parse(packet, currentLoot_, wotlkLoot)) return;
     const bool hasLoot = !currentLoot_.items.empty() || currentLoot_.gold > 0;
-    LOG_DEBUG("SMSG_LOOT_RESPONSE: guid=0x", std::hex, currentLoot_.lootGuid, std::dec,
-              " items=", currentLoot_.items.size(), " gold=", currentLoot_.gold);
-    if (!hasLoot && owner_.isCasting() && owner_.getCurrentCastSpellId() != 0 && lastInteractedGoGuid_ != 0) {
-        LOG_DEBUG("Ignoring empty SMSG_LOOT_RESPONSE during gather cast");
+    LOG_INFO("SMSG_LOOT_RESPONSE: guid=0x", std::hex, currentLoot_.lootGuid, std::dec,
+             " items=", currentLoot_.items.size(), " gold=", currentLoot_.gold);
+    auto& lastInteractedGoGuid = owner_.lastInteractedGoGuidRef();
+    const bool isLastInteractedGoLoot =
+        lastInteractedGoGuid != 0 && currentLoot_.lootGuid == lastInteractedGoGuid;
+    if (!hasLoot && isLastInteractedGoLoot &&
+        ((owner_.isCasting() && owner_.getCurrentCastSpellId() != 0) ||
+         owner_.hasPendingGameObjectLootOpen(currentLoot_.lootGuid))) {
+        LOG_DEBUG("Ignoring empty SMSG_LOOT_RESPONSE during pending gather/open");
         return;
     }
     lootWindowOpen_ = true;
@@ -713,11 +870,10 @@ void InventoryHandler::handleLootResponse(network::Packet& packet) {
         owner_.addonEventCallbackRef()("LOOT_OPENED", {});
         owner_.addonEventCallbackRef()("LOOT_READY", {});
     }
-    lastInteractedGoGuid_ = 0;
-    pendingGameObjectLootOpens_.erase(
-        std::remove_if(pendingGameObjectLootOpens_.begin(), pendingGameObjectLootOpens_.end(),
-                       [&](const PendingLootOpen& p) { return p.guid == currentLoot_.lootGuid; }),
-        pendingGameObjectLootOpens_.end());
+    if (currentLoot_.lootGuid == lastInteractedGoGuid) {
+        lastInteractedGoGuid = 0;
+    }
+    owner_.clearPendingGameObjectLootOpen(currentLoot_.lootGuid);
     auto& localLoot = localLootState_[currentLoot_.lootGuid];
     localLoot.data = currentLoot_;
 
@@ -741,8 +897,18 @@ void InventoryHandler::handleLootResponse(network::Packet& packet) {
         }
     }
 
-    if (autoLoot_ && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket() && !localLoot.itemAutoLootSent) {
+    // Game-object quest containers are single-action pickups in normal play.
+    // Autostore their returned items even when general creature auto-loot is off;
+    // otherwise right-click opens server loot but never grants the objective item.
+    const bool autoStoreGameObjectLoot = isLastInteractedGoLoot;
+    if ((autoLoot_ || autoStoreGameObjectLoot) &&
+        owner_.getState() == WorldState::IN_WORLD && owner_.getSocket() &&
+        !localLoot.itemAutoLootSent) {
         for (const auto& item : currentLoot_.items) {
+            LOG_INFO("Autostoring loot slot=", static_cast<int>(item.slotIndex),
+                     " item=", item.itemId, " count=", item.count,
+                     " fromGuid=0x", std::hex, currentLoot_.lootGuid, std::dec,
+                     " gameObject=", autoStoreGameObjectLoot);
             auto pkt = AutostoreLootItemPacket::build(item.slotIndex);
             owner_.getSocket()->send(pkt);
         }
@@ -752,10 +918,13 @@ void InventoryHandler::handleLootResponse(network::Packet& packet) {
 
 void InventoryHandler::handleLootReleaseResponse(network::Packet& packet) {
     (void)packet;
-    localLootState_.erase(currentLoot_.lootGuid);
+    const uint64_t lootGuid = currentLoot_.lootGuid;
+    const bool despawnGatherNode = owner_.isGatherGameObject(lootGuid);
+    localLootState_.erase(lootGuid);
     lootWindowOpen_ = false;
     if (owner_.lootWindowCallbackRef()) owner_.lootWindowCallbackRef()(false);
     if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("LOOT_CLOSED", {});
+    if (despawnGatherNode) owner_.despawnGameObjectLocally(lootGuid);
     currentLoot_ = LootResponseData{};
 }
 
@@ -763,20 +932,10 @@ void InventoryHandler::handleLootRemoved(network::Packet& packet) {
     uint8_t slotIndex = packet.readUInt8();
     for (auto it = currentLoot_.items.begin(); it != currentLoot_.items.end(); ++it) {
         if (it->slotIndex == slotIndex) {
-            std::string itemName = "item #" + std::to_string(it->itemId);
-            uint32_t quality = 1;
-            if (const ItemQueryResponseData* info = owner_.getItemInfo(it->itemId)) {
-                if (!info->name.empty()) itemName = info->name;
-                quality = info->quality;
-            }
-            std::string link = buildItemLink(it->itemId, quality, itemName);
-            std::string msgStr = "Looted: " + link;
-            if (it->count > 1) msgStr += " x" + std::to_string(it->count);
-            owner_.addSystemChatMessage(msgStr);
-            if (auto* ac = owner_.services().audioCoordinator) {
-                if (auto* sfx = ac->getUiSoundManager())
-                    sfx->playLootItem();
-            }
+            // SMSG_ITEM_PUSH_RESULT is the authoritative inventory receipt and
+            // emits the single "Received item" notification. Slot removal only
+            // updates the open loot window; announcing here duplicated chat and
+            // the loot sound for the same item.
             currentLoot_.items.erase(it);
             if (owner_.addonEventCallbackRef())
                 owner_.addonEventCallbackRef()("LOOT_SLOT_CLEARED", {std::to_string(slotIndex + 1)});
@@ -809,7 +968,7 @@ void InventoryHandler::handleLootRoll(network::Packet& packet) {
     uint64_t playerGuid = packet.readUInt64();
     /*uint32_t itemId     =*/ packet.readUInt32();
     /*uint32_t randSuffix =*/ packet.readUInt32();
-    /*int32_t  randProp   =*/ static_cast<int32_t>(packet.readUInt32());
+    (void)packet.readUInt32(); // random property
     uint8_t rollNumber  = packet.readUInt8();
     uint8_t rollType    = packet.readUInt8();
     /*uint8_t autoPass   =*/ packet.readUInt8();
@@ -884,7 +1043,6 @@ void InventoryHandler::handleLootRollWon(network::Packet& packet) {
 
 void InventoryHandler::openVendor(uint64_t npcGuid) {
     if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
-    buybackItems_.clear();
     auto packet = ListInventoryPacket::build(npcGuid);
     owner_.getSocket()->send(packet);
 }
@@ -893,13 +1051,62 @@ void InventoryHandler::closeVendor() {
     bool wasOpen = vendorWindowOpen_;
     vendorWindowOpen_ = false;
     currentVendorItems_ = ListInventoryData{};
-    buybackItems_.clear();
-    pendingSellToBuyback_.clear();
+    // Keep buybackItems_ and pendingSellToBuyback_: buyback slots live on the
+    // player server-side (wire slots 74-85) and persist across vendor windows,
+    // so the local mirror must too — clearing here made the buyback list
+    // vanish when the vendor was reopened. The mirror resets on world entry.
     pendingBuybackSlot_ = -1;
     pendingBuybackWireSlot_ = 0;
     pendingBuyItemId_ = 0;
     pendingBuyItemSlot_ = 0;
     if (wasOpen && owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("MERCHANT_CLOSED", {});
+}
+
+void InventoryHandler::clearBuybackState() {
+    buybackItems_.clear();
+    pendingSellToBuyback_.clear();
+    buybackSlotGuids_.fill(0);
+    pendingBuybackSlot_ = -1;
+    pendingBuybackWireSlot_ = 0;
+}
+
+void InventoryHandler::reconcileBuybackSlots() {
+    for (auto it = buybackItems_.begin(); it != buybackItems_.end();) {
+        const auto slot = std::find(buybackSlotGuids_.begin(),
+                                    buybackSlotGuids_.end(), it->itemGuid);
+        if (slot != buybackSlotGuids_.end()) {
+            it->wireSlot = kBuybackWireSlotStart +
+                static_cast<uint32_t>(std::distance(buybackSlotGuids_.begin(), slot));
+            pendingSellToBuyback_.erase(it->itemGuid);
+            ++it;
+        } else if (it->wireSlot != 0) {
+            // A previously confirmed item disappeared from the server-owned
+            // buyback fields (purchase or ring replacement).
+            it = buybackItems_.erase(it);
+        } else {
+            // SMSG_SELL_ITEM and the player-field delta may arrive in either
+            // order. Keep the just-sold entry hidden from clicks until mapped.
+            ++it;
+        }
+    }
+
+    // A ring slot can only identify one entry. Remove any stale duplicate that
+    // may remain after a replacement update.
+    for (uint32_t wire = kBuybackWireSlotStart; wire < kBuybackWireSlotEnd; ++wire) {
+        bool kept = false;
+        for (auto it = buybackItems_.begin(); it != buybackItems_.end();) {
+            if (it->wireSlot != wire) {
+                ++it;
+                continue;
+            }
+            if (!kept) {
+                kept = true;
+                ++it;
+            } else {
+                it = buybackItems_.erase(it);
+            }
+        }
+    }
 }
 
 void InventoryHandler::buyItem(uint64_t vendorGuid, uint32_t itemId, uint32_t slot, uint32_t count) {
@@ -946,10 +1153,9 @@ void InventoryHandler::sellItemBySlot(int backpackIndex) {
         return;
     }
 
-    uint64_t itemGuid = owner_.backpackSlotGuidsRef()[backpackIndex];
-    if (itemGuid == 0) {
-        itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
-    }
+    uint64_t itemGuid = slot.item.guid;
+    if (itemGuid == 0) itemGuid = owner_.backpackSlotGuidsRef()[backpackIndex];
+    if (itemGuid == 0) itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
     LOG_DEBUG("sellItemBySlot: slot=", backpackIndex,
               " item=", slot.item.name,
               " itemGuid=0x", std::hex, itemGuid, std::dec,
@@ -959,9 +1165,8 @@ void InventoryHandler::sellItemBySlot(int backpackIndex) {
         sold.itemGuid = itemGuid;
         sold.item = slot.item;
         sold.count = 1;
-        buybackItems_.push_front(sold);
-        if (buybackItems_.size() > 12) buybackItems_.pop_back();
         pendingSellToBuyback_[itemGuid] = sold;
+        buybackItems_.push_back(sold);
         sellItem(currentVendorItems_.vendorGuid, itemGuid, 1);
     } else if (itemGuid == 0) {
         owner_.addSystemChatMessage("Cannot sell: item not found in inventory.");
@@ -988,9 +1193,9 @@ void InventoryHandler::sellItemInBag(int bagIndex, int slotIndex) {
         return;
     }
 
-    uint64_t itemGuid = 0;
+    uint64_t itemGuid = slot.item.guid;
     uint64_t bagGuid = owner_.equipSlotGuidsRef()[Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex];
-    if (bagGuid != 0) {
+    if (itemGuid == 0 && bagGuid != 0) {
         auto it = owner_.containerContentsRef().find(bagGuid);
         if (it != owner_.containerContentsRef().end() && slotIndex < static_cast<int>(it->second.numSlots)) {
             itemGuid = it->second.slotGuids[slotIndex];
@@ -1005,9 +1210,8 @@ void InventoryHandler::sellItemInBag(int bagIndex, int slotIndex) {
         sold.itemGuid = itemGuid;
         sold.item = slot.item;
         sold.count = 1;
-        buybackItems_.push_front(sold);
-        if (buybackItems_.size() > 12) buybackItems_.pop_back();
         pendingSellToBuyback_[itemGuid] = sold;
+        buybackItems_.push_back(sold);
         sellItem(currentVendorItems_.vendorGuid, itemGuid, 1);
     } else if (itemGuid == 0) {
         owner_.addSystemChatMessage("Cannot sell: item not found.");
@@ -1018,8 +1222,13 @@ void InventoryHandler::sellItemInBag(int bagIndex, int slotIndex) {
 
 void InventoryHandler::buyBackItem(uint32_t buybackSlot) {
     if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket() || currentVendorItems_.vendorGuid == 0) return;
-    constexpr uint32_t kBuybackSlotStart = 74;
-    uint32_t wireSlot = kBuybackSlotStart + buybackSlot;
+    if (buybackSlot >= buybackItems_.size()) return;
+    const uint32_t wireSlot = buybackItems_[buybackSlot].wireSlot;
+    if (wireSlot < kBuybackWireSlotStart || wireSlot >= kBuybackWireSlotEnd) {
+        LOG_WARNING("Buyback request rejected: row ", buybackSlot,
+                    " has invalid wire slot ", wireSlot);
+        return;
+    }
     pendingBuyItemId_ = 0;
     pendingBuyItemSlot_ = 0;
     LOG_INFO("Buyback request: vendorGuid=0x", std::hex, currentVendorItems_.vendorGuid,
@@ -1117,6 +1326,96 @@ void InventoryHandler::autoEquipItemInBag(int bagIndex, int slotIndex) {
     }
 }
 
+// Dispatches CMSG_USE_ITEM for an item already located at (wowBag, wowSlot).
+// Spells that enchant another item (sharpening stones, weightstones, weapon oils)
+// cannot be sent immediately: they need the target item's GUID, so the use is
+// parked and completed by completeItemUseOnItem() once the player picks a target.
+void InventoryHandler::dispatchUseItem(uint8_t wowBag, uint8_t wowSlot, uint64_t itemGuid,
+                                       const ItemDef& item) {
+    if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+    if (owner_.isRestoring()) owner_.cancelCast();
+    if (itemGuid == 0) {
+        LOG_WARNING("useItem: itemGuid=0 for item='", item.name, "' entry=", item.itemId,
+                    " — cannot use");
+        owner_.addSystemChatMessage("Cannot use that item right now.");
+        return;
+    }
+
+    const auto* itemInfo = owner_.getItemInfo(item.itemId);
+    uint32_t useSpellId = 0;
+    if (itemInfo) {
+        for (const auto& sp : itemInfo->spells) {
+            if (sp.spellId != 0 && (sp.spellTrigger == 0 || sp.spellTrigger == 5)) {
+                useSpellId = sp.spellId;
+                break;
+            }
+        }
+    }
+    LOG_DEBUG("useItem: bag=", (int)wowBag, " slot=", (int)wowSlot, " entry=", item.itemId,
+              " spellId=", useSpellId);
+
+    if (useSpellId != 0 &&
+        (owner_.getSpellTargetFlags(useSpellId) & kSpellTargetFlagItem) != 0) {
+        pendingItemTarget_ = PendingItemTarget{wowBag, wowSlot, itemGuid, useSpellId,
+                                               item.itemId, item.name};
+        owner_.addSystemChatMessage("Choose an item to apply " + item.name + " to.");
+        return;
+    }
+
+    if (isBandageItem(itemInfo)) synchronizeStationaryBandageCast(owner_);
+    sendUseItem(wowBag, wowSlot, itemGuid, useSpellId,
+                targetGuidForUseItem(owner_, itemInfo), 0);
+}
+
+void InventoryHandler::sendUseItem(uint8_t wowBag, uint8_t wowSlot, uint64_t itemGuid,
+                                   uint32_t spellId, uint64_t targetGuid, uint64_t itemTargetGuid) {
+    auto packet = owner_.getPacketParsers()
+        ? owner_.getPacketParsers()->buildUseItem(wowBag, wowSlot, itemGuid, spellId,
+                                                  targetGuid, itemTargetGuid)
+        : UseItemPacket::build(wowBag, wowSlot, itemGuid, spellId, targetGuid, itemTargetGuid);
+    LOG_INFO("Sending CMSG_USE_ITEM: bag=", (int)wowBag, " slot=", (int)wowSlot,
+             " spell=", spellId, " itemTarget=0x", std::hex, itemTargetGuid, std::dec,
+             " packetSize=", packet.getSize());
+    owner_.getSocket()->send(packet);
+}
+
+bool InventoryHandler::isAwaitingItemTarget() const {
+    if (!pendingItemTarget_) return false;
+    // Leaving the world abandons the pending use — the slot and GUID would be
+    // stale for the next character.
+    if (owner_.getState() != WorldState::IN_WORLD) {
+        pendingItemTarget_.reset();
+        return false;
+    }
+    return true;
+}
+
+uint32_t InventoryHandler::getPendingItemTargetSourceItemId() const {
+    return pendingItemTarget_ ? pendingItemTarget_->itemId : 0;
+}
+
+void InventoryHandler::cancelItemTargeting() {
+    pendingItemTarget_.reset();
+}
+
+void InventoryHandler::completeItemUseOnItem(uint64_t targetItemGuid) {
+    if (!isAwaitingItemTarget()) return;
+    const PendingItemTarget pending = *pendingItemTarget_;
+    pendingItemTarget_.reset();
+
+    if (targetItemGuid == 0 || !owner_.getSocket()) {
+        owner_.addSystemChatMessage("That is not a valid target.");
+        return;
+    }
+    // Applying to itself is never valid and the server would silently drop it.
+    if (targetItemGuid == pending.itemGuid) {
+        owner_.addSystemChatMessage("You cannot apply " + pending.itemName + " to itself.");
+        return;
+    }
+
+    sendUseItem(pending.bag, pending.slot, pending.itemGuid, pending.spellId, 0, targetItemGuid);
+}
+
 void InventoryHandler::useItemBySlot(int backpackIndex) {
     if (backpackIndex < 0 || backpackIndex >= owner_.inventoryRef().getBackpackSize()) return;
     const auto& slot = owner_.inventoryRef().getBackpackSlot(backpackIndex);
@@ -1127,27 +1426,8 @@ void InventoryHandler::useItemBySlot(int backpackIndex) {
         itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
     }
 
-    if (itemGuid != 0 && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
-        uint32_t useSpellId = 0;
-        if (auto* info = owner_.getItemInfo(slot.item.itemId)) {
-            for (const auto& sp : info->spells) {
-                if (sp.spellId != 0 && (sp.spellTrigger == 0 || sp.spellTrigger == 5)) {
-                    useSpellId = sp.spellId;
-                    break;
-                }
-            }
-            LOG_DEBUG("useItemBySlot: entry=", slot.item.itemId,
-                      " spellId=", useSpellId);
-        }
-        auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId)
-            : UseItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex), itemGuid, useSpellId);
-        owner_.getSocket()->send(packet);
-    } else if (itemGuid == 0) {
-        LOG_WARNING("useItemBySlot: itemGuid=0 for item='", slot.item.name,
-                    "' entry=", slot.item.itemId, " — cannot use");
-        owner_.addSystemChatMessage("Cannot use that item right now.");
-    }
+    dispatchUseItem(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex),
+                    itemGuid, slot.item);
 }
 
 void InventoryHandler::useItemInBag(int bagIndex, int slotIndex) {
@@ -1171,27 +1451,8 @@ void InventoryHandler::useItemInBag(int bagIndex, int slotIndex) {
     LOG_INFO("useItemInBag: bag=", bagIndex, " slot=", slotIndex, " itemId=", slot.item.itemId,
              " itemGuid=0x", std::hex, itemGuid, std::dec);
 
-    if (itemGuid != 0 && owner_.getState() == WorldState::IN_WORLD && owner_.getSocket()) {
-        uint32_t useSpellId = 0;
-        if (auto* info = owner_.getItemInfo(slot.item.itemId)) {
-            for (const auto& sp : info->spells) {
-                if (sp.spellId != 0 && (sp.spellTrigger == 0 || sp.spellTrigger == 5)) {
-                    useSpellId = sp.spellId;
-                    break;
-                }
-            }
-        }
-        uint8_t wowBag = static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex);
-        auto packet = owner_.getPacketParsers()
-            ? owner_.getPacketParsers()->buildUseItem(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId)
-            : UseItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex), itemGuid, useSpellId);
-        LOG_INFO("useItemInBag: sending CMSG_USE_ITEM, bag=", (int)wowBag, " slot=", slotIndex,
-                 " packetSize=", packet.getSize());
-        owner_.getSocket()->send(packet);
-    } else if (itemGuid == 0) {
-        LOG_WARNING("Use item in bag failed: missing item GUID for bag ", bagIndex, " slot ", slotIndex);
-        owner_.addSystemChatMessage("Cannot use that item right now.");
-    }
+    dispatchUseItem(static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex),
+                    static_cast<uint8_t>(slotIndex), itemGuid, slot.item);
 }
 
 void InventoryHandler::openItemBySlot(int backpackIndex) {
@@ -1212,6 +1473,59 @@ void InventoryHandler::openItemInBag(int bagIndex, int slotIndex) {
     auto packet = OpenItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex));
     LOG_INFO("openItemInBag: CMSG_OPEN_ITEM bag=", (int)wowBag, " slot=", slotIndex);
     owner_.getSocket()->send(packet);
+}
+
+void InventoryHandler::readItemBySlot(int backpackIndex) {
+    if (backpackIndex < 0 || backpackIndex >= owner_.inventoryRef().getBackpackSize()) return;
+    const auto& slot = owner_.inventoryRef().getBackpackSlot(backpackIndex);
+    if (slot.empty()) return;
+    if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+
+    const auto* info = owner_.getItemInfo(slot.item.itemId);
+    uint32_t pageTextId = info ? info->pageTextId : slot.item.pageTextId;
+    if (pageTextId == 0) return;
+
+    uint64_t itemGuid = owner_.backpackSlotGuidsRef()[backpackIndex];
+    if (itemGuid == 0) itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
+
+    owner_.bookPagesRef().clear();
+    auto readPacket = ReadItemPacket::build(0xFF, static_cast<uint8_t>(Inventory::NUM_EQUIP_SLOTS + backpackIndex));
+    owner_.getSocket()->send(readPacket);
+    auto pagePacket = PageTextQueryPacket::build(pageTextId, itemGuid != 0 ? itemGuid : owner_.getPlayerGuid());
+    owner_.getSocket()->send(pagePacket);
+    LOG_INFO("readItemBySlot: CMSG_READ_ITEM pageTextId=", pageTextId,
+             " bag=0xFF slot=", (Inventory::NUM_EQUIP_SLOTS + backpackIndex));
+}
+
+void InventoryHandler::readItemInBag(int bagIndex, int slotIndex) {
+    if (bagIndex < 0 || bagIndex >= owner_.inventoryRef().NUM_BAG_SLOTS) return;
+    if (slotIndex < 0 || slotIndex >= owner_.inventoryRef().getBagSize(bagIndex)) return;
+    const auto& slot = owner_.inventoryRef().getBagSlot(bagIndex, slotIndex);
+    if (slot.empty()) return;
+    if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+
+    const auto* info = owner_.getItemInfo(slot.item.itemId);
+    uint32_t pageTextId = info ? info->pageTextId : slot.item.pageTextId;
+    if (pageTextId == 0) return;
+
+    uint64_t itemGuid = 0;
+    uint64_t bagGuid = owner_.equipSlotGuidsRef()[Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex];
+    if (bagGuid != 0) {
+        auto it = owner_.containerContentsRef().find(bagGuid);
+        if (it != owner_.containerContentsRef().end() && slotIndex < static_cast<int>(it->second.numSlots)) {
+            itemGuid = it->second.slotGuids[slotIndex];
+        }
+    }
+    if (itemGuid == 0) itemGuid = owner_.resolveOnlineItemGuid(slot.item.itemId);
+
+    uint8_t wowBag = static_cast<uint8_t>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIndex);
+    owner_.bookPagesRef().clear();
+    auto readPacket = ReadItemPacket::build(wowBag, static_cast<uint8_t>(slotIndex));
+    owner_.getSocket()->send(readPacket);
+    auto pagePacket = PageTextQueryPacket::build(pageTextId, itemGuid != 0 ? itemGuid : owner_.getPlayerGuid());
+    owner_.getSocket()->send(pagePacket);
+    LOG_INFO("readItemInBag: CMSG_READ_ITEM pageTextId=", pageTextId,
+             " bag=", static_cast<int>(wowBag), " slot=", slotIndex);
 }
 
 void InventoryHandler::destroyItem(uint8_t bag, uint8_t slot, uint8_t count) {
@@ -1465,7 +1779,9 @@ void InventoryHandler::handleTrainerList(network::Packet& packet) {
 }
 
 void InventoryHandler::trainSpell(uint32_t spellId) {
-    LOG_INFO("trainSpell called: spellId=", spellId, " state=", (int)owner_.getState(), " socket=", (owner_.getSocket() ? "yes" : "no"));
+    LOG_INFO("Trainer purchase requested: spellId=", spellId,
+             " state=", (int)owner_.getState(),
+             " socket=", (owner_.getSocket() ? "yes" : "no"));
     if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) {
         LOG_WARNING("trainSpell: Not in world or no socket connection");
         return;
@@ -1708,8 +2024,18 @@ void InventoryHandler::handleSendMailResult(network::Packet& packet) {
     uint32_t mailId = packet.readUInt32();
     uint32_t action = packet.readUInt32();
     uint32_t error  = packet.readUInt32();
-    (void)mailId;
-    if (action == 0) { // SEND
+    // WotLK MailResponseType values from SharedDefines.h.
+    constexpr uint32_t MAIL_SEND = 0;
+    constexpr uint32_t MAIL_MONEY_TAKEN = 1;
+    constexpr uint32_t MAIL_ITEM_TAKEN = 2;
+    constexpr uint32_t MAIL_RETURNED_TO_SENDER = 3;
+    constexpr uint32_t MAIL_DELETED = 4;
+    constexpr uint32_t MAIL_MADE_PERMANENT = 5;
+
+    auto mailIt = std::find_if(mailInbox_.begin(), mailInbox_.end(),
+        [mailId](const MailMessage& mail) { return mail.messageId == mailId; });
+
+    if (action == MAIL_SEND) {
         if (error == 0) {
             owner_.addSystemChatMessage("Mail sent.");
             clearMailAttachments();
@@ -1717,22 +2043,37 @@ void InventoryHandler::handleSendMailResult(network::Packet& packet) {
         } else {
             owner_.addSystemChatMessage("Failed to send mail (error " + std::to_string(error) + ").");
         }
-    } else if (action == 4) { // TAKE_ITEM
+    } else if (action == MAIL_ITEM_TAKEN) {
         if (error == 0) {
             owner_.addSystemChatMessage("Item taken from mail.");
             if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("BAG_UPDATE", {});
         } else {
             owner_.addSystemChatMessage("Failed to take item (error " + std::to_string(error) + ").");
         }
-    } else if (action == 5) { // TAKE_MONEY
+    } else if (action == MAIL_MONEY_TAKEN) {
         if (error == 0) {
+            if (mailIt != mailInbox_.end()) mailIt->money = 0;
             owner_.addSystemChatMessage("Money taken from mail.");
-            if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("PLAYER_MONEY", {});
+            if (owner_.addonEventCallbackRef()) {
+                owner_.addonEventCallbackRef()("PLAYER_MONEY", {});
+                owner_.addonEventCallbackRef()("MAIL_INBOX_UPDATE", {});
+            }
+        } else {
+            owner_.addSystemChatMessage("Failed to take money (error " + std::to_string(error) + ").");
         }
-    } else if (action == 2) { // DELETE
+    } else if (action == MAIL_DELETED || action == MAIL_RETURNED_TO_SENDER) {
         if (error == 0) {
-            owner_.addSystemChatMessage("Mail deleted.");
+            owner_.addSystemChatMessage(action == MAIL_DELETED ? "Mail deleted." : "Mail returned.");
+            if (mailIt != mailInbox_.end()) {
+                const int erasedIndex = static_cast<int>(std::distance(mailInbox_.begin(), mailIt));
+                mailInbox_.erase(mailIt);
+                if (selectedMailIndex_ == erasedIndex) selectedMailIndex_ = -1;
+                else if (selectedMailIndex_ > erasedIndex) --selectedMailIndex_;
+            }
+            if (owner_.addonEventCallbackRef()) owner_.addonEventCallbackRef()("MAIL_INBOX_UPDATE", {});
         }
+    } else if (action == MAIL_MADE_PERMANENT && error == 0) {
+        owner_.addSystemChatMessage("Mail text copied.");
     }
     refreshMailList();
 }
@@ -1990,7 +2331,10 @@ void InventoryHandler::handleAuctionHello(network::Packet& packet) {
 
 void InventoryHandler::handleAuctionListResult(network::Packet& packet) {
     AuctionListResult result;
-    if (!AuctionListResultParser::parse(packet, result)) return;
+    // Vanilla sends a single enchantId; TBC inspects 6 enchant slots per item,
+    // WotLK 7 (PRISMATIC_ENCHANTMENT_SLOT joined the inspected range in 3.x).
+    const int enchantSlots = isClassicLikeExpansion() ? 1 : (isPreWotlk() ? 6 : 7);
+    if (!AuctionListResultParser::parse(packet, result, enchantSlots)) return;
 
     if (pendingAuctionTarget_ == AuctionResultTarget::OWNER) {
         auctionOwnerResults_ = std::move(result);
@@ -2007,6 +2351,7 @@ void InventoryHandler::handleAuctionListResult(network::Packet& packet) {
     auto ensureEntries = [this](const AuctionListResult& r) {
         for (const auto& e : r.auctions) {
             owner_.ensureItemInfo(e.itemEntry);
+            if (e.ownerGuid != 0) owner_.queryPlayerName(e.ownerGuid);
         }
     };
     if (pendingAuctionTarget_ == AuctionResultTarget::OWNER) ensureEntries(auctionOwnerResults_);
@@ -2469,7 +2814,7 @@ void InventoryHandler::handleItemQueryResponse(network::Packet& packet) {
             if (it->itemId == data.entry) {
                 std::string itemName = data.name.empty() ? ("item #" + std::to_string(data.entry)) : data.name;
                 std::string link = buildItemLink(data.entry, data.quality, itemName);
-                std::string msg = "Received: " + link;
+                std::string msg = "Received item: " + link;
                 if (it->count > 1) msg += " x" + std::to_string(it->count);
                 owner_.addSystemChatMessage(msg);
                 if (auto* ac = owner_.services().audioCoordinator) {
@@ -2523,10 +2868,15 @@ void InventoryHandler::handleItemQueryResponse(network::Packet& packet) {
 
 uint64_t InventoryHandler::resolveOnlineItemGuid(uint32_t itemId) const {
     if (itemId == 0) return 0;
+    uint64_t candidate = 0;
     for (const auto& [guid, info] : owner_.onlineItemsRef()) {
-        if (info.entry == itemId) return guid;
+        if (info.entry != itemId) continue;
+        // Item IDs are templates, not identities. Only use this compatibility
+        // fallback when the matching online object is unambiguous.
+        if (candidate != 0) return 0;
+        candidate = guid;
     }
-    return 0;
+    return candidate;
 }
 
 void InventoryHandler::detectInventorySlotBases(const FlatFieldMap& fields) {
@@ -2616,6 +2966,7 @@ void InventoryHandler::detectInventorySlotBases(const FlatFieldMap& fields) {
 
 bool InventoryHandler::applyInventoryFields(const FlatFieldMap& fields) {
     bool slotsChanged = false;
+    bool buybackSlotsChanged = false;
     int equipBase = (owner_.invSlotBaseRef() >= 0) ? owner_.invSlotBaseRef() : static_cast<int>(fieldIndex(UF::PLAYER_FIELD_INV_SLOT_HEAD));
     int packBase = (owner_.packSlotBaseRef() >= 0) ? owner_.packSlotBaseRef() : static_cast<int>(fieldIndex(UF::PLAYER_FIELD_PACK_SLOT_1));
     int bankBase = static_cast<int>(fieldIndex(UF::PLAYER_FIELD_BANK_SLOT_1));
@@ -2628,6 +2979,8 @@ bool InventoryHandler::applyInventoryFields(const FlatFieldMap& fields) {
     }
 
     int keyringBase = static_cast<int>(fieldIndex(UF::PLAYER_FIELD_KEYRING_SLOT_1));
+    const int buybackBase = bankBagBase != 0xFFFF
+        ? bankBagBase + (effectiveBankBagSlots_ * 2) : 0xFFFF;
     if (keyringBase == 0xFFFF && bankBagBase != 0xFFFF) {
         // Layout fallback for profiles that don't define PLAYER_FIELD_KEYRING_SLOT_1.
         // Bank bag slots are followed by 12 vendor buyback slots (24 fields), then keyring.
@@ -2689,7 +3042,22 @@ bool InventoryHandler::applyInventoryFields(const FlatFieldMap& fields) {
                 slotsChanged = true;
             }
         }
+
+        // The server owns the buyback ring. Bind local item metadata to these
+        // GUID fields rather than assuming displayed row N means wire slot 74+N.
+        if (buybackBase != 0xFFFF && key >= static_cast<uint16_t>(buybackBase) &&
+            key <= static_cast<uint16_t>(buybackBase) +
+                   (kBuybackWireSlotCount * 2 - 1)) {
+            const int slotIndex = (key - buybackBase) / 2;
+            const bool isLow = ((key - buybackBase) % 2 == 0);
+            uint64_t& guid = buybackSlotGuids_[slotIndex];
+            if (isLow) guid = (guid & 0xFFFFFFFF00000000ULL) | val;
+            else guid = (guid & 0x00000000FFFFFFFFULL) | (uint64_t(val) << 32);
+            buybackSlotsChanged = true;
+        }
     }
+
+    if (buybackSlotsChanged) reconcileBuybackSlots();
 
     return slotsChanged;
 }
@@ -2728,6 +3096,7 @@ ItemDef InventoryHandler::buildItemDef(uint32_t entry, uint32_t stackCount,
                                        uint32_t curDur, uint32_t maxDur, uint64_t guid) {
     ItemDef def;
     def.itemId = entry;
+    def.guid = guid;
     def.stackCount = stackCount;
     def.curDurability = curDur;
     def.maxDurability = maxDur;
@@ -2756,6 +3125,7 @@ ItemDef InventoryHandler::buildItemDef(uint32_t entry, uint32_t stackCount,
         def.requiredLevel = info.requiredLevel;
         def.bindType = info.bindType;
         def.description = info.description;
+        def.pageTextId = info.pageTextId;
         def.startQuestId = info.startQuestId;
         def.extraStats.clear();
         for (const auto& es : info.extraStats)
@@ -2811,19 +3181,27 @@ void InventoryHandler::rebuildOnlineInventory() {
         if (contIt != owner_.containerContentsRef().end()) {
             numSlots = static_cast<int>(contIt->second.numSlots);
         }
-        if (numSlots <= 0) {
+        const ItemQueryResponseData* bagTemplate = nullptr;
+        {
             auto bagItemIt = owner_.onlineItemsRef().find(bagGuid);
             if (bagItemIt != owner_.onlineItemsRef().end()) {
                 auto bagInfoIt = owner_.itemInfoCacheRef().find(bagItemIt->second.entry);
-                if (bagInfoIt != owner_.itemInfoCacheRef().end()) {
-                    numSlots = bagInfoIt->second.containerSlots;
-                }
+                if (bagInfoIt != owner_.itemInfoCacheRef().end())
+                    bagTemplate = &bagInfoIt->second;
             }
+        }
+        if (numSlots <= 0 && bagTemplate) {
+            numSlots = bagTemplate->containerSlots;
         }
         if (numSlots <= 0) continue;
 
         // Set the bag size in the inventory bag data
         owner_.inventoryRef().setBagSize(bagIdx, numSlots);
+        // Quivers (class 11) and profession bags (class 1, subclass != 0) only
+        // accept their own item type — sorting and the combined grid must know.
+        owner_.inventoryRef().setBagSpecial(bagIdx, bagTemplate &&
+            (bagTemplate->itemClass == 11 ||
+             (bagTemplate->itemClass == 1 && bagTemplate->subClass != 0)));
 
         // Also set bagSlots on the equipped bag item (for UI display)
         auto& bagEquipSlot = owner_.inventoryRef().getEquipSlot(static_cast<EquipSlot>(Inventory::FIRST_BAG_EQUIP_SLOT + bagIdx));
@@ -2993,14 +3371,26 @@ void InventoryHandler::rebuildOnlineInventory() {
         }
     }
 
-    // Only mark equipment dirty if equipped item displayInfoIds actually changed
+    // Only mark equipment dirty if equipped item displayInfoIds actually changed.
+    // Enchants count too: applying a sharpening stone leaves the displayInfoId alone
+    // but changes the visual effect hanging off the weapon.
     std::array<uint32_t, 19> currentEquipDisplayIds{};
+    std::array<uint64_t, 19> currentEquipEnchantIds{};
     for (int i = 0; i < 19; i++) {
         const auto& slot = owner_.inventoryRef().getEquipSlot(static_cast<EquipSlot>(i));
         if (!slot.empty()) currentEquipDisplayIds[i] = slot.item.displayInfoId;
+
+        uint64_t guid = owner_.equipSlotGuidsRef()[i];
+        if (guid != 0) {
+            auto [permEnchantId, tempEnchantId] = owner_.getItemEnchantIds(guid);
+            currentEquipEnchantIds[i] =
+                (static_cast<uint64_t>(permEnchantId) << 32) | tempEnchantId;
+        }
     }
-    if (currentEquipDisplayIds != owner_.lastEquipDisplayIdsRef()) {
+    if (currentEquipDisplayIds != owner_.lastEquipDisplayIdsRef() ||
+        currentEquipEnchantIds != lastEquipEnchantIds_) {
         owner_.lastEquipDisplayIdsRef() = currentEquipDisplayIds;
+        lastEquipEnchantIds_ = currentEquipEnchantIds;
         owner_.onlineEquipDirtyRef() = true;
     }
 
@@ -3015,7 +3405,113 @@ void InventoryHandler::rebuildOnlineInventory() {
 
 void InventoryHandler::maybeDetectVisibleItemLayout() {
     if (owner_.visibleItemLayoutVerifiedRef()) return;
+    if (usesVisibleItemDisplayIds()) {
+        std::array<uint32_t, 19> equipDisplayIds = owner_.lastEquipDisplayIdsRef();
+        int nonZero = 0;
+        for (int i = 0; i < 19; ++i) {
+            if (equipDisplayIds[i] == 0) {
+                const auto& slot = owner_.inventoryRef().getEquipSlot(static_cast<EquipSlot>(i));
+                if (!slot.empty()) equipDisplayIds[i] = slot.item.displayInfoId;
+            }
+            if (equipDisplayIds[i] != 0) nonZero++;
+        }
+
+        int bestBase = -1;
+        int bestStride = 0;
+        int bestMatches = 0;
+        int bestMismatches = 9999;
+        int bestScore = -999999;
+
+        if (nonZero >= 2 && !owner_.lastPlayerFieldsRef().empty()) {
+            const uint16_t maxKey = owner_.lastPlayerFieldsRef().back().first;
+            const int strides[] = {16, 12, 8, 4, 2, 3, 1};
+            for (int stride : strides) {
+                for (const auto& [baseIdxU16, _v] : owner_.lastPlayerFieldsRef()) {
+                    const int base = static_cast<int>(baseIdxU16);
+                    if (base + 18 * stride > static_cast<int>(maxKey)) continue;
+
+                    int matches = 0;
+                    int mismatches = 0;
+                    for (int s = 0; s < 19; ++s) {
+                        uint32_t want = equipDisplayIds[s];
+                        if (want == 0) continue;
+                        const uint16_t idx = static_cast<uint16_t>(base + s * stride);
+                        auto it = owner_.lastPlayerFieldsRef().find(idx);
+                        if (it == owner_.lastPlayerFieldsRef().end()) continue;
+                        if (it->second == want) {
+                            matches++;
+                        } else if (it->second != 0) {
+                            mismatches++;
+                        }
+                    }
+
+                    int score = matches * 3 - mismatches * 2;
+                    if (score > bestScore ||
+                        (score == bestScore && matches > bestMatches) ||
+                        (score == bestScore && matches == bestMatches && mismatches < bestMismatches) ||
+                        (score == bestScore && matches == bestMatches && mismatches == bestMismatches &&
+                         (bestBase < 0 || base < bestBase))) {
+                        bestScore = score;
+                        bestMatches = matches;
+                        bestMismatches = mismatches;
+                        bestBase = base;
+                        bestStride = stride;
+                    }
+                }
+            }
+        }
+
+        bool changed = false;
+        if (bestMatches >= 2 && bestBase >= 0 && bestStride > 0 && bestMismatches <= 2) {
+            changed = owner_.visibleItemEntryBaseRef() != bestBase ||
+                      owner_.visibleItemStrideRef() != bestStride;
+            owner_.visibleItemEntryBaseRef() = bestBase;
+            owner_.visibleItemStrideRef() = bestStride;
+            owner_.visibleItemLayoutVerifiedRef() = true;
+            LOG_INFO("Detected TBC PLAYER_VISIBLE_ITEM display layout: base=", bestBase,
+                     " stride=", bestStride, " (matches=", bestMatches,
+                     " mismatches=", bestMismatches, " score=", bestScore, ")");
+        } else {
+            // TBC exposes display IDs rather than item entries, but private cores
+            // are not perfectly consistent about the base offset. Keep the known
+            // 2.4.x fallback active without marking it verified, so later local
+            // equipment updates can still detect a better layout.
+            const int kTbcFallbackBase = tbcVisibleItemBaseFallback();
+            constexpr int kTbcFallbackStride = kTbcVisibleItemStride;
+            changed = owner_.visibleItemEntryBaseRef() != kTbcFallbackBase ||
+                      owner_.visibleItemStrideRef() != kTbcFallbackStride;
+            owner_.visibleItemEntryBaseRef() = kTbcFallbackBase;
+            owner_.visibleItemStrideRef() = kTbcFallbackStride;
+            static bool loggedProvisionalLayout = false;
+            if (!loggedProvisionalLayout) {
+                loggedProvisionalLayout = true;
+                LOG_INFO("Using provisional TBC PLAYER_VISIBLE_ITEM display layout: base=",
+                         kTbcFallbackBase, " stride=", kTbcFallbackStride,
+                         " (waiting for local display-ID confirmation)");
+            }
+            if (visibleEquipmentFieldDiagEnabled()) {
+                LOG_INFO("TBC visible layout detection pending: localDisplayIds=", nonZero,
+                         " bestBase=", bestBase, " bestStride=", bestStride,
+                         " matches=", bestMatches, " mismatches=", bestMismatches,
+                         " score=", bestScore);
+            }
+        }
+
+        if (changed || owner_.visibleItemLayoutVerifiedRef()) {
+            for (const auto& [guid, ent] : owner_.getEntityManager().getEntities()) {
+                if (!ent || ent->getType() != ObjectType::PLAYER) continue;
+                if (guid == owner_.getPlayerGuid()) continue;
+                updateOtherPlayerVisibleItems(guid, ent->getFields());
+            }
+        }
+        return;
+    }
     if (owner_.lastPlayerFieldsRef().empty()) return;
+
+    if (isActiveExpansion("tbc")) {
+        owner_.visibleItemEntryBaseRef() = tbcVisibleItemBaseFallback();
+        owner_.visibleItemStrideRef() = kTbcVisibleItemStride;
+    }
 
     std::array<uint32_t, 19> equipEntries{};
     int nonZero = 0;
@@ -3044,7 +3540,9 @@ void InventoryHandler::maybeDetectVisibleItemLayout() {
     int bestMismatches = 9999;
     int bestScore = -999999;
 
-    const int strides[] = {2, 3, 4, 1};
+    const std::array<int, 5> strides = isActiveExpansion("tbc")
+        ? std::array<int, 5>{16, 2, 3, 4, 1}
+        : std::array<int, 5>{2, 3, 4, 1, 16};
     for (int stride : strides) {
         for (const auto& [baseIdxU16, _v] : owner_.lastPlayerFieldsRef()) {
             const int base = static_cast<int>(baseIdxU16);
@@ -3103,8 +3601,19 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
     // Use the current base/stride (defaults are correct for WotLK 3.3.5a: base=284, stride=2).
     // The heuristic may refine these later, but we proceed immediately with whatever values
     // are set rather than waiting for verification.
-    const int base = owner_.visibleItemEntryBaseRef();
-    const int stride = owner_.visibleItemStrideRef();
+    const bool valuesAreDisplayIds = usesVisibleItemDisplayIds();
+    int base = owner_.visibleItemEntryBaseRef();
+    int stride = owner_.visibleItemStrideRef();
+    if (isActiveExpansion("tbc") && !owner_.visibleItemLayoutVerifiedRef()) {
+        const int kTbcFallbackBase = tbcVisibleItemBaseFallback();
+        constexpr int kTbcFallbackStride = kTbcVisibleItemStride;
+        if (base != kTbcFallbackBase || stride != kTbcFallbackStride) {
+            base = kTbcFallbackBase;
+            stride = kTbcFallbackStride;
+            owner_.visibleItemEntryBaseRef() = base;
+            owner_.visibleItemStrideRef() = stride;
+        }
+    }
     if (base < 0 || stride <= 0) return; // Defensive: should never happen with defaults.
 
     std::array<uint32_t, 19> newEntries{};
@@ -3116,6 +3625,19 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
 
     int nonZero = 0;
     for (uint32_t e : newEntries) { if (e != 0) nonZero++; }
+    const bool hasVisibleBodySlot =
+        newEntries[2] != 0 ||  // shoulders
+        newEntries[4] != 0 ||  // chest
+        newEntries[6] != 0 ||  // legs
+        newEntries[7] != 0 ||  // feet
+        newEntries[9] != 0 ||  // hands
+        newEntries[15] != 0 || // main hand
+        newEntries[16] != 0;   // off hand
+    const bool sparseTbcVisible =
+        valuesAreDisplayIds &&
+        (nonZero == 0 || nonZero < 4 || (!hasVisibleBodySlot && nonZero < 8));
+    const bool hasInspectedEntries =
+        owner_.inspectedPlayerItemEntriesRef().find(guid) != owner_.inspectedPlayerItemEntriesRef().end();
 
     // Dump raw fields around visible item range to find the correct offset
     static int dumpCount = 0;
@@ -3131,13 +3653,48 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
         }
         LOG_DEBUG("RAW FIELDS 270-340:", dump);
     }
+    static int diagDumpCount = 0;
+    if (visibleEquipmentFieldDiagEnabled() && diagDumpCount < 8 && fields.size() > 20) {
+        diagDumpCount++;
+        std::ostringstream dump;
+        int emitted = 0;
+        uint16_t maxField = 0;
+        for (const auto& [idx, val] : fields) {
+            if (idx > maxField) maxField = idx;
+            if (idx < 220 || idx > 760 || val == 0) continue;
+            dump << " [" << idx << "]=" << val;
+            if (++emitted >= 180) {
+                dump << " ...";
+                break;
+            }
+        }
+        LOG_INFO("VISIBLE EQUIP FIELD DIAG guid=0x", std::hex, guid, std::dec,
+                 " fieldCount=", fields.size(), " maxField=", maxField,
+                 " base=", base, " stride=", stride,
+                 " verified=", owner_.visibleItemLayoutVerifiedRef(),
+                 " nonZero[220-760]=", dump.str());
+    }
 
     if (nonZero > 0) {
         LOG_DEBUG("updateOtherPlayerVisibleItems: guid=0x", std::hex, guid, std::dec,
                  " nonZero=", nonZero, " base=", base, " stride=", stride,
+                 " values=", (valuesAreDisplayIds ? "displayIds" : "itemEntries"),
                  " head=", newEntries[0], " shoulders=", newEntries[2],
                  " chest=", newEntries[4], " legs=", newEntries[6],
                  " mainhand=", newEntries[15], " offhand=", newEntries[16]);
+    }
+
+    if (sparseTbcVisible) {
+        if (!hasInspectedEntries && owner_.getSocket() && owner_.getState() == WorldState::IN_WORLD) {
+            owner_.pendingAutoInspectRef().insert(guid);
+            LOG_DEBUG("updateOtherPlayerVisibleItems: guid=0x", std::hex, guid, std::dec,
+                      " sparse TBC visible fields (nonZero=", nonZero,
+                      ", base=", base, ", stride=", stride,
+                      ") - queuing auto-inspect");
+        } else if (hasInspectedEntries) {
+            LOG_DEBUG("updateOtherPlayerVisibleItems: guid=0x", std::hex, guid, std::dec,
+                      " sparse TBC visible fields ignored; inspect gear already cached");
+        }
     }
 
     bool changed = false;
@@ -3145,6 +3702,17 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
     if (old != newEntries) {
         old = newEntries;
         changed = true;
+    }
+
+    if (valuesAreDisplayIds) {
+        if (sparseTbcVisible && hasInspectedEntries) {
+            return;
+        }
+        if (changed) {
+            owner_.otherPlayerVisibleDirtyRef().insert(guid);
+            emitOtherPlayerEquipment(guid);
+        }
+        return;
     }
 
     // Request item templates for any new visible entries.
@@ -3173,6 +3741,43 @@ void InventoryHandler::updateOtherPlayerVisibleItems(uint64_t guid, const FlatFi
     }
 }
 
+void InventoryHandler::cacheInspectedPlayerEquipment(uint64_t guid, const std::array<uint32_t, 19>& itemEntries) {
+    if (guid == 0) return;
+
+    owner_.inspectedPlayerItemEntriesRef()[guid] = itemEntries;
+
+    std::array<uint32_t, 19> displayIds{};
+    std::array<uint8_t, 19> invTypes{};
+    int entries = 0;
+    int resolved = 0;
+
+    for (int s = 0; s < 19; ++s) {
+        const uint32_t entry = itemEntries[s];
+        if (entry == 0) continue;
+        entries++;
+
+        auto infoIt = owner_.itemInfoCacheRef().find(entry);
+        if (infoIt != owner_.itemInfoCacheRef().end()) {
+            displayIds[s] = infoIt->second.displayInfoId;
+            invTypes[s] = static_cast<uint8_t>(infoIt->second.inventoryType);
+            resolved++;
+            continue;
+        }
+
+        queryItemInfo(entry, 0);
+    }
+
+    LOG_DEBUG("cacheInspectedPlayerEquipment: guid=0x", std::hex, guid, std::dec,
+              " entries=", entries, " resolved=", resolved,
+              " head=", displayIds[0], " shoulders=", displayIds[2],
+              " chest=", displayIds[4], " legs=", displayIds[6],
+              " mainhand=", displayIds[15], " offhand=", displayIds[16]);
+
+    if (resolved > 0 && owner_.playerEquipmentCallbackRef()) {
+        owner_.playerEquipmentCallbackRef()(guid, displayIds, invTypes);
+    }
+}
+
 void InventoryHandler::emitOtherPlayerEquipment(uint64_t guid) {
     if (!owner_.playerEquipmentCallbackRef()) return;
     auto it = owner_.otherPlayerVisibleItemEntriesRef().find(guid);
@@ -3180,6 +3785,26 @@ void InventoryHandler::emitOtherPlayerEquipment(uint64_t guid) {
 
     std::array<uint32_t, 19> displayIds{};
     std::array<uint8_t, 19> invTypes{};
+    if (usesVisibleItemDisplayIds()) {
+        displayIds = it->second;
+        invTypes = inferredVisibleInventoryTypes();
+        int nonZeroDisplay = 0;
+        for (uint32_t displayId : displayIds) {
+            if (displayId != 0) nonZeroDisplay++;
+        }
+
+        LOG_DEBUG("emitOtherPlayerEquipment: guid=0x", std::hex, guid, std::dec,
+                 " TBC displayIds=", nonZeroDisplay,
+                 " head=", displayIds[0], " shoulders=", displayIds[2],
+                 " chest=", displayIds[4], " legs=", displayIds[6],
+                 " mainhand=", displayIds[15], " offhand=", displayIds[16]);
+
+        if (nonZeroDisplay == 0) return;
+        owner_.playerEquipmentCallbackRef()(guid, displayIds, invTypes);
+        owner_.otherPlayerVisibleDirtyRef().erase(guid);
+        return;
+    }
+
     bool anyEntry = false;
     int resolved = 0, unresolved = 0;
 
@@ -3255,14 +3880,21 @@ void InventoryHandler::handleTrainerBuyFailed(network::Packet& packet) {
     std::string msg = "Cannot learn ";
     if (!spellName.empty()) msg += spellName;
     else msg += "spell #" + std::to_string(spellId);
-    if (errorCode == 0) msg += " (not enough money)";
-    else if (errorCode == 1) msg += " (not enough skill)";
-    else if (errorCode == 2) msg += " (already known)";
-    else if (errorCode != 0) msg += " (error " + std::to_string(errorCode) + ")";
+    // SMSG_TRAINER_BUY_FAILED reason codes (WoW 3.3.5a):
+    //   0 = trainer service unavailable / cannot learn (requirements unmet, e.g. skill too low)
+    //   1 = not enough money
+    //   2 = does not meet requirements (class/race/level/skill)
+    if (errorCode == 1) msg += " (not enough money)";
+    else if (errorCode == 2) msg += " (requirements not met)";
+    else msg += " (requirements not met)";
     owner_.addUIError(msg);
     owner_.addSystemChatMessage(msg);
     if (auto* ac = owner_.services().audioCoordinator)
         if (auto* sfx = ac->getUiSoundManager()) sfx->playError();
+    if (errorCode == 1)
+        owner_.playErrorSpeech(audio::PlayerErrorSpeech::NOT_ENOUGH_MONEY);
+    else
+        owner_.playErrorSpeech(audio::PlayerErrorSpeech::CANT_LEARN_SPELL);
 }
 
 // ============================================================

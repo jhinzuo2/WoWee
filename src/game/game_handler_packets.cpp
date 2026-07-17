@@ -1,4 +1,5 @@
 #include "game/game_handler.hpp"
+#include "game/protocol_constants.hpp"
 #include "game/game_utils.hpp"
 #include "game/chat_handler.hpp"
 #include "game/movement_handler.hpp"
@@ -17,6 +18,8 @@
 #include "game/update_field_table.hpp"
 #include "game/expansion_profile.hpp"
 #include "rendering/renderer.hpp"
+#include "rendering/camera_controller.hpp"
+#include "rendering/post_process_pipeline.hpp"
 #include "rendering/spell_visual_system.hpp"
 #include "audio/audio_coordinator.hpp"
 #include "audio/activity_sound_manager.hpp"
@@ -242,26 +245,31 @@ void GameHandler::registerOpcodeHandlers() {
         LOG_DEBUG("SMSG_UPDATE_WORLD_STATE: field=", field, " value=", value);
         fireAddonEvent("UPDATE_WORLD_STATES", {});
     };
-    dispatchTable_[Opcode::SMSG_WORLD_STATE_UI_TIMER_UPDATE] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_WORLD_STATE_UI_TIMER_UPDATE] = [](network::Packet& packet) {
         if (packet.hasRemaining(4)) {
             uint32_t serverTime = packet.readUInt32();
             LOG_DEBUG("SMSG_WORLD_STATE_UI_TIMER_UPDATE: serverTime=", serverTime);
         }
     };
     dispatchTable_[Opcode::SMSG_START_MIRROR_TIMER] = [this](network::Packet& packet) {
+        // type(4) + value(4) + maxValue(4) + scale(4) + paused(1) + spellId(4).
+        // The last two were being read the other way round: harmless while the
+        // spell id is 0, but a non-zero one would land its high byte in paused and
+        // freeze the bar.
         if (!packet.hasRemaining(21)) return;
         uint32_t type  = packet.readUInt32();
         int32_t  value = static_cast<int32_t>(packet.readUInt32());
         int32_t  maxV  = static_cast<int32_t>(packet.readUInt32());
         int32_t  scale = static_cast<int32_t>(packet.readUInt32());
-        /*uint32_t tracker =*/ packet.readUInt32();
         uint8_t  paused = packet.readUInt8();
+        /*uint32_t spellId =*/ packet.readUInt32();
         if (type < 3) {
-            mirrorTimers_[type].value    = value;
-            mirrorTimers_[type].maxValue = maxV;
-            mirrorTimers_[type].scale    = scale;
-            mirrorTimers_[type].paused   = (paused != 0);
-            mirrorTimers_[type].active   = true;
+            mirrorTimers_[type].value     = value;
+            mirrorTimers_[type].maxValue  = maxV;
+            mirrorTimers_[type].scale     = scale;
+            mirrorTimers_[type].paused    = (paused != 0);
+            mirrorTimers_[type].active    = true;
+            mirrorTimers_[type].pendingMs = 0.0f;  // server re-sync; drop the local carry
                             fireAddonEvent("MIRROR_TIMER_START", {
                     std::to_string(type), std::to_string(value),
                     std::to_string(maxV), std::to_string(scale),
@@ -352,7 +360,7 @@ void GameHandler::registerOpcodeHandlers() {
         addSystemChatMessage(msg);
         LOG_INFO("SMSG_TITLE_EARNED: bit=", titleBit, " lost=", isLost, " title='", titleStr, "'");
     };
-    dispatchTable_[Opcode::SMSG_LEARNED_DANCE_MOVES] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_LEARNED_DANCE_MOVES] = [](network::Packet& packet) {
         LOG_DEBUG("SMSG_LEARNED_DANCE_MOVES: ignored (size=", packet.getSize(), ")");
     };
     dispatchTable_[Opcode::SMSG_CHAR_RENAME] = [this](network::Packet& packet) {
@@ -384,8 +392,10 @@ void GameHandler::registerOpcodeHandlers() {
         /*uint64_t binderGuid =*/ packet.readUInt64();
         uint32_t mapId  = packet.readUInt32();
         uint32_t zoneId = packet.readUInt32();
+        bool changed = !hasHomeBind_ || homeBindMapId_ != mapId || homeBindZoneId_ != zoneId;
         homeBindMapId_  = mapId;
         homeBindZoneId_ = zoneId;
+        if (!changed) return;
         std::string pbMsg = "Your home location has been set";
         std::string zoneName = getAreaName(zoneId);
         if (!zoneName.empty()) pbMsg += " to " + zoneName;
@@ -428,14 +438,30 @@ void GameHandler::registerOpcodeHandlers() {
         addSystemChatMessage("Your corpse is outside this instance. Release spirit to retrieve it.");
     };
     dispatchTable_[Opcode::SMSG_CROSSED_INEBRIATION_THRESHOLD] = [this](network::Packet& packet) {
-        if (packet.hasRemaining(12)) {
+        if (packet.hasRemaining(16)) {
             uint64_t guid      = packet.readUInt64();
             uint32_t threshold = packet.readUInt32();
-            if (guid == playerGuid && threshold > 0) addSystemChatMessage("You feel rather drunk.");
-            LOG_DEBUG("SMSG_CROSSED_INEBRIATION_THRESHOLD: guid=0x", std::hex, guid, std::dec, " threshold=", threshold);
+            uint32_t itemId    = packet.readUInt32();
+            if (guid == playerGuid) {
+                const float amount = static_cast<float>(std::min(threshold, 3u)) / 3.0f;
+                if (threshold == 1) addSystemChatMessage("You feel tipsy.");
+                else if (threshold == 2) addSystemChatMessage("You feel drunk.");
+                else if (threshold >= 3) addSystemChatMessage("You feel completely smashed.");
+                else addSystemChatMessage("You feel sober again.");
+                if (auto* renderer = services_.renderer) {
+                    if (auto* camera = renderer->getCameraController()) {
+                        camera->setIntoxication(amount);
+                    }
+                    if (auto* post = renderer->getPostProcessPipeline()) {
+                        post->setIntoxication(amount);
+                    }
+                }
+            }
+            LOG_DEBUG("SMSG_CROSSED_INEBRIATION_THRESHOLD: guid=0x", std::hex, guid,
+                      std::dec, " threshold=", threshold, " itemId=", itemId);
         }
     };
-    dispatchTable_[Opcode::SMSG_CLEAR_FAR_SIGHT_IMMEDIATE] = [this](network::Packet& /*packet*/) {
+    dispatchTable_[Opcode::SMSG_CLEAR_FAR_SIGHT_IMMEDIATE] = [](network::Packet& /*packet*/) {
         LOG_DEBUG("SMSG_CLEAR_FAR_SIGHT_IMMEDIATE");
     };
     registerSkipHandler(Opcode::SMSG_COMBAT_EVENT_FAILED);
@@ -444,7 +470,7 @@ void GameHandler::registerOpcodeHandlers() {
             uint64_t animGuid = packet.readPackedGuid();
             if (packet.hasRemaining(4)) {
                 uint32_t animId = packet.readUInt32();
-                if (emoteAnimCallback_) emoteAnimCallback_(animGuid, animId);
+                if (emoteAnimCallback_) emoteAnimCallback_(animGuid, animId, /*isState=*/false);
             }
         }
     };
@@ -471,6 +497,11 @@ void GameHandler::registerOpcodeHandlers() {
     };
     dispatchTable_[Opcode::SMSG_FORCED_DEATH_UPDATE] = [this](network::Packet& packet) {
         playerDead_ = true;
+        corpseX_ = movementInfo.y;
+        corpseY_ = movementInfo.x;
+        corpseZ_ = movementInfo.z;
+        corpseMapId_ = currentMapId_;
+        corpsePositionValid_ = true;
         if (ghostStateCallback_) ghostStateCallback_(false);
         fireAddonEvent("PLAYER_DEAD", {});
         addSystemChatMessage("You have been killed.");
@@ -488,7 +519,7 @@ void GameHandler::registerOpcodeHandlers() {
             LOG_INFO("SMSG_CORPSE_RECLAIM_DELAY: ", delayMs, "ms");
         }
     };
-    dispatchTable_[Opcode::SMSG_DEATH_RELEASE_LOC] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_DEATH_RELEASE_LOC] = [](network::Packet& packet) {
         if (packet.hasRemaining(16)) {
             uint32_t relMapId = packet.readUInt32();
             float relX = packet.readFloat(), relY = packet.readFloat(), relZ = packet.readFloat();
@@ -517,6 +548,7 @@ void GameHandler::registerOpcodeHandlers() {
             corpseY_ = cy;
             corpseZ_ = cz;
             corpseMapId_ = corpseMapId;
+            corpsePositionValid_ = true;
             LOG_INFO("MSG_CORPSE_QUERY: corpse at (", cx, ",", cy, ",", cz, ") map=", corpseMapId);
         }
     };
@@ -524,7 +556,7 @@ void GameHandler::registerOpcodeHandlers() {
         addUIError("Your Feign Death was resisted.");
         addSystemChatMessage("Your Feign Death attempt was resisted.");
     };
-    dispatchTable_[Opcode::SMSG_CHANNEL_MEMBER_COUNT] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_CHANNEL_MEMBER_COUNT] = [](network::Packet& packet) {
         std::string chanName = packet.readString();
         if (packet.hasRemaining(5)) {
             /*uint8_t flags =*/ packet.readUInt8();
@@ -550,7 +582,7 @@ void GameHandler::registerOpcodeHandlers() {
         }
         packet.skipAll();
     };
-    dispatchTable_[Opcode::SMSG_GAMETIMEBIAS_SET] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_GAMETIMEBIAS_SET] = [](network::Packet& packet) {
         packet.skipAll();
     };
     dispatchTable_[Opcode::SMSG_ACHIEVEMENT_DELETED] = [this](network::Packet& packet) {
@@ -585,6 +617,46 @@ void GameHandler::registerOpcodeHandlers() {
 
     // Mount/dismount
     dispatchTable_[Opcode::SMSG_DISMOUNT] = [this](network::Packet& /*packet*/) {
+        // Live-confirmed: CMaNGOS sends this partway through a taxi flight (its
+        // own server-side flight-completion estimate firing early, well before
+        // the client-simulated path actually finishes) - obeying it unconditionally
+        // cancelled the taxi mount animation while updateClientTaxi() kept flying
+        // the real path for several more seconds, seen as "walking in the air".
+        // But other cores (e.g. AzerothCore) finalize taxi flights server-side -
+        // dismounting/stopping the player is the *authoritative* completion
+        // signal there, not a premature estimate - so a blanket "ignore while
+        // flying" guard could let the client fly past a real landing if local
+        // spline timing ever drifts from the server's. Distinguish the two using
+        // the server's own UNIT_FLAG_TAXI_FLIGHT: still set means this is the
+        // premature-estimate quirk (ignore, let updateClientTaxi() finish
+        // naturally); already cleared means the server considers the flight
+        // genuinely over (honor it now instead of waiting on our own spline).
+        const bool onTaxiFlight = movementHandler_ && movementHandler_->isOnTaxiFlight();
+        bool serverStillTaxiing = false;
+        if (onTaxiFlight) {
+            auto playerEntity = entityController_->getEntityManager().getEntity(playerGuid);
+            auto playerUnit = std::dynamic_pointer_cast<Unit>(playerEntity);
+            if (playerUnit) {
+                serverStillTaxiing = (playerUnit->getUnitFlags() & UNIT_FLAG_TAXI_FLIGHT) != 0;
+            }
+        }
+        const bool nearDestination = onTaxiFlight && movementHandler_ &&
+                                     movementHandler_->isNearTaxiDestination();
+        LOG_INFO("SMSG_DISMOUNT received: onTaxiFlight=", onTaxiFlight,
+                 " serverStillTaxiing=", serverStillTaxiing,
+                 " nearDestination=", nearDestination);
+        if (onTaxiFlight && (serverStillTaxiing || !nearDestination)) {
+            movementHandler_->deferServerTaxiCompletion();
+            LOG_WARNING("Deferring premature SMSG_DISMOUNT until taxi landing zone");
+            return;
+        }
+        if (onTaxiFlight && movementHandler_) {
+            // Authoritative server completion ahead of our own spline - stop the
+            // client flight now rather than snapping to a final waypoint that may
+            // not match where the server actually stopped us.
+            movementHandler_->finishClientTaxiFlight(/*snapToFinalWaypoint=*/false);
+            return;
+        }
         currentMountDisplayId_ = 0;
         if (mountCallback_) mountCallback_(0);
     };
@@ -641,13 +713,18 @@ void GameHandler::registerOpcodeHandlers() {
             glm::vec3 canonical = core::coords::serverToCanonical(
                 glm::vec3(data.x, data.y, data.z));
             bool wasSet = hasHomeBind_;
+            bool changed =
+                !hasHomeBind_ ||
+                homeBindMapId_ != data.mapId ||
+                homeBindZoneId_ != data.zoneId ||
+                glm::length(homeBindPos_ - canonical) > 0.5f;
             hasHomeBind_ = true;
             homeBindMapId_ = data.mapId;
             homeBindZoneId_ = data.zoneId;
             homeBindPos_ = canonical;
             if (bindPointCallback_)
                 bindPointCallback_(data.mapId, canonical.x, canonical.y, canonical.z);
-            if (wasSet) {
+            if (wasSet && changed) {
                 std::string bindMsg = "Your home has been set";
                 std::string zoneName = getAreaName(data.zoneId);
                 if (!zoneName.empty()) bindMsg += " to " + zoneName;
@@ -756,7 +833,7 @@ void GameHandler::registerOpcodeHandlers() {
 
     // (SMSG_INITIALIZE_FACTIONS, SMSG_SET_FACTION_STANDING,
     //  SMSG_SET_FACTION_ATWAR, SMSG_SET_FACTION_VISIBLE → moved to SocialHandler)
-    dispatchTable_[Opcode::SMSG_FEATURE_SYSTEM_STATUS] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_FEATURE_SYSTEM_STATUS] = [](network::Packet& packet) {
         packet.skipAll();
     };
 
@@ -796,7 +873,7 @@ void GameHandler::registerOpcodeHandlers() {
     // ---- Batch 5: Teleport, taxi, BG, LFG, arena, movement relay, mail, bank, auction, quests ----
 
     // Teleport
-    dispatchTable_[Opcode::SMSG_TRANSFER_PENDING] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_TRANSFER_PENDING] = [](network::Packet& packet) {
         uint32_t pendingMapId = packet.readUInt32();
         if (packet.hasRemaining(8)) {
             packet.readUInt32(); // transportEntry
@@ -827,7 +904,15 @@ void GameHandler::registerOpcodeHandlers() {
     // Taxi
     dispatchTable_[Opcode::SMSG_STANDSTATE_UPDATE] = [this](network::Packet& packet) {
         if (packet.hasRemaining(1)) {
-            standState_ = packet.readUInt8();
+            const uint8_t newStandState = packet.readUInt8();
+            if (newStandState == standState_) {
+                return;
+            }
+            standState_ = newStandState;
+            // 0=stand, 1=sit, 2-6=sit variants, 7=dead, 8=kneel. Logged because a
+            // wrong state here is indistinguishable, in-game, from a wrong animation.
+            // At warning level: the file log filters info out by default.
+            LOG_WARNING("SMSG_STANDSTATE_UPDATE: standState=", static_cast<int>(standState_));
             if (standStateCallback_) standStateCallback_(standState_);
         }
     };
@@ -835,14 +920,9 @@ void GameHandler::registerOpcodeHandlers() {
         addSystemChatMessage("New flight path discovered!");
     };
 
-    // Arena
-    dispatchTable_[Opcode::MSG_TALENT_WIPE_CONFIRM] = [this](network::Packet& packet) {
-        if (!packet.hasRemaining(12)) { packet.skipAll(); return; }
-        talentWipeNpcGuid_ = packet.readUInt64();
-        talentWipeCost_    = packet.readUInt32();
-        talentWipePending_ = true;
-                    fireAddonEvent("CONFIRM_TALENT_WIPE", {std::to_string(talentWipeCost_)});
-    };
+    // (MSG_TALENT_WIPE_CONFIRM → registered by SpellHandler, which owns the
+    // pending-wipe state the confirm dialog reads. Handling it here wrote to
+    // dead duplicate members and the dialog never appeared.)
 
     // (SMSG_CHANNEL_LIST → moved to ChatHandler)
     // (SMSG_GROUP_SET_LEADER → moved to SocialHandler)
@@ -852,26 +932,34 @@ void GameHandler::registerOpcodeHandlers() {
         if (packet.getSize() < 12) return;
         uint64_t guid = packet.readUInt64();
         uint32_t animId = packet.readUInt32();
-        if (gameObjectCustomAnimCallback_)
-            gameObjectCustomAnimCallback_(guid, animId);
-        if (animId == 0) {
-            auto goEnt = entityController_->getEntityManager().getEntity(guid);
-            if (goEnt && goEnt->getType() == ObjectType::GAMEOBJECT) {
-                auto go = std::static_pointer_cast<GameObject>(goEnt);
-                // Only show fishing message if the bobber belongs to us
-                // OBJECT_FIELD_CREATED_BY is a uint64 at field indices 6-7
-                uint64_t createdBy = static_cast<uint64_t>(go->getField(6))
-                                   | (static_cast<uint64_t>(go->getField(7)) << 32);
-                if (createdBy == playerGuid) {
-                    auto* info = getCachedGameObjectInfo(go->getEntry());
-                    if (info && info->type == 17) {
-                        addUIError("A fish is on your line!");
-                        addSystemChatMessage("A fish is on your line!");
-                        withSoundManager(&audio::AudioCoordinator::getUiSoundManager, [](auto* sfx) { sfx->playQuestUpdate(); });
-                    }
-                }
+        bool ownedFishingBite = false;
+        auto goEnt = entityController_->getEntityManager().getEntity(guid);
+        if (goEnt && goEnt->getType() == ObjectType::GAMEOBJECT) {
+            auto go = std::static_pointer_cast<GameObject>(goEnt);
+            // Only treat custom animation as a bite when this is our bobber.
+            // AzerothCore sends the GO's animation progress (normally 100), not
+            // M2 animation id 0, so the packet payload itself cannot identify it.
+            uint64_t createdBy = static_cast<uint64_t>(go->getField(6))
+                               | (static_cast<uint64_t>(go->getField(7)) << 32);
+            auto* info = getCachedGameObjectInfo(go->getEntry());
+            ownedFishingBite = createdBy == playerGuid && (!info || info->type == 17);
+            if (ownedFishingBite) {
+                hookedFishingBobberGuid_ = guid;
+                // G_FishingBobber.m2 sequence 153 is its authored 1.33s bite/splash
+                // animation; sequence 0 is the normal three-second idle bob.
+                constexpr uint32_t kFishingBobberBiteAnimation = 153;
+                if (gameObjectCustomAnimCallback_)
+                    gameObjectCustomAnimCallback_(guid, kFishingBobberBiteAnimation);
+                addUIError("A fish is on your line! Right-click to reel it in.");
+                addSystemChatMessage("A fish is on your line! Right-click to reel it in.");
+                withSoundManager(&audio::AudioCoordinator::getUiSoundManager,
+                                 [](auto* sfx) { sfx->playFishingBite(); });
+                LOG_WARNING("Fishing bite ready: guid=0x", std::hex, guid, std::dec,
+                            " serverAnimProgress=", animId);
             }
         }
+        if (!ownedFishingBite && gameObjectCustomAnimCallback_)
+            gameObjectCustomAnimCallback_(guid, animId);
     };
 
     // Item refund / socket gems / item time
@@ -890,7 +978,7 @@ void GameHandler::registerOpcodeHandlers() {
             else addSystemChatMessage("Failed to socket gems.");
         }
     };
-    dispatchTable_[Opcode::SMSG_ITEM_TIME_UPDATE] = [this](network::Packet& packet) {
+    dispatchTable_[Opcode::SMSG_ITEM_TIME_UPDATE] = [](network::Packet& packet) {
         if (packet.hasRemaining(12)) {
             packet.readUInt64(); // itemGuid
             packet.readUInt32(); // durationMs
@@ -905,14 +993,16 @@ void GameHandler::registerOpcodeHandlers() {
         handleAllAchievementData(packet);
     };
     dispatchTable_[Opcode::SMSG_FISH_NOT_HOOKED] = [this](network::Packet& /*packet*/) {
+        hookedFishingBobberGuid_ = 0;
         addSystemChatMessage("Your fish got away.");
     };
     dispatchTable_[Opcode::SMSG_FISH_ESCAPED] = [this](network::Packet& /*packet*/) {
+        hookedFishingBobberGuid_ = 0;
         addSystemChatMessage("Your fish escaped!");
     };
 
     // ---- Auto-repeat / auras / dispel / totem ----
-    dispatchTable_[Opcode::SMSG_CANCEL_AUTO_REPEAT] = [this](network::Packet& /*packet*/) {
+    dispatchTable_[Opcode::SMSG_CANCEL_AUTO_REPEAT] = [](network::Packet& /*packet*/) {
         // Server signals to stop a repeating spell (wand/shoot); no client action needed
     };
 
@@ -921,8 +1011,8 @@ void GameHandler::registerOpcodeHandlers() {
 
     // ---- SMSG_INIT_WORLD_STATES ----
     dispatchTable_[Opcode::SMSG_INIT_WORLD_STATES] = [this](network::Packet& packet) {
-        // WotLK format: uint32 mapId, uint32 zoneId, uint32 areaId, uint16 count, N*(uint32 key, uint32 val)
-        // Classic/TBC format: uint32 mapId, uint32 zoneId, uint16 count, N*(uint32 key, uint32 val)
+        // WotLK/TBC format: uint32 mapId, uint32 zoneId, uint32 areaId, uint16 count, N*(uint32 key, uint32 val)
+        // Classic format: uint32 mapId, uint32 zoneId, uint16 count, N*(uint32 key, uint32 val)
         if (!packet.hasRemaining(10)) {
             LOG_WARNING("SMSG_INIT_WORLD_STATES too short: ", packet.getSize(), " bytes");
             return;
@@ -938,11 +1028,11 @@ void GameHandler::registerOpcodeHandlers() {
                 worldStateZoneId_ = newZoneId;
             }
         }
-        // WotLK adds areaId (uint32) before count; Classic/TBC/Turtle use the shorter format
+        // TBC added areaId in 2.1.0; WotLK kept it. Classic/Turtle use the shorter format.
         size_t remaining = packet.getRemainingSize();
-        bool isWotLKFormat = isActiveExpansion("wotlk");
-        if (isWotLKFormat && remaining >= 6) {
-            packet.readUInt32(); // areaId (WotLK only)
+        bool hasAreaId = isActiveExpansion("tbc") || isActiveExpansion("wotlk");
+        if (hasAreaId && remaining >= 6) {
+            packet.readUInt32(); // areaId
         }
         uint16_t count = packet.readUInt16();
         size_t needed = static_cast<size_t>(count) * 8;
@@ -1002,7 +1092,7 @@ void GameHandler::registerOpcodeHandlers() {
             if (rem < 4) return;
             uint32_t packed = packet.readUInt32();
             rem -= 4;
-            if (i >= ACTION_BAR_SLOTS) continue;  // only load bars 1 and 2
+            if (i >= ACTION_BAR_SLOTS) continue;
             if (packed == 0) {
                 // Empty slot — only clear if not already set to Attack/Hearthstone defaults
                 // so we don't wipe hardcoded fallbacks when the server sends zeros.
@@ -1154,7 +1244,7 @@ void GameHandler::registerOpcodeHandlers() {
 
     // ---- SMSG_BARBER_SHOP_RESULT ----
     dispatchTable_[Opcode::SMSG_BARBER_SHOP_RESULT] = [this](network::Packet& packet) {
-        // uint32 result (0 = success, 1 = no money, 2 = not barber, 3 = sitting)
+        // uint32 result: 0=success, 1/3=not enough money, 2=not seated at barber
         if (packet.hasRemaining(4)) {
             uint32_t result = packet.readUInt32();
             if (result == 0) {
@@ -1162,9 +1252,8 @@ void GameHandler::registerOpcodeHandlers() {
                 barberShopOpen_ = false;
                 fireAddonEvent("BARBER_SHOP_CLOSE", {});
             } else {
-                const char* msg = (result == 1) ? "Not enough money for new hairstyle."
+                const char* msg = (result == 1 || result == 3) ? "Not enough money for new hairstyle."
                                 : (result == 2) ? "You are not at a barber shop."
-                                : (result == 3) ? "You must stand up to use the barber shop."
                                 : "Barber shop unavailable.";
                 addUIError(msg);
                 addSystemChatMessage(msg);
@@ -1379,7 +1468,7 @@ void GameHandler::registerOpcodeHandlers() {
         }
         packet.skipAll();
     };
-    dispatchTable_[Opcode::SMSG_MOUNTSPECIAL_ANIM] = [this](network::Packet& packet) { (void)packet.readPackedGuid(); };
+    dispatchTable_[Opcode::SMSG_MOUNTSPECIAL_ANIM] = [](network::Packet& packet) { (void)packet.readPackedGuid(); };
     dispatchTable_[Opcode::SMSG_CHAR_CUSTOMIZE] = [this](network::Packet& packet) {
         if (packet.hasRemaining(1)) {
             uint8_t result = packet.readUInt8();
@@ -1868,16 +1957,9 @@ void GameHandler::registerOpcodeHandlers() {
         packet.skipAll();
     };
 
-    // SMSG_PET_UNLEARN_CONFIRM: uint64 petGuid + uint32 cost (copper).
-    // The other pet opcodes have different formats and must NOT set unlearn state.
-    dispatchTable_[Opcode::SMSG_PET_UNLEARN_CONFIRM] = [this](network::Packet& packet) {
-        if (packet.hasRemaining(12)) {
-            petUnlearnGuid_ = packet.readUInt64();
-            petUnlearnCost_ = packet.readUInt32();
-            petUnlearnPending_ = true;
-        }
-        packet.skipAll();
-    };
+    // (SMSG_PET_UNLEARN_CONFIRM → registered by SpellHandler, which owns the
+    // pending-unlearn state the confirm dialog reads. Handling it here wrote
+    // to dead duplicate members and the dialog never appeared.)
     // These pet opcodes have incompatible formats — just consume the packet.
     // Previously they shared the unlearn handler, which misinterpreted sound IDs
     // or GUID lists as unlearn costs and could trigger a bogus unlearn dialog.
@@ -1940,13 +2022,7 @@ void GameHandler::registerOpcodeHandlers() {
             ir.enchantIds     = {};
         }
 
-        // Also cache for future talent-inspect cross-reference
-        inspectedPlayerItemEntries_[guid] = items;
-
-        // Trigger item queries for non-empty slots
-        for (int s = 0; s < kGearSlots; ++s) {
-            if (items[s] != 0) queryItemInfo(items[s], 0);
-        }
+        cacheInspectedPlayerEquipment(guid, items);
 
         LOG_INFO("SMSG_INSPECT (Classic): ", playerName, " has gear in ",
                  std::count_if(items.begin(), items.end(),
@@ -2649,11 +2725,11 @@ void GameHandler::registerOpcodeHandlers() {
 }
 
 void GameHandler::handlePacket(network::Packet& packet) {
-    if (packet.getSize() < 1) {
-        LOG_DEBUG("Received empty world packet (ignored)");
-        return;
-    }
-
+    // Do NOT drop packets with an empty body. getSize() is the payload length and the
+    // opcode is carried separately, so for the many opcodes that have no payload the
+    // opcode *is* the message. Dropping them here silently swallowed
+    // SMSG_LOGOUT_COMPLETE — the server logged the character out and moved on while
+    // the client waited forever, so the countdown ended and nothing happened.
     uint16_t opcode = packet.getOpcode();
 
     try {
@@ -2722,74 +2798,6 @@ void GameHandler::handlePacket(network::Packet& packet) {
             if (playMusicCallback_) playMusicCallback_(soundId);
             return;
         }
-    } else if (opcode == 0x0480) {
-        // Observed on this WotLK profile immediately after CMSG_BUYBACK_ITEM.
-        // Treat as vendor/buyback transaction result (7-byte payload on this core).
-        if (packet.hasRemaining(7)) {
-            uint8_t opType = packet.readUInt8();
-            uint8_t resultCode = packet.readUInt8();
-            uint8_t slotOrCount = packet.readUInt8();
-            uint32_t itemId = packet.readUInt32();
-            LOG_INFO("Vendor txn result (0x480): opType=", static_cast<int>(opType),
-                     " result=", static_cast<int>(resultCode),
-                     " slot/count=", static_cast<int>(slotOrCount),
-                     " itemId=", itemId,
-                     " pendingBuybackSlot=", pendingBuybackSlot_,
-                     " pendingBuyItemId=", pendingBuyItemId_,
-                     " pendingBuyItemSlot=", pendingBuyItemSlot_);
-
-            if (pendingBuybackSlot_ >= 0) {
-                if (resultCode == 0) {
-                    // Success: remove the bought-back slot from our local UI cache.
-                    if (pendingBuybackSlot_ < static_cast<int>(buybackItems_.size())) {
-                        buybackItems_.erase(buybackItems_.begin() + pendingBuybackSlot_);
-                    }
-                } else {
-                    const char* msg = "Buyback failed.";
-                    // Best-effort mapping; keep raw code visible for unknowns.
-                    switch (resultCode) {
-                        case 2: msg = "Buyback failed: not enough money."; break;
-                        case 4: msg = "Buyback failed: vendor too far away."; break;
-                        case 5: msg = "Buyback failed: item unavailable."; break;
-                        case 6: msg = "Buyback failed: inventory full."; break;
-                        case 8: msg = "Buyback failed: requirements not met."; break;
-                        default: break;
-                    }
-                    addSystemChatMessage(std::string(msg) + " (code " + std::to_string(resultCode) + ")");
-                }
-                pendingBuybackSlot_ = -1;
-                pendingBuybackWireSlot_ = 0;
-
-                // Refresh vendor list so UI state stays in sync after buyback result.
-                if (getVendorItems().vendorGuid != 0 && socket && state == WorldState::IN_WORLD) {
-                    auto pkt = ListInventoryPacket::build(getVendorItems().vendorGuid);
-                    socket->send(pkt);
-                }
-            } else if (pendingBuyItemId_ != 0) {
-                if (resultCode != 0) {
-                    const char* msg = "Purchase failed.";
-                    switch (resultCode) {
-                        case 2: msg = "Purchase failed: not enough money."; break;
-                        case 4: msg = "Purchase failed: vendor too far away."; break;
-                        case 5: msg = "Purchase failed: item sold out."; break;
-                        case 6: msg = "Purchase failed: inventory full."; break;
-                        case 8: msg = "Purchase failed: requirements not met."; break;
-                        default: break;
-                    }
-                    addSystemChatMessage(std::string(msg) + " (code " + std::to_string(resultCode) + ")");
-                }
-                pendingBuyItemId_ = 0;
-                pendingBuyItemSlot_ = 0;
-            }
-            return;
-        }
-    } else if (opcode == 0x046A) {
-        // Server-specific vendor/buyback state packet (observed 25-byte records).
-        // Consume to keep stream aligned; currently not used for gameplay logic.
-        if (packet.hasRemaining(25)) {
-            packet.setReadPos(packet.getReadPos() + 25);
-            return;
-        }
     }
 
     auto preLogicalOp = opcodeTable_.fromWire(opcode);
@@ -2807,17 +2815,39 @@ void GameHandler::handlePacket(network::Packet& packet) {
     LOG_DEBUG("Received world packet: opcode=0x", std::hex, opcode, std::dec,
               " size=", packet.getSize(), " bytes");
 
-    // Translate wire opcode to logical opcode via expansion table
-    auto logicalOp = opcodeTable_.fromWire(opcode);
+    auto logicalOp = preLogicalOp;
 
     if (!logicalOp) {
-        static std::unordered_set<uint16_t> loggedUnknownWireOpcodes;
-        if (loggedUnknownWireOpcodes.insert(opcode).second) {
-            LOG_WARNING("Unhandled world opcode: 0x", std::hex, opcode, std::dec,
-                        " state=", static_cast<int>(state),
-                        " size=", packet.getSize());
+        // Login-critical opcodes share the same wire values across all expansions.
+        // Fall back to hardcoded mapping so the auth/char pipeline works even when
+        // the expansion opcode table failed to load (wrong CWD, missing Data/, etc.).
+        switch (opcode) {
+            case 0x1EC: logicalOp = Opcode::SMSG_AUTH_CHALLENGE; break;
+            case 0x1EE: logicalOp = Opcode::SMSG_AUTH_RESPONSE;  break;
+            case 0x03B: logicalOp = Opcode::SMSG_CHAR_ENUM;      break;
+            case 0x03A: logicalOp = Opcode::SMSG_CHAR_CREATE;     break;
+            case 0x03C: logicalOp = Opcode::SMSG_CHAR_DELETE;     break;
+            case 0x2E6: logicalOp = Opcode::SMSG_WARDEN_DATA;     break;
+            default: break;
         }
-        return;
+        if (logicalOp) {
+            static bool loggedFallback = false;
+            if (!loggedFallback) {
+                loggedFallback = true;
+                LOG_WARNING("Opcode table lookup failed for login-critical opcode 0x",
+                            std::hex, opcode, std::dec,
+                            " (table has ", opcodeTable_.size(), " entries). "
+                            "Using hardcoded fallback. Check that Data/expansions/<id>/opcodes.json is loadable.");
+            }
+        } else {
+            static std::unordered_set<uint16_t> loggedUnknownWireOpcodes;
+            if (loggedUnknownWireOpcodes.insert(opcode).second) {
+                LOG_WARNING("Unhandled world opcode: 0x", std::hex, opcode, std::dec,
+                            " state=", static_cast<int>(state),
+                            " size=", packet.getSize());
+            }
+            return;
+        }
     }
 
     // Dispatch via the opcode handler table

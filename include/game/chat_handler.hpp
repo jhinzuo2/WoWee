@@ -5,6 +5,7 @@
 #include "game/handler_types.hpp"
 #include "network/packet.hpp"
 #include <deque>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <unordered_map>
@@ -61,13 +62,20 @@ private:
     void handleTextEmote(network::Packet& packet);
     void handleChannelNotify(network::Packet& packet);
     void handleChannelList(network::Packet& packet);
+    void initializeChatLog();
+    void logChatMessage(const MessageChatData& msg, const char* source);
 
     GameHandler& owner_;
 
     // --- State ---
     std::deque<MessageChatData> chatHistory_;
     size_t maxChatHistory_ = 100;
+    uint64_t chatUidCounter_ = 0;  // monotonic uid for MessageChatData::uid
     std::vector<std::string> joinedChannels_;
+    bool chatLogEnabled_ = false;
+    bool chatLogInitialized_ = false;
+    std::string chatLogPath_;
+    std::ofstream chatLogStream_;
 
     // Track senders we've already auto-replied to (AFK/DND) this session
     // to prevent infinite reply loops. Cleared when AFK/DND is toggled off.

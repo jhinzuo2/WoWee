@@ -85,7 +85,7 @@ void ActivityFSM::setStandState(uint8_t standState) {
 
     if (standState == STAND_STATE_SIT) {
         sitDownAnim_ = anim::SIT_GROUND_DOWN;
-        sitLoopAnim_ = anim::SITTING;
+        sitLoopAnim_ = seatedLoopOverride_ != 0 ? seatedLoopOverride_ : anim::SITTING;
         sitUpAnim_   = anim::SIT_GROUND_UP;
         sitDownAnimSeen_ = false;
         sitDownFrames_ = 0;
@@ -121,6 +121,13 @@ void ActivityFSM::setStandState(uint8_t standState) {
         sitLoopAnim_ = 0;
         sitUpAnim_   = 0;
         return;
+    }
+}
+
+void ActivityFSM::setSeatedLoopAnimation(uint32_t animationId) {
+    seatedLoopOverride_ = animationId;
+    if (standState_ == STAND_STATE_SIT) {
+        sitLoopAnim_ = animationId != 0 ? animationId : anim::SITTING;
     }
 }
 
@@ -324,6 +331,7 @@ void ActivityFSM::reset() {
     standState_ = 0;
     sitDownAnim_ = 0;
     sitLoopAnim_ = 0;
+    seatedLoopOverride_ = 0;
     sitUpAnim_ = 0;
     sitDownAnimSeen_ = false;
     sitUpAnimSeen_ = false;

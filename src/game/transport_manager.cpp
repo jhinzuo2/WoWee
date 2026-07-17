@@ -1,6 +1,7 @@
 #include "game/transport_manager.hpp"
 #include "game/transport_clock_sync.hpp"
 #include "game/transport_animator.hpp"
+#include "game/game_utils.hpp"
 #include "rendering/wmo_renderer.hpp"
 #include "rendering/m2_renderer.hpp"
 #include "core/coordinates.hpp"
@@ -8,10 +9,111 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/constants.hpp>
 #include <glm/gtx/quaternion.hpp>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
 namespace wowee::game {
+
+namespace {
+
+bool seedDeeprunTramStationPhase(ActiveTransport& transport,
+                                 const PathEntry& pathEntry,
+                                 const glm::vec3& serverPosition) {
+    const auto& spline = pathEntry.spline;
+    const auto& keys = spline.keys();
+    if (!pathEntry.fromDBC || spline.durationMs() == 0 || keys.empty()) {
+        return false;
+    }
+
+    size_t maxOffsetIdx = 0;
+    float maxAbsX = 0.0f;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const float absX = std::abs(keys[i].position.x);
+        if (absX > maxAbsX) {
+            maxAbsX = absX;
+            maxOffsetIdx = i;
+        }
+    }
+
+    if (maxAbsX < 100.0f) {
+        return false;
+    }
+
+    const bool pathMaxIsPositive = keys[maxOffsetIdx].position.x > 0.0f;
+    const bool serverAtPositiveEnd = serverPosition.x > 1000.0f;
+    const bool useMaxOffsetStation = (pathMaxIsPositive == serverAtPositiveEnd);
+
+    size_t stationIdx = maxOffsetIdx;
+    if (!useMaxOffsetStation) {
+        stationIdx = 0;
+        for (size_t step = 1; step < keys.size(); ++step) {
+            const size_t idx = (maxOffsetIdx + step) % keys.size();
+            if (std::abs(keys[idx].position.x) < 1.0f) {
+                stationIdx = idx;
+                break;
+            }
+        }
+    }
+
+    // CMaNGOS's "presence echo" for these objects is always the same static DB spawn
+    // row, not a live position - it tells us this spawn coordinate corresponds to
+    // local path point stationIdx (a geometric fact about how this entry's path is
+    // anchored in world space), not that the tram is *currently* there. Correct
+    // basePosition so the path curve sits in the right place; leave localClockMs
+    // alone so it keeps reflecting the absolute-time-derived phase set at
+    // registration (see nowEpochMs comment above) instead of snapping back to
+    // "docked at this waypoint" every time an echo arrives.
+    const glm::vec3 stationOffset = keys[stationIdx].position;
+    const glm::vec3 candidateBasePosition = serverPosition - stationOffset;
+
+    // The useMaxOffsetStation==true branch assumes the server's static echo represents
+    // the tram docked at the path's far/max-offset end - true for most of these six
+    // paths, but at least one (176085) has local key data where that assumption is
+    // simply wrong: the echo position is really the near-origin "home" point, and
+    // trusting the heuristic silently shifted basePosition by ~2481 units toward the
+    // opposite station. That desyncs this car's *logical* position (used for boarding
+    // distance and path evaluation) from where it's actually spawned/rendered, while
+    // leaving it looking fine on screen - "climbed onto the middle car, it drove away
+    // without me, hung in midair" reported live, and very likely also this entry's
+    // contribution to "solo cars" (its real position no longer lines up with its train).
+    // registerTransport() already computed a sane basePosition from the spawn position
+    // directly; a legitimate correction should only be a modest nudge from that, not a
+    // jump on the order of the whole route length. Reject implausible corrections
+    // rather than trust the heuristic blindly.
+    // Note: returning true here (not false) is deliberate even though no correction is
+    // applied. The caller's false-branch fallback resets localClockMs to 0 and slams
+    // basePosition to the raw server position - correct for the genuinely-no-usable-path
+    // cases above, but here registerTransport() already left the transport in a good
+    // state (sane basePosition, correctly-seeded localClockMs); rejecting a bad
+    // correction should mean "leave that alone", not "wipe it and start over".
+    constexpr float kMaxPlausibleCorrectionDist = 300.0f;
+    if (glm::distance(candidateBasePosition, transport.basePosition) > kMaxPlausibleCorrectionDist) {
+        // Entry 176085 rejects this every re-sync cycle by design (its real spawn is
+        // legitimately far from the heuristic's candidate) - routine, not worth WARN.
+        LOG_DEBUG("Deeprun tram station anchor correction rejected as implausible: guid=0x",
+                    std::hex, transport.guid, std::dec,
+                    " entry=", transport.entry, " pathId=", transport.pathId,
+                    " candidateBase=(", candidateBasePosition.x, ",", candidateBasePosition.y, ",", candidateBasePosition.z, ")",
+                    " existingBase=(", transport.basePosition.x, ",", transport.basePosition.y, ",", transport.basePosition.z, ")");
+        return true;
+    }
+
+    transport.basePosition = candidateBasePosition;
+    transport.position = transport.basePosition + spline.evaluatePosition(transport.localClockMs % spline.durationMs());
+    transport.hasServerYaw = false;
+
+    LOG_DEBUG("Deeprun tram station anchor corrected: guid=0x", std::hex, transport.guid, std::dec,
+                " entry=", transport.entry,
+                " pathId=", transport.pathId,
+                " localClockMs=", transport.localClockMs,
+                " stationOffset=(", stationOffset.x, ",", stationOffset.y, ",", stationOffset.z, ")",
+                " base=(", transport.basePosition.x, ",", transport.basePosition.y, ",", transport.basePosition.z, ")",
+                " serverPos=(", serverPosition.x, ",", serverPosition.y, ",", serverPosition.z, ")");
+    return true;
+}
+
+} // namespace
 
 TransportManager::TransportManager() = default;
 TransportManager::~TransportManager() = default;
@@ -26,7 +128,13 @@ void TransportManager::update(float deltaTime) {
     }
 }
 
-void TransportManager::registerTransport(uint64_t guid, uint32_t wmoInstanceId, uint32_t pathId, const glm::vec3& spawnWorldPos, uint32_t entry) {
+void TransportManager::registerTransport(uint64_t guid,
+                                         uint32_t wmoInstanceId,
+                                         uint32_t pathId,
+                                         const glm::vec3& spawnWorldPos,
+                                         uint32_t entry,
+                                         uint32_t displayId,
+                                         bool isM2) {
     auto* pathEntry = pathRepo_.findPath(pathId);
     if (!pathEntry) {
         LOG_ERROR("TransportManager: Path ", pathId, " not found for transport ", guid);
@@ -44,6 +152,8 @@ void TransportManager::registerTransport(uint64_t guid, uint32_t wmoInstanceId, 
     transport.wmoInstanceId = wmoInstanceId;
     transport.pathId = pathId;
     transport.entry = entry;
+    transport.displayId = displayId;
+    transport.isM2 = isM2;
     transport.allowBootstrapVelocity = false;
 
     // CRITICAL: Set basePosition from spawn position and t=0 offset
@@ -96,8 +206,16 @@ void TransportManager::registerTransport(uint64_t guid, uint32_t wmoInstanceId, 
     transport.hasServerVelocity = false;
 
     if (transport.useClientAnimation && spline.durationMs() > 0) {
-        // Seed to a stable phase based on our local clock so elevators don't all start at t=0.
-        transport.localClockMs = static_cast<uint32_t>(elapsedTime_ * 1000.0) % spline.durationMs();
+        // Seed to a stable phase derived from absolute time (see nowEpochMs comment)
+        // so elevators don't all start at t=0, and so paired/opposing transports like
+        // the Deeprun Tram's two cars land at the same relative phase for every client.
+        // Deeprun tram cars use a rounded duration for the modulo (see
+        // deeprunTramSeedDurationMs comment) since sibling cars' own path durations
+        // don't quite match and that mismatch was decorrelating their seeds.
+        const uint32_t seedDurationMs = isDeeprunTramTransport(transport)
+            ? deeprunTramSeedDurationMs(spline.durationMs())
+            : spline.durationMs();
+        transport.localClockMs = static_cast<uint32_t>(nowEpochMs() % seedDurationMs);
         LOG_INFO("TransportManager: Enabled client animation for transport 0x",
                  std::hex, guid, std::dec, " path=", pathId,
                  " durationMs=", spline.durationMs(), " seedMs=", transport.localClockMs,
@@ -115,14 +233,100 @@ void TransportManager::registerTransport(uint64_t guid, uint32_t wmoInstanceId, 
     LOG_INFO("TransportManager: Registered transport 0x", std::hex, guid, std::dec,
              " at path ", pathId, " with ", (pathEntry ? pathEntry->spline.keyCount() : 0u), " waypoints",
              " wmoInstanceId=", wmoInstanceId,
+             " entry=", entry,
+             " displayId=", displayId,
+             " isM2=", isM2,
              " spawnPos=(", spawnWorldPos.x, ", ", spawnWorldPos.y, ", ", spawnWorldPos.z, ")",
              " basePos=(", transport.basePosition.x, ", ", transport.basePosition.y, ", ", transport.basePosition.z, ")",
              " initialRenderPos=(", renderPos.x, ", ", renderPos.y, ", ", renderPos.z, ")");
+
+    if (isDeeprunTramTransport(transport)) {
+        LOG_DEBUG("Deeprun tram registered: guid=0x", std::hex, guid, std::dec,
+                    " entry=", entry,
+                    " displayId=", displayId,
+                    " pathId=", pathId,
+                    " instanceId=", wmoInstanceId,
+                    " isM2=", isM2,
+                    " mode=", (transport.useClientAnimation ? "client" : "server"),
+                    " spawn=(", spawnWorldPos.x, ",", spawnWorldPos.y, ",", spawnWorldPos.z, ")",
+                    " base=(", transport.basePosition.x, ",", transport.basePosition.y, ",", transport.basePosition.z, ")");
+    }
 }
 
 void TransportManager::unregisterTransport(uint64_t guid) {
     transports_.erase(guid);
     LOG_INFO("TransportManager: Unregistered transport ", guid);
+}
+
+void TransportManager::resolveAndRegisterSpawn(uint64_t guid,
+                                               uint32_t entry,
+                                               uint32_t displayId,
+                                               const glm::vec3& canonicalSpawnPos,
+                                               uint32_t wmoInstanceId,
+                                               bool isM2,
+                                               bool preferServerData) {
+    // TransportAnimation.dbc is indexed by GameObject entry.
+    uint32_t pathId = entry;
+
+    // Check if we have a real usable path, otherwise remap/infer/fall back to stationary.
+    const bool shipOrZeppelinDisplay =
+        (displayId == 3015 || displayId == 3031 || displayId == 7546 ||
+         displayId == 7446 || displayId == 1587 || displayId == 2454 ||
+         displayId == 807 || displayId == 808);
+    bool hasUsablePath = hasPathForEntry(entry);
+    if (shipOrZeppelinDisplay) {
+        hasUsablePath = hasUsableMovingPathForEntry(entry, 25.0f);
+    }
+    if (preferServerData) {
+        // Strict server-authoritative mode: no inferred/remapped fallback routes.
+        if (!hasUsablePath) {
+            std::vector<glm::vec3> path = { canonicalSpawnPos };
+            loadPathFromNodes(pathId, path, false, 0.0f);
+            LOG_INFO("Auto-spawned transport in strict server-first mode (stationary fallback): entry=", entry,
+                     " displayId=", displayId, " wmoInstance=", wmoInstanceId);
+        } else {
+            LOG_INFO("Auto-spawned transport in server-first mode with entry DBC path: entry=", entry,
+                     " displayId=", displayId, " wmoInstance=", wmoInstanceId);
+        }
+    } else if (!hasUsablePath) {
+        bool allowZOnly = (displayId == 455 || displayId == 462);
+        uint32_t inferredPath = inferDbcPathForSpawn(canonicalSpawnPos, 1200.0f, allowZOnly);
+        if (inferredPath != 0) {
+            pathId = inferredPath;
+            LOG_INFO("Auto-spawned transport with inferred path: entry=", entry,
+                     " inferredPath=", pathId, " displayId=", displayId,
+                     " wmoInstance=", wmoInstanceId);
+        } else {
+            uint32_t remappedPath = pickFallbackMovingPath(entry, displayId);
+            if (remappedPath != 0) {
+                pathId = remappedPath;
+                LOG_INFO("Auto-spawned transport with remapped fallback path: entry=", entry,
+                         " remappedPath=", pathId, " displayId=", displayId,
+                         " wmoInstance=", wmoInstanceId);
+            } else {
+                std::vector<glm::vec3> path = { canonicalSpawnPos };
+                loadPathFromNodes(pathId, path, false, 0.0f);
+                LOG_INFO("Auto-spawned transport with stationary path: entry=", entry,
+                         " displayId=", displayId, " wmoInstance=", wmoInstanceId);
+            }
+        }
+    } else {
+        LOG_INFO("Auto-spawned transport with real path: entry=", entry,
+                 " displayId=", displayId, " wmoInstance=", wmoInstanceId);
+    }
+
+    registerTransport(guid, wmoInstanceId, pathId, canonicalSpawnPos, entry, displayId, isM2);
+
+    if (displayId == 3831u) {
+        if (auto* tr = getTransport(guid)) {
+            LOG_DEBUG("Auto-spawned Deeprun tram transport: guid=0x",
+                        std::hex, guid, std::dec,
+                        " entry=", entry,
+                        " pathId=", tr->pathId,
+                        " isM2=", tr->isM2,
+                        " mode=", (tr->useClientAnimation ? "client" : "server"));
+        }
+    }
 }
 
 ActiveTransport* TransportManager::getTransport(uint64_t guid) {
@@ -277,11 +481,70 @@ void TransportManager::updateServerTransport(uint64_t guid, const glm::vec3& pos
         return;
     }
 
+    if (transport->isM2 && isDeeprunTramTransport(*transport) && pathEntry->fromDBC && isPreWotlk()) {
+        // CMangos sends occasional position echoes for Deeprun subway cars, but the client
+        // owns the TransportAnimation.dbc path phase. Treat those samples as presence/yaw
+        // hints rather than switching the M2 tram into stationary server-driven mode.
+        const bool firstUpdate = transport->serverUpdateCount == 0;
+        transport->serverUpdateCount++;
+        transport->lastServerUpdate = elapsedTime_;
+        transport->useClientAnimation = true;
+        transport->clientAnimationReverse = false;
+        transport->hasServerClock = false;
+        const glm::vec3 baseDelta = position - transport->basePosition;
+        const bool stationEcho = glm::dot(baseDelta, baseDelta) < 4.0f;
+        if (firstUpdate || stationEcho) {
+            if (!seedDeeprunTramStationPhase(*transport, *pathEntry, position)) {
+                transport->basePosition = position;
+                transport->position = position;
+                transport->localClockMs = 0;
+                transport->hasServerYaw = false;
+                transport->rotation = glm::angleAxis(orientation, glm::vec3(0.0f, 0.0f, 1.0f));
+            }
+        }
+        if (transport->serverUpdateCount <= 3) {
+            LOG_DEBUG("Deeprun tram server update kept client-driven: guid=0x", std::hex, guid, std::dec,
+                        " entry=", transport->entry,
+                        " displayId=", transport->displayId,
+                        " pathId=", transport->pathId,
+                        " pos=(", position.x, ",", position.y, ",", position.z, ")",
+                        " orientation=", orientation);
+        }
+        updateTransformMatrices(*transport);
+        pushTransform(*transport);
+        return;
+    }
+
     // Delegate clock sync, yaw correction, and velocity bootstrap to ClockSync.
     clockSync_.processServerUpdate(*transport, pathEntry, position, orientation, elapsedTime_);
 
     updateTransformMatrices(*transport);
     pushTransform(*transport);
+}
+
+void TransportManager::rebindTransportInstance(uint64_t guid, uint32_t instanceId, bool isM2, uint32_t displayId) {
+    auto* transport = getTransport(guid);
+    if (!transport) return;
+
+    const bool changed = transport->wmoInstanceId != instanceId ||
+                         transport->isM2 != isM2 ||
+                         (displayId != 0 && transport->displayId != displayId);
+    transport->wmoInstanceId = instanceId;
+    transport->isM2 = isM2;
+    if (displayId != 0) {
+        transport->displayId = displayId;
+    }
+
+    updateTransformMatrices(*transport);
+    pushTransform(*transport);
+
+    if (changed && isDeeprunTramTransport(*transport)) {
+        LOG_INFO("Deeprun tram rebound to render instance: guid=0x", std::hex, guid, std::dec,
+                    " instanceId=", instanceId,
+                    " isM2=", isM2,
+                    " displayId=", transport->displayId,
+                    " pathId=", transport->pathId);
+    }
 }
 
 bool TransportManager::loadTransportAnimationDBC(pipeline::AssetManager* assetMgr) {
@@ -322,9 +585,9 @@ bool TransportManager::assignTaxiPathToTransport(uint32_t entry, uint32_t taxiPa
         }
         transport.useClientAnimation = true;  // Server won't send position updates
 
-        // Seed local clock to a deterministic phase
+        // Seed local clock to a deterministic phase (see nowEpochMs comment above)
         if (storedEntry && storedEntry->spline.durationMs() > 0) {
-            transport.localClockMs = static_cast<uint32_t>(elapsedTime_ * 1000.0) % storedEntry->spline.durationMs();
+            transport.localClockMs = static_cast<uint32_t>(nowEpochMs() % storedEntry->spline.durationMs());
         }
 
         updateTransformMatrices(transport);

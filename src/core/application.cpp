@@ -8,11 +8,14 @@
 #include "core/transport_callback_handler.hpp"
 #include "core/world_entry_callback_handler.hpp"
 #include "core/ui_screen_callback_handler.hpp"
+#include "game/spell_classification.hpp"
 #include "rendering/animation/animation_ids.hpp"
 #include "rendering/animation_controller.hpp"
 #include <unordered_set>
 #include <cmath>
 #include <chrono>
+#include <limits>
+#include <utility>
 #include "core/spawn_presets.hpp"
 #include "core/logger.hpp"
 #include "core/memory_monitor.hpp"
@@ -31,6 +34,7 @@
 #include "rendering/clouds.hpp"
 #include "rendering/lens_flare.hpp"
 #include "rendering/weather.hpp"
+#include "rendering/lighting_manager.hpp"
 #include "rendering/character_renderer.hpp"
 #include "rendering/wmo_renderer.hpp"
 #include "rendering/m2_renderer.hpp"
@@ -52,6 +56,7 @@
 #include "ui/ui_services.hpp"
 #include "auth/auth_handler.hpp"
 #include "game/game_handler.hpp"
+#include "game/faction_hostility.hpp"
 #include "game/transport_manager.hpp"
 #include "game/world.hpp"
 #include "game/expansion_profile.hpp"
@@ -96,6 +101,58 @@ bool envFlagEnabled(const char* key, bool defaultValue = false) {
              raw[0] == 'n' || raw[0] == 'N');
 }
 
+std::optional<float> movingEntityFloor(rendering::Renderer* renderer,
+                                        const glm::vec3& renderPos,
+                                        const std::optional<glm::vec3>& previousRenderPos) {
+    if (!renderer) return std::nullopt;
+
+    // Server movement Z is the reference surface.  In WMO overlap regions the
+    // outdoor heightfield may be a roof many units above a tunnel/interior, so
+    // choose the closest reachable floor instead of blindly preferring terrain.
+    constexpr float kMaxStepUp = 1.5f;
+    constexpr float kMaxGroundDrop = 3.0f;
+    const float probeZ = renderPos.z + kMaxStepUp;
+    std::optional<float> best;
+
+    auto consider = [&](const std::optional<float>& floor) {
+        if (!floor || *floor > probeZ || *floor < renderPos.z - kMaxGroundDrop) return;
+        if (!best || std::abs(*floor - renderPos.z) < std::abs(*best - renderPos.z)) {
+            best = floor;
+        }
+    };
+
+    if (auto* terrain = renderer->getTerrainManager()) {
+        consider(terrain->getHeightAt(renderPos.x, renderPos.y));
+    }
+    // Outdoor movers almost always match the terrain heightfield. Avoid the
+    // expensive WMO/M2 collision walks in that common case. Tunnel, bridge,
+    // and interior overlaps still use full arbitration because raw terrain is
+    // not close to the server-provided Z there.
+    if (best && std::abs(*best - renderPos.z) <= 0.35f) {
+        return best;
+    }
+    if (auto* wmo = renderer->getWMORenderer()) {
+        consider(wmo->getFloorHeight(renderPos.x, renderPos.y, probeZ));
+    }
+    if (auto* m2 = renderer->getM2Renderer()) {
+        consider(m2->getFloorHeight(renderPos.x, renderPos.y, probeZ));
+    }
+
+    // A broader floor candidate is useful on stairs and uneven terrain, but it is
+    // ambiguous near overlapping shells or non-collidable authored props. Require
+    // continuity with the last rendered ground position before accepting it. This
+    // preserves server-authored waypoint height without creature-entry exceptions.
+    if (best && std::abs(*best - renderPos.z) > 0.35f) {
+        if (!previousRenderPos) return std::nullopt;
+        const glm::vec2 planarDelta = glm::vec2(renderPos) - glm::vec2(*previousRenderPos);
+        const float maxContinuousStep = 0.35f + glm::length(planarDelta) * 1.5f;
+        if (std::abs(*best - previousRenderPos->z) > maxContinuousStep) {
+            return std::nullopt;
+        }
+    }
+    return best;
+}
+
 } // namespace
 
 Application* Application::instance = nullptr;
@@ -120,7 +177,9 @@ bool Application::initialize() {
     windowConfig.title = "Wowee";
     windowConfig.width = 1280;
     windowConfig.height = 720;
-    windowConfig.vsync = false;
+    // Pace rendering to the display by default. The old 240 FPS default kept
+    // the main thread near a full core even while the scene was idle.
+    windowConfig.vsync = true;
 
     window = std::make_unique<Window>(windowConfig);
     if (!window->initialize()) {
@@ -232,6 +291,14 @@ bool Application::initialize() {
     LOG_INFO("Attempting to load WoW assets from: ", assetPath);
     if (assetManager->initialize(assetPath)) {
         LOG_INFO("Asset manager initialized successfully");
+
+        // Renderer creation precedes AssetManager creation, so DBC-driven
+        // lighting must be initialized here rather than in Renderer::initialize.
+        if (renderer && renderer->getLightingManager() &&
+            !renderer->getLightingManager()->initialize(assetManager.get())) {
+            LOG_WARNING("Lighting manager initialization failed; using fallback lighting");
+        }
+
         // Eagerly load creature display DBC lookups so first spawn doesn't stall
         entitySpawner_ = std::make_unique<EntitySpawner>(
             renderer.get(), assetManager.get(), gameHandler.get(),
@@ -364,11 +431,14 @@ bool Application::initialize() {
                             uint32_t iconField = 133; // WotLK default
                             uint32_t idField = 0;
                             if (spellL) {
-                                uint32_t layoutIcon = (*spellL)["IconID"];
-                                if (layoutIcon < fieldCount && fieldCount <= layoutIcon + 20) {
-                                    iconField = layoutIcon;
-                                    idField = (*spellL)["ID"];
-                                }
+                                try {
+                                    uint32_t layoutId = (*spellL)["ID"];
+                                    uint32_t layoutIcon = (*spellL)["IconID"];
+                                    if (layoutId < fieldCount && layoutIcon < fieldCount) {
+                                        iconField = layoutIcon;
+                                        idField = layoutId;
+                                    }
+                                } catch (...) {}
                             }
                             for (uint32_t i = 0; i < spellDbc->getRecordCount(); i++) {
                                 uint32_t id = spellDbc->getUInt32(i, idField);
@@ -583,45 +653,10 @@ void Application::run() {
     ZoneScopedN("Application::run");
     LOG_INFO("Starting main loop");
 
-    // Pin main thread to a dedicated CPU core to reduce scheduling jitter
-    {
-        int numCores = static_cast<int>(std::thread::hardware_concurrency());
-        if (numCores >= 2) {
-#ifdef __linux__
-            cpu_set_t cpuset;
-            CPU_ZERO(&cpuset);
-            CPU_SET(0, &cpuset);
-            int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-            if (rc == 0) {
-                LOG_INFO("Main thread pinned to CPU core 0 (", numCores, " cores available)");
-            } else {
-                LOG_WARNING("Failed to pin main thread to CPU core 0 (error ", rc, ")");
-            }
-#elif defined(_WIN32)
-            DWORD_PTR mask = 1; // Core 0
-            DWORD_PTR prev = SetThreadAffinityMask(GetCurrentThread(), mask);
-            if (prev != 0) {
-                LOG_INFO("Main thread pinned to CPU core 0 (", numCores, " cores available)");
-            } else {
-                LOG_WARNING("Failed to pin main thread to CPU core 0 (error ", GetLastError(), ")");
-            }
-#elif defined(__APPLE__)
-            // macOS doesn't support hard pinning — use affinity tags to hint
-            // that the main thread should stay on its own core group
-            thread_affinity_policy_data_t policy = { 1 }; // tag 1 = main thread group
-            kern_return_t kr = thread_policy_set(
-                pthread_mach_thread_np(pthread_self()),
-                THREAD_AFFINITY_POLICY,
-                reinterpret_cast<thread_policy_t>(&policy),
-                THREAD_AFFINITY_POLICY_COUNT);
-            if (kr == KERN_SUCCESS) {
-                LOG_INFO("Main thread affinity tag set (", numCores, " cores available)");
-            } else {
-                LOG_WARNING("Failed to set main thread affinity tag (error ", kr, ")");
-            }
-#endif
-        }
-    }
+    // Do not pin the main thread. The shared render pool is created lazily
+    // from this thread, and OS threads inherit their creator's affinity mask
+    // on Linux. Pinning here silently confined every later render worker to
+    // CPU 0 and defeated all command-recording parallelism.
 
     const bool frameProfileEnabled = envFlagEnabled("WOWEE_FRAME_PROFILE", false);
     if (frameProfileEnabled) {
@@ -630,10 +665,8 @@ void Application::run() {
 
     auto lastTime = std::chrono::high_resolution_clock::now();
     std::atomic<bool> watchdogRunning{true};
-    std::atomic<int64_t> watchdogHeartbeatMs{
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count()
-    };
+    beatWatchdog();
+    std::atomic<int64_t>& watchdogHeartbeatMs = watchdogHeartbeatMs_;
     // Signal flag: watchdog sets this when a stall is detected, main loop
     // handles the actual SDL calls. SDL2 video functions must only be called
     // from the main thread (the one that called SDL_Init); calling them from
@@ -663,10 +696,8 @@ void Application::run() {
 
     try {
         while (running && !window->shouldClose()) {
-            watchdogHeartbeatMs.store(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count(),
-                std::memory_order_release);
+            const auto frameStart = std::chrono::steady_clock::now();
+            beatWatchdog();
 
             // Handle watchdog mouse-release request on the main thread where
             // SDL video calls are safe (required by SDL2 threading model).
@@ -675,6 +706,9 @@ void Application::run() {
                 SDL_ShowCursor(SDL_ENABLE);
                 if (window && window->getSDLWindow()) {
                     SDL_SetWindowGrab(window->getSDLWindow(), SDL_FALSE);
+                }
+                if (renderer && renderer->getCameraController()) {
+                    renderer->getCameraController()->releaseMouseCapture();
                 }
                 LOG_WARNING("Watchdog: force-released mouse capture on main thread");
             }
@@ -688,6 +722,10 @@ void Application::run() {
             // Cap delta time to prevent large jumps
             if (deltaTime > 0.1f) {
                 deltaTime = 0.1f;
+            }
+
+            if (renderer && renderer->getCameraController() && ImGui::GetIO().WantCaptureMouse) {
+                renderer->getCameraController()->releaseMouseCapture();
             }
 
             // Poll events
@@ -770,6 +808,10 @@ void Application::run() {
                 }
             }
 
+            if (window->shouldClose()) {
+                break;
+            }
+
             // Update input
             Input::getInstance().update();
 
@@ -785,6 +827,9 @@ void Application::run() {
                 LOG_ERROR("Exception during Application::update (state=", static_cast<int>(state),
                           ", dt=", deltaTime, "): ", e.what());
                 throw;
+            }
+            if (window->shouldClose()) {
+                break;
             }
             // Render
             try {
@@ -807,19 +852,26 @@ void Application::run() {
                 throw;
             }
 
+            processDeferredLogoutToLogin();
+
             // Exit gracefully on GPU device lost (unrecoverable)
             if (renderer && renderer->getVkContext() && renderer->getVkContext()->isDeviceLost()) {
                 LOG_ERROR("GPU device lost — exiting application");
                 window->setShouldClose(true);
             }
 
-            // Soft frame rate cap when vsync is off to prevent 100% CPU usage.
-            // Target ~240 FPS max (~4.2ms per frame); vsync handles its own pacing.
-            if (!window->isVsyncEnabled() && deltaTime < 0.004f) {
-                float sleepMs = (0.004f - deltaTime) * 1000.0f;
-                if (sleepMs > 0.5f)
-                    std::this_thread::sleep_for(std::chrono::microseconds(
-                        static_cast<int64_t>(sleepMs * 900.0f)));  // 90% of target to account for sleep overshoot
+            // Pace from the start of the frame we just completed. Using deltaTime
+            // here measured the previous frame, and relying only on FIFO present
+            // still allowed the main thread to saturate a core on high-refresh or
+            // compositor-managed displays. VSync defaults to a conservative 60 Hz;
+            // disabling it retains the existing 240 Hz ceiling.
+            const auto targetFrame = window->isVsyncEnabled()
+                ? std::chrono::microseconds(16667)
+                : std::chrono::microseconds(4167);
+            const auto deadline = frameStart + targetFrame;
+            const auto now = std::chrono::steady_clock::now();
+            if (now < deadline) {
+                std::this_thread::sleep_until(deadline);
             }
         }
     } catch (...) {
@@ -979,7 +1031,7 @@ void Application::setState(AppState newState) {
                 gameHandler->setMeleeSwingCallback([this](uint32_t spellId) {
                     if (renderer) {
                         // Ranged auto-attack spells: Auto Shot (75), Shoot (5019), Throw (2764)
-                        if (spellId == 75 || spellId == 5019 || spellId == 2764) {
+                        if (game::spellclass::isRangedWeaponAutoAttack(spellId)) {
                             if (appearanceComposer_ && !appearanceComposer_->isShowingRanged())
                                 appearanceComposer_->showRangedWeapon(true);
                             if (auto* ac = renderer->getAnimationController()) ac->triggerRangedShot();
@@ -996,6 +1048,26 @@ void Application::setState(AppState newState) {
                 });
                 gameHandler->setRangedWeaponSwapCallback([this](bool show) {
                     if (appearanceComposer_) appearanceComposer_->showRangedWeapon(show);
+                });
+                if (renderer && renderer->getAnimationController()) {
+                    renderer->getAnimationController()->setRangedShotCompleteCallback([this]() {
+                        if (appearanceComposer_) appearanceComposer_->showRangedWeapon(false);
+                    });
+                }
+                // The logout countdown finishing is not the end of it: the server
+                // confirms with SMSG_LOGOUT_COMPLETE, and only then does the client
+                // leave. Without this the countdown ran out and nothing happened.
+                gameHandler->setLogoutCompleteCallback([this](bool exiting) {
+                    if (exiting) {
+                        if (auto* ac = getAudioCoordinator()) {
+                            if (auto* music = ac->getMusicManager()) music->stopMusic(0.0f);
+                        }
+                        LOG_INFO("Logout complete — quitting");
+                        if (window) window->setShouldClose(true);
+                    } else {
+                        LOG_INFO("Logout complete — returning to character select");
+                        logoutToLogin();
+                    }
                 });
                 gameHandler->setKnockBackCallback([this](float vcos, float vsin, float hspeed, float vspeed) {
                     if (renderer && renderer->getCameraController()) {
@@ -1025,6 +1097,22 @@ void Application::setState(AppState newState) {
             // Back to auth
             break;
     }
+}
+
+bool Application::setAssetExpansionOverride(const std::string& id) {
+    if (id.empty() || id == "legacy") {
+        assetExpansionOverrideId_ = id;
+        return true;
+    }
+    if (!expansionRegistry_) return false;
+    const auto* profile = expansionRegistry_->getProfile(id);
+    if (!profile || !std::filesystem::exists(profile->dataPath + "/manifest.json")) {
+        LOG_WARNING("Cannot select asset profile '", id,
+                    "': no extracted manifest is available");
+        return false;
+    }
+    assetExpansionOverrideId_ = id;
+    return true;
 }
 
 void Application::reloadExpansionData() {
@@ -1058,6 +1146,28 @@ void Application::reloadExpansionData() {
 
     // Update expansion data path for CSV DBC lookups and clear DBC cache
     if (assetManager && !profile->dataPath.empty()) {
+        const char* dataPathEnv = std::getenv("WOW_DATA_PATH");
+        const std::string baseDataPath = dataPathEnv ? dataPathEnv : "./Data";
+        const game::ExpansionProfile* assetProfile = profile;
+        if (!assetExpansionOverrideId_.empty() &&
+            assetExpansionOverrideId_ != "legacy") {
+            if (const auto* selected = expansionRegistry_->getProfile(assetExpansionOverrideId_)) {
+                assetProfile = selected;
+            }
+        }
+        const std::string assetManifest = assetProfile->dataPath + "/manifest.json";
+        const bool useLegacyAssets = assetExpansionOverrideId_ == "legacy";
+        const std::string desiredAssetPath = !useLegacyAssets &&
+                                                  std::filesystem::exists(assetManifest)
+            ? assetProfile->dataPath
+            : baseDataPath;
+        if (desiredAssetPath != assetManager->getDataPath() &&
+            assetManager->switchDataPath(desiredAssetPath) &&
+            desiredAssetPath != baseDataPath) {
+            assetManager->setBaseFallbackPath(baseDataPath);
+        }
+        LOG_INFO("Protocol profile '", profile->id, "' using asset source '",
+                 useLegacyAssets ? std::string("legacy") : assetProfile->id, "'");
         assetManager->setExpansionDataPath(profile->dataPath);
         assetManager->clearDBCCache();
     }
@@ -1075,6 +1185,24 @@ void Application::reloadExpansionData() {
 }
 
 void Application::logoutToLogin() {
+    if (renderingFrame_) {
+        if (!logoutToLoginPending_) {
+            LOG_INFO("Logout requested during render; deferring until frame completes");
+        }
+        logoutToLoginPending_ = true;
+        return;
+    }
+
+    performLogoutToLogin();
+}
+
+void Application::processDeferredLogoutToLogin() {
+    if (!logoutToLoginPending_) return;
+    logoutToLoginPending_ = false;
+    performLogoutToLogin();
+}
+
+void Application::performLogoutToLogin() {
     LOG_INFO("Logout requested");
 
     // Disconnect TransportManager from WMORenderer before tearing down
@@ -1105,6 +1233,11 @@ void Application::logoutToLogin() {
     spawnedPlayerGuid_ = 0;
     spawnedAppearanceBytes_ = 0;
     spawnedFacialFeatures_ = 0;
+
+    if (renderer && renderer->getVkContext() && !renderer->getVkContext()->isDeviceLost()) {
+        LOG_DEBUG("Waiting for GPU idle before logout scene cleanup...");
+        vkDeviceWaitIdle(renderer->getVkContext()->getDevice());
+    }
 
     // --- Reset all EntitySpawner state (mount, creatures, players, GOs, queues, caches) ---
     if (entitySpawner_) entitySpawner_->resetAllState();
@@ -1224,7 +1357,27 @@ void Application::update(float deltaTime) {
             updateCheckpoint = "in_game: auto-unsheathe";
             if (gameHandler) {
                 const bool autoAttacking = gameHandler->isAutoAttacking();
-                if (autoAttacking && !wasAutoAttacking_ && appearanceComposer_ && appearanceComposer_->isWeaponsSheathed()) {
+                // Keep the attachment state consistent with the ongoing attack, not
+                // just the initial false -> true transition. Z can be pressed after
+                // combat has already started, and pre-WotLK servers briefly send
+                // ATTACKSTOP while the client retains attack intent for a retry.
+                const bool attackWeaponNeeded = autoAttacking || gameHandler->hasAutoAttackIntent();
+                const auto& inventory = gameHandler->getInventory();
+                const auto& mainHand = inventory.getEquipSlot(game::EquipSlot::MAIN_HAND);
+                const auto& offHand = inventory.getEquipSlot(game::EquipSlot::OFF_HAND);
+                const auto& ranged = inventory.getEquipSlot(game::EquipSlot::RANGED);
+                const bool hasOffHandWeapon = !offHand.empty() &&
+                    offHand.item.inventoryType == game::InvType::ONE_HAND;
+                const bool hasRangedWeapon = !ranged.empty() &&
+                    (ranged.item.inventoryType == game::InvType::RANGED_BOW ||
+                     ranged.item.inventoryType == game::InvType::RANGED_GUN ||
+                     ranged.item.inventoryType == game::InvType::THROWN);
+                const bool hasDrawableWeapon = !mainHand.empty() || hasOffHandWeapon || hasRangedWeapon;
+                if (attackWeaponNeeded && hasDrawableWeapon && appearanceComposer_ &&
+                    appearanceComposer_->isWeaponsSheathed()) {
+                    if (renderer && renderer->getAnimationController()) {
+                        renderer->getAnimationController()->playWeaponSheathAnimation(false);
+                    }
                     appearanceComposer_->setWeaponsSheathed(false);
                     appearanceComposer_->loadEquippedWeapons();
                 }
@@ -1242,6 +1395,10 @@ void Application::update(float deltaTime) {
                 const bool uiWantsKeyboard = ImGui::GetIO().WantCaptureKeyboard;
                 auto& input = Input::getInstance();
                 if (!uiWantsKeyboard && input.isKeyJustPressed(SDL_SCANCODE_Z) && appearanceComposer_) {
+                    const bool sheathing = !appearanceComposer_->isWeaponsSheathed();
+                    if (renderer && renderer->getAnimationController()) {
+                        renderer->getAnimationController()->playWeaponSheathAnimation(sheathing);
+                    }
                     appearanceComposer_->toggleWeaponsSheathed();
                     appearanceComposer_->loadEquippedWeapons();
                 }
@@ -1381,6 +1538,21 @@ void Application::update(float deltaTime) {
                               (gameHandler->isOnTaxiFlight() ||
                                gameHandler->isTaxiMountActive() ||
                                gameHandler->isTaxiActivationPending());
+                // Deliberately narrower than onTaxi: only true once the flight is
+                // actually happening (mounted/flying), not merely pending a reply.
+                // A rejected CMSG_ACTIVATETAXI sets isTaxiActivationPending() true
+                // for one or two frames and then clears it - if that alone counted
+                // as "was taxiing", the landing clamp below would arm on every
+                // rejected activation and snap the player onto whatever floor
+                // candidate is closest to their current (never-actually-flown-from)
+                // position, exactly as if a real flight had just landed. Live-hit
+                // this at Booty Bay (multi-level WMO): a rejected activation while
+                // standing on the upper platform snapped the character down to the
+                // level below, with a "Cannot take that flight path" chat message
+                // and zero actual movement in between.
+                bool actuallyFlying = gameHandler &&
+                                      (gameHandler->isOnTaxiFlight() ||
+                                       gameHandler->isTaxiMountActive());
                 bool onTransportNow = gameHandler && gameHandler->isOnTransport();
                 // Clear stale client-side transport state when the tracked transport no longer exists.
                 if (onTransportNow && gameHandler->getTransportManager()) {
@@ -1431,7 +1603,15 @@ void Application::update(float deltaTime) {
                     renderer->getCameraController()->clearMovementInputs();
                     // Keep clamping until terrain loads at landing position.
                     // Timer only counts down once a valid floor is found.
-                    if (worldEntryCallbacks_) worldEntryCallbacks_->setTaxiLandingClampTimer(2.0f);
+                    if (worldEntryCallbacks_) {
+                        worldEntryCallbacks_->setTaxiLandingClampTimer(2.0f);
+                        // Capture where the flight itself left the player, before terrain/WMO
+                        // streaming has a chance to move things around - this is the ground
+                        // truth the floor-selection below picks the closest candidate to.
+                        if (renderer) {
+                            worldEntryCallbacks_->setTaxiLandingReferenceZ(renderer->getCharacterPosition().z);
+                        }
+                    }
                 }
                 if (landingClampActive) {
                     if (renderer && gameHandler) {
@@ -1451,15 +1631,48 @@ void Application::update(float deltaTime) {
                             m2Floor = renderer->getM2Renderer()->getFloorHeight(p.x, p.y, p.z + 40.0f);
                         }
 
+                        // Pick whichever floor candidate is closest to where the taxi flight
+                        // itself left the player, rather than unconditionally preferring
+                        // WMO/M2 over terrain. Unconditionally preferring WMO/M2 fixed
+                        // underground landings (terrain has no notion of being underground -
+                        // e.g. a WMO tunnel beneath a mountain, like Ironforge's flight point,
+                        // where terrainFloor=769 the mountain surface beat the correct
+                        // wmoFloor=502 the tunnel floor with "highest wins"), but could just as
+                        // easily snap an *outdoor* landing down onto an unrelated structure
+                        // sitting underneath it. referenceZ - captured once when the clamp
+                        // armed, from wherever the flight simulation actually left the player -
+                        // is ground truth for which candidate is plausible.
+                        const float referenceZ = worldEntryCallbacks_
+                            ? worldEntryCallbacks_->getTaxiLandingReferenceZ() : p.z;
                         std::optional<float> targetFloor;
-                        if (terrainFloor) targetFloor = terrainFloor;
-                        if (wmoFloor && (!targetFloor || *wmoFloor > *targetFloor)) targetFloor = wmoFloor;
-                        if (m2Floor && (!targetFloor || *m2Floor > *targetFloor)) targetFloor = m2Floor;
+                        const char* pickedFrom = "none";
+                        float bestDist = std::numeric_limits<float>::max();
+                        const std::pair<std::optional<float>, const char*> floorCandidates[] = {
+                            {wmoFloor, "wmo"}, {m2Floor, "m2"}, {terrainFloor, "terrain"}};
+                        for (const auto& [candidate, name] : floorCandidates) {
+                            if (!candidate) continue;
+                            float dist = std::abs(*candidate - referenceZ);
+                            if (dist < bestDist) {
+                                bestDist = dist;
+                                targetFloor = candidate;
+                                pickedFrom = name;
+                            }
+                        }
+
+                        LOG_INFO("Taxi landing clamp: pos=(", p.x, ", ", p.y, ", ", p.z, ") ",
+                                 "referenceZ=", referenceZ, " ",
+                                 "terrainFloor=", terrainFloor ? std::to_string(*terrainFloor) : "none", " ",
+                                 "wmoFloor=", wmoFloor ? std::to_string(*wmoFloor) : "none", " ",
+                                 "m2Floor=", m2Floor ? std::to_string(*m2Floor) : "none", " ",
+                                 "picked=", pickedFrom, " ",
+                                 "timer=", worldEntryCallbacks_ ? worldEntryCallbacks_->getTaxiLandingClampTimer() : 0.0f);
 
                         if (targetFloor) {
                             // Floor found — snap player to it and start countdown to release
                             float targetZ = *targetFloor + 0.10f;
                             if (std::abs(p.z - targetZ) > 0.05f) {
+                                LOG_INFO("Taxi landing clamp: snapping z ", p.z, " -> ", targetZ,
+                                         " (source=", pickedFrom, ")");
                                 p.z = targetZ;
                                 renderer->getCharacterPosition() = p;
                                 glm::vec3 canonical = core::coords::renderToCanonical(p);
@@ -1489,11 +1702,15 @@ void Application::update(float deltaTime) {
                 // Taxi flights move fast (32 u/s) — load further ahead so terrain is ready
                 // before the camera arrives.  Keep updates frequent to spot new tiles early.
                 renderer->getTerrainManager()->setUpdateInterval(onTaxi ? 0.033f : 0.033f);
-                renderer->getTerrainManager()->setLoadRadius(onTaxi ? 8 : 4);
-                renderer->getTerrainManager()->setUnloadRadius(onTaxi ? 12 : 7);
+                const int configuredLoadRadius = renderer->getTerrainLoadRadius();
+                const int configuredUnloadRadius = renderer->getTerrainUnloadRadius();
+                renderer->getTerrainManager()->setLoadRadius(
+                    onTaxi ? std::max(8, configuredLoadRadius) : configuredLoadRadius);
+                renderer->getTerrainManager()->setUnloadRadius(
+                    onTaxi ? std::max(12, configuredUnloadRadius) : configuredUnloadRadius);
                 renderer->getTerrainManager()->setTaxiStreamingMode(onTaxi);
                 }
-                if (worldEntryCallbacks_) worldEntryCallbacks_->setLastTaxiFlight(onTaxi);
+                if (worldEntryCallbacks_) worldEntryCallbacks_->setLastTaxiFlight(actuallyFlying);
 
                 // Sync character render position ↔ canonical WoW coords each frame
                 if (renderer && gameHandler) {
@@ -1559,16 +1776,90 @@ void Application::update(float deltaTime) {
                         auto* tr = gameHandler->getTransportManager()->getTransport(
                             gameHandler->getPlayerTransportGuid());
                         if (tr) {
-                            // Keep passenger locked to elevator vertical motion while grounded.
-                            // Without this, floor clamping can hold world-Z static unless the
-                            // player is jumping, which makes lifts appear to not move vertically.
-                            glm::vec3 tentativeCanonical = core::coords::renderToCanonical(renderPos);
+                            // Ride along at a fixed offset from the transport's current position
+                            // (set once at boarding - see GameHandler::updateM2TransportBoarding),
+                            // plus whatever the player has walked on the deck since then. WASD
+                            // input runs earlier in the frame and moves renderer's character
+                            // position directly; comparing that (tentativeCanonical) against
+                            // where *we* locked it last frame isolates just that walked delta,
+                            // so standing still holds a fixed deck position while active input
+                            // still moves the player, instead of either (a) fully locking
+                            // movement or (b) recomputing offset from the absolute position,
+                            // which is a no-op identity once fed back into
+                            // lockedCanonical = tr->position + offset: the character's render
+                            // position could never actually change due to the tram moving, so
+                            // riding appeared to "float" in place no matter how far the tram
+                            // traveled underneath.
+                            const bool isDeeprunTram =
+                                tr->displayId == 3831u ||
+                                (tr->entry >= 176080u && tr->entry <= 176085u) ||
+                                (tr->pathId >= 176080u && tr->pathId <= 176085u);
                             glm::vec3 localOffset = gameHandler->getPlayerTransportOffset();
-                            localOffset.x = tentativeCanonical.x - tr->position.x;
-                            localOffset.y = tentativeCanonical.y - tr->position.y;
-                            if (renderer->getCameraController() &&
+                            glm::vec3 tentativeCanonical = core::coords::renderToCanonical(renderPos);
+                            if (hasM2RideLock_) {
+                                glm::vec3 walkDelta = tentativeCanonical - lastM2RideLockedCanonical_;
+                                // Root cause found: the 60-unit clamp added last round was a backstop
+                                // that treated the symptom, not the cause - live data showed it
+                                // getting maxed out exactly (horizDist=60.0 at the eventual disembark),
+                                // meaning the runaway drift reaches whatever ceiling is set as long as
+                                // that ceiling is above the 18-unit disembark threshold, so it still
+                                // ended the ride ("I still got kicked off... but at least I didn't die
+                                // this time" reported live). The actual bug: there's no real floor
+                                // under a moving M2 car, so gravity keeps trying to pull the character
+                                // down every frame even while standing still; since Z is locked, that
+                                // shows up as horizontal render-position drift, and this code
+                                // previously couldn't tell that apart from real WASD input - it baked
+                                // ANY frame-to-frame position change into localOffset, compounding
+                                // forever. Gate on genuine movement input (the same signal driving the
+                                // walking animation) so gravity noise while stationary is ignored
+                                // instead of accumulated; only apply the delta when the player is
+                                // actually pressing a movement key.
+                                const bool hasMovementInput = renderer->getCameraController() &&
+                                    renderer->getCameraController()->isMoving();
+                                if (hasMovementInput) {
+                                    localOffset.x += walkDelta.x;
+                                    localOffset.y += walkDelta.y;
+                                }
+                                // Keep a generous distance clamp as a secondary backstop for any
+                                // other source of drift (e.g. knockback, server-forced movement)
+                                // this input gate doesn't cover.
+                                if (isDeeprunTram) {
+                                    constexpr float kMaxRideOffsetDist = 60.0f;
+                                    const float offsetLen = std::sqrt(localOffset.x * localOffset.x + localOffset.y * localOffset.y);
+                                    if (offsetLen > kMaxRideOffsetDist) {
+                                        const float scale = kMaxRideOffsetDist / offsetLen;
+                                        localOffset.x *= scale;
+                                        localOffset.y *= scale;
+                                    }
+                                }
+                            }
+                            // Z is fully locked for the Deeprun tram (see below), so
+                            // CameraController's own gravity integration never sees a
+                            // grounded frame and silently accumulates fall velocity the
+                            // entire ride - reported live as clipping through the world
+                            // "at a weird angle" right after disembarking, and as being
+                            // unable to jump while riding (coyote time never has a
+                            // grounded frame to key off). Suppress it every frame the
+                            // lock is active so nothing is queued up to unleash later.
+                            if (isDeeprunTram && renderer->getCameraController()) {
+                                renderer->getCameraController()->suppressVerticalPhysics();
+                            }
+                            // Thunder Bluff lifts have real floor at both ends of their travel,
+                            // so letting Z track physics while airborne (jumping) is recoverable -
+                            // the player lands back on the platform. The Deeprun Tram tunnel has
+                            // no floor at all except at the two station platforms; if this ran for
+                            // it, isGrounded() ever reporting false mid-tunnel (e.g. because M2
+                            // collision for a moving instance isn't recognized as ground the same
+                            // way static terrain is) would let gravity pull the player away from
+                            // the tram with nothing to land on - reported live as falling through
+                            // the tram/tunnel and dying. Keep Z fully locked for the tram; only
+                            // lifts get the airborne exception.
+                            if (!isDeeprunTram && renderer->getCameraController() &&
                                 !renderer->getCameraController()->isGrounded()) {
-                                // While airborne (jump/fall), allow local Z offset to change.
+                                // While airborne (jump/fall), let vertical offset track normal
+                                // physics instead of staying pinned to the boarding-time value.
+                                // Without this, floor clamping can hold world-Z static unless the
+                                // player is jumping, which makes lifts appear to not move vertically.
                                 localOffset.z = tentativeCanonical.z - tr->position.z;
                             }
                             gameHandler->setPlayerTransportOffset(localOffset);
@@ -1576,7 +1867,14 @@ void Application::update(float deltaTime) {
                             glm::vec3 lockedCanonical = tr->position + localOffset;
                             renderPos = core::coords::canonicalToRender(lockedCanonical);
                             renderer->getCharacterPosition() = renderPos;
+                            lastM2RideLockedCanonical_ = lockedCanonical;
+                            hasM2RideLock_ = true;
                         }
+                    } else {
+                        hasM2RideLock_ = false;
+                    }
+                    if (auto* ac = renderer->getAnimationController()) {
+                        ac->setM2TransportRiding(hasM2RideLock_);
                     }
 
                     glm::vec3 canonical = core::coords::renderToCanonical(renderPos);
@@ -1611,75 +1909,12 @@ void Application::update(float deltaTime) {
                         }
                     }
 
-                    // Client-side transport boarding detection (for M2 transports like trams
-                    // and lifts where the server doesn't send transport attachment data).
-                    // Thunder Bluff elevators use model origins that can be far from the deck
-                    // the player stands on, so they need wider attachment bounds.
-                    if (gameHandler->getTransportManager() && !gameHandler->isOnTransport()) {
-                        auto* tm = gameHandler->getTransportManager();
+                    // Client-side M2 transport (trams, lifts) board/disembark check - shared
+                    // with any other driver that knows the player's canonical position (see
+                    // GameHandler::updateM2TransportBoarding).
+                    if (gameHandler->getTransportManager()) {
                         glm::vec3 playerCanonical = core::coords::renderToCanonical(renderPos);
-                        constexpr float kM2BoardHorizDistSq = 12.0f * 12.0f;
-                        constexpr float kM2BoardVertDist = 15.0f;
-                        constexpr float kTbLiftBoardHorizDistSq = 22.0f * 22.0f;
-                        constexpr float kTbLiftBoardVertDist = 14.0f;
-
-                        uint64_t bestGuid = 0;
-                        float bestScore = 1e30f;
-                        for (auto& [guid, transport] : tm->getTransports()) {
-                            if (!transport.isM2) continue;
-                            const bool isThunderBluffLift =
-                                (transport.entry >= 20649u && transport.entry <= 20657u);
-                            const float maxHorizDistSq = isThunderBluffLift
-                                ? kTbLiftBoardHorizDistSq
-                                : kM2BoardHorizDistSq;
-                            const float maxVertDist = isThunderBluffLift
-                                ? kTbLiftBoardVertDist
-                                : kM2BoardVertDist;
-                            glm::vec3 diff = playerCanonical - transport.position;
-                            float horizDistSq = diff.x * diff.x + diff.y * diff.y;
-                            float vertDist = std::abs(diff.z);
-                            if (horizDistSq < maxHorizDistSq && vertDist < maxVertDist) {
-                                float score = horizDistSq + vertDist * vertDist;
-                                if (score < bestScore) {
-                                    bestScore = score;
-                                    bestGuid = guid;
-                                }
-                            }
-                        }
-                        if (bestGuid != 0) {
-                            auto* tr = tm->getTransport(bestGuid);
-                            if (tr) {
-                                gameHandler->setPlayerOnTransport(bestGuid, playerCanonical - tr->position);
-                                LOG_DEBUG("M2 transport boarding: guid=0x", std::hex, bestGuid, std::dec);
-                            }
-                        }
-                    }
-
-                    // M2 transport disembark: player walked far enough from transport center
-                    if (isM2Transport && gameHandler->getTransportManager()) {
-                        auto* tm = gameHandler->getTransportManager();
-                        auto* tr = tm->getTransport(gameHandler->getPlayerTransportGuid());
-                        if (tr) {
-                            glm::vec3 playerCanonical = core::coords::renderToCanonical(renderPos);
-                            glm::vec3 diff = playerCanonical - tr->position;
-                            float horizDistSq = diff.x * diff.x + diff.y * diff.y;
-                            const bool isThunderBluffLift =
-                                (tr->entry >= 20649u && tr->entry <= 20657u);
-                            constexpr float kM2DisembarkHorizDistSq = 15.0f * 15.0f;
-                            constexpr float kTbLiftDisembarkHorizDistSq = 28.0f * 28.0f;
-                            constexpr float kM2DisembarkVertDist = 18.0f;
-                            constexpr float kTbLiftDisembarkVertDist = 16.0f;
-                            const float disembarkHorizDistSq = isThunderBluffLift
-                                ? kTbLiftDisembarkHorizDistSq
-                                : kM2DisembarkHorizDistSq;
-                            const float disembarkVertDist = isThunderBluffLift
-                                ? kTbLiftDisembarkVertDist
-                                : kM2DisembarkVertDist;
-                            if (horizDistSq > disembarkHorizDistSq || std::abs(diff.z) > disembarkVertDist) {
-                                gameHandler->clearPlayerTransport();
-                                LOG_DEBUG("M2 transport disembark");
-                            }
-                        }
+                        gameHandler->updateM2TransportBoarding(playerCanonical);
                     }
                 }
                 }
@@ -1714,14 +1949,13 @@ void Application::update(float deltaTime) {
                 }
                 const float syncRadiusSq = 320.0f * 320.0f;
                 auto& _creatureInstances = entitySpawner_->getCreatureInstances();
-                auto& _creatureWeaponsAttached = entitySpawner_->getCreatureWeaponsAttached();
-                auto& _creatureWeaponAttachAttempts = entitySpawner_->getCreatureWeaponAttachAttempts();
                 auto& _creatureModelIds = entitySpawner_->getCreatureModelIds();
                 auto& _modelIdIsWolfLike = entitySpawner_->getModelIdIsWolfLike();
                 auto& _creatureRenderPosCache = entitySpawner_->getCreatureRenderPosCache();
                 auto& _creatureSwimmingState = entitySpawner_->getCreatureSwimmingState();
                 auto& _creatureWalkingState = entitySpawner_->getCreatureWalkingState();
                 auto& _creatureFlyingState = entitySpawner_->getCreatureFlyingState();
+                auto& _creatureActiveEmotes = entitySpawner_->getCreatureActiveEmotes();
                 auto& _creatureWasMoving = entitySpawner_->getCreatureWasMoving();
                 auto& _creatureWasSwimming = entitySpawner_->getCreatureWasSwimming();
                 auto& _creatureWasFlying = entitySpawner_->getCreatureWasFlying();
@@ -1731,19 +1965,9 @@ void Application::update(float deltaTime) {
                     if (!entity || entity->getType() != game::ObjectType::UNIT) continue;
 
                     if (npcWeaponRetryTick &&
-                        weaponAttachesThisTick < EntitySpawner::MAX_WEAPON_ATTACHES_PER_TICK &&
-                        !_creatureWeaponsAttached.count(guid)) {
-                        uint8_t attempts = 0;
-                        auto itAttempts = _creatureWeaponAttachAttempts.find(guid);
-                        if (itAttempts != _creatureWeaponAttachAttempts.end()) attempts = itAttempts->second;
-                        if (attempts < 30) {
+                        weaponAttachesThisTick < EntitySpawner::MAX_WEAPON_ATTACHES_PER_TICK) {
+                        if (entitySpawner_->retryCreatureVirtualWeapons(guid, instanceId, 30)) {
                             weaponAttachesThisTick++;
-                            if (entitySpawner_->tryAttachCreatureVirtualWeapons(guid, instanceId)) {
-                                _creatureWeaponsAttached.insert(guid);
-                                _creatureWeaponAttachAttempts.erase(guid);
-                            } else {
-                                _creatureWeaponAttachAttempts[guid] = static_cast<uint8_t>(attempts + 1);
-                            }
                         }
                     }
 
@@ -1771,15 +1995,21 @@ void Application::update(float deltaTime) {
                         inOverrun ? entity->getLatestY() : entity->getY(),
                         inOverrun ? entity->getLatestZ() : entity->getZ());
                     glm::vec3 renderPos = core::coords::canonicalToRender(canonical);
+                    auto posIt = _creatureRenderPosCache.find(guid);
+                    const std::optional<glm::vec3> previousRenderPos =
+                        posIt != _creatureRenderPosCache.end()
+                            ? std::optional<glm::vec3>(posIt->second)
+                            : std::nullopt;
 
-                    // Clamp creature Z to terrain surface during movement interpolation.
-                    // The server sends single-segment moves and expects the client to place
-                    // creatures on the ground.  Only clamp while actively moving — idle
-                    // creatures keep their server-authoritative Z (flight masters, etc.).
-                    if (entity->isActivelyMoving() && renderer->getTerrainManager()) {
-                        auto terrainZ = renderer->getTerrainManager()->getHeightAt(renderPos.x, renderPos.y);
-                        if (terrainZ.has_value()) {
-                            renderPos.z = terrainZ.value();
+                    // Ground-moving entities need client floor projection between server
+                    // spline points. Use the floor nearest server Z so outdoor terrain
+                    // above a tunnel cannot move the model into/onto the WMO shell.
+                    const bool groundCreature = !_creatureFlyingState.count(guid) &&
+                                                !_creatureSwimmingState.count(guid);
+                    if (entity->isActivelyMoving() && groundCreature) {
+                        if (auto floorZ = movingEntityFloor(renderer.get(), renderPos,
+                                                            previousRenderPos)) {
+                            renderPos.z = *floorZ;
                         }
                     }
 
@@ -1848,7 +2078,6 @@ void Application::update(float deltaTime) {
                         }
                     }
 
-                    auto posIt = _creatureRenderPosCache.find(guid);
                     if (posIt == _creatureRenderPosCache.end()) {
                         charRenderer->setInstancePosition(instanceId, renderPos);
                         _creatureRenderPosCache[guid] = renderPos;
@@ -1877,10 +2106,12 @@ void Application::update(float deltaTime) {
                         if (deadOrCorpse || largeCorrection) {
                             charRenderer->setInstancePosition(instanceId, renderPos);
                         } else if (planarDistSq > kMoveThreshSq || dz > 0.08f) {
-                            // Position changed in entity coords → drive renderer toward it.
-                            float planarDist = std::sqrt(planarDistSq);
-                            float duration = std::clamp(planarDist / 5.5f, 0.05f, 0.22f);
-                            charRenderer->moveInstanceTo(instanceId, renderPos, duration);
+                            // Entity::updateMovement already evaluates the server spline for
+                            // this frame. Starting another renderer interpolation here resets
+                            // that interpolation every frame and leaves the model trailing its
+                            // authoritative entity position. Copy the evaluated position
+                            // directly; animation transitions remain driven below.
+                            charRenderer->setInstancePosition(instanceId, renderPos);
                         }
                         // When entity is moving but getX/Y/Z is stale (distance-culled),
                         // don't call moveInstanceTo — creatureMoveCallback_ already drove
@@ -1923,7 +2154,18 @@ void Application::update(float deltaTime) {
                                 } else {
                                     if (isFlyingNow)        targetAnim = rendering::anim::FLY_IDLE;
                                     else if (isSwimmingNow) targetAnim = rendering::anim::SWIM_IDLE;
-                                    else                    targetAnim = rendering::anim::STAND;
+                                    else {
+                                        // Resume a retained state emote (work/chop loop),
+                                        // but only if this model ships the animation —
+                                        // display swaps can land on models without it
+                                        // (the log-carrying peasant has no chop anim).
+                                        targetAnim = rendering::anim::STAND;
+                                        auto emoteIt = _creatureActiveEmotes.find(guid);
+                                        if (emoteIt != _creatureActiveEmotes.end() &&
+                                            charRenderer->hasAnimation(instanceId, emoteIt->second)) {
+                                            targetAnim = emoteIt->second;
+                                        }
+                                    }
                                 }
                                 charRenderer->playAnimation(instanceId, targetAnim, /*loop=*/true);
                             }
@@ -1985,16 +2227,23 @@ void Application::update(float deltaTime) {
                         inOverrun ? entity->getLatestY() : entity->getY(),
                         inOverrun ? entity->getLatestZ() : entity->getZ());
                     glm::vec3 renderPos = core::coords::canonicalToRender(canonical);
+                    auto posIt = _pCreatureRenderPosCache.find(guid);
+                    const std::optional<glm::vec3> previousRenderPos =
+                        posIt != _pCreatureRenderPosCache.end()
+                            ? std::optional<glm::vec3>(posIt->second)
+                            : std::nullopt;
 
-                    // Clamp other players' Z to terrain surface during movement
-                    if (entity->isActivelyMoving() && renderer->getTerrainManager()) {
-                        auto terrainZ = renderer->getTerrainManager()->getHeightAt(renderPos.x, renderPos.y);
-                        if (terrainZ.has_value()) {
-                            renderPos.z = terrainZ.value();
+                    // Match creature projection: terrain alone is not a valid floor in
+                    // WMO overlap regions (tunnels, buildings, bridges).
+                    const bool groundPlayer = !_pCreatureFlyingState.count(guid) &&
+                                              !_pCreatureSwimmingState.count(guid);
+                    if (entity->isActivelyMoving() && groundPlayer) {
+                        if (auto floorZ = movingEntityFloor(renderer.get(), renderPos,
+                                                            previousRenderPos)) {
+                            renderPos.z = *floorZ;
                         }
                     }
 
-                    auto posIt = _pCreatureRenderPosCache.find(guid);
                     if (posIt == _pCreatureRenderPosCache.end()) {
                         charRenderer->setInstancePosition(instanceId, renderPos);
                         _pCreatureRenderPosCache[guid] = renderPos;
@@ -2136,33 +2385,55 @@ void Application::update(float deltaTime) {
     }
 }
 
+void Application::beatWatchdog() {
+    watchdogHeartbeatMs_.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(),
+        std::memory_order_release);
+}
+
 void Application::render() {
     if (!renderer) {
         return;
     }
 
-    renderer->beginFrame();
+    // Mirrors the IN_GAME update stages: a frame that blocks long enough to trip the
+    // watchdog needs to say which phase did it.
+    auto runRenderStage = [](const char* stageName, auto&& fn) {
+        auto stageStart = std::chrono::steady_clock::now();
+        fn();
+        float stageMs = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - stageStart).count();
+        if (stageMs > 50.0f) {
+            LOG_WARNING("SLOW render stage '", stageName, "': ", stageMs, "ms");
+        }
+    };
+
+    renderingFrame_ = true;
+    runRenderStage("beginFrame", [&] { renderer->beginFrame(); });
 
     // Only render 3D world when in-game
     if (state == AppState::IN_GAME) {
-        if (world) {
-            renderer->renderWorld(world.get(), gameHandler.get());
-        } else {
-            renderer->renderWorld(nullptr, gameHandler.get());
-        }
+        runRenderStage("renderWorld", [&] {
+            renderer->renderWorld(world ? world.get() : nullptr, gameHandler.get());
+        });
     }
 
     // Render performance HUD (within ImGui frame, before UI ends the frame)
     if (renderer) {
-        renderer->renderHUD();
+        runRenderStage("renderHUD", [&] { renderer->renderHUD(); });
     }
 
     // Render UI on top (ends ImGui frame with ImGui::Render())
     if (uiManager) {
-        uiManager->render(state, authHandler.get(), gameHandler.get());
+        runRenderStage("uiManager->render", [&] {
+            uiManager->render(state, authHandler.get(), gameHandler.get());
+        });
     }
 
-    renderer->endFrame();
+    runRenderStage("endFrame", [&] { renderer->endFrame(); });
+    renderingFrame_ = false;
+    processDeferredLogoutToLogin();
 }
 
 void Application::setupUICallbacks() {
@@ -2193,7 +2464,7 @@ void Application::setupUICallbacks() {
 
     // ── Animation: death, respawn, swing, hit, spell, emote, charge, etc. ──
     animationCallbacks_ = std::make_unique<AnimationCallbackHandler>(
-        *entitySpawner_, *renderer, *gameHandler);
+        *entitySpawner_, *renderer, *gameHandler, *appearanceComposer_);
     animationCallbacks_->setupCallbacks();
 
     // ── NPC interaction: greeting, farewell, vendor, aggro voice ──
@@ -2209,7 +2480,8 @@ void Application::setupUICallbacks() {
 
     // ── Transport: mount, taxi, transport spawn/move ──
     transportCallbacks_ = std::make_unique<TransportCallbackHandler>(
-        *entitySpawner_, *renderer, *gameHandler, worldLoader_.get());
+        *entitySpawner_, *renderer, *gameHandler, worldLoader_.get(),
+        appearanceComposer_.get());
     transportCallbacks_->setupCallbacks();
 }
 
@@ -2242,6 +2514,7 @@ void Application::spawnPlayerCharacter() {
         auto m2Data = assetManager->readFile(m2Path);
         if (!m2Data.empty()) {
             auto model = pipeline::M2Loader::load(m2Data);
+            if (model.name.empty()) model.name = m2Path;
 
             // Load skin file for submesh/batch data
             std::string skinPath = modelDir + baseName + "00.skin";
@@ -2452,131 +2725,8 @@ void Application::spawnPlayerCharacter() {
 }
 
 void Application::buildFactionHostilityMap(uint8_t playerRace) {
-    if (!assetManager || !assetManager->isInitialized() || !gameHandler) return;
-
-    auto ftDbc = assetManager->loadDBC("FactionTemplate.dbc");
-    auto fDbc = assetManager->loadDBC("Faction.dbc");
-    if (!ftDbc || !ftDbc->isLoaded()) return;
-
-    // Race enum → race mask bit: race 1=0x1, 2=0x2, 3=0x4, 4=0x8, 5=0x10, 6=0x20, 7=0x40, 8=0x80, 10=0x200, 11=0x400
-    uint32_t playerRaceMask = 0;
-    if (playerRace >= 1 && playerRace <= 8) {
-        playerRaceMask = 1u << (playerRace - 1);
-    } else if (playerRace == 10) {
-        playerRaceMask = 0x200;  // Blood Elf
-    } else if (playerRace == 11) {
-        playerRaceMask = 0x400;  // Draenei
-    }
-
-    // Race → player faction template ID
-    // Human=1, Orc=2, Dwarf=3, NightElf=4, Undead=5, Tauren=6, Gnome=115, Troll=116, BloodElf=1610, Draenei=1629
-    uint32_t playerFtId = 0;
-    switch (playerRace) {
-        case 1: playerFtId = 1; break;     // Human
-        case 2: playerFtId = 2; break;     // Orc
-        case 3: playerFtId = 3; break;     // Dwarf
-        case 4: playerFtId = 4; break;     // Night Elf
-        case 5: playerFtId = 5; break;     // Undead
-        case 6: playerFtId = 6; break;     // Tauren
-        case 7: playerFtId = 115; break;   // Gnome
-        case 8: playerFtId = 116; break;   // Troll
-        case 10: playerFtId = 1610; break; // Blood Elf
-        case 11: playerFtId = 1629; break; // Draenei
-        default: playerFtId = 1; break;
-    }
-
-    // Build set of hostile parent faction IDs from Faction.dbc base reputation
-    const auto* facL = pipeline::getActiveDBCLayout() ? pipeline::getActiveDBCLayout()->getLayout("Faction") : nullptr;
-    const auto* ftL = pipeline::getActiveDBCLayout() ? pipeline::getActiveDBCLayout()->getLayout("FactionTemplate") : nullptr;
-    std::unordered_set<uint32_t> hostileParentFactions;
-    if (fDbc && fDbc->isLoaded()) {
-        const uint32_t facID = facL ? (*facL)["ID"] : 0;
-        const uint32_t facRaceMask0 = facL ? (*facL)["ReputationRaceMask0"] : 2;
-        const uint32_t facBase0 = facL ? (*facL)["ReputationBase0"] : 10;
-        for (uint32_t i = 0; i < fDbc->getRecordCount(); i++) {
-            uint32_t factionId = fDbc->getUInt32(i, facID);
-            for (int slot = 0; slot < 4; slot++) {
-                uint32_t raceMask = fDbc->getUInt32(i, facRaceMask0 + slot);
-                if (raceMask & playerRaceMask) {
-                    int32_t baseRep = fDbc->getInt32(i, facBase0 + slot);
-                    if (baseRep < 0) {
-                        hostileParentFactions.insert(factionId);
-                    }
-                    break;
-                }
-            }
-        }
-        LOG_INFO("Faction.dbc: ", hostileParentFactions.size(), " factions hostile to race ", static_cast<int>(playerRace));
-    }
-
-    // Get player faction template data
-    const uint32_t ftID = ftL ? (*ftL)["ID"] : 0;
-    const uint32_t ftFaction = ftL ? (*ftL)["Faction"] : 1;
-    const uint32_t ftFG = ftL ? (*ftL)["FactionGroup"] : 3;
-    const uint32_t ftFriend = ftL ? (*ftL)["FriendGroup"] : 4;
-    const uint32_t ftEnemy = ftL ? (*ftL)["EnemyGroup"] : 5;
-    const uint32_t ftEnemy0 = ftL ? (*ftL)["Enemy0"] : 6;
-    uint32_t playerFriendGroup = 0;
-    uint32_t playerEnemyGroup = 0;
-    uint32_t playerFactionId = 0;
-    for (uint32_t i = 0; i < ftDbc->getRecordCount(); i++) {
-        if (ftDbc->getUInt32(i, ftID) == playerFtId) {
-            playerFriendGroup = ftDbc->getUInt32(i, ftFriend) | ftDbc->getUInt32(i, ftFG);
-            playerEnemyGroup = ftDbc->getUInt32(i, ftEnemy);
-            playerFactionId = ftDbc->getUInt32(i, ftFaction);
-            break;
-        }
-    }
-
-    // Build hostility map for each faction template
-    std::unordered_map<uint32_t, bool> factionMap;
-    for (uint32_t i = 0; i < ftDbc->getRecordCount(); i++) {
-        uint32_t id = ftDbc->getUInt32(i, ftID);
-        uint32_t parentFaction = ftDbc->getUInt32(i, ftFaction);
-        uint32_t factionGroup = ftDbc->getUInt32(i, ftFG);
-        uint32_t friendGroup = ftDbc->getUInt32(i, ftFriend);
-        uint32_t enemyGroup = ftDbc->getUInt32(i, ftEnemy);
-
-        // 1. Symmetric group check
-        bool hostile = (enemyGroup & playerFriendGroup) != 0
-                    || (factionGroup & playerEnemyGroup) != 0;
-
-        // 2. Monster factionGroup bit (8)
-        if (!hostile && (factionGroup & 8) != 0) {
-            hostile = true;
-        }
-
-        // 3. Individual enemy faction IDs
-        if (!hostile && playerFactionId > 0) {
-            for (uint32_t e = ftEnemy0; e <= ftEnemy0 + 3; e++) {
-                if (ftDbc->getUInt32(i, e) == playerFactionId) {
-                    hostile = true;
-                    break;
-                }
-            }
-        }
-
-        // 4. Parent faction base reputation check (Faction.dbc)
-        if (!hostile && parentFaction > 0) {
-            if (hostileParentFactions.count(parentFaction)) {
-                hostile = true;
-            }
-        }
-
-        // 5. If explicitly friendly (friendGroup includes player), override to non-hostile
-        if (hostile && (friendGroup & playerFriendGroup) != 0) {
-            hostile = false;
-        }
-
-        factionMap[id] = hostile;
-    }
-
-    uint32_t hostileCount = 0;
-    for (const auto& [fid, h] : factionMap) { if (h) hostileCount++; }
-    gameHandler->setFactionHostileMap(std::move(factionMap));
-    LOG_INFO("Faction hostility for race ", static_cast<int>(playerRace), " (FT ", playerFtId, "): ",
-        hostileCount, "/", ftDbc->getRecordCount(),
-        " hostile (friendGroup=0x", std::hex, playerFriendGroup, ", enemyGroup=0x", playerEnemyGroup, std::dec, ")");
+    if (!assetManager || !gameHandler) return;
+    game::buildFactionHostilityMap(*assetManager, *gameHandler, playerRace);
 }
 
 // Render bounds/position queries — delegates to EntitySpawner

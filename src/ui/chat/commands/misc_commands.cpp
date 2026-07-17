@@ -5,6 +5,7 @@
 #include "ui/chat/i_chat_command.hpp"
 #include "ui/chat_panel.hpp"
 #include "game/game_handler.hpp"
+#include "game/transport_manager.hpp"
 #include "game/entity.hpp"
 #include "rendering/renderer.hpp"
 #include <algorithm>
@@ -38,6 +39,43 @@ inline std::string getEntityName(const std::shared_ptr<game::Entity>& entity) {
 }
 
 } // anon namespace
+
+// --- /transportinfo ---
+// Dumps active transport state (entry, path, clock mode, position) so
+// stationary/invisible transports can be diagnosed live instead of guessing.
+class TransportInfoCommand : public IChatCommand {
+public:
+    ChatCommandResult execute(ChatCommandContext& ctx) override {
+        auto say = [&ctx](const std::string& text) {
+            game::MessageChatData m;
+            m.type = game::ChatType::SYSTEM;
+            m.language = game::ChatLanguage::UNIVERSAL;
+            m.message = text;
+            ctx.gameHandler.addLocalChatMessage(m);
+        };
+        auto* tm = ctx.gameHandler.getTransportManager();
+        if (!tm) { say("Transport manager unavailable."); return {}; }
+        const auto& transports = tm->getTransports();
+        say("Active transports: " + std::to_string(transports.size()));
+        for (const auto& [guid, t] : transports) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "entry=%u disp=%u path=%u pos=(%.1f, %.1f, %.1f) %s clock=%s updates=%d inst=%u%s",
+                     t.entry, t.displayId, t.pathId,
+                     t.position.x, t.position.y, t.position.z,
+                     t.isM2 ? "M2" : "WMO",
+                     t.useClientAnimation ? (t.hasServerClock ? "client+sync" : "client")
+                                          : "server",
+                     t.serverUpdateCount,
+                     t.wmoInstanceId,
+                     t.wmoInstanceId == 0 ? " (NO RENDER INSTANCE)" : "");
+            say(buf);
+        }
+        return {};
+    }
+    std::vector<std::string> aliases() const override { return {"transportinfo"}; }
+    std::string helpText() const override { return "List active transports and their state"; }
+};
 
 // --- /time ---
 class TimeCommand : public IChatCommand {
@@ -189,7 +227,7 @@ public:
         return {};
     }
     std::vector<std::string> aliases() const override { return {"follow", "f"}; }
-    std::string helpText() const override { return "Follow target"; }
+    std::string helpText() const override { return "Walk toward and camera-follow your current target"; }
 };
 
 // --- /stopfollow ---
@@ -398,6 +436,7 @@ void registerMiscCommands(ChatCommandRegistry& reg) {
     reg.registerCommand(std::make_unique<UnstuckGyCommand>());
     reg.registerCommand(std::make_unique<UnstuckHearthCommand>());
     reg.registerCommand(std::make_unique<TransportBoardCommand>());
+    reg.registerCommand(std::make_unique<TransportInfoCommand>());
 }
 
 } // namespace ui

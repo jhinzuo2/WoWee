@@ -2,9 +2,106 @@
 // Unit tests for wowee::math::CatmullRomSpline
 #include <catch_amalgamated.hpp>
 #include "math/spline.hpp"
+#include "game/spline_packet.hpp"
+#include "network/packet.hpp"
 #include <cmath>
 
 using namespace wowee::math;
+
+namespace {
+
+void writeWotlkCreateSplineHeader(wowee::network::Packet& packet, uint32_t nodeCount) {
+    packet.writeUInt32(0);       // spline flags
+    packet.writeUInt32(25);      // time passed
+    packet.writeUInt32(1000);    // duration
+    packet.writeUInt32(7);       // spline id
+    packet.writeFloat(1.0f);     // duration mod
+    packet.writeFloat(1.0f);     // duration mod next
+    packet.writeFloat(0.0f);     // vertical acceleration
+    packet.writeUInt32(0);       // effect start time
+    packet.writeUInt32(nodeCount);
+}
+
+} // namespace
+
+TEST_CASE("Pre-WotLK monster-move run mode has the protocol spline bit", "[spline][packet][movement]") {
+    REQUIRE(wowee::game::SplineFlag::PRE_WOTLK_RUNMODE == 0x00000100u);
+    REQUIRE(wowee::game::isPreWotlkSplineWalking(0u));
+    REQUIRE_FALSE(wowee::game::isPreWotlkSplineWalking(
+        wowee::game::SplineFlag::PRE_WOTLK_RUNMODE));
+}
+
+TEST_CASE("WotLK AzerothCore create spline consumes uncompressed nodes", "[spline][packet]") {
+    wowee::network::Packet packet;
+    writeWotlkCreateSplineHeader(packet, 2);
+    packet.writeFloat(10.0f); packet.writeFloat(20.0f); packet.writeFloat(30.0f);
+    packet.writeFloat(11.0f); packet.writeFloat(21.0f); packet.writeFloat(31.0f);
+    packet.writeUInt8(1); // spline mode
+    packet.writeFloat(12.0f); packet.writeFloat(22.0f); packet.writeFloat(32.0f);
+    packet.writeUInt32(0xAABBCCDD); // next block sentinel
+
+    wowee::game::SplineBlockData data;
+    REQUIRE(wowee::game::parseWotlkMoveUpdateSpline(packet, data));
+    REQUIRE(packet.getRemainingSize() == 4);
+    REQUIRE(packet.readUInt32() == 0xAABBCCDD);
+    REQUIRE(data.endPoint.x == Catch::Approx(12.0f));
+}
+
+TEST_CASE("WotLK AzerothCore zero-node spline still consumes trailer", "[spline][packet]") {
+    wowee::network::Packet packet;
+    writeWotlkCreateSplineHeader(packet, 0);
+    packet.writeUInt8(0); // spline mode
+    packet.writeFloat(40.0f); packet.writeFloat(50.0f); packet.writeFloat(60.0f);
+    packet.writeUInt32(0x11223344); // next block sentinel
+
+    wowee::game::SplineBlockData data;
+    REQUIRE(wowee::game::parseWotlkMoveUpdateSpline(packet, data));
+    REQUIRE(packet.getRemainingSize() == 4);
+    REQUIRE(packet.readUInt32() == 0x11223344);
+}
+
+TEST_CASE("WotLK compressed create spline remains supported as fallback", "[spline][packet]") {
+    wowee::network::Packet packet;
+    writeWotlkCreateSplineHeader(packet, 2);
+    packet.writeFloat(10.0f); packet.writeFloat(20.0f); packet.writeFloat(30.0f);
+    packet.writeUInt32(0); // one packed intermediate delta
+    packet.writeUInt8(1);  // spline mode
+    packet.writeFloat(12.0f); packet.writeFloat(22.0f); packet.writeFloat(32.0f);
+    packet.writeUInt32(0x55667788); // next block sentinel
+
+    wowee::game::SplineBlockData data;
+    REQUIRE(wowee::game::parseWotlkMoveUpdateSpline(packet, data));
+    REQUIRE(packet.getRemainingSize() == 4);
+    REQUIRE(packet.readUInt32() == 0x55667788);
+}
+
+TEST_CASE("WotLK taxi spline accepts vertical acceleration without effect start", "[spline][packet][taxi]") {
+    wowee::network::Packet packet;
+    packet.writeUInt32(wowee::game::SplineFlag::FINAL_POINT);
+    packet.writeFloat(-9215.0f); packet.writeFloat(43.0f); packet.writeFloat(85.0f);
+    packet.writeUInt32(0);       // time passed
+    packet.writeUInt32(12000);   // duration
+    packet.writeUInt32(9);       // spline id
+    packet.writeFloat(1.0f);     // duration mod
+    packet.writeFloat(0.0f);     // duration mod next
+    packet.writeFloat(0.0f);     // vertical acceleration
+    packet.writeUInt32(4);       // point count; this layout has no effect start time
+    for (int i = 0; i < 4; ++i) {
+        packet.writeFloat(-9200.0f + static_cast<float>(i) * 10.0f);
+        packet.writeFloat(50.0f + static_cast<float>(i));
+        packet.writeFloat(90.0f + static_cast<float>(i));
+    }
+    packet.writeUInt8(1);        // spline mode
+    packet.writeFloat(-9160.0f); packet.writeFloat(54.0f); packet.writeFloat(94.0f);
+    packet.writeUInt32(0xCAFEBABE);
+
+    wowee::game::SplineBlockData data;
+    REQUIRE(wowee::game::parseWotlkMoveUpdateSpline(packet, data));
+    REQUIRE(packet.getRemainingSize() == 4);
+    REQUIRE(packet.readUInt32() == 0xCAFEBABE);
+    REQUIRE(data.hasEndPoint);
+    REQUIRE(data.endPoint.x == Catch::Approx(-9160.0f));
+}
 
 // ── Helper: build a simple 4-point linear path ─────────────────────
 static std::vector<SplineKey> linearKeys() {

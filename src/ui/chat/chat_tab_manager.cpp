@@ -53,6 +53,21 @@ void ChatTabManager::clearUnread(int idx) {
         unread_[idx] = 0;
 }
 
+void ChatTabManager::markAllRead() {
+    std::fill(unread_.begin(), unread_.end(), 0);
+}
+
+const char* ChatTabManager::getTabTooltip(int idx) {
+    switch (idx) {
+        case 0: return "Everything: player chat, channels, system messages";
+        case 1: return "Combat log: system, loot, skill-ups, and NPC dialogue";
+        case 2: return "Private messages to and from you";
+        case 3: return "Guild and officer chat";
+        case 4: return "City channels: General, Trade, LookingForGroup, LocalDefense";
+        default: return "";
+    }
+}
+
 void ChatTabManager::updateUnread(const std::deque<game::MessageChatData>& history, int activeTab) {
     // Ensure unread array is sized correctly (guards against late init)
     if (unread_.size() != tabs_.size())

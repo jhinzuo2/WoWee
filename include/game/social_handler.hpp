@@ -103,11 +103,13 @@ public:
     }
     const std::vector<BgPlayerPosition>& getBgPlayerPositions() const { return bgPlayerPositions_; }
 
-    // Logout
-    void requestLogout();
+    // Logout. exitAfterLogout distinguishes /quit and /exit, which leave the game
+    // entirely, from /logout and /camp, which drop back to character select.
+    void requestLogout(bool exitAfterLogout = false);
     void cancelLogout();
     bool  isLoggingOut()        const { return loggingOut_; }
     float getLogoutCountdown()  const { return logoutCountdown_; }
+    bool  isLogoutToExit()      const { return exitAfterLogout_; }
 
     // Guild
     void requestGuildInfo();
@@ -230,7 +232,8 @@ public:
     void toggleHelm();
     void toggleCloak();
     void setStandState(uint8_t standState);
-    void sendAlterAppearance(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair);
+    void sendAlterAppearance(uint32_t hairStyleEntry, uint32_t hairColor,
+                             uint32_t facialHairEntry, uint32_t skinColorEntry);
     void deleteGmTicket();
     void requestGmTicket();
 
@@ -353,6 +356,9 @@ private:
     void handleSetFactionVisible(network::Packet& packet);
     void handleGroupSetLeader(network::Packet& packet);
     void handleTalentsInfo(network::Packet& packet);
+    void loadGuildNameCache();
+    void saveGuildNameCache() const;
+    void rememberGuildName(uint32_t guildId, const std::string& guildName);
 
     GameHandler& owner_;
 
@@ -363,6 +369,7 @@ private:
 
     // Logout
     bool  loggingOut_        = false;
+    bool  exitAfterLogout_   = false;
     float logoutCountdown_   = 0.0f;
 
     // Time played
@@ -389,7 +396,7 @@ private:
     GuildQueryResponseData guildQueryData_;
     bool hasGuildRoster_ = false;
     std::unordered_map<uint32_t, std::string> guildNameCache_;
-    std::unordered_set<uint32_t> pendingGuildNameQueries_;
+    std::unordered_map<uint32_t, std::chrono::steady_clock::time_point> pendingGuildNameQueries_;
     bool pendingGuildInvite_ = false;
     std::string pendingGuildInviterName_;
     std::string pendingGuildInviteGuildName_;

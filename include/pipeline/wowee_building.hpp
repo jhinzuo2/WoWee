@@ -8,6 +8,8 @@
 namespace wowee {
 namespace pipeline {
 
+struct WMOModel;
+
 // Wowee Open Building format (.wob) — novel WMO replacement
 // Buildings with multiple groups, portals, and doodad sets
 struct WoweeBuilding {
@@ -63,10 +65,10 @@ public:
     static bool exists(const std::string& basePath);
 
     // Convert WOB to WMOModel for the client's WMO renderer
-    static bool toWMOModel(const WoweeBuilding& building, class WMOModel& outModel);
+    static bool toWMOModel(const WoweeBuilding& building, WMOModel& outModel);
 
     // Convert WMOModel to WOB (for editor export)
-    static WoweeBuilding fromWMO(const class WMOModel& wmo, const std::string& name = "");
+    static WoweeBuilding fromWMO(const WMOModel& wmo, const std::string& name = "");
 
     // Convenience: try loading <path-without-ext>.wob from the standard editor
     // search paths (custom_zones/buildings/, output/buildings/). `extraPrefixes`

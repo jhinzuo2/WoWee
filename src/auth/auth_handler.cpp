@@ -199,6 +199,7 @@ void AuthHandler::authenticate(const std::string& user, const std::string& pass,
     username = user;
     password = pass;
     pendingSecurityCode_ = pin;
+    protocolFailureSuspected_ = false;
     securityFlags_ = 0;
     pinGridSeed_ = 0;
     pinServerSalt_ = {};
@@ -235,6 +236,7 @@ void AuthHandler::authenticateWithHash(const std::string& user, const std::vecto
     username = user;
     password.clear();
     pendingSecurityCode_ = pin;
+    protocolFailureSuspected_ = false;
     securityFlags_ = 0;
     pinGridSeed_ = 0;
     pinServerSalt_ = {};
@@ -263,7 +265,10 @@ void AuthHandler::handleLogonChallengeResponse(network::Packet& packet) {
 
     LogonChallengeResponse response;
     if (!LogonChallengeResponseParser::parse(packet, response)) {
-        fail("Server sent an invalid response - it may use an incompatible protocol version");
+        // An unparseable challenge response is the classic symptom of the
+        // server speaking a different auth protocol than we announced.
+        fail("Server sent an invalid response - it may use an incompatible protocol version",
+             /*protocolRelated=*/true);
         return;
     }
 
@@ -279,6 +284,8 @@ void AuthHandler::handleLogonChallengeResponse(network::Packet& packet) {
                << ", realm/proof protocol " << static_cast<int>(clientInfo.protocolVersion) << ")";
             fail(ss.str());
         } else {
+            // Account-level rejections (unknown account, wrong password, banned,
+            // suspended, in use) are NOT protocol problems — never retry those.
             fail(std::string("LOGON_CHALLENGE failed: ") + getAuthResultString(response.result));
         }
         return;
@@ -293,6 +300,12 @@ void AuthHandler::handleLogonChallengeResponse(network::Packet& packet) {
 
     LOG_WARNING("Auth challenge accepted: N=", response.N.size(), "B g=", response.g.size(), "B salt=",
                 response.salt.size(), "B secFlags=0x", std::hex, static_cast<int>(response.securityFlags), std::dec);
+
+    if (clientInfo.protocolVersion < 8 && response.securityFlags != 0) {
+        fail("Server requires auth protocol 8 security extensions",
+             /*protocolRelated=*/true);
+        return;
+    }
 
     // Feed SRP with server challenge data
     srp->feed(response.B, response.g, response.N, response.salt);
@@ -452,6 +465,10 @@ void AuthHandler::sendLogonProof() {
         socket->send(packet);
     } else {
         auto packet = LogonProofPacket::build(A, M1, securityFlags_, crcHashPtr, pinClientSaltPtr, pinHashPtr);
+        LOG_INFO("LOGON_PROOF payload: protocol=", static_cast<int>(clientInfo.protocolVersion),
+                 " secFlags=0x", std::hex, static_cast<int>(securityFlags_), std::dec,
+                 " pinData=", ((pinClientSaltPtr && pinHashPtr) ? "yes" : "no"),
+                 " payloadSize=", packet.getSize(), "B");
         socket->send(packet);
 
         if (securityFlags_ & kSecurityFlagAuthenticator) {
@@ -482,20 +499,31 @@ void AuthHandler::handleLogonProofResponse(network::Packet& packet) {
 
     LogonProofResponse response;
     if (!LogonProofResponseParser::parse(packet, response)) {
-        fail("Server sent an invalid login response - it may use an incompatible protocol");
+        fail("Server sent an invalid login response - it may use an incompatible protocol",
+             /*protocolRelated=*/true);
         return;
     }
 
     if (!response.isSuccess()) {
+        // Credential/account rejection — a different protocol won't help, and
+        // retrying can trip the server's failed-login lockout.
         std::string reason = "Login failed: ";
-        reason += getAuthResultString(static_cast<AuthResult>(response.status));
+        if (response.status == static_cast<uint8_t>(AuthResult::ACCOUNT_INVALID) &&
+            (securityFlags_ & kSecurityFlagPin)) {
+            reason += "PIN/2FA proof was rejected";
+        } else {
+            reason += getAuthResultString(static_cast<AuthResult>(response.status));
+        }
         fail(reason);
         return;
     }
 
-    // Verify server proof
+    // Verify server proof. A mismatch here means our SRP inputs differ from the
+    // server's — a wrong password is rejected above, so this points at the
+    // handshake shape (i.e. protocol) instead.
     if (!srp->verifyServerProof(response.M2)) {
-        fail("Server identity verification failed - the server may be running an incompatible version");
+        fail("Server identity verification failed - the server may be running an incompatible version",
+             /*protocolRelated=*/true);
         return;
     }
 
@@ -537,7 +565,7 @@ void AuthHandler::handleRealmListResponse(network::Packet& packet) {
     LOG_DEBUG("Handling REALM_LIST response");
 
     RealmListResponse response;
-    if (!RealmListResponseParser::parse(packet, response, clientInfo.protocolVersion)) {
+    if (!RealmListResponseParser::parse(packet, response, clientInfo.legacyVanillaRealmList)) {
         LOG_ERROR("Failed to parse REALM_LIST response");
         return;
     }
@@ -662,7 +690,14 @@ void AuthHandler::update(float /*deltaTime*/) {
             state != AuthState::FAILED &&
             state != AuthState::AUTHENTICATED &&
             state != AuthState::REALM_LIST_RECEIVED) {
-            fail("Disconnected by auth server");
+            // A server that doesn't recognise the announced protocol version
+            // frequently just closes the socket instead of replying, so treat a
+            // drop during the challenge as a protocol candidate. Once we've sent
+            // proof the credentials were already accepted at challenge time, so a
+            // drop there is a server-side/network problem, not our protocol.
+            const bool duringChallenge = (state == AuthState::CHALLENGE_SENT ||
+                                          state == AuthState::CONNECTED);
+            fail("Disconnected by auth server", /*protocolRelated=*/duringChallenge);
         }
     }
 }
@@ -674,8 +709,9 @@ void AuthHandler::setState(AuthState newState) {
     }
 }
 
-void AuthHandler::fail(const std::string& reason) {
+void AuthHandler::fail(const std::string& reason, bool protocolRelated) {
     LOG_ERROR("Authentication failed: ", reason);
+    protocolFailureSuspected_ = protocolRelated;
     setState(AuthState::FAILED);
 
     if (onFailure) {

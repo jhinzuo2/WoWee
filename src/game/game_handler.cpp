@@ -369,6 +369,12 @@ void GameHandler::updateNetworking(float deltaTime) {
 }
 
 void GameHandler::updateTaxiAndMountState(float deltaTime) {
+// MovementHandler owns the active taxi path state. Always let it advance its
+// client path; updateClientTaxi() is a cheap no-op when no taxi is active.
+// Gating this on GameHandler's legacy duplicate onTaxiFlight_ flag stranded
+// every route at waypoint zero after taxi handling was extracted.
+updateClientTaxi(deltaTime);
+
 // Update taxi landing cooldown
 if (taxiLandingCooldown_ > 0.0f) {
     taxiLandingCooldown_ -= deltaTime;
@@ -384,36 +390,14 @@ if (playerTransportStickyTimer_ > 0.0f) {
     }
 }
 
-// Detect taxi flight landing: UNIT_FLAG_TAXI_FLIGHT (0x00000100) cleared
-if (onTaxiFlight_) {
-    updateClientTaxi(deltaTime);
-    auto playerEntity = entityController_->getEntityManager().getEntity(playerGuid);
-    auto unit = std::dynamic_pointer_cast<Unit>(playerEntity);
-    if (unit &&
-        (unit->getUnitFlags() & game::UNIT_FLAG_TAXI_FLIGHT) == 0 &&
-        !taxiClientActive_ &&
-        !taxiActivatePending_ &&
-        taxiStartGrace_ <= 0.0f) {
-        onTaxiFlight_ = false;
-        taxiLandingCooldown_ = 2.0f;  // 2 second cooldown to prevent re-entering
-        if (taxiMountActive_ && mountCallback_) {
-            mountCallback_(0);
-        }
-        taxiMountActive_ = false;
-        taxiMountDisplayId_ = 0;
-        currentMountDisplayId_ = 0;
-        taxiClientActive_ = false;
-        taxiClientPath_.clear();
-        taxiRecoverPending_ = false;
-        movementInfo.flags = 0;
-        movementInfo.flags2 = 0;
-        if (socket) {
-            sendMovement(Opcode::MSG_MOVE_STOP);
-            sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
-        }
-        LOG_INFO("Taxi flight landed");
-    }
-}
+// Landing detection/cleanup already happens inside MovementHandler::updateClientTaxi()'s
+// finishTaxiFlight() (called unconditionally above, using MovementHandler's own real taxi
+// state) - mount callback, MSG_MOVE_STOP/HEARTBEAT, state reset, all handled there. Upstream
+// independently discovered the same "updateClientTaxi() never called" bug and fixed it by
+// making the call above unconditional, but kept this landing-detection duplicate gated on
+// GameHandler's onTaxiFlight_ - the same legacy copy noted above, never set true reachably
+// (activateTaxi() only sets MovementHandler's copy), so it's dead code here. Dropped rather
+// than merged in to avoid double-processing landing every frame a flight completes.
 
 // Safety: if taxi flight ended but mount is still active, force dismount.
 // Guard against transient taxi-state flicker.
@@ -445,7 +429,7 @@ if (!onTaxiFlight_ && taxiMountActive_) {
 // Keep non-taxi mount state server-authoritative.
 // Some server paths don't emit explicit mount field updates in lockstep
 // with local visual state changes, so reconcile continuously.
-if (!onTaxiFlight_ && !taxiMountActive_) {
+if (!(movementHandler_ && movementHandler_->isOnTaxiFlight()) && !taxiMountActive_) {
     auto playerEntity = entityController_->getEntityManager().getEntity(playerGuid);
     auto playerUnit = std::dynamic_pointer_cast<Unit>(playerEntity);
     if (playerUnit) {
@@ -511,31 +495,27 @@ void GameHandler::updateAutoAttack(float deltaTime) {
 void GameHandler::updateEntityInterpolation(float deltaTime) {
 // Update entity movement interpolation (keeps targeting in sync with visuals)
 // Only update entities within reasonable distance for performance
-const float updateRadiusSq = game::ENTITY_UPDATE_RADIUS * game::ENTITY_UPDATE_RADIUS;  // 150 unit radius
 auto playerEntity = entityController_->getEntityManager().getEntity(playerGuid);
 glm::vec3 playerPos = playerEntity ? glm::vec3(playerEntity->getX(), playerEntity->getY(), playerEntity->getZ()) : glm::vec3(0.0f);
+const uint64_t attackTargetGuid = combatHandler_ ? combatHandler_->getAutoAttackTargetGuid() : 0;
+if (playerEntity) playerEntity->updateMovement(deltaTime);
+if (targetGuid != 0 && targetGuid != playerGuid) {
+    if (auto selected = entityController_->getEntityManager().getEntity(targetGuid))
+        selected->updateMovement(deltaTime);
+}
+if (attackTargetGuid != 0 && attackTargetGuid != playerGuid && attackTargetGuid != targetGuid) {
+    if (auto engaged = entityController_->getEntityManager().getEntity(attackTargetGuid))
+        engaged->updateMovement(deltaTime);
+}
 
-for (auto& [guid, entity] : entityController_->getEntityManager().getEntities()) {
-    // Always update player
-    if (guid == playerGuid) {
-        entity->updateMovement(deltaTime);
-        continue;
-    }
-    // Keep selected/engaged target interpolation exact for UI targeting circle.
-    if (guid == targetGuid || (combatHandler_ && guid == combatHandler_->getAutoAttackTargetGuid())) {
-        entity->updateMovement(deltaTime);
-        continue;
-    }
-
-    // Distance cull other entities (use latest position to avoid culling by stale origin).
-    // glm::dot takes its args by value, so passing (entityPos - playerPos) twice
-    // would build the diff vector twice — compute it once.
-    glm::vec3 entityPos(entity->getLatestX(), entity->getLatestY(), entity->getLatestZ());
-    glm::vec3 diff = entityPos - playerPos;
-    float distSq = glm::dot(diff, diff);
-    if (distSq < updateRadiusSq) {
-        entity->updateMovement(deltaTime);
-    }
+static thread_local std::vector<std::shared_ptr<Entity>> nearbyEntities;
+entityController_->getEntityManager().getEntitiesNear(
+    playerPos.x, playerPos.y, game::ENTITY_UPDATE_RADIUS, nearbyEntities);
+for (const auto& entity : nearbyEntities) {
+    if (!entity) continue;
+    const uint64_t guid = entity->getGuid();
+    if (guid == playerGuid || guid == targetGuid || guid == attackTargetGuid) continue;
+    entity->updateMovement(deltaTime);
 }
 }
 
@@ -553,22 +533,28 @@ void GameHandler::updateTimers(float deltaTime) {
         }
     }
 
-    if (auctionSearchDelayTimer_ > 0.0f) {
-        auctionSearchDelayTimer_ -= deltaTime;
-        if (auctionSearchDelayTimer_ < 0.0f) auctionSearchDelayTimer_ = 0.0f;
-    }
+    // Tick InventoryHandler's auction search cooldown (the authoritative
+    // timer — GameHandler previously ticked its own never-set duplicate).
+    if (inventoryHandler_) inventoryHandler_->tickAuctionSearchDelay(deltaTime);
 
-    for (auto it = pendingQuestAcceptTimeouts_.begin(); it != pendingQuestAcceptTimeouts_.end();) {
-        it->second -= deltaTime;
-        if (it->second <= 0.0f) {
-            const uint32_t questId = it->first;
-            const uint64_t npcGuid = pendingQuestAcceptNpcGuids_.count(questId) != 0
-                ? pendingQuestAcceptNpcGuids_[questId] : 0;
-            triggerQuestAcceptResync(questId, npcGuid, "timeout");
-            it = pendingQuestAcceptTimeouts_.erase(it);
-            pendingQuestAcceptNpcGuids_.erase(questId);
-        } else {
-            ++it;
+    // Tick QuestHandler's pending-accept timeouts (the authoritative maps —
+    // GameHandler previously ticked its own never-populated copies, so lost
+    // or rejected quest accepts were never resynced or unblocked).
+    if (questHandler_) {
+        auto& acceptTimeouts = questHandler_->pendingQuestAcceptTimeoutsRef();
+        auto& acceptNpcGuids = questHandler_->pendingQuestAcceptNpcGuidsRef();
+        for (auto it = acceptTimeouts.begin(); it != acceptTimeouts.end();) {
+            it->second -= deltaTime;
+            if (it->second <= 0.0f) {
+                const uint32_t questId = it->first;
+                auto guidIt = acceptNpcGuids.find(questId);
+                const uint64_t npcGuid = guidIt != acceptNpcGuids.end() ? guidIt->second : 0;
+                triggerQuestAcceptResync(questId, npcGuid, "timeout");
+                it = acceptTimeouts.erase(it);
+                acceptNpcGuids.erase(questId);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -629,7 +615,13 @@ void GameHandler::updateTimers(float deltaTime) {
                 }
                 lootTarget(it->guid);
             }
-            it = pendingGameObjectLootOpens_.erase(it);
+            if (it->remainingAttempts > 1) {
+                --it->remainingAttempts;
+                it->timer = 0.75f;
+                ++it;
+            } else {
+                it = pendingGameObjectLootOpens_.erase(it);
+            }
         } else {
             ++it;
         }
@@ -776,6 +768,7 @@ void GameHandler::update(float deltaTime) {
         if (followEnt) {
             followRenderPos_ = core::coords::canonicalToRender(
                 glm::vec3(followEnt->getX(), followEnt->getY(), followEnt->getZ()));
+            if (movementHandler_) movementHandler_->updateFollowMovement(deltaTime);
         } else {
             cancelFollow();
         }
@@ -822,13 +815,14 @@ void GameHandler::update(float deltaTime) {
             static_cast<uint32_t>(MovementFlags::SWIMMING) |
             static_cast<uint32_t>(MovementFlags::FALLING) |
             static_cast<uint32_t>(MovementFlags::FALLINGFAR);
+        const bool onRealTaxiFlight = movementHandler_ && movementHandler_->isOnTaxiFlight();
         const bool classicLikeStationaryCombatSync =
             classicLikeCombatSync &&
-            !onTaxiFlight_ &&
+            !onRealTaxiFlight &&
             !taxiActivatePending_ &&
             !taxiClientActive_ &&
             (movementInfo.flags & locomotionFlags) == 0;
-        float heartbeatInterval = (onTaxiFlight_ || taxiActivatePending_ || taxiClientActive_)
+        float heartbeatInterval = (onRealTaxiFlight || taxiActivatePending_ || taxiClientActive_)
                                       ? game::HEARTBEAT_INTERVAL_TAXI
                                       : (classicLikeStationaryCombatSync ? game::HEARTBEAT_INTERVAL_STATIONARY_COMBAT
                                                                          : (classicLikeCombatSync ? game::HEARTBEAT_INTERVAL_MOVING_COMBAT
@@ -855,7 +849,7 @@ void GameHandler::update(float deltaTime) {
             addSystemChatMessage("Interrupted.");
         }
         // Check if client-side cast timer expired (tick-down is in SpellHandler::updateTimers).
-        // Two paths depending on whether this is a GO interaction cast:
+        // Three paths depending on whether this is a GO interaction or craft-queue cast:
         if (spellHandler_ && spellHandler_->isCasting() && spellHandler_->getCastTimeRemaining() <= 0.0f) {
             if (pendingGameObjectInteractGuid_ != 0) {
                 // GO interaction cast: do NOT call resetCastState() here. The server
@@ -866,10 +860,20 @@ void GameHandler::update(float deltaTime) {
                 // path (CMSG_LOOT via lastInteractedGoGuid_) never fires.
                 // Let the cast bar sit at 100% until SMSG_SPELL_GO arrives to clean up.
                 pendingGameObjectInteractGuid_ = 0;
+            } else if (spellHandler_->getCraftQueueRemaining() > 0 && craftCastGoGraceSec_ < 2.0f) {
+                // Craft queue cast: SMSG_SPELL_GO is what decrements the queue and
+                // re-casts the next item, and it races this client-side timer.
+                // resetCastState() here would wipe the queue mid-run ("Create All"
+                // stopping after one item), so let the cast bar sit at 100% briefly.
+                // The 2s grace bails out if SPELL_GO never arrives (cast failed
+                // without a result packet, e.g. reagents gone).
+                craftCastGoGraceSec_ += deltaTime;
             } else {
                 // Regular cast with no GO pending: clean up immediately.
                 spellHandler_->resetCastState();
             }
+        } else {
+            craftCastGoGraceSec_ = 0.0f;
         }
 
         // Unit cast states and spell cooldowns are ticked by SpellHandler::updateTimers()
@@ -886,6 +890,7 @@ void GameHandler::update(float deltaTime) {
         // Update combat text (Phase 2)
         updateCombatText(deltaTime);
         tickMinimapPings(deltaTime);
+        tickMirrorTimers(deltaTime);
 
         // Tick logout countdown
         if (socialHandler_) socialHandler_->updateLogoutCountdown(deltaTime);
@@ -1154,12 +1159,28 @@ void GameHandler::saveCharacterConfig() {
         out << "tracked_quests=" << ids << "\n";
     }
 
+    // Map visibility is independent from HUD tracking. An empty set means no
+    // quest objectives are shown on either map.
+    if (!mapVisibleQuestIds_.empty()) {
+        std::string ids;
+        for (uint32_t qid : mapVisibleQuestIds_) {
+            if (!ids.empty()) ids += ',';
+            ids += std::to_string(qid);
+        }
+        out << "map_visible_quests=" << ids << "\n";
+    }
+
     LOG_INFO("Character config saved to ", path);
 }
 
 void GameHandler::loadCharacterConfig() {
     const Character* ch = getActiveCharacter();
     if (!ch || ch->name.empty()) return;
+
+    // These selections are per-character. Clear the previous character's
+    // values even when the new character has no saved config yet.
+    trackedQuestIds_.clear();
+    mapVisibleQuestIds_.clear();
 
     std::string path = getCharacterConfigDir() + "/" + ch->name + ".cfg";
     std::ifstream in(path);
@@ -1207,9 +1228,12 @@ void GameHandler::loadCharacterConfig() {
                 }
                 macros_[macroId] = std::move(unescaped);
             }
-        } else if (key == "tracked_quests" && !val.empty()) {
-            // Parse comma-separated quest IDs
-            trackedQuestIds_.clear();
+        } else if ((key == "tracked_quests" || key == "map_visible_quests") &&
+                   !val.empty()) {
+            // Parse comma-separated quest IDs into the appropriate selection.
+            auto& destination = key == "tracked_quests"
+                ? trackedQuestIds_ : mapVisibleQuestIds_;
+            destination.clear();
             size_t tqPos = 0;
             while (tqPos <= val.size()) {
                 size_t comma = val.find(',', tqPos);
@@ -1217,7 +1241,7 @@ void GameHandler::loadCharacterConfig() {
                     ? val.substr(tqPos, comma - tqPos) : val.substr(tqPos);
                 try {
                     uint32_t qid = static_cast<uint32_t>(std::stoul(idStr));
-                    if (qid != 0) trackedQuestIds_.insert(qid);
+                    if (qid != 0) destination.insert(qid);
                 } catch (...) {}
                 if (comma == std::string::npos) break;
                 tqPos = comma + 1;
@@ -1361,6 +1385,243 @@ glm::vec3 GameHandler::getComposedWorldPosition() {
     }
     // Not on transport, return normal movement position
     return glm::vec3(movementInfo.x, movementInfo.y, movementInfo.z);
+}
+
+// Client-side transport boarding/disembark detection for M2 transports (trams, lifts)
+// where the server doesn't send transport attachment data - unlike WMO transports
+// (ships), which get onTransport straight from the server's movement block (see
+// EntityController::applyPlayerTransportState). Shared between the GUI Application's
+// per-frame update loop and any other driver (e.g. a headless harness) that knows the
+// player's current canonical world position but has no renderer/camera of its own.
+void GameHandler::updateM2TransportBoarding(const glm::vec3& playerCanonical) {
+    auto* tm = getTransportManager();
+    if (!tm) return;
+
+    if (!isOnTransport()) {
+        // Thunder Bluff elevators use model origins that can be far from the deck
+        // the player stands on, so they need wider attachment bounds.
+        constexpr float kM2BoardHorizDistSq = 12.0f * 12.0f;
+        constexpr float kM2BoardVertDist = 15.0f;
+        constexpr float kTbLiftBoardHorizDistSq = 22.0f * 22.0f;
+        constexpr float kTbLiftBoardVertDist = 14.0f;
+        // Deeprun's capture radius has swung twice on the horizontal axis already:
+        // 18/18 (too wide - boarding triggered far enough away that the rider ended up
+        // floating off to the side) down to 7/6 (too tight - stopped attaching at all).
+        // 9.5 horizontal turned out fine - live diagnostic data (logged every second
+        // while no candidate is in range) showed horizDist getting down to ~1-2 units
+        // repeatedly, well inside the box. But boarding *still* never fired, because the
+        // vertical threshold was the real problem all along: vertDist sat consistently
+        // around 10.4-11.9 units at every one of those close-horizontal-approach samples,
+        // across all three different cars tested, far outside the old 8.0 vertical
+        // window. That's not noise - it's SubwayCar.m2's model origin sitting well below
+        // the deck the player actually stands on (same root cause already called out for
+        // Thunder Bluff lifts above: kTbLiftBoardVertDist=14 exists for exactly this
+        // reason). Widen vertical to comfortably clear the observed ~11.9 max.
+        constexpr float kDeeprunTramBoardVertDist = 13.0f;
+        // An isotropic horizontal radius from the car's center can't tell "on this car"
+        // from "on the neighboring car" (adjacent cars are only ~20 units apart along the
+        // track - a 9.5 radius from each center overlaps its neighbor) or from "still
+        // standing on the platform, several units to the side" (the platform-to-deck
+        // vertical gap is nearly identical on the platform as on the actual car, so vert
+        // distance alone can't disambiguate either). Live logs caught both: walking along
+        // the platform re-boarded the adjacent car in the same train, and walking across
+        // one car's width boarded on one side then rode with a lateral offset of ~9.5 -
+        // effectively standing on empty platform on the *other* side of the car body
+        // (SubwayCar.m2's real half-width from its own mesh is only 5.68). Test against
+        // the car's actual oriented footprint instead: transform the player into the
+        // car's local model space (same invTransform already computed every frame for
+        // collision) and bound against the real mesh extents (X ~9.18 half-length along
+        // the direction of travel, Y ~5.68 half-width across it), not a radius from a
+        // point. Small margin added on top for the "about to step across from the
+        // platform" approach.
+        constexpr float kDeeprunTramBoardHalfLength = 9.18f + 1.5f;  // along direction of travel
+        constexpr float kDeeprunTramBoardHalfWidth = 5.68f + 1.5f;   // across the car's width
+
+        uint64_t bestGuid = 0;
+        float bestScore = 1e30f;
+        // Tracks the closest Deeprun tram car even when it's outside the capture
+        // radius, purely so a rejection can be logged with real distance numbers -
+        // the capture radius has been re-tuned blind twice already (18/18, then 7/6)
+        // from user reports alone with no actual miss-distance data to tune against.
+        uint64_t nearestDeeprunGuid = 0;
+        float nearestDeeprunLocalX = 0.0f;
+        float nearestDeeprunLocalY = 0.0f;
+        float nearestDeeprunLocalDistSq = 1e30f;
+        float nearestDeeprunVertDist = 0.0f;
+        const glm::vec3 playerRenderPos = core::coords::canonicalToRender(playerCanonical);
+        for (auto& [guid, transport] : tm->getTransports()) {
+            if (!transport.isM2) continue;
+            const bool isThunderBluffLift =
+                (transport.entry >= 20649u && transport.entry <= 20657u);
+            const bool isDeeprunTram =
+                transport.displayId == 3831u ||
+                (transport.entry >= 176080u && transport.entry <= 176085u) ||
+                (transport.pathId >= 176080u && transport.pathId <= 176085u);
+            glm::vec3 diff = playerCanonical - transport.position;
+            float vertDist = std::abs(diff.z);
+
+            if (isDeeprunTram) {
+                const glm::vec4 local4 = transport.invTransform * glm::vec4(playerRenderPos, 1.0f);
+                const glm::vec3 local(local4);
+                const float localDistSq = local.x * local.x + local.y * local.y;
+                if (localDistSq < nearestDeeprunLocalDistSq) {
+                    nearestDeeprunLocalDistSq = localDistSq;
+                    nearestDeeprunLocalX = local.x;
+                    nearestDeeprunLocalY = local.y;
+                    nearestDeeprunVertDist = vertDist;
+                    nearestDeeprunGuid = guid;
+                }
+                if (std::abs(local.x) < kDeeprunTramBoardHalfLength &&
+                    std::abs(local.y) < kDeeprunTramBoardHalfWidth &&
+                    vertDist < kDeeprunTramBoardVertDist) {
+                    const float score = localDistSq + vertDist * vertDist;
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestGuid = guid;
+                    }
+                }
+                continue;
+            }
+
+            const float maxHorizDistSq = isThunderBluffLift
+                ? kTbLiftBoardHorizDistSq
+                : kM2BoardHorizDistSq;
+            const float maxVertDist = isThunderBluffLift
+                ? kTbLiftBoardVertDist
+                : kM2BoardVertDist;
+            float horizDistSq = diff.x * diff.x + diff.y * diff.y;
+            if (horizDistSq < maxHorizDistSq && vertDist < maxVertDist) {
+                float score = horizDistSq + vertDist * vertDist;
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestGuid = guid;
+                }
+            }
+        }
+        if (bestGuid == 0 && nearestDeeprunGuid != 0) {
+            // Boarding/disembark are now on a well-tested oriented-footprint check
+            // (verified live) rather than the blind-tuned isotropic radius this was
+            // originally added to debug. Routine while just walking around Deeprun not
+            // boarded - demoted to DEBUG. Still throttled to ~1/sec since this runs
+            // every frame while not boarded.
+            static double lastLogTime = -1000.0;
+            const double now = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count()) / 1000.0;
+            if (now - lastLogTime >= 1.0) {
+                lastLogTime = now;
+                LOG_DEBUG("Deeprun tram boarding: no candidate in range, nearest car guid=0x",
+                            std::hex, nearestDeeprunGuid, std::dec,
+                            " localX=", nearestDeeprunLocalX,
+                            " localY=", nearestDeeprunLocalY,
+                            " vertDist=", nearestDeeprunVertDist);
+            }
+        }
+        if (bestGuid != 0) {
+            auto* tr = tm->getTransport(bestGuid);
+            if (tr) {
+                const bool isDeeprunTram =
+                    tr->displayId == 3831u ||
+                    (tr->entry >= 176080u && tr->entry <= 176085u) ||
+                    (tr->pathId >= 176080u && tr->pathId <= 176085u);
+                const glm::vec3 offset = playerCanonical - tr->position;
+                setPlayerOnTransport(bestGuid, offset);
+                if (isDeeprunTram) {
+                    const bool attached = getPlayerTransportGuid() == bestGuid;
+                    LOG_INFO("Deeprun tram boarding candidate ", (attached ? "accepted" : "rejected"),
+                                ": guid=0x", std::hex, bestGuid, std::dec,
+                                " entry=", tr->entry,
+                                " pathId=", tr->pathId,
+                                " player=(", playerCanonical.x, ",", playerCanonical.y, ",", playerCanonical.z, ")",
+                                " tram=(", tr->position.x, ",", tr->position.y, ",", tr->position.z, ")",
+                                " offset=(", offset.x, ",", offset.y, ",", offset.z, ")");
+                } else {
+                    LOG_DEBUG("M2 transport boarding: guid=0x", std::hex, bestGuid, std::dec);
+                }
+            }
+        }
+        return;
+    }
+
+    // M2 transport disembark: player walked far enough from transport center.
+    auto* tr = tm->getTransport(getPlayerTransportGuid());
+    if (!tr) return;
+    glm::vec3 diff = playerCanonical - tr->position;
+    float horizDistSq = diff.x * diff.x + diff.y * diff.y;
+
+    // Sanity guard against a transient bad position sample rather than a real disembark.
+    // Live data caught one: player=(-44.9,2309.03,..) vs tram=(2309.83,-45.4,..) - the
+    // player's X and Y are each within ~1 unit of the tram's Y and X respectively (an
+    // axis swap, not a real position), giving horizDist~3330 in a single frame despite
+    // riding smoothly for the prior ~70 seconds. Nothing can legitimately move that far
+    // between frames; whatever produced that sample (suspected: a raw server-coordinate
+    // movement update landing without the usual serverToCanonical swap, since that
+    // conversion has the exact same X/Y-swap shape as the corruption seen - possibly
+    // tied to a packet glitch, a "MSG_MOVE_TELEPORT_ACK: not enough data for movement
+    // info" was logged moments later in the same session) shouldn't be trusted enough to
+    // eject the player over open track - "kicked me off when I almost got to the other
+    // station" reported live. Skip disembark entirely this frame on an implausible jump;
+    // it'll re-evaluate next frame against (presumably) good data instead.
+    constexpr float kImplausibleDisembarkDistSq = 200.0f * 200.0f;
+    if (horizDistSq > kImplausibleDisembarkDistSq) {
+        LOG_WARNING("Deeprun tram disembark check skipped - implausible jump: guid=0x",
+                    std::hex, getPlayerTransportGuid(), std::dec,
+                    " horizDist=", std::sqrt(horizDistSq),
+                    " player=(", playerCanonical.x, ",", playerCanonical.y, ",", playerCanonical.z, ")",
+                    " tram=(", tr->position.x, ",", tr->position.y, ",", tr->position.z, ")");
+        return;
+    }
+
+    const bool isThunderBluffLift =
+        (tr->entry >= 20649u && tr->entry <= 20657u);
+    const bool isDeeprunTram =
+        tr->displayId == 3831u ||
+        (tr->entry >= 176080u && tr->entry <= 176085u) ||
+        (tr->pathId >= 176080u && tr->pathId <= 176085u);
+
+    if (isDeeprunTram) {
+        // Same oriented-footprint reasoning as the boarding scan above: an isotropic
+        // radius from the car's center can't tell "still on the car" from "walked off
+        // the far side onto open platform." Live data caught exactly that - a rider's
+        // lateral offset swung from +9.5 to -9.5 (fully across and off SubwayCar.m2's
+        // real 5.68-unit half-width) while still reading as "on board" the whole way,
+        // because the old 18-unit isotropic radius didn't clear until well past the
+        // real car body in every direction. Test the player's position in the car's own
+        // local space instead, with a modest margin over the real mesh extents (X 9.18,
+        // Y 5.68) so ordinary standing/shifting on the deck doesn't hair-trigger an
+        // eject, without allowing a full walk-through before releasing.
+        constexpr float kDeeprunTramDisembarkHalfLength = 9.18f + 3.0f;
+        constexpr float kDeeprunTramDisembarkHalfWidth = 5.68f + 3.0f;
+        constexpr float kDeeprunTramDisembarkVertDist = 22.0f;
+        const glm::vec3 playerRenderPos = core::coords::canonicalToRender(playerCanonical);
+        const glm::vec4 local4 = tr->invTransform * glm::vec4(playerRenderPos, 1.0f);
+        const glm::vec3 local(local4);
+        if (std::abs(local.x) > kDeeprunTramDisembarkHalfLength ||
+            std::abs(local.y) > kDeeprunTramDisembarkHalfWidth ||
+            std::abs(diff.z) > kDeeprunTramDisembarkVertDist) {
+            LOG_INFO("Deeprun tram disembark: guid=0x", std::hex, getPlayerTransportGuid(), std::dec,
+                        " localX=", local.x, " localY=", local.y, " vertDist=", std::abs(diff.z),
+                        " player=(", playerCanonical.x, ",", playerCanonical.y, ",", playerCanonical.z, ")",
+                        " tram=(", tr->position.x, ",", tr->position.y, ",", tr->position.z, ")");
+            clearPlayerTransport();
+            LOG_DEBUG("M2 transport disembark");
+        }
+        return;
+    }
+
+    constexpr float kM2DisembarkHorizDistSq = 15.0f * 15.0f;
+    constexpr float kTbLiftDisembarkHorizDistSq = 28.0f * 28.0f;
+    constexpr float kM2DisembarkVertDist = 18.0f;
+    constexpr float kTbLiftDisembarkVertDist = 16.0f;
+    const float disembarkHorizDistSq = isThunderBluffLift
+        ? kTbLiftDisembarkHorizDistSq
+        : kM2DisembarkHorizDistSq;
+    const float disembarkVertDist = isThunderBluffLift
+        ? kTbLiftDisembarkVertDist
+        : kM2DisembarkVertDist;
+    if (horizDistSq > disembarkHorizDistSq || std::abs(diff.z) > disembarkVertDist) {
+        clearPlayerTransport();
+        LOG_DEBUG("M2 transport disembark");
+    }
 }
 
 // ============================================================
@@ -1865,6 +2126,7 @@ void GameHandler::loadMapNameCache() const {
     // 4=MapName_enUS (display name), fields 5+ = other locales
     for (uint32_t i = 0; i < dbc->getRecordCount(); ++i) {
         uint32_t id = dbc->getUInt32(i, 0);
+        mapInstanceTypeCache_[id] = dbc->getUInt32(i, 2);
         std::string name = dbc->getString(i, 4);
         if (name.empty()) name = dbc->getString(i, 1); // internal name fallback
         if (!name.empty() && !mapNameCache_.count(id)) {
@@ -1960,6 +2222,15 @@ const std::vector<GameHandler::WhoEntry>& GameHandler::getWhoResults() const {
     if (socialHandler_) return socialHandler_->getWhoResults();
     static const std::vector<WhoEntry> empty;
     return empty;
+}
+
+bool GameHandler::isInGroup() const {
+    return socialHandler_ ? socialHandler_->isInGroup() : !partyData.isEmpty();
+}
+
+const GroupListData& GameHandler::getPartyData() const {
+    if (socialHandler_) return socialHandler_->getPartyData();
+    return partyData;
 }
 
 uint32_t GameHandler::getWhoOnlineCount() const {
@@ -2111,7 +2382,13 @@ bool GameHandler::isInstanceHeroic() const {
 }
 
 bool GameHandler::isInInstance() const {
-    return socialHandler_ ? socialHandler_->isInInstance() : false;
+    // Difficulty packets advertise the player's preferred dungeon setting and
+    // are also sent in the open world, so they cannot establish instance
+    // presence. Map.dbc InstanceType is authoritative: 1=party, 2=raid.
+    loadMapNameCache();
+    auto it = mapInstanceTypeCache_.find(currentMapId_);
+    return it != mapInstanceTypeCache_.end() &&
+           (it->second == 1 || it->second == 2);
 }
 
 bool GameHandler::hasPendingDuelRequest() const {
@@ -2252,6 +2529,11 @@ const GossipMessageData& GameHandler::getCurrentGossip() const {
     if (questHandler_) return questHandler_->getCurrentGossip();
     return currentGossip;
 }
+const std::string& GameHandler::getNpcText(uint32_t textId) const {
+    static const std::string empty;
+    if (questHandler_) return questHandler_->getNpcText(textId);
+    return empty;
+}
 bool GameHandler::isQuestDetailsOpen() {
     if (questHandler_) return questHandler_->isQuestDetailsOpen();
     return questDetailsOpen;
@@ -2279,6 +2561,13 @@ const std::vector<GameHandler::QuestLogEntry>& GameHandler::getQuestLog() const 
     if (questHandler_) return questHandler_->getQuestLog();
     static const std::vector<QuestLogEntry> empty;
     return empty;
+}
+int GameHandler::getMaxQuestLogSlots() const {
+    return questHandler_ ? questHandler_->maxQuestLogSlots() : 25;
+}
+const std::string& GameHandler::getQuestSortName(uint32_t sortId) const {
+    static const std::string empty;
+    return questHandler_ ? questHandler_->getQuestSortName(sortId) : empty;
 }
 bool GameHandler::isQuestOfferRewardOpen() const {
     return questHandler_ ? questHandler_->isQuestOfferRewardOpen() : false;
@@ -2313,9 +2602,7 @@ const std::string& GameHandler::getSharedQuestTitle() const {
     return empty;
 }
 const std::unordered_set<uint32_t>& GameHandler::getTrackedQuestIds() const {
-    if (questHandler_) return questHandler_->getTrackedQuestIds();
-    static const std::unordered_set<uint32_t> empty;
-    return empty;
+    return trackedQuestIds_;
 }
 bool GameHandler::hasPendingSharedQuest() const {
     return questHandler_ ? questHandler_->hasPendingSharedQuest() : false;
@@ -2377,6 +2664,14 @@ const std::unordered_map<uint32_t, GameHandler::TaxiNode>& GameHandler::getTaxiN
     if (movementHandler_) return movementHandler_->getTaxiNodes();
     static const std::unordered_map<uint32_t, TaxiNode> empty;
     return empty;
+}
+bool GameHandler::isKnownTaxiNode(uint32_t nodeId) const {
+    // Was reading a GameHandler-local knownTaxiMask_ that nothing ever wrote
+    // to (handleShowTaxiNodes only updates MovementHandler's own copy), so
+    // this always returned false - broke the world map's discovered-node
+    // display and the Lua IsTaxiNodeKnown-equivalent. Delegate like the
+    // other taxi accessors above.
+    return movementHandler_ && movementHandler_->isKnownTaxiNode(nodeId);
 }
 
 } // namespace game

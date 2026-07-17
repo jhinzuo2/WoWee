@@ -408,7 +408,9 @@ void Weather::initializeZoneWeatherDefaults() {
     zoneWeatherInitialized_ = true;
 
     // Eastern Kingdoms zones
-    setZoneWeather(10,   Type::RAIN, 0.2f, 0.6f, 0.3f);   // Duskwood — frequent rain
+    // Duskwood's persistent atmosphere is supplied by its lighting fog profile.
+    // Do not synthesize rain here: the streak particles read as wind-blown fog.
+    // Renderer also suppresses server rain in Duskwood so its fog stays legible.
     setZoneWeather(11,   Type::RAIN, 0.1f, 0.4f, 0.15f);  // Wetlands — moderate rain
     setZoneWeather(8,    Type::RAIN, 0.1f, 0.5f, 0.2f);   // Swamp of Sorrows
     setZoneWeather(33,   Type::RAIN, 0.2f, 0.7f, 0.25f);  // Stranglethorn Vale

@@ -18,7 +18,7 @@ namespace wowee {
 namespace game {
 
 // Normalize WoW in-text tokens (e.g. "$B", "|n") into plain text suitable for UI.
-std::string normalizeWowTextTokens(std::string text);
+std::string normalizeWowTextTokens(std::string text, const std::string& playerName = "");
 
 /**
  * SMSG_AUTH_CHALLENGE data (from server)
@@ -679,6 +679,9 @@ struct MessageChatData {
     std::string channelName;  // For channel messages
     uint8_t chatTag = 0;      // Player flags (AFK, DND, GM, etc.)
     std::chrono::system_clock::time_point timestamp = std::chrono::system_clock::now();
+    // Monotonic id assigned by ChatHandler when the message enters history.
+    // Stable cache key for the chat UI's formatted/parsed line cache.
+    uint64_t uid = 0;
 
     bool isValid() const { return !message.empty(); }
 };
@@ -726,8 +729,8 @@ struct TextEmoteData {
  */
 class TextEmoteParser {
 public:
-    // legacyFormat: Classic 1.12 and TBC 2.4.3 send textEmoteId+emoteNum first, then senderGuid.
-    //               WotLK 3.3.5a reverses this: senderGuid first, then textEmoteId+emoteNum.
+    // legacyFormat: Classic 1.12 sends textEmoteId+emoteNum first, then senderGuid.
+    //               TBC/WotLK send senderGuid first, then textEmoteId+emoteNum.
     static bool parse(network::Packet& packet, TextEmoteData& data, bool legacyFormat = false);
 };
 
@@ -1644,6 +1647,7 @@ struct ItemQueryResponseData {
     std::array<ItemSpell, 5> spells{};
     uint32_t bindType = 0;      // 0=none, 1=BoP, 2=BoE, 3=BoU, 4=BoQ
     std::string description;    // Flavor/lore text
+    uint32_t pageTextId = 0;     // Non-zero: item can be read via CMSG_READ_ITEM + page query
     // Generic stat pairs for non-primary stats (hit, crit, haste, AP, SP, etc.)
     struct ExtraStat { uint32_t statType = 0; int32_t statValue = 0; };
     std::vector<ExtraStat> extraStats;
@@ -1838,6 +1842,7 @@ public:
 class CastSpellPacket {
 public:
     static network::Packet build(uint32_t spellId, uint64_t targetGuid, uint8_t castCount);
+    static network::Packet buildGameObjectTarget(uint32_t spellId, uint64_t targetGuid, uint8_t castCount);
 };
 
 /** CMSG_CANCEL_AURA packet builder */
@@ -1854,10 +1859,41 @@ public:
 };
 
 /** SMSG_CAST_FAILED data */
+// Normalized (WotLK-numbered) SpellCastResults whose SMSG_CAST_RESULT /
+// SMSG_CAST_FAILED payload carries trailing uint32 ids the client can surface:
+//  - requires-spell-focus: one SpellFocusObject id (forge, anvil, cooking fire)
+//  - totems / totem-category: up to two ids naming the missing crafting tool —
+//    item ids for totems, TotemCategory.dbc ids (Blacksmith Hammer, Mining
+//    Pick, ...) for totem-category.
+inline constexpr uint8_t kCastResultRequiresSpellFocus = 102;
+inline constexpr uint8_t kCastResultTotemCategory = 130;
+inline constexpr uint8_t kCastResultTotems = 131;
+
+/// Read the optional trailing ids of a cast failure payload (see above).
+inline void readCastResultArgs(network::Packet& packet, uint8_t result,
+                               uint32_t& arg1, uint32_t& arg2) {
+    arg1 = 0;
+    arg2 = 0;
+    switch (result) {
+        case kCastResultRequiresSpellFocus:
+            if (packet.hasRemaining(4)) arg1 = packet.readUInt32();
+            break;
+        case kCastResultTotems:
+        case kCastResultTotemCategory:
+            if (packet.hasRemaining(4)) arg1 = packet.readUInt32();
+            if (packet.hasRemaining(4)) arg2 = packet.readUInt32();
+            break;
+        default:
+            break;
+    }
+}
+
 struct CastFailedData {
     uint8_t castCount = 0;
     uint32_t spellId = 0;
     uint8_t result = 0;
+    uint32_t miscArg = 0;   // first trailing id (see readCastResultArgs)
+    uint32_t miscArg2 = 0;  // second trailing id (totem failures only)
 
     bool isValid() const { return spellId != 0; }
 };
@@ -1958,7 +1994,8 @@ struct GroupInviteResponseData {
 
 class GroupInviteResponseParser {
 public:
-    static bool parse(network::Packet& packet, GroupInviteResponseData& data);
+    static bool parse(network::Packet& packet, GroupInviteResponseData& data,
+                      bool hasCanAccept = true);
 };
 
 /** CMSG_GROUP_ACCEPT packet builder */
@@ -1978,7 +2015,9 @@ class GroupListParser {
 public:
     // hasRoles: WotLK 3.3.5a added a roles byte at group level and per-member for LFD.
     //           Classic 1.12 and TBC 2.4.3 do not send this byte.
-    static bool parse(network::Packet& packet, GroupListData& data, bool hasRoles = true);
+    // hasBattleGroupFlag: CMaNGOS TBC sends an extra battle-group byte after the raid flag.
+    static bool parse(network::Packet& packet, GroupListData& data,
+                      bool hasRoles = true, bool hasBattleGroupFlag = false);
 };
 
 /** SMSG_PARTY_COMMAND_RESULT data */
@@ -2050,11 +2089,19 @@ public:
 /** CMSG_USE_ITEM packet builder */
 class UseItemPacket {
 public:
-    static network::Packet build(uint8_t bagIndex, uint8_t slotIndex, uint64_t itemGuid, uint32_t spellId = 0);
+    static network::Packet build(uint8_t bagIndex, uint8_t slotIndex,
+                                 uint64_t itemGuid, uint32_t spellId = 0,
+                                 uint64_t targetGuid = 0, uint64_t itemTargetGuid = 0);
 };
 
 /** CMSG_OPEN_ITEM packet builder (for locked containers / lockboxes) */
 class OpenItemPacket {
+public:
+    static network::Packet build(uint8_t bagIndex, uint8_t slotIndex);
+};
+
+/** CMSG_READ_ITEM packet builder (for readable books / scrolls / notes) */
+class ReadItemPacket {
 public:
     static network::Packet build(uint8_t bagIndex, uint8_t slotIndex);
 };
@@ -2262,10 +2309,33 @@ struct QuestOfferRewardData {
     std::vector<QuestRewardItem> fixedRewards;   // Always given
 };
 
+/** Protocol era for quest packets whose layout differs per expansion. */
+enum class QuestPacketEra { CLASSIC, TBC, WOTLK };
+
 /** SMSG_QUESTGIVER_OFFER_REWARD parser */
 class QuestOfferRewardParser {
 public:
+    /** Era resolved from the active expansion profile. */
     static bool parse(network::Packet& packet, QuestOfferRewardData& data);
+    static bool parse(network::Packet& packet, QuestOfferRewardData& data, QuestPacketEra era);
+};
+
+/** Reward block extracted from SMSG_QUEST_QUERY_RESPONSE (quest log rewards). */
+struct QuestQueryRewardsData {
+    int32_t  rewardMoney = 0;
+    std::array<uint32_t, 4> itemId{};
+    std::array<uint32_t, 4> itemCount{};
+    std::array<uint32_t, 6> choiceItemId{};
+    std::array<uint32_t, 6> choiceItemCount{};
+    bool valid = false;
+};
+
+/** Fixed-offset reward extractor for SMSG_QUEST_QUERY_RESPONSE.
+ *  `data` is the full packet payload (starting at questId);
+ *  `questLogStride` selects the expansion layout (3=Classic, 4=TBC, 5=WotLK). */
+class QuestQueryRewardsParser {
+public:
+    static QuestQueryRewardsData parse(const std::vector<uint8_t>& data, uint8_t questLogStride);
 };
 
 /** CMSG_QUESTGIVER_COMPLETE_QUEST packet builder */
@@ -2347,7 +2417,7 @@ public:
 
 struct TrainerSpell {
     uint32_t spellId = 0;
-    uint8_t state = 0;         // 0=unavailable(grey), 1=available(green), 2=known(green)
+    uint8_t state = 0;         // 0=available(green), 1=unavailable(grey), 2=known
     uint32_t spellCost = 0;    // copper
     uint32_t profDialog = 0;
     uint32_t profButton = 0;
@@ -2777,8 +2847,10 @@ public:
 /** SMSG_AUCTION_LIST_RESULT parser (shared for browse/owner/bidder) */
 class AuctionListResultParser {
 public:
-    // numEnchantSlots: Classic 1.12 = 1, TBC/WotLK = 3 (extra enchant slots per entry)
-    static bool parse(network::Packet& packet, AuctionListResult& data, int numEnchantSlots = 3);
+    // numEnchantSlots (MAX_INSPECTED_ENCHANTMENT_SLOT): Classic 1.12 = 1
+    // (single enchantId, no duration/charges, no flags field), TBC = 6,
+    // WotLK = 7. Slot count selects the whole entry layout, not just the loop.
+    static bool parse(network::Packet& packet, AuctionListResult& data, int numEnchantSlots = 7);
 };
 
 /** SMSG_AUCTION_COMMAND_RESULT parser */
@@ -2823,11 +2895,13 @@ public:
     static network::Packet build(int32_t titleBit);
 };
 
-/** CMSG_ALTER_APPEARANCE – barber shop: change hair style, color, facial hair.
- *  Payload: uint32 hairStyle, uint32 hairColor, uint32 facialHair. */
+/** CMSG_ALTER_APPEARANCE – WotLK barber shop.
+ *  Hair/facial/skin are BarberShopStyle.dbc entry IDs; color is the raw
+ *  CharSections hair-color ID. */
 class AlterAppearancePacket {
 public:
-    static network::Packet build(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair);
+    static network::Packet build(uint32_t hairStyleEntry, uint32_t hairColor,
+                                 uint32_t facialHairEntry, uint32_t skinColorEntry);
 };
 
 } // namespace game

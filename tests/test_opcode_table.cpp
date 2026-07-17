@@ -83,6 +83,25 @@ TEST_CASE("OpcodeTable loadFromJson nonexistent file", "[opcode_table]") {
     REQUIRE(table.size() == 0);
 }
 
+TEST_CASE("OpcodeTable failed reload preserves existing data", "[opcode_table]") {
+    std::string json = R"({ "CMSG_PING": "0x1DC" })";
+    auto path = writeTempJson(json);
+
+    OpcodeTable table;
+    REQUIRE(table.loadFromJson(path));
+    REQUIRE(table.size() == 1);
+    REQUIRE(table.toWire(LogicalOpcode::CMSG_PING) == 0x1DC);
+
+    REQUIRE_FALSE(table.loadFromJson("/nonexistent/path/opcodes.json"));
+    REQUIRE(table.size() == 1);
+    REQUIRE(table.toWire(LogicalOpcode::CMSG_PING) == 0x1DC);
+    auto result = table.fromWire(0x1DC);
+    REQUIRE(result.has_value());
+    REQUIRE(*result == LogicalOpcode::CMSG_PING);
+
+    std::remove(path.c_str());
+}
+
 TEST_CASE("OpcodeTable logicalToName returns enum name", "[opcode_table]") {
     const char* name = OpcodeTable::logicalToName(LogicalOpcode::CMSG_PING);
     REQUIRE(name != nullptr);

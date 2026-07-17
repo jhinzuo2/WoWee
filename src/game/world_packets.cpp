@@ -15,14 +15,6 @@
 #include <zlib.h>
 
 namespace {
-    inline uint32_t bswap32(uint32_t v) {
-        return ((v & 0xFF000000u) >> 24) | ((v & 0x00FF0000u) >> 8)
-             | ((v & 0x0000FF00u) << 8)  | ((v & 0x000000FFu) << 24);
-    }
-    inline uint16_t bswap16(uint16_t v) {
-        return static_cast<uint16_t>(((v & 0xFF00u) >> 8) | ((v & 0x00FFu) << 8));
-    }
-
     const char* updateTypeName(wowee::game::UpdateType type) {
         using wowee::game::UpdateType;
         switch (type) {
@@ -40,7 +32,7 @@ namespace {
 namespace wowee {
 namespace game {
 
-std::string normalizeWowTextTokens(std::string text) {
+std::string normalizeWowTextTokens(std::string text, const std::string& playerName) {
     if (text.empty()) return text;
 
     size_t pos = 0;
@@ -50,6 +42,9 @@ std::string normalizeWowTextTokens(std::string text) {
         if (code == 'b' || code == 'B') {
             text.replace(pos, 2, "\n");
             ++pos;
+        } else if ((code == 'n' || code == 'N') && !playerName.empty()) {
+            text.replace(pos, 2, playerName);
+            pos += playerName.size();
         } else {
             ++pos;
         }

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include <string>
 #include <vector>
 #include <glm/glm.hpp>
@@ -60,6 +62,8 @@ public:
 
     // ── Emote support ──────────────────────────────────────────────────────
     void playEmote(const std::string& emoteName);
+    /// Play the one-shot reach animation used by the manual Z sheath toggle.
+    void playWeaponSheathAnimation(bool sheathing);
     void cancelEmote();
     bool isEmoteActive() const { return characterAnimator_.getActivity().isEmoteActive(); }
     static std::string getEmoteText(const std::string& emoteName,
@@ -69,6 +73,10 @@ public:
                                            const std::string& senderName,
                                            const std::string* targetName = nullptr);
     static uint32_t getEmoteAnimByDbcId(uint32_t dbcId);
+    static uint32_t getEmoteAnimByEmotesId(uint32_t emoteId);
+    /// True if the Emotes.dbc entry is a persistent STATE_ emote (loops until
+    /// cleared) rather than a one-shot.
+    static bool isStateEmoteById(uint32_t emoteId);
 
     // ── Targeting / combat ─────────────────────────────────────────────────
     void setTargetPosition(const glm::vec3* pos);
@@ -93,6 +101,10 @@ public:
 
     // ── Ranged combat ──────────────────────────────────────────────────────
     void setEquippedRangedType(RangedWeaponType type);
+    void setRangedWeaponActive(bool active);
+    void setRangedShotCompleteCallback(std::function<void()> callback) {
+        rangedShotCompleteCallback_ = std::move(callback);
+    }
     /// Trigger a ranged shot animation (Auto Shot, Shoot, Throw)
     void triggerRangedShot();
     RangedWeaponType getEquippedRangedType() const { return weaponLoadout_.rangedType; }
@@ -107,6 +119,7 @@ public:
                         uint32_t finalizeAnimId = 0);
     /// Leave spell cast animation state → plays finalization anim then idle.
     void stopSpellCast();
+    void setSeatedLoopAnimation(uint32_t animationId);
 
     // ── Loot animation ─────────────────────────────────────────────────────
     void startLooting();
@@ -155,6 +168,18 @@ public:
     void setMounted(uint32_t mountInstId, uint32_t mountDisplayId,
                     float heightOffset, const std::string& modelPath = "");
     void setTaxiFlight(bool onTaxi) { taxiFlight_ = onTaxi; }
+    // M2 transport riding (Deeprun Tram, Thunder Bluff lifts): the ride-lock code in
+    // Application overwrites the character's render position directly every frame, so
+    // the camera controller's own gravity/collision never finds real ground beneath a
+    // moving platform over open track and reports not-grounded - correctly for physics
+    // purposes (there genuinely isn't a static floor there), but that fed straight into
+    // the animation FSM as "falling", so riders saw a falling animation play the entire
+    // ride even though position tracking was correct - "kept like playing the falling
+    // animation the whole time... it sure looked like it was going to [fall off]"
+    // reported live. Override just the animation-facing grounded signal while actively
+    // riding; leave the camera controller's real physics/collision untouched (needed
+    // for walk-while-riding to keep working).
+    void setM2TransportRiding(bool riding) { m2TransportRiding_ = riding; }
     void setMountPitchRoll(float pitch, float roll) { mountPitch_ = pitch; mountRoll_ = roll; }
     void clearMount();
     bool isMounted() const { return mountInstanceId_ != 0; }
@@ -202,6 +227,8 @@ private:
     // ── Ranged weapon state ──────────────────────────────────────────────
     float rangedShootTimer_ = 0.0f;
     uint32_t rangedAnimId_ = 0;
+    bool restoreWeaponAfterRangedShot_ = false;
+    std::function<void()> rangedShotCompleteCallback_;
 
     // ── Mount state (discovery + positioning need renderer) ──────────────
     uint32_t mountInstanceId_ = 0;
@@ -212,6 +239,7 @@ private:
     glm::vec3 smoothedMountSeatPos_ = glm::vec3(0.0f);
     bool mountSeatSmoothingInit_ = false;
     bool taxiFlight_ = false;
+    bool m2TransportRiding_ = false;
     bool sprintAuraActive_ = false;
 
     // ── Private helpers ──────────────────────────────────────────────────

@@ -18,6 +18,9 @@ struct ChatSettings {
     // Appearance
     bool showTimestamps  = false;
     int  fontSize        = 1;   // 0=small, 1=medium, 2=large
+    float backgroundAlpha = 0.6f;  // 0.0=transparent, 1.0=opaque
+    float messageFadeTime = 20.0f; // seconds before messages fade (0=never)
+    bool  fadeMessages    = true;  // enable message fade-out when not hovering
 
     // Auto-join channels
     bool autoJoinGeneral      = true;

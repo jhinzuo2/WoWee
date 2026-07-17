@@ -68,6 +68,11 @@ public:
     const std::vector<uint8_t>& getSessionKey() const { return sessionKey; }
     const std::string& getUsername() const { return username; }
 
+    /** True when the last failure is consistent with an auth-protocol mismatch
+     *  (rather than bad credentials), so the caller may retry on another
+     *  protocol version. See protocolFailureSuspected_. */
+    bool lastFailureWasProtocol() const { return protocolFailureSuspected_; }
+
     // Callbacks
     void setOnSuccess(AuthSuccessCallback callback) { onSuccess = callback; }
     void setOnFailure(AuthFailureCallback callback) { onFailure = callback; }
@@ -86,7 +91,11 @@ private:
     void handlePacket(network::Packet& packet);
 
     void setState(AuthState newState);
-    void fail(const std::string& reason);
+    /** protocolRelated: the failure is consistent with the server speaking a
+     *  different auth protocol than clientInfo.protocolVersion (bad handshake
+     *  parse, build/version rejection, mid-handshake drop) rather than the
+     *  credentials being wrong. Drives the caller's protocol fallback. */
+    void fail(const std::string& reason, bool protocolRelated = false);
 
     std::unique_ptr<network::TCPSocket> socket;
     std::unique_ptr<SRP> srp;
@@ -95,6 +104,11 @@ private:
     std::string username;
     std::string password;
     ClientInfo clientInfo;
+
+    // True when the last failure looks like an auth-protocol mismatch rather
+    // than a credential/account problem. Never set for wrong-password, banned,
+    // suspended, or account-in-use results — retrying those risks lockouts.
+    bool protocolFailureSuspected_ = false;
 
     std::vector<uint8_t> sessionKey;
     std::vector<Realm> realms;

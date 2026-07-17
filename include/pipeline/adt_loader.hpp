@@ -44,11 +44,12 @@ struct TextureLayer {
  * Map chunk (256x256 units, 1/16 of ADT)
  */
 struct MapChunk {
-    uint32_t flags;
-    uint32_t indexX;
-    uint32_t indexY;
-    uint16_t holes;          // 4x4 bitmask for terrain holes (cave entrances, etc.)
-    float position[3];       // World position (X, Y, Z)
+    uint32_t flags = 0;
+    uint32_t indexX = 0;
+    uint32_t indexY = 0;
+    uint32_t areaId = 0;     // AreaTable ID for this precise terrain chunk
+    uint16_t holes = 0;      // 4x4 bitmask for terrain holes (cave entrances, etc.)
+    float position[3] = {};  // World position (X, Y, Z)
 
     HeightMap heightMap;
     std::vector<TextureLayer> layers;

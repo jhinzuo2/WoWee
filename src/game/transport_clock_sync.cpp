@@ -143,11 +143,34 @@ void TransportClockSync::processServerUpdate(
             }
         }
     } else {
-        // Seed fallback path phase from nearest waypoint to the first authoritative sample.
+        // Seed fallback path phase from the first authoritative sample.
         if (pathEntry && pathEntry->spline.keyCount() > 0 && pathEntry->spline.durationMs() > 0) {
-            glm::vec3 local = position - transport.basePosition;
-            size_t bestIdx = pathEntry->spline.findNearestKey(local);
-            transport.localClockMs = pathEntry->spline.keys()[bestIdx].timeMs % pathEntry->spline.durationMs();
+            if (transport.useClientAnimation) {
+                // Client-animated transports (no real position stream - see
+                // TransportManager::updateServerTransport's Deeprun-tram branch and
+                // comment on nowEpochMs()) need a phase anchored to absolute time, not
+                // to whichever waypoint happens to geometrically match wherever this
+                // first echo landed. The previous "nearest waypoint" seed here made
+                // this transport's phase depend on incidental details of its first
+                // update rather than real elapsed time - same bug as the two other
+                // seed sites, just reached by a different path (this fires whenever
+                // this is the first authoritative sample for a transport
+                // TransportManager::registerTransport()/resolveAndRegisterSpawn()
+                // didn't already classify into the Deeprun-specific early-return
+                // branch in updateServerTransport()).
+                const uint32_t seedDurationMs = TransportManager::isDeeprunTramTransport(transport)
+                    ? TransportManager::deeprunTramSeedDurationMs(pathEntry->spline.durationMs())
+                    : pathEntry->spline.durationMs();
+                transport.localClockMs = static_cast<uint32_t>(TransportManager::nowEpochMs() % seedDurationMs);
+            } else {
+                // Nearest-waypoint seed is legitimate here: this transport is
+                // genuinely server-position-driven (e.g. a boat), so "which point on
+                // the path does our first real position correspond to" is a real
+                // question with a real geometric answer.
+                glm::vec3 local = position - transport.basePosition;
+                size_t bestIdx = pathEntry->spline.findNearestKey(local);
+                transport.localClockMs = pathEntry->spline.keys()[bestIdx].timeMs % pathEntry->spline.durationMs();
+            }
         }
 
         // Bootstrap velocity from mapped DBC path on first authoritative sample.

@@ -1,5 +1,6 @@
 #include "game/entity_controller.hpp"
 #include "game/game_handler.hpp"
+#include "game/protocol_constants.hpp"
 #include "game/game_utils.hpp"
 #include "game/packet_parsers.hpp"
 #include "game/entity.hpp"
@@ -10,6 +11,7 @@
 #include "core/logger.hpp"
 #include "core/coordinates.hpp"
 #include "network/world_socket.hpp"
+#include "rendering/animation_controller.hpp"
 #include <algorithm>
 #include <cstring>
 #include <zlib.h>
@@ -252,6 +254,8 @@ void EntityController::processOutOfRangeObjects(const std::vector<uint64_t>& gui
             pendingNameQueries.erase(guid);
         } else if (entity->getType() == ObjectType::GAMEOBJECT && owner_.gameObjectDespawnCallbackRef()) {
             owner_.gameObjectDespawnCallbackRef()(guid);
+        } else if (entity->getType() == ObjectType::CORPSE && owner_.playerDespawnCallbackRef()) {
+            owner_.playerDespawnCallbackRef()(guid);
         }
         transportGuids_.erase(guid);
         serverUpdatedTransportGuids_.erase(guid);
@@ -437,13 +441,13 @@ void EntityController::updateNonPlayerTransportAttachment(const UpdateBlock& blo
     }
 }
 
-//     Rebuild playerAuras from UNIT_FIELD_AURAS (Classic/vanilla only).
+//     Rebuild playerAuras from UNIT_FIELD_AURAS (Classic/TBC-era clients).
 //     blockFields is used to check if any aura field was updated in this packet.
 //     entity->getFields() is used for reading the full accumulated state.
-//     Normalises Classic harmful bit (0x02) to WotLK debuff bit (0x80) so
+//     Normalises pre-WotLK harmful bit (0x02) to WotLK debuff bit (0x80) so
 //     downstream code checking for 0x80 works consistently across expansions.
-void EntityController::syncClassicAurasFromFields(const std::shared_ptr<Entity>& entity) {
-    if (!isClassicLikeExpansion() || !owner_.getSpellHandler()) return;
+void EntityController::syncPreWotlkAurasFromFields(const std::shared_ptr<Entity>& entity) {
+    if (!isPreWotlk() || !owner_.getSpellHandler()) return;
 
     const uint16_t ufAuras     = fieldIndex(UF::UNIT_FIELD_AURAS);
     const uint16_t ufAuraFlags = fieldIndex(UF::UNIT_FIELD_AURAFLAGS);
@@ -472,7 +476,7 @@ void EntityController::syncClassicAurasFromFields(const std::shared_ptr<Entity>&
                 if (fit != allFields.end())
                     aFlag = static_cast<uint8_t>((fit->second >> ((slot % 4) * 8)) & 0xFF);
             }
-            // Normalize Classic harmful bit (0x02) to WotLK debuff bit (0x80)
+            // Normalize pre-WotLK harmful bit (0x02) to WotLK debuff bit (0x80)
             // so downstream code checking for 0x80 works consistently.
             if (aFlag & 0x02)
                 aFlag = (aFlag & ~0x02) | 0x80;
@@ -483,13 +487,48 @@ void EntityController::syncClassicAurasFromFields(const std::shared_ptr<Entity>&
             a.receivedAtMs = nowMs;
         }
     }
-    LOG_DEBUG("[Classic] Rebuilt playerAuras from UNIT_FIELD_AURAS");
+    LOG_DEBUG("[pre-WotLK] Rebuilt playerAuras from UNIT_FIELD_AURAS");
+    owner_.getSpellHandler()->refreshRestorationState();
     pendingEvents_.emit("UNIT_AURA", {"player"});
 }
 
 // Detect player mount/dismount from UNIT_FIELD_MOUNTDISPLAYID changes
 void EntityController::detectPlayerMountChange(uint32_t newMountDisplayId,
                                                 const FlatFieldMap& blockFields) {
+    // Live-confirmed: CMaNGOS can push a player values-update mid-taxi-flight
+    // that zeroes UNIT_FIELD_MOUNTDISPLAYID before the client's own flight
+    // simulation actually finishes (same early-completion behavior already
+    // seen and guarded for SMSG_DISMOUNT) - obeying it here cut the mount
+    // animation while MovementHandler::updateClientTaxi() kept flying the
+    // real path for several more seconds. But some cores finalize taxi
+    // flights server-side, so a bare "ignore while flying" guard could let
+    // the client fly past a genuine server landing if local spline timing
+    // ever drifts. Distinguish using the server's own UNIT_FLAG_TAXI_FLIGHT,
+    // same as the SMSG_DISMOUNT guard: still set means premature (ignore,
+    // let the client spline finish naturally); already cleared means the
+    // server considers the flight over (honor it now).
+    const bool onRealTaxiFlight = owner_.getMovementHandler() && owner_.getMovementHandler()->isOnTaxiFlight();
+    if (onRealTaxiFlight && newMountDisplayId == 0) {
+        bool serverStillTaxiing = false;
+        auto playerEntity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid());
+        auto playerUnit = std::dynamic_pointer_cast<Unit>(playerEntity);
+        if (playerUnit) {
+            serverStillTaxiing = (playerUnit->getUnitFlags() & UNIT_FLAG_TAXI_FLIGHT) != 0;
+        }
+        const bool nearDestination = owner_.getMovementHandler()->isNearTaxiDestination();
+        if (serverStillTaxiing || !nearDestination) {
+            owner_.getMovementHandler()->deferServerTaxiCompletion();
+            if (!nearDestination) {
+                LOG_WARNING("Deferring premature taxi mount clear until landing zone");
+            }
+            return;
+        }
+        // Authoritative server completion ahead of our own spline - stop the
+        // client flight now rather than snapping to a final waypoint that may
+        // not match where the server actually stopped us.
+        owner_.getMovementHandler()->finishClientTaxiFlight(/*snapToFinalWaypoint=*/false);
+        return;
+    }
     uint32_t old = owner_.currentMountDisplayIdRef();
     owner_.currentMountDisplayIdRef() = newMountDisplayId;
     if (newMountDisplayId != old && owner_.mountCallbackRef()) owner_.mountCallbackRef()(newMountDisplayId);
@@ -503,7 +542,7 @@ void EntityController::detectPlayerMountChange(uint32_t newMountDisplayId,
                 owner_.mountAuraSpellIdRef() = a.spellId;
             }
         }
-        // Classic/vanilla fallback: scan UNIT_FIELD_AURAS from same update block
+        // Pre-WotLK fallback: scan UNIT_FIELD_AURAS from same update block
         if (owner_.mountAuraSpellIdRef() == 0) {
             const uint16_t ufAuras = fieldIndex(UF::UNIT_FIELD_AURAS);
             if (ufAuras != 0xFFFF) {
@@ -545,6 +584,7 @@ EntityController::UnitFieldIndices EntityController::UnitFieldIndices::resolve()
         fieldIndex(UF::UNIT_FIELD_FACTIONTEMPLATE),
         fieldIndex(UF::UNIT_FIELD_FLAGS),
         fieldIndex(UF::UNIT_DYNAMIC_FLAGS),
+        fieldIndex(UF::UNIT_FIELD_AURASTATE),
         fieldIndex(UF::UNIT_FIELD_DISPLAYID),
         fieldIndex(UF::UNIT_FIELD_MOUNTDISPLAYID),
         fieldIndex(UF::UNIT_NPC_FLAGS),
@@ -674,9 +714,6 @@ bool EntityController::applyUnitFieldsOnCreate(const UpdateBlock& block,
                                                  std::shared_ptr<Unit>& unit,
                                                  const UnitFieldIndices& ufi) {
     bool unitInitiallyDead = false;
-    constexpr uint32_t UNIT_DYNFLAG_DEAD = 0x0008;
-    constexpr uint32_t UNIT_DYNFLAG_LOOTABLE = 0x0001;
-
     for (const auto& [key, val] : block.fields) {
         // Check all specific fields BEFORE power/maxpower range checks.
         // In Classic, power indices (23-27) are adjacent to maxHealth (28),
@@ -685,7 +722,8 @@ bool EntityController::applyUnitFieldsOnCreate(const UpdateBlock& block,
         // incorrectly capture maxHealth/level/faction in Classic's tight layout.
         if (key == ufi.health) {
             unit->setHealth(val);
-            if (block.objectType == ObjectType::UNIT && val == 0) {
+            if ((block.objectType == ObjectType::UNIT ||
+                 block.objectType == ObjectType::PLAYER) && val == 0) {
                 unitInitiallyDead = true;
             }
             if (block.guid == owner_.getPlayerGuid() && val == 0) {
@@ -711,6 +749,9 @@ bool EntityController::applyUnitFieldsOnCreate(const UpdateBlock& block,
                     pendingEvents_.emit("UNIT_FLAGS", {uid});
             }
         }
+        else if (ufi.auraState != 0xFFFF && key == ufi.auraState) {
+            unit->setAuraState(val);
+        }
         else if (key == ufi.bytes0) {
             unit->setPowerType(static_cast<uint8_t>((val >> 24) & 0xFF));
         } else if (key == ufi.displayId) {
@@ -725,7 +766,8 @@ bool EntityController::applyUnitFieldsOnCreate(const UpdateBlock& block,
         else if (key == ufi.npcEmoteState) { unit->setNpcEmoteState(val); }
         else if (key == ufi.dynFlags) {
             unit->setDynamicFlags(val);
-            if (block.objectType == ObjectType::UNIT &&
+            if ((block.objectType == ObjectType::UNIT ||
+                 block.objectType == ObjectType::PLAYER) &&
                 ((val & UNIT_DYNFLAG_DEAD) != 0 || (val & UNIT_DYNFLAG_LOOTABLE) != 0)) {
                 unitInitiallyDead = true;
             }
@@ -743,6 +785,13 @@ bool EntityController::applyUnitFieldsOnCreate(const UpdateBlock& block,
             unit->setMountDisplayId(val);
         }
     }
+    // Initial update masks commonly omit fields whose value is zero. A dead unit
+    // can therefore arrive without UNIT_FIELD_HEALTH even though its default
+    // client-side health is zero; the dynamic corpse bits remain authoritative.
+    if ((block.objectType == ObjectType::UNIT || block.objectType == ObjectType::PLAYER) &&
+        isUnitCorpseState(unit->getHealth(), unit->getMaxHealth(), unit->getDynamicFlags())) {
+        unitInitiallyDead = true;
+    }
     return unitInitiallyDead;
 }
 
@@ -759,6 +808,7 @@ void EntityController::markPlayerDead(const char* source) {
     owner_.corpseYRef()     = owner_.movementInfoRef().x;
     owner_.corpseZRef()     = owner_.movementInfoRef().z;
     owner_.corpseMapIdRef() = owner_.currentMapIdRef();
+    owner_.corpsePositionValidRef() = true;
     LOG_INFO("Player died (", source, "). Corpse cached at server=(",
              owner_.corpseXRef(), ",", owner_.corpseYRef(), ",", owner_.corpseZRef(),
              ") map=", owner_.corpseMapIdRef());
@@ -772,8 +822,6 @@ EntityController::UnitFieldUpdateResult EntityController::applyUnitFieldsOnUpdat
     UnitFieldUpdateResult result;
     result.oldDisplayId = unit->getDisplayId();
     uint32_t oldHealth = unit->getHealth();
-    constexpr uint32_t UNIT_DYNFLAG_DEAD = 0x0008;
-
     for (const auto& [key, val] : block.fields) {
         if (key == ufi.health) {
             unit->setHealth(val);
@@ -829,27 +877,41 @@ EntityController::UnitFieldUpdateResult EntityController::applyUnitFieldsOnUpdat
             if (block.guid == owner_.getPlayerGuid() && owner_.stunStateCallbackRef()) {
                 bool wasStunned = (oldFlags & UNIT_FLAG_STUNNED) != 0;
                 bool nowStunned = (val & UNIT_FLAG_STUNNED) != 0;
+                // The server stuns the player for the logout countdown, to root them
+                // in place — it sits them down in the same breath. That is a movement
+                // restriction, not a stun: playing the stun animation over it leaves
+                // the character slumped rather than seated. Clearing the flag is still
+                // honoured, so a cancelled logout recovers.
+                if (nowStunned && owner_.isLoggingOut()) {
+                    nowStunned = false;
+                }
                 if (wasStunned != nowStunned) {
                     owner_.stunStateCallbackRef()(nowStunned);
                 }
             }
-            // Detect stealth state change on local player
-            constexpr uint32_t UNIT_FLAG_SNEAKING = 0x02000000;
-            if (block.guid == owner_.getPlayerGuid() && owner_.stealthStateCallbackRef()) {
-                bool wasStealth = (oldFlags & UNIT_FLAG_SNEAKING) != 0;
-                bool nowStealth = (val & UNIT_FLAG_SNEAKING) != 0;
-                if (wasStealth != nowStealth) {
-                    owner_.stealthStateCallbackRef()(nowStealth);
-                }
-            }
         }
-        else if (ufi.bytes1 != 0xFFFF && key == ufi.bytes1 && block.guid == owner_.getPlayerGuid()) {
-            uint8_t newForm = static_cast<uint8_t>((val >> 24) & 0xFF);
-            if (newForm != owner_.shapeshiftFormIdRef()) {
-                owner_.shapeshiftFormIdRef() = newForm;
-                LOG_INFO("Shapeshift form changed: ", static_cast<int>(newForm));
+        else if (ufi.auraState != 0xFFFF && key == ufi.auraState) {
+            unit->setAuraState(val);
+        }
+        else if (ufi.bytes1 != 0xFFFF && key == ufi.bytes1) {
+            const uint8_t oldVisibilityFlags = unit->getVisibilityFlags();
+            const uint8_t newVisibilityFlags = static_cast<uint8_t>((val >> 16) & 0xFF);
+            unit->setVisibilityFlags(newVisibilityFlags);
+
+            if (block.guid == owner_.getPlayerGuid()) {
+                const bool wasStealthed = (oldVisibilityFlags & UNIT_VIS_FLAG_CREEP) != 0;
+                const bool nowStealthed = (newVisibilityFlags & UNIT_VIS_FLAG_CREEP) != 0;
+                if (wasStealthed != nowStealthed && owner_.stealthStateCallbackRef()) {
+                    owner_.stealthStateCallbackRef()(nowStealthed);
+                }
+
+                uint8_t newForm = static_cast<uint8_t>((val >> 24) & 0xFF);
+                if (newForm != owner_.shapeshiftFormIdRef()) {
+                    owner_.shapeshiftFormIdRef() = newForm;
+                    LOG_INFO("Shapeshift form changed: ", static_cast<int>(newForm));
                     pendingEvents_.emit("UPDATE_SHAPESHIFT_FORM", {});
                     pendingEvents_.emit("UPDATE_SHAPESHIFT_FORMS", {});
+                }
             }
         }
         else if (key == ufi.dynFlags) {
@@ -879,6 +941,11 @@ EntityController::UnitFieldUpdateResult EntityController::applyUnitFieldsOnUpdat
                         owner_.npcRespawnCallbackRef()(block.guid);
                         result.npcRespawnNotified = true;
                     }
+                }
+                if (entity->getType() == ObjectType::UNIT &&
+                    (oldDyn & UNIT_DYNFLAG_LOOTABLE) != 0 &&
+                    (val & UNIT_DYNFLAG_LOOTABLE) == 0) {
+                    result.lootableCleared = true;
                 }
             }
         } else if (key == ufi.level) {
@@ -915,7 +982,14 @@ EntityController::UnitFieldUpdateResult EntityController::applyUnitFieldsOnUpdat
             unit->setNpcEmoteState(val);
             // Fire emote animation callback so entity_spawner can update the NPC's idle anim
             if (val != oldEmote && owner_.emoteAnimCallbackRef()) {
-                owner_.emoteAnimCallbackRef()(block.guid, val);
+                uint32_t animId = val != 0 ? rendering::AnimationController::getEmoteAnimByEmotesId(val) : 0;
+                if (val == 0 || animId != 0) {
+                    // UNIT_NPC_EMOTESTATE is persistent by definition — a zero
+                    // here genuinely clears the state loop.
+                    owner_.emoteAnimCallbackRef()(block.guid, animId, /*isState=*/true);
+                } else {
+                    LOG_DEBUG("UNIT_NPC_EMOTESTATE emoteId=", val, " had no Emotes.dbc animation mapping");
+                }
             }
         }
         // Power/maxpower range checks AFTER all specific fields
@@ -1061,6 +1135,7 @@ bool EntityController::applyPlayerStatFields(const FlatFieldMap& fields,
                 owner_.resurrectPendingRef() = false;
                 owner_.selfResAvailableRef() = false;
                 owner_.corpseMapIdRef() = 0;  // corpse reclaimed
+                owner_.corpsePositionValidRef() = false;
                 owner_.corpseGuidRef() = 0;
                 owner_.corpseReclaimAvailableMsRef() = 0;
                 LOG_INFO("Player resurrected (PLAYER_FLAGS ghost cleared)");
@@ -1429,7 +1504,6 @@ void EntityController::onCreatePlayer(const UpdateBlock& block, std::shared_ptr<
 
     // Self-player post-unit-field handling
     if (block.guid == owner_.getPlayerGuid()) {
-        constexpr uint32_t UNIT_FLAG_TAXI_FLIGHT = 0x00000100;
         if ((unit->getUnitFlags() & UNIT_FLAG_TAXI_FLIGHT) != 0 && !owner_.onTaxiFlightRef() && owner_.taxiLandingCooldownRef() <= 0.0f) {
             owner_.onTaxiFlightRef() = true;
             owner_.taxiStartGraceRef() = std::max(owner_.taxiStartGraceRef(), 2.0f);
@@ -1438,7 +1512,7 @@ void EntityController::onCreatePlayer(const UpdateBlock& block, std::shared_ptr<
         }
     }
     if (block.guid == owner_.getPlayerGuid() &&
-        (unit->getDynamicFlags() & 0x0008 /*UNIT_DYNFLAG_DEAD*/) != 0) {
+        (unit->getDynamicFlags() & UNIT_DYNFLAG_DEAD) != 0) {
         owner_.playerDeadRef() = true;
         LOG_INFO("Player logged in dead (dynamic flags)");
     }
@@ -1458,9 +1532,9 @@ void EntityController::onCreatePlayer(const UpdateBlock& block, std::shared_ptr<
             }
         }
     }
-    // Classic aura sync on initial object create
+    // Pre-WotLK aura sync on initial object create
     if (block.guid == owner_.getPlayerGuid()) {
-        syncClassicAurasFromFields(entity);
+        syncPreWotlkAurasFromFields(entity);
     }
 
     // Hostility
@@ -1575,6 +1649,39 @@ void EntityController::onCreateCorpse(const UpdateBlock& block) {
             owner_.corpseYRef()     = block.y;
             owner_.corpseZRef()     = block.z;
             owner_.corpseMapIdRef() = owner_.currentMapIdRef();
+            owner_.corpsePositionValidRef() = true;
+
+            // Corpse objects carry ownership and position but not a standalone
+            // render model. Reuse the owning character's appearance and equipment
+            // under the corpse GUID, then force the queued instance into DEATH.
+            auto characterIt = std::find_if(owner_.charactersRef().begin(), owner_.charactersRef().end(),
+                [&](const Character& character) { return character.guid == owner_.getPlayerGuid(); });
+            if (characterIt != owner_.charactersRef().end() && owner_.playerSpawnCallbackRef()) {
+                glm::vec3 canonical = core::coords::serverToCanonical(
+                    glm::vec3(block.x, block.y, block.z));
+                float orientation = core::coords::serverToCanonicalYaw(block.orientation);
+                owner_.playerSpawnCallbackRef()(
+                    block.guid, 0,
+                    static_cast<uint8_t>(characterIt->race),
+                    static_cast<uint8_t>(characterIt->gender),
+                    characterIt->appearanceBytes,
+                    characterIt->facialFeatures,
+                    canonical.x, canonical.y, canonical.z, orientation);
+
+                if (owner_.playerEquipmentCallbackRef()) {
+                    std::array<uint32_t, 19> displayInfoIds{};
+                    std::array<uint8_t, 19> inventoryTypes{};
+                    const size_t count = std::min<size_t>(19, characterIt->equipment.size());
+                    for (size_t i = 0; i < count; ++i) {
+                        displayInfoIds[i] = characterIt->equipment[i].displayModel;
+                        inventoryTypes[i] = characterIt->equipment[i].inventoryType;
+                    }
+                    owner_.playerEquipmentCallbackRef()(block.guid, displayInfoIds, inventoryTypes);
+                }
+            }
+            if (owner_.npcDeathCallbackRef()) {
+                owner_.npcDeathCallbackRef()(block.guid);
+            }
             LOG_INFO("Corpse object detected: guid=0x", std::hex, owner_.corpseGuidRef(), std::dec,
                      " server=(", block.x, ", ", block.y, ", ", block.z,
                      ") map=", owner_.corpseMapIdRef());
@@ -1594,10 +1701,8 @@ void EntityController::handleDisplayIdChange(const UpdateBlock& block,
         unit->getDisplayId() == result.oldDisplayId)
         return;
 
-    constexpr uint32_t UNIT_DYNFLAG_DEAD = 0x0008;
-    constexpr uint32_t UNIT_DYNFLAG_LOOTABLE = 0x0001;
-    bool isDeadNow = (unit->getHealth() == 0) ||
-        ((unit->getDynamicFlags() & (UNIT_DYNFLAG_DEAD | UNIT_DYNFLAG_LOOTABLE)) != 0);
+    bool isDeadNow = isUnitCorpseState(
+        unit->getHealth(), unit->getMaxHealth(), unit->getDynamicFlags());
     dispatchEntitySpawn(block.guid, entity->getType(), entity, unit,
                         isDeadNow && !result.npcDeathNotified);
     if (owner_.addonEventCallbackRef()) {
@@ -1615,6 +1720,15 @@ void EntityController::onValuesUpdateUnit(const UpdateBlock& block, std::shared_
     UnitFieldIndices ufi = UnitFieldIndices::resolve();
     UnitFieldUpdateResult result = applyUnitFieldsOnUpdate(block, entity, unit, ufi);
     handleDisplayIdChange(block, entity, unit, result);
+
+    // A corpse that has been looted empty has nothing left to offer, so drop it.
+    // Skinnable corpses stay until they have been skinned. Done here rather than
+    // inside the field loop so the entity is not removed while it is being read.
+    constexpr uint32_t UNIT_FLAG_SKINNABLE = 0x04000000;
+    if (result.lootableCleared && unit->getHealth() == 0 &&
+        (unit->getUnitFlags() & UNIT_FLAG_SKINNABLE) == 0) {
+        owner_.despawnCreatureLocally(block.guid);
+    }
 }
 
 void EntityController::onValuesUpdatePlayer(const UpdateBlock& block, std::shared_ptr<Entity>& entity) {
@@ -1628,9 +1742,9 @@ void EntityController::onValuesUpdatePlayer(const UpdateBlock& block, std::share
     UnitFieldIndices ufi = UnitFieldIndices::resolve();
     UnitFieldUpdateResult result = applyUnitFieldsOnUpdate(block, entity, unit, ufi);
 
-    // Classic aura sync from UNIT_FIELD_AURAS when those fields are updated
+    // Pre-WotLK aura sync from UNIT_FIELD_AURAS when those fields are updated
     if (block.guid == owner_.getPlayerGuid()) {
-        syncClassicAurasFromFields(entity);
+        syncPreWotlkAurasFromFields(entity);
     }
 
     // Display ID changed — re-spawn/model-change
@@ -1647,7 +1761,8 @@ void EntityController::onValuesUpdatePlayer(const UpdateBlock& block, std::share
         if (block.hasMovement && block.runSpeed > 0.1f && block.runSpeed < 100.0f) {
             owner_.serverRunSpeedRef() = block.runSpeed;
             // Some server dismount paths update run speed without updating mount display field.
-            if (!owner_.onTaxiFlightRef() && !owner_.taxiMountActiveRef() &&
+            const bool onRealTaxiFlight = owner_.getMovementHandler() && owner_.getMovementHandler()->isOnTaxiFlight();
+            if (!onRealTaxiFlight && !owner_.taxiMountActiveRef() &&
                 owner_.currentMountDisplayIdRef() != 0 && block.runSpeed <= 8.5f) {
                 LOG_INFO("Auto-clearing mount from movement speed update: speed=", block.runSpeed,
                          " displayId=", owner_.currentMountDisplayIdRef());
@@ -1910,9 +2025,14 @@ void EntityController::handleDestroyObject(network::Packet& packet) {
             const bool playerAboardNow = (owner_.playerTransportGuidRef() == data.guid);
             const bool stickyAboard = (owner_.playerTransportStickyGuidRef() == data.guid && owner_.playerTransportStickyTimerRef() > 0.0f);
             const bool movementSaysAboard = (owner_.movementInfoRef().transportGuid == data.guid);
-            if (playerAboardNow || stickyAboard || movementSaysAboard) {
+            // CMaNGOS judges visibility using the transport's static DB spawn
+            // coordinate, which can be far from where a client-animated transport
+            // currently is — keep all transports alive unconditionally on pre-WotLK.
+            // AzerothCore (WotLK) sends legitimate destroy/recreate cycles, so only
+            // preserve if the player is actually aboard.
+            if (isPreWotlk() || playerAboardNow || stickyAboard || movementSaysAboard) {
                 serverUpdatedTransportGuids_.erase(data.guid);
-                LOG_INFO("Preserving in-use transport on destroy: 0x", std::hex, data.guid, std::dec,
+                LOG_INFO("Preserving transport on destroy: 0x", std::hex, data.guid, std::dec,
                          " now=", playerAboardNow,
                          " sticky=", stickyAboard,
                          " movement=", movementSaysAboard);
@@ -1935,6 +2055,8 @@ void EntityController::handleDestroyObject(network::Packet& packet) {
                 pendingNameQueries.erase(data.guid);
             } else if (entity->getType() == ObjectType::GAMEOBJECT && owner_.gameObjectDespawnCallbackRef()) {
                 owner_.gameObjectDespawnCallbackRef()(data.guid);
+            } else if (entity->getType() == ObjectType::CORPSE && owner_.playerDespawnCallbackRef()) {
+                owner_.playerDespawnCallbackRef()(data.guid);
             }
         }
         if (transportGuids_.count(data.guid) > 0) {
@@ -2209,6 +2331,13 @@ void EntityController::handlePageTextQueryResponse(network::Packet& packet) {
     if (!PageTextQueryResponseParser::parse(packet, data)) return;
 
     if (!data.isValid()) return;
+
+    std::string playerName;
+    if (auto entity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid())) {
+        if (auto unit = std::dynamic_pointer_cast<Unit>(entity))
+            playerName = unit->getName();
+    }
+    data.text = normalizeWowTextTokens(data.text, playerName);
 
     // Append page if not already collected
     bool alreadyHave = false;

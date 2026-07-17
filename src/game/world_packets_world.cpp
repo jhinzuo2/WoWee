@@ -1,6 +1,7 @@
 #include "game/world_packets.hpp"
 #include "game/packet_parsers.hpp"
 #include "game/opcodes.hpp"
+#include "game/game_utils.hpp"
 #include "game/character.hpp"
 #include "auth/crypto.hpp"
 #include "core/logger.hpp"
@@ -332,18 +333,21 @@ network::Packet GroupInvitePacket::build(const std::string& playerName) {
     return packet;
 }
 
-bool GroupInviteResponseParser::parse(network::Packet& packet, GroupInviteResponseData& data) {
-    // Validate minimum packet size: canAccept(1)
+bool GroupInviteResponseParser::parse(network::Packet& packet, GroupInviteResponseData& data,
+                                      bool hasCanAccept) {
     if (!packet.hasRemaining(1)) {
         LOG_WARNING("SMSG_GROUP_INVITE: packet too small (", packet.getSize(), " bytes)");
         return false;
     }
 
-    data.canAccept = packet.readUInt8();
-    // Note: inviterName is a string, which is always safe to read even if empty
+    // WotLK has a canAccept byte before the inviter name; Classic/TBC do not.
+    if (hasCanAccept)
+        data.canAccept = packet.readUInt8();
+    else
+        data.canAccept = 1;
     data.inviterName = packet.readString();
     LOG_INFO("Group invite from: ", data.inviterName, " (canAccept=", static_cast<int>(data.canAccept), ")");
-    return true;
+    return !data.inviterName.empty();
 }
 
 network::Packet GroupAcceptPacket::build() {
@@ -357,13 +361,17 @@ network::Packet GroupDeclinePacket::build() {
     return packet;
 }
 
-bool GroupListParser::parse(network::Packet& packet, GroupListData& data, bool hasRoles) {
+bool GroupListParser::parse(network::Packet& packet, GroupListData& data,
+                            bool hasRoles, bool hasBattleGroupFlag) {
     auto rem = [&]() { return packet.getRemainingSize(); };
 
-    if (rem() < 3) return false;
+    if (rem() < (hasBattleGroupFlag ? 4u : 3u)) return false;
     data.groupType = packet.readUInt8();
-    data.subGroup  = packet.readUInt8();
-    data.flags     = packet.readUInt8();
+    if (hasBattleGroupFlag) {
+        packet.readUInt8(); // isBattleGroup, sent by CMaNGOS TBC before subgroup.
+    }
+    data.subGroup = packet.readUInt8();
+    data.flags    = packet.readUInt8();
 
     // WotLK 3.3.5a added a roles byte (tank/healer/dps) for the dungeon finder.
     // Classic 1.12 and TBC 2.4.3 do not have this byte.
@@ -385,9 +393,12 @@ bool GroupListParser::parse(network::Packet& packet, GroupListData& data, bool h
         }
     }
 
-    if (rem() < 12) return false;
+    if (rem() < 8) return false;
     packet.readUInt64(); // group GUID
-    packet.readUInt32(); // update counter
+    if (hasRoles) {
+        if (rem() < 4) return false;
+        packet.readUInt32(); // update counter (WotLK)
+    }
 
     if (rem() < 4) return false;
     data.memberCount = packet.readUInt32();
@@ -484,7 +495,9 @@ network::Packet AutostoreLootItemPacket::build(uint8_t slotIndex) {
     return packet;
 }
 
-network::Packet UseItemPacket::build(uint8_t bagIndex, uint8_t slotIndex, uint64_t itemGuid, uint32_t spellId) {
+network::Packet UseItemPacket::build(uint8_t bagIndex, uint8_t slotIndex,
+                                     uint64_t itemGuid, uint32_t spellId,
+                                     uint64_t targetGuid, uint64_t itemTargetGuid) {
     network::Packet packet(wireOpcode(Opcode::CMSG_USE_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
@@ -493,13 +506,29 @@ network::Packet UseItemPacket::build(uint8_t bagIndex, uint8_t slotIndex, uint64
     packet.writeUInt64(itemGuid); // full 8-byte GUID
     packet.writeUInt32(0); // glyph index
     packet.writeUInt8(0);  // cast flags
-    // SpellCastTargets: self
-    packet.writeUInt32(0x00);
+    if (itemTargetGuid != 0) {
+        // Sharpening stones, weightstones and weapon oils enchant another item:
+        // the server requires the target item in SpellCastTargets.
+        packet.writeUInt32(0x10); // TARGET_FLAG_ITEM
+        packet.writePackedGuid(itemTargetGuid);
+    } else if (targetGuid != 0) {
+        packet.writeUInt32(0x02); // TARGET_FLAG_UNIT
+        packet.writePackedGuid(targetGuid);
+    } else {
+        packet.writeUInt32(0x00); // TARGET_FLAG_SELF
+    }
     return packet;
 }
 
 network::Packet OpenItemPacket::build(uint8_t bagIndex, uint8_t slotIndex) {
     network::Packet packet(wireOpcode(Opcode::CMSG_OPEN_ITEM));
+    packet.writeUInt8(bagIndex);
+    packet.writeUInt8(slotIndex);
+    return packet;
+}
+
+network::Packet ReadItemPacket::build(uint8_t bagIndex, uint8_t slotIndex) {
+    network::Packet packet(wireOpcode(Opcode::CMSG_READ_ITEM));
     packet.writeUInt8(bagIndex);
     packet.writeUInt8(slotIndex);
     return packet;
@@ -691,15 +720,21 @@ bool QuestDetailsParser::parse(network::Packet& packet, QuestDetailsData& data) 
         return true;
     }
 
+    // WotLK 3.3.5a (AzerothCore/TrinityCore) — verified against GossipDef.cpp:
+    // u8 activateAccept, u32 flags, u32 suggestedPlayers, u8 isFinished, then
+    // VARIABLE-count reward arrays (count == entries actually written; only
+    // non-empty slots are serialized). No portrait strings — those are 4.x+.
     /*activateAccept*/ packet.readUInt8();
     /*flags*/ packet.readUInt32();
     data.suggestedPlayers = packet.readUInt32();
     /*isFinished*/ packet.readUInt8();
 
-    // Reward choice items: server always writes 6 entries (QUEST_REWARD_CHOICES_COUNT)
+    // Reward choice items: count then count × (itemId, count, displayId).
+    // QUEST_FLAGS_HIDDEN_REWARDS quests send counts of 0 with no entries.
     if (packet.hasRemaining(4)) {
-        /*choiceCount*/ packet.readUInt32();
-        for (int i = 0; i < 6; i++) {
+        uint32_t choiceCount = packet.readUInt32();
+        if (choiceCount > 6) choiceCount = 0; // misaligned stream guard
+        for (uint32_t i = 0; i < choiceCount; i++) {
             if (!packet.hasRemaining(12)) break;
             uint32_t itemId = packet.readUInt32();
             uint32_t count  = packet.readUInt32();
@@ -707,16 +742,17 @@ bool QuestDetailsParser::parse(network::Packet& packet, QuestDetailsData& data) 
             if (itemId != 0) {
                 QuestRewardItem ri;
                 ri.itemId = itemId; ri.count = count; ri.displayInfoId = dispId;
-                ri.choiceSlot = static_cast<uint32_t>(i);
+                ri.choiceSlot = i;
                 data.rewardChoiceItems.push_back(ri);
             }
         }
     }
 
-    // Reward items: server always writes 4 entries (QUEST_REWARDS_COUNT)
+    // Fixed reward items: count then count × (itemId, count, displayId)
     if (packet.hasRemaining(4)) {
-        /*rewardCount*/ packet.readUInt32();
-        for (int i = 0; i < 4; i++) {
+        uint32_t rewardCount = packet.readUInt32();
+        if (rewardCount > 4) rewardCount = 0; // misaligned stream guard
+        for (uint32_t i = 0; i < rewardCount; i++) {
             if (!packet.hasRemaining(12)) break;
             uint32_t itemId = packet.readUInt32();
             uint32_t count  = packet.readUInt32();
@@ -921,6 +957,14 @@ bool QuestRequestItemsParser::parse(network::Packet& packet, QuestRequestItemsDa
 }
 
 bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData& data) {
+    QuestPacketEra era = !isPreWotlk() ? QuestPacketEra::WOTLK
+                       : isClassicLikeExpansion() ? QuestPacketEra::CLASSIC
+                                                  : QuestPacketEra::TBC;
+    return parse(packet, data, era);
+}
+
+bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData& data,
+                                   QuestPacketEra era) {
     if (!packet.hasRemaining(20)) return false;
     data.npcGuid = packet.readUInt64();
     data.questId = packet.readUInt32();
@@ -932,13 +976,78 @@ bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData
         return true;
     }
 
-    // After the two strings the packet contains a variable prefix (autoFinish + optional fields)
-    // before the emoteCount.  Different expansions and server emulator versions differ:
-    //   Classic 1.12   : uint8 autoFinish + uint32 suggestedPlayers  = 5 bytes
-    //   TBC 2.4.3      : uint32 autoFinish + uint32 suggestedPlayers = 8 bytes (variable arrays)
-    //   WotLK 3.3.5a   : uint32 autoFinish + uint32 suggestedPlayers = 8 bytes (fixed 6/4 arrays)
-    // Some vanilla-family servers omit autoFinish entirely (0 bytes of prefix).
-    // We scan prefix sizes 0..16 bytes with both fixed and variable array layouts, scoring each.
+    // WotLK 3.3.5a (AzerothCore/TrinityCore) — verified against GossipDef.cpp:
+    // u8 autoFinish + u32 flags + u32 suggestedPlayers + emotes +
+    // VARIABLE-count choice/reward arrays (count == entries written) +
+    // money + xp + trailing (honor, spells, title, talents, reputation arrays).
+    // No portrait strings — those are 4.x+.
+    if (era == QuestPacketEra::WOTLK) {
+        if (!packet.hasRemaining(9)) return true;
+        packet.readUInt8();  // autoFinish
+        packet.readUInt32(); // questFlags
+        packet.readUInt32(); // suggestedPlayers
+
+        if (!packet.hasRemaining(4)) return true;
+        uint32_t emoteCount = packet.readUInt32();
+        if (emoteCount > 32) return true;
+        for (uint32_t i = 0; i < emoteCount; ++i) {
+            if (!packet.hasRemaining(8)) return true;
+            packet.readUInt32(); // delay
+            packet.readUInt32(); // emote
+        }
+
+        if (!packet.hasRemaining(4)) return true;
+        uint32_t choiceCount = packet.readUInt32();
+        if (choiceCount > 6) return true;
+        for (uint32_t i = 0; i < choiceCount; ++i) {
+            if (!packet.hasRemaining(12)) return true;
+            QuestRewardItem item;
+            item.itemId = packet.readUInt32();
+            item.count = packet.readUInt32();
+            item.displayInfoId = packet.readUInt32();
+            item.choiceSlot = i;
+            if (item.itemId > 0)
+                data.choiceRewards.push_back(item);
+        }
+
+        if (!packet.hasRemaining(4)) return true;
+        uint32_t rewardCount = packet.readUInt32();
+        if (rewardCount > 4) return true;
+        for (uint32_t i = 0; i < rewardCount; ++i) {
+            if (!packet.hasRemaining(12)) return true;
+            QuestRewardItem item;
+            item.itemId = packet.readUInt32();
+            item.count = packet.readUInt32();
+            item.displayInfoId = packet.readUInt32();
+            if (item.itemId > 0)
+                data.fixedRewards.push_back(item);
+        }
+
+        if (packet.hasRemaining(4))
+            data.rewardMoney = packet.readUInt32();
+        if (packet.hasRemaining(4))
+            data.rewardXp = packet.readUInt32();
+
+        LOG_INFO("Quest offer reward: id=", data.questId, " title='", data.title,
+                 "' choices=", data.choiceRewards.size(), " fixed=", data.fixedRewards.size(),
+                 " money=", data.rewardMoney, " xp=", data.rewardXp);
+        for (const auto& ri : data.choiceRewards)
+            LOG_INFO("  choice: itemId=", ri.itemId, " count=", ri.count,
+                     " displayId=", ri.displayInfoId, " slot=", ri.choiceSlot);
+        for (const auto& ri : data.fixedRewards)
+            LOG_INFO("  fixed: itemId=", ri.itemId, " count=", ri.count,
+                     " displayId=", ri.displayInfoId);
+        return true;
+    }
+
+    // Classic/TBC — verified against vmangos / cmangos-tbc GossipDef.cpp:
+    //   Classic 1.12 : u32 autoFinish                          (4-byte prefix)
+    //   TBC 2.4.3    : u32 autoFinish + u32 suggestedPlayers   (8-byte prefix)
+    // then emoteCount + count×(delay,emote), choiceCount + count×(id,count,display),
+    // rewardCount + count×(id,count,display), money, and a small trailing block
+    // (Classic: flags+spell = 8 bytes; TBC: honor+0x08+spell+spellCast+title = 20).
+    // Parse that layout deterministically; fall back to the prefix scanner only
+    // if it doesn't validate (custom vanilla-family servers alter the prefix).
 
     struct ParsedTail {
         uint32_t rewardMoney = 0;
@@ -957,13 +1066,12 @@ bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData
         out.fixedArrays = fixedArrays;
         packet.setReadPos(startPos);
 
-        // Skip the prefix bytes (autoFinish + optional suggestedPlayers before emoteCount)
         if (!packet.hasRemaining(prefixSkip)) return out;
         packet.setReadPos(packet.getReadPos() + prefixSkip);
 
         if (!packet.hasRemaining(4)) return out;
         uint32_t emoteCount = packet.readUInt32();
-        if (emoteCount > 32) return out;  // guard against misalignment
+        if (emoteCount > 32) return out;
         for (uint32_t i = 0; i < emoteCount; ++i) {
             if (!packet.hasRemaining(8)) return out;
             packet.readUInt32(); // delay
@@ -1014,57 +1122,135 @@ bool QuestOfferRewardParser::parse(network::Packet& packet, QuestOfferRewardData
 
         out.ok = true;
         out.score = 0;
-        // Prefer the standard WotLK/TBC 8-byte prefix (uint32 autoFinish + uint32 suggestedPlayers)
-        if (prefixSkip == 8) out.score += 3;
-        else if (prefixSkip == 5) out.score += 1;  // Classic uint8 autoFinish + uint32 suggestedPlayers
-        // Prefer fixed arrays (WotLK/TBC servers always send 6+4 slots)
-        if (fixedArrays) out.score += 2;
-        // Valid counts
+        if (prefixSkip == 4 || prefixSkip == 8) out.score += 3;
+        else if (prefixSkip == 5) out.score += 1;
         if (choiceCount <= 6) out.score += 3;
         if (rewardCount <= 4) out.score += 3;
-        // All non-zero items are within declared counts
         if (nonZeroChoice <= choiceCount) out.score += 2;
         if (nonZeroFixed <= rewardCount) out.score += 2;
-        // No bytes left over (or only a few)
+        for (const auto& ri : out.choiceRewards) {
+            if (ri.itemId > 0 && ri.itemId < 100000 && ri.count > 0 && ri.count < 1000 && ri.displayInfoId > 0)
+                out.score += 2;
+            else if (ri.itemId >= 100000)
+                out.score -= 2;
+        }
+        for (const auto& ri : out.fixedRewards) {
+            if (ri.itemId > 0 && ri.itemId < 100000 && ri.count > 0 && ri.count < 1000 && ri.displayInfoId > 0)
+                out.score += 2;
+            else if (ri.itemId >= 100000)
+                out.score -= 2;
+        }
         size_t remaining = packet.getRemainingSize();
         if (remaining == 0) out.score += 5;
         else if (remaining <= 4) out.score += 3;
         else if (remaining <= 8) out.score += 2;
         else if (remaining <= 16) out.score += 1;
         else out.score -= static_cast<int>(remaining / 4);
-        // Plausible money/XP values
-        if (out.rewardMoney < 5000000u) out.score += 1;   // < 500g
-        if (out.rewardXp < 200000u) out.score += 1;       // < 200k XP
+        if (out.rewardMoney < 5000000u) out.score += 1;
+        if (out.rewardXp < 200000u) out.score += 1;
         return out;
     };
 
     size_t tailStart = packet.getReadPos();
-    // Try prefix sizes 0..16 bytes with both fixed and variable array layouts
-    std::vector<ParsedTail> candidates;
-    candidates.reserve(34);
-    for (size_t skip = 0; skip <= 16; ++skip) {
-        candidates.push_back(parseTail(tailStart, skip, true));   // fixed arrays
-        candidates.push_back(parseTail(tailStart, skip, false));  // variable arrays
+
+    // Deterministic first: the documented layout for the active expansion.
+    const size_t knownPrefix = (era == QuestPacketEra::CLASSIC) ? 4u : 8u;
+    ParsedTail direct = parseTail(tailStart, knownPrefix, false);
+    size_t directRemaining = packet.getRemainingSize(); // pos is at end of the direct parse
+    bool directValid = direct.ok && directRemaining <= 24;
+    if (directValid) {
+        for (const auto& ri : direct.choiceRewards)
+            if (ri.itemId >= 0x01000000u || ri.count > 1000) { directValid = false; break; }
+        for (const auto& ri : direct.fixedRewards)
+            if (ri.itemId >= 0x01000000u || ri.count > 1000) { directValid = false; break; }
     }
 
     const ParsedTail* best = nullptr;
-    for (const auto& cand : candidates) {
-        if (!cand.ok) continue;
-        if (!best || cand.score > best->score) best = &cand;
+    std::vector<ParsedTail> candidates;
+    if (directValid) {
+        best = &direct;
+    } else {
+        candidates.reserve(34);
+        for (size_t skip = 0; skip <= 16; ++skip) {
+            candidates.push_back(parseTail(tailStart, skip, true));
+            candidates.push_back(parseTail(tailStart, skip, false));
+        }
+        for (const auto& cand : candidates) {
+            if (!cand.ok) continue;
+            if (!best || cand.score > best->score) best = &cand;
+        }
     }
 
     if (best) {
         data.choiceRewards = best->choiceRewards;
         data.fixedRewards  = best->fixedRewards;
         data.rewardMoney   = best->rewardMoney;
-        data.rewardXp      = best->rewardXp;
+        // Pre-WotLK servers do not send an XP field here; parseTail's trailing
+        // read lands on flags (Classic) or honor (TBC). Never surface it as XP.
+        data.rewardXp      = 0;
     }
 
-    LOG_DEBUG("Quest offer reward: id=", data.questId, " title='", data.title,
+    LOG_INFO("Quest offer reward: id=", data.questId, " title='", data.title,
              "' choices=", data.choiceRewards.size(), " fixed=", data.fixedRewards.size(),
+             " money=", data.rewardMoney, " xp=", data.rewardXp,
              " prefix=", (best ? best->prefixSkip : size_t(0)),
+             " score=", (best ? best->score : -1),
              (best && best->fixedArrays ? " fixed" : " var"));
+    for (const auto& ri : data.choiceRewards)
+        LOG_INFO("  choice: itemId=", ri.itemId, " count=", ri.count,
+                 " displayId=", ri.displayInfoId, " slot=", ri.choiceSlot);
+    for (const auto& ri : data.fixedRewards)
+        LOG_INFO("  fixed: itemId=", ri.itemId, " count=", ri.count,
+                 " displayId=", ri.displayInfoId);
     return true;
+}
+
+QuestQueryRewardsData QuestQueryRewardsParser::parse(const std::vector<uint8_t>& data,
+                                                     uint8_t questLogStride) {
+    // Reward arrays are ALWAYS interleaved (itemId, count) pairs, present even
+    // for QUEST_FLAGS_HIDDEN_REWARDS (written as zero pairs). Field indices are
+    // relative to base=8 (questId + questMethod already skipped), i.e. absolute
+    // field - 2. Verified against the server serializers:
+    //   Classic  (vmangos Quest.cpp):      money=abs10, pairs at abs15, choice abs23
+    //   TBC      (cmangos-tbc):            money=abs11, pairs at abs19, choice abs27
+    //   WotLK    (AzerothCore GossipDef):  money=abs13, pairs at abs26, choice abs34
+    const size_t base = 8;
+    size_t moneyField, rewardPairsField, choicePairsField;
+    if (questLogStride >= 5) {        // WotLK
+        moneyField = 11; rewardPairsField = 24; choicePairsField = 32;
+    } else if (questLogStride == 4) { // TBC
+        moneyField = 9;  rewardPairsField = 17; choicePairsField = 25;
+    } else {                          // Classic / Turtle
+        moneyField = 8;  rewardPairsField = 13; choicePairsField = 21;
+    }
+    const size_t lastField = choicePairsField + 6 * 2; // exclusive end of choice pairs
+    if (data.size() < base + lastField * 4u) return {};
+
+    auto readU32At = [&data](size_t pos) -> uint32_t {
+        return static_cast<uint32_t>(data[pos])
+             | (static_cast<uint32_t>(data[pos + 1]) << 8)
+             | (static_cast<uint32_t>(data[pos + 2]) << 16)
+             | (static_cast<uint32_t>(data[pos + 3]) << 24);
+    };
+
+    QuestQueryRewardsData out;
+    out.rewardMoney = static_cast<int32_t>(readU32At(base + moneyField * 4u));
+    for (size_t i = 0; i < 4; ++i) {
+        out.itemId[i]    = readU32At(base + (rewardPairsField + i * 2) * 4u);
+        out.itemCount[i] = readU32At(base + (rewardPairsField + i * 2 + 1) * 4u);
+    }
+    for (size_t i = 0; i < 6; ++i) {
+        out.choiceItemId[i]    = readU32At(base + (choicePairsField + i * 2) * 4u);
+        out.choiceItemCount[i] = readU32At(base + (choicePairsField + i * 2 + 1) * 4u);
+    }
+    // Plausibility gate: a layout mismatch lands in string data or floats and
+    // produces absurd ids/counts — better to keep no reward data than garbage.
+    for (size_t i = 0; i < 4; ++i)
+        if (out.itemId[i] > 0x00FFFFFFu || out.itemCount[i] > 0xFFFFu) return {};
+    for (size_t i = 0; i < 6; ++i)
+        if (out.choiceItemId[i] > 0x00FFFFFFu || out.choiceItemCount[i] > 0xFFFFu) return {};
+    out.valid = true;
+    return out;
 }
 
 network::Packet QuestgiverCompleteQuestPacket::build(uint64_t npcGuid, uint32_t questId) {

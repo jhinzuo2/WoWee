@@ -24,10 +24,13 @@ bool computeIntegrityHashWin32(const std::array<uint8_t, 16>& checksumSalt,
                                std::string& outError);
 
 // Same as computeIntegrityHashWin32, but allows selecting the EXE filename used in the file set.
+// clientBuild controls which companion DLLs are included: Classic (<=6005)
+// needs fmod/ijl15/dbghelp/unicows; TBC/WotLK clients did not ship those.
 bool computeIntegrityHashWin32WithExe(const std::array<uint8_t, 16>& checksumSalt,
                                       const std::vector<uint8_t>& clientPublicKeyA,
                                       const std::string& miscDir,
                                       const std::string& exeName,
+                                      uint16_t clientBuild,
                                       std::array<uint8_t, 20>& outHash,
                                       std::string& outError);
 

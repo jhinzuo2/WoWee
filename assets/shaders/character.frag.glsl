@@ -11,6 +11,9 @@ layout(set = 0, binding = 0) uniform PerFrame {
     vec4 fogColor;
     vec4 fogParams;
     vec4 shadowParams;
+    vec4 localLightPosRadius[64];
+    vec4 localLightColorIntensity[64];
+    ivec4 localLightMeta;
 };
 
 layout(set = 1, binding = 0) uniform sampler2D uTexture;
@@ -21,7 +24,11 @@ layout(set = 1, binding = 1) uniform CharMaterial {
     int colorKeyBlack;
     int unlit;
     float emissiveBoost;
-    vec3 emissiveTint;
+    // Keep these as scalar floats to match the C++ UBO packing. A std140 vec3
+    // would insert padding here and shift the following material flags.
+    float emissiveTintR;
+    float emissiveTintG;
+    float emissiveTintB;
     float specularIntensity;
     int enableNormalMap;
     int enablePOM;
@@ -29,6 +36,7 @@ layout(set = 1, binding = 1) uniform CharMaterial {
     int pomMaxSamples;
     float heightMapVariance;
     float normalMapStrength;
+    int hairMaterial;
 };
 
 layout(set = 1, binding = 2) uniform sampler2D uNormalHeightMap;
@@ -43,6 +51,8 @@ layout(location = 4) in vec3 Bitangent;
 
 layout(location = 0) out vec4 outColor;
 
+const int PREVIEW_SIMPLE_TEXTURE_MODE = -31336;
+
 const float SHADOW_TEXEL = 1.0 / 4096.0;
 
 float sampleShadowPCF(sampler2DShadow smap, vec3 coords) {
@@ -55,12 +65,88 @@ float sampleShadowPCF(sampler2DShadow smap, vec3 coords) {
     return shadow / 9.0;
 }
 
+vec3 localLightContribution(vec3 pos, vec3 normal, vec3 albedo) {
+    vec3 sum = vec3(0.0);
+    for (int i = 0; i < min(localLightMeta.x, 64); ++i) {
+        vec3 toLight = localLightPosRadius[i].xyz - pos;
+        float dist = length(toLight);
+        float radius = localLightPosRadius[i].w;
+        if (dist >= radius || radius <= 0.0) continue;
+        float attenuation = 1.0 - dist / radius;
+        attenuation *= attenuation;
+        float wrappedDiffuse = 0.22 + 0.78 * max(dot(normal, toLight / max(dist, 0.001)), 0.0);
+        sum += albedo * localLightColorIntensity[i].rgb *
+               (localLightColorIntensity[i].w * attenuation * wrappedDiffuse);
+    }
+    return sum;
+}
+
 // LOD factor from screen-space UV derivatives
 float computeLodFactor() {
     vec2 dx = dFdx(TexCoord);
     vec2 dy = dFdy(TexCoord);
     float texelDensity = max(dot(dx, dx), dot(dy, dy));
     return smoothstep(0.0001, 0.005, texelDensity);
+}
+
+vec3 safeNormalize(vec3 v, vec3 fallback) {
+    float len2 = dot(v, v);
+    if (len2 > 1e-8) {
+        return v * inversesqrt(len2);
+    }
+    return fallback;
+}
+
+vec3 fallbackTangent(vec3 n) {
+    vec3 axis = abs(n.z) < 0.999 ? vec3(0.0, 0.0, 1.0) : vec3(0.0, 1.0, 0.0);
+    return safeNormalize(cross(axis, n), vec3(1.0, 0.0, 0.0));
+}
+
+bool finiteVec3(vec3 v) {
+    return all(equal(v, v)) && all(lessThan(abs(v), vec3(1e10)));
+}
+
+bool isMagentaKeyColor(vec4 color) {
+    return color.r >= 0.58 && color.b >= 0.58 && color.g <= 0.48 &&
+           color.r >= color.g + 0.22 && color.b >= color.g + 0.22 &&
+           abs(color.r - color.b) <= 0.38;
+}
+
+ivec2 wrapPreviewTexel(ivec2 texel, ivec2 texSize) {
+    return ivec2((texel.x % texSize.x + texSize.x) % texSize.x,
+                 (texel.y % texSize.y + texSize.y) % texSize.y);
+}
+
+vec4 samplePreviewTexture(sampler2D tex, vec2 uv) {
+    ivec2 texSize = textureSize(tex, 0);
+    if (texSize.x <= 0 || texSize.y <= 0) {
+        return textureLod(tex, uv, 0.0);
+    }
+
+    vec2 wrappedUv = uv - floor(uv);
+    ivec2 baseTexel = ivec2(floor(wrappedUv * vec2(texSize)));
+    baseTexel = wrapPreviewTexel(baseTexel, texSize);
+
+    vec4 color = texelFetch(tex, baseTexel, 0);
+    if (!isMagentaKeyColor(color)) {
+        return color;
+    }
+
+    for (int radius = 1; radius <= 4; ++radius) {
+        for (int y = -radius; y <= radius; ++y) {
+            for (int x = -radius; x <= radius; ++x) {
+                if (abs(x) != radius && abs(y) != radius) {
+                    continue;
+                }
+                vec4 candidate = texelFetch(tex, wrapPreviewTexel(baseTexel + ivec2(x, y), texSize), 0);
+                if (!isMagentaKeyColor(candidate)) {
+                    return vec4(candidate.rgb, 0.0);
+                }
+            }
+        }
+    }
+
+    return vec4(0.0);
 }
 
 // Parallax Occlusion Mapping with angle-adaptive sampling
@@ -104,20 +190,52 @@ vec2 parallaxOcclusionMap(vec2 uv, vec3 viewDirTS, float lodFactor) {
 }
 
 void main() {
+    if (enablePOM == PREVIEW_SIMPLE_TEXTURE_MODE) {
+        vec4 texColor = samplePreviewTexture(uTexture, TexCoord);
+        if (isMagentaKeyColor(texColor)) {
+            discard;
+        }
+        if (alphaTest != 0 && texColor.a < 0.5) {
+            discard;
+        }
+        if (alphaTest != 0 && hairMaterial != 0) {
+            texColor.a = 1.0;
+        }
+        if (colorKeyBlack != 0) {
+            float lum = dot(texColor.rgb, vec3(0.299, 0.587, 0.114));
+            float ck = smoothstep(0.12, 0.30, lum);
+            texColor.a *= ck;
+            if (texColor.a < 0.01) discard;
+        }
+        outColor = vec4(texColor.rgb, texColor.a * opacity);
+        return;
+    }
+
     float lodFactor = computeLodFactor();
 
-    vec3 vertexNormal = normalize(Normal);
+    vec3 vertexNormal = safeNormalize(Normal, vec3(0.0, 0.0, 1.0));
     if (!gl_FrontFacing) vertexNormal = -vertexNormal;
 
     vec2 finalUV = TexCoord;
 
-    // Build TBN matrix
-    vec3 T = normalize(Tangent);
-    vec3 B = normalize(Bitangent);
-    vec3 N = vertexNormal;
-    mat3 TBN = mat3(T, B, N);
+    bool usePOM = enablePOM != 0 &&
+                  alphaTest == 0 &&
+                  colorKeyBlack == 0 &&
+                  heightMapVariance > 0.001 &&
+                  lodFactor < 0.99;
+    bool useNormalMap = enableNormalMap != 0 &&
+                        unlit == 0 &&
+                        lodFactor < 0.99 &&
+                        normalMapStrength > 0.001;
+    mat3 TBN;
+    if (usePOM || useNormalMap) {
+        vec3 T = safeNormalize(Tangent, fallbackTangent(vertexNormal));
+        T = safeNormalize(T - dot(T, vertexNormal) * vertexNormal, fallbackTangent(vertexNormal));
+        vec3 B = safeNormalize(Bitangent, safeNormalize(cross(vertexNormal, T), vec3(0.0, 1.0, 0.0)));
+        TBN = mat3(T, B, vertexNormal);
+    }
 
-    if (enablePOM != 0 && heightMapVariance > 0.001 && lodFactor < 0.99) {
+    if (usePOM) {
         mat3 TBN_inv = transpose(TBN);
         vec3 viewDirWorld = normalize(viewPos.xyz - FragPos);
         vec3 viewDirTS = TBN_inv * viewDirWorld;
@@ -125,8 +243,30 @@ void main() {
     }
 
     vec4 texColor = texture(uTexture, finalUV);
+    // Repair dark DXT fringes on alpha-cut character textures such as hair.
+    // Transparent edge texels can carry black/garbage RGB even when alpha is
+    // valid; pull color from a coarser mip and trust the source more as alpha
+    // approaches opaque. This matches the generic M2 path.
+    if (alphaTest != 0 && texColor.a > 0.01 && texColor.a < 1.0) {
+        vec3 mipColor = textureLod(uTexture, finalUV, 4.0).rgb;
+        float trust = smoothstep(0.0, 0.9, texColor.a);
+        texColor.rgb = mix(mipColor, texColor.rgb, trust);
+    }
 
-    if (alphaTest != 0) {
+    // Some classic/TBC character textures use bright magenta as a color key.
+    // Apply this before any material-specific alpha path because a few preview
+    // batches report as opaque/blended even when their texture still carries
+    // mask-color texels.
+    if (texColor.r > 0.78 && texColor.g < 0.28 && texColor.b > 0.78) {
+        discard;
+    }
+
+    if (alphaTest != 0 && hairMaterial != 0) {
+        if (texColor.a < 0.5) {
+            discard;
+        }
+        texColor.a = 1.0;
+    } else if (alphaTest != 0) {
         // Screen-space sharpened alpha for alpha-to-coverage anti-aliasing.
         // Rescales alpha so the 0.5 cutoff maps to exactly the texel boundary,
         // giving smooth edges when MSAA + alpha-to-coverage is active.
@@ -143,19 +283,20 @@ void main() {
 
     // Compute normal (with normal mapping if enabled)
     vec3 norm = vertexNormal;
-    if (enableNormalMap != 0 && lodFactor < 0.99 && normalMapStrength > 0.001) {
+    if (useNormalMap) {
         vec3 mapNormal = texture(uNormalHeightMap, finalUV).rgb * 2.0 - 1.0;
         mapNormal.xy *= normalMapStrength;
-        mapNormal = normalize(mapNormal);
-        vec3 worldNormal = normalize(TBN * mapNormal);
+        mapNormal = safeNormalize(mapNormal, vec3(0.0, 0.0, 1.0));
+        vec3 worldNormal = safeNormalize(TBN * mapNormal, vertexNormal);
         if (!gl_FrontFacing) worldNormal = -worldNormal;
         float blendFactor = max(lodFactor, 1.0 - normalMapStrength);
-        norm = normalize(mix(worldNormal, vertexNormal, blendFactor));
+        norm = safeNormalize(mix(worldNormal, vertexNormal, blendFactor), vertexNormal);
     }
 
     vec3 result;
 
     if (unlit != 0) {
+        vec3 emissiveTint = vec3(emissiveTintR, emissiveTintG, emissiveTintB);
         vec3 warm = emissiveTint * emissiveBoost;
         result = texColor.rgb * (1.0 + warm);
     } else {
@@ -186,9 +327,14 @@ void main() {
                + shadow * (diff * lightColor.rgb * texColor.rgb + spec * lightColor.rgb);
     }
 
+    if (unlit == 0) result += localLightContribution(FragPos, norm, texColor.rgb);
+
     float dist = length(viewPos.xyz - FragPos);
     float fogFactor = clamp((fogParams.y - dist) / (fogParams.y - fogParams.x), 0.0, 1.0);
     result = mix(fogColor.rgb, result, fogFactor);
+    if (!finiteVec3(result)) {
+        result = texColor.rgb;
+    }
 
     outColor = vec4(result, texColor.a * opacity);
 }

@@ -872,10 +872,7 @@ void TerrainRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, c
     }
 
     glm::vec3 camPos = camera.getPosition();
-    // Terrain chunks beyond this distance are culled. 1200 world units ≈ 9 ADT tiles,
-    // matching the asset loading radius (8 tiles) plus a buffer for pop-in avoidance.
-    constexpr float kMaxTerrainViewDist = 1200.0f;
-    const float maxTerrainDistSq = kMaxTerrainViewDist * kMaxTerrainViewDist;
+    const float maxTerrainDistSq = maxViewDistance_ * maxViewDistance_;
 
     renderedChunks = 0;
     culledChunks = 0;

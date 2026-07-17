@@ -7,7 +7,7 @@ namespace wowee {
 
 namespace rendering { class Renderer; }
 namespace game { class GameHandler; }
-namespace core { class EntitySpawner; }
+namespace core { class AppearanceComposer; class EntitySpawner; }
 
 namespace core {
 
@@ -18,7 +18,8 @@ class AnimationCallbackHandler {
 public:
     AnimationCallbackHandler(EntitySpawner& entitySpawner,
                              rendering::Renderer& renderer,
-                             game::GameHandler& gameHandler);
+                             game::GameHandler& gameHandler,
+                             AppearanceComposer& appearanceComposer);
 
     void setupCallbacks();
 
@@ -36,6 +37,7 @@ private:
     EntitySpawner& entitySpawner_;
     rendering::Renderer& renderer_;
     game::GameHandler& gameHandler_;
+    AppearanceComposer& appearanceComposer_;
 
     // Charge rush state (moved from Application)
     bool chargeActive_ = false;

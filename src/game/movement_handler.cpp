@@ -23,6 +23,50 @@
 namespace wowee {
 namespace game {
 
+namespace {
+
+struct KnownAreaTriggerDestination {
+    uint32_t triggerId;
+    uint32_t mapId;
+    float serverX;
+    float serverY;
+    float serverZ;
+    float serverO;
+};
+
+constexpr KnownAreaTriggerDestination kKnownAreaTriggerDestinations[] = {
+    {2166, 0,   -4838.95f, -1318.46f, 501.868f, 1.42372f}, // Deeprun Tram -> Ironforge
+    {2171, 0,   -8364.57f,   535.981f, 91.7969f, 2.24619f}, // Deeprun Tram -> Stormwind
+    {2173, 369,    68.3006f, 2490.91f, -4.29647f, 3.12192f}, // Stormwind -> Deeprun Tram
+    {2175, 369,    69.2542f,   10.257f, -4.29664f, 3.09832f}, // Ironforge -> Deeprun Tram
+};
+
+const KnownAreaTriggerDestination* findKnownAreaTriggerDestination(uint32_t triggerId, uint32_t mapId) {
+    for (const auto& dest : kKnownAreaTriggerDestinations) {
+        if (dest.triggerId == triggerId && dest.mapId == mapId) return &dest;
+    }
+    return nullptr;
+}
+
+const KnownAreaTriggerDestination* findKnownAreaTriggerDestinationByTrigger(uint32_t triggerId) {
+    for (const auto& dest : kKnownAreaTriggerDestinations) {
+        if (dest.triggerId == triggerId) return &dest;
+    }
+    return nullptr;
+}
+
+uint32_t findKnownReturnAreaTrigger(uint32_t triggerId) {
+    switch (triggerId) {
+        case 2166: return 2175; // Deeprun Tram -> Ironforge, return via Ironforge portal
+        case 2171: return 2173; // Deeprun Tram -> Stormwind, return via Stormwind portal
+        case 2173: return 2171; // Stormwind -> Deeprun Tram, exit on Stormwind side
+        case 2175: return 2166; // Ironforge -> Deeprun Tram, exit on Ironforge side
+        default: return 0;
+    }
+}
+
+} // namespace
+
 MovementHandler::MovementHandler(GameHandler& owner)
     : owner_(owner), movementInfo(owner.movementInfoRef()) {}
 
@@ -40,7 +84,7 @@ void MovementHandler::registerOpcodes(DispatchTable& table) {
                      Opcode::SMSG_SPLINE_MOVE_NORMAL_FALL,
                      Opcode::SMSG_SPLINE_MOVE_ROOT,
                      Opcode::SMSG_SPLINE_MOVE_SET_HOVER }) {
-        table[op] = [this](network::Packet& packet) {
+        table[op] = [](network::Packet& packet) {
             if (packet.hasRemaining(1))
                 (void)packet.readPackedGuid();
         };
@@ -187,7 +231,7 @@ void MovementHandler::registerOpcodes(DispatchTable& table) {
     for (auto op : {Opcode::SMSG_SPLINE_MOVE_UNROOT,
                     Opcode::SMSG_SPLINE_MOVE_UNSET_HOVER,
                     Opcode::SMSG_SPLINE_MOVE_WATER_WALK}) {
-        table[op] = [this](network::Packet& packet) {
+        table[op] = [](network::Packet& packet) {
             // Minimal parse: PackedGuid only — no animation-relevant state change.
             if (packet.hasRemaining(1)) {
                 (void)packet.readPackedGuid();
@@ -266,7 +310,7 @@ void MovementHandler::handleClientControlUpdate(network::Packet& packet) {
     for (int i = 0; i < 8; ++i) {
         if (guidMask & (1u << i)) ++guidBytes;
     }
-    if (!packet.hasRemaining(guidBytes) + 1) {
+    if (!packet.hasRemaining(guidBytes + 1)) {
         LOG_WARNING("SMSG_CLIENT_CONTROL_UPDATE malformed (truncated packed guid)");
         packet.skipAll();
         return;
@@ -328,6 +372,39 @@ uint32_t MovementHandler::nextMovementTimestampMs() {
     return candidate;
 }
 
+bool MovementHandler::restoreWorldTransferFallbackIfNearOrigin(const char* context) {
+    if (!worldTransferFallbackValid_ || owner_.getCurrentMapId() != worldTransferFallbackMapId_) {
+        return false;
+    }
+    if (owner_.getCurrentMapId() != 0 ||
+        std::abs(movementInfo.x) >= 1000.0f || std::abs(movementInfo.y) >= 1000.0f) {
+        return false;
+    }
+
+    LOG_WARNING(context,
+                ": correcting near-origin map 0 position using area trigger ",
+                worldTransferFallbackTriggerId_,
+                " fallback canonical=(",
+                worldTransferFallbackCanonicalPos_.x, ", ",
+                worldTransferFallbackCanonicalPos_.y, ", ",
+                worldTransferFallbackCanonicalPos_.z, ")");
+
+    movementInfo.x = worldTransferFallbackCanonicalPos_.x;
+    movementInfo.y = worldTransferFallbackCanonicalPos_.y;
+    movementInfo.z = worldTransferFallbackCanonicalPos_.z;
+    movementInfo.orientation = worldTransferFallbackCanonicalO_;
+    movementInfo.transportGuid = 0;
+    movementInfo.transportSeat = -1;
+    movementInfo.flags &= ~static_cast<uint32_t>(MovementFlags::ONTRANSPORT);
+    owner_.clearPlayerTransport();
+
+    if (auto player = owner_.getEntityManager().getEntity(owner_.getPlayerGuid())) {
+        player->setPosition(movementInfo.x, movementInfo.y, movementInfo.z, movementInfo.orientation);
+    }
+
+    return true;
+}
+
 // ============================================================
 // sendMovement
 // ============================================================
@@ -374,8 +451,9 @@ void MovementHandler::sendMovement(Opcode opcode) {
                                static_cast<uint32_t>(MovementFlags::STRAFE_RIGHT);
     const bool wasMoving = (movementInfo.flags & kMoveMask) != 0;
 
-    // Cancel any timed (non-channeled) cast the moment the player starts moving.
-    if (owner_.isCasting() && !owner_.isChanneling()) {
+    // Cancel any timed non-channel cast, plus food/water restoration, the moment
+    // the player starts moving. Other channels retain their normal behavior.
+    if (owner_.isCasting() && (!owner_.isChanneling() || owner_.isRestoring())) {
         const bool isPositionalMove =
             opcode == Opcode::MSG_MOVE_START_FORWARD  ||
             opcode == Opcode::MSG_MOVE_START_BACKWARD ||
@@ -619,12 +697,14 @@ void MovementHandler::sendMovement(Opcode opcode) {
     // the bad position across sessions and creates a teleport loop.
     if (owner_.getCurrentMapId() == 0 &&
         std::abs(movementInfo.x) < 1000.0f && std::abs(movementInfo.y) < 1000.0f) {
-        LOG_WARNING("sendMovement: BLOCKED near-origin heartbeat canonical=(",
-                    movementInfo.x, ", ", movementInfo.y, ", ", movementInfo.z,
-                    ") onTransport=", owner_.isOnTransport(),
-                    " transportGuid=0x", std::hex, owner_.playerTransportGuidRef(), std::dec,
-                    " flags=0x", std::hex, movementInfo.flags, std::dec);
-        return;
+        if (!restoreWorldTransferFallbackIfNearOrigin("sendMovement")) {
+            LOG_WARNING("sendMovement: BLOCKED near-origin heartbeat canonical=(",
+                        movementInfo.x, ", ", movementInfo.y, ", ", movementInfo.z,
+                        ") onTransport=", owner_.isOnTransport(),
+                        " transportGuid=0x", std::hex, owner_.playerTransportGuidRef(), std::dec,
+                        " flags=0x", std::hex, movementInfo.flags, std::dec);
+            return;
+        }
     }
 
     // Convert canonical → server coordinates for the wire
@@ -707,16 +787,24 @@ void MovementHandler::forceClearTaxiAndMovementState() {
     taxiActivateTimer_ = 0.0f;
     taxiClientActive_ = false;
     taxiClientPath_.clear();
+    taxiServerCompletionPending_ = false;
     taxiRecoverPending_ = false;
     taxiStartGrace_ = 0.0f;
     onTaxiFlight_ = false;
 
-    if (taxiMountActive_ && owner_.mountCallbackRef()) {
+    const bool clearingTaxiMount = taxiMountActive_;
+    if (clearingTaxiMount && owner_.mountCallbackRef()) {
         owner_.mountCallbackRef()(0);
     }
     taxiMountActive_ = false;
     taxiMountDisplayId_ = 0;
-    owner_.currentMountDisplayIdRef() = 0;
+    // A normal mount is owned by its aura/update-field path. Do not silently
+    // zero it here without firing the mount callback: that leaves the rendered
+    // mount behind and reconciliation spawns a duplicate. Unstuck explicitly
+    // dismounts normal mounts before calling this movement reset.
+    if (clearingTaxiMount) {
+        owner_.currentMountDisplayIdRef() = 0;
+    }
     owner_.vehicleIdRef() = 0;
     // Death/resurrect state is intentionally NOT cleared here.
     // Previously this method reset 10 death-related fields despite being named
@@ -769,7 +857,7 @@ void MovementHandler::dismount() {
         taxiMountActive_ = false;
         taxiMountDisplayId_ = 0;
         owner_.mountAuraSpellIdRef() = 0;
-        LOG_INFO("Dismount: cleared local mount state");
+        LOG_INFO("Dismount: cleared local mount state, onTaxiFlight=", onTaxiFlight_);
     }
     uint16_t cancelMountWire = wireOpcode(Opcode::CMSG_CANCEL_MOUNT_AURA);
     if (cancelMountWire != 0xFFFF) {
@@ -1014,9 +1102,14 @@ void MovementHandler::handleMoveSetSpeed(network::Packet& packet) {
 }
 
 void MovementHandler::handleOtherPlayerMovement(network::Packet& packet) {
-    const bool otherMoveTbc = isPreWotlk();
-    uint64_t moverGuid = otherMoveTbc
-        ? packet.readUInt64() : packet.readPackedGuid();
+    // Same packed-guid mismatch found and fixed for MSG_MOVE_TELEPORT_ACK:
+    // CMaNGOS sends a packed guid here on TBC too, not a raw UInt64. Reading
+    // it as raw corrupted moverGuid, so getEntity(moverGuid) below always
+    // missed - the entity still existed (created fine), but its position
+    // never updated from these packets. Live-observed as another player's
+    // tracked position staying frozen at wherever they were first spotted,
+    // even while they kept walking.
+    uint64_t moverGuid = packet.readPackedGuid();
     if (moverGuid == owner_.getPlayerGuid() || moverGuid == 0) {
         return;
     }
@@ -1417,6 +1510,22 @@ void MovementHandler::handleMonsterMove(network::Packet& packet) {
         return;
     }
 
+    // Classic/TBC creature patrols encode ground locomotion in the spline:
+    // RUNMODE set means Run, while a clear bit means Walk. Publish it before
+    // the render callback. WotLK uses the separate spline mode opcodes already
+    // registered above, and 0x100 means DONE there, so do not reinterpret it.
+    const bool usesPreWotlkSplineFlags = isActiveExpansion("classic") ||
+                                          isActiveExpansion("turtle") ||
+                                          isActiveExpansion("tbc");
+    if (usesPreWotlkSplineFlags && entity->getType() == ObjectType::UNIT &&
+        owner_.unitMoveFlagsCallbackRef()) {
+        const uint32_t locomotionFlags =
+            isPreWotlkSplineWalking(data.splineFlags)
+                ? static_cast<uint32_t>(MovementFlags::WALKING)
+                : 0u;
+        owner_.unitMoveFlagsCallbackRef()(data.guid, locomotionFlags);
+    }
+
     if (data.hasDest) {
         glm::vec3 destCanonical = core::coords::serverToCanonical(
             glm::vec3(data.destX, data.destY, data.destZ));
@@ -1591,6 +1700,18 @@ void MovementHandler::handleMonsterMoveTransport(network::Packet& packet) {
     float destLocalZ = spline.hasDest ? spline.destination.z : localZ;
     bool hasDest = spline.hasDest;
 
+    const bool usesPreWotlkSplineFlags = isActiveExpansion("classic") ||
+                                          isActiveExpansion("turtle") ||
+                                          isActiveExpansion("tbc");
+    if (usesPreWotlkSplineFlags && entity->getType() == ObjectType::UNIT &&
+        owner_.unitMoveFlagsCallbackRef()) {
+        const uint32_t locomotionFlags =
+            isPreWotlkSplineWalking(splineFlags)
+                ? static_cast<uint32_t>(MovementFlags::WALKING)
+                : 0u;
+        owner_.unitMoveFlagsCallbackRef()(moverGuid, locomotionFlags);
+    }
+
     if (!owner_.getTransportManager()) {
         LOG_WARNING("SMSG_MONSTER_MOVE_TRANSPORT: TransportManager not available for mover 0x",
                     std::hex, moverGuid, std::dec);
@@ -1633,19 +1754,26 @@ void MovementHandler::handleMonsterMoveTransport(network::Packet& packet) {
 // ============================================================
 
 void MovementHandler::handleTeleportAck(network::Packet& packet) {
-    const bool taTbc = isPreWotlk();
-    if (packet.getRemainingSize() < (taTbc ? 8u : 4u)) {
+    if (packet.getRemainingSize() < 1u) {
         LOG_WARNING("MSG_MOVE_TELEPORT_ACK too short");
         return;
     }
 
-    uint64_t guid = taTbc
-        ? packet.readUInt64() : packet.readPackedGuid();
+    // CMaNGOS sends a packed guid here on every expansion, including TBC -
+    // confirmed by live packet capture: reading a raw UInt64 instead
+    // misaligned every field after it, so the guid never matched the local
+    // player and the position update was silently dropped as "remote entity".
+    uint64_t guid = packet.readPackedGuid();
     if (!packet.hasRemaining(4)) return;
     uint32_t counter = packet.readUInt32();
 
     const bool taNoFlags2 = isPreWotlk();
-    const size_t minMoveSz = taNoFlags2 ? (4 + 4 + 4 * 4) : (4 + 2 + 4 + 4 * 4);
+    // Pre-WotLK sends one extra byte here that isn't part of the documented
+    // MovementInfo layout - confirmed by live capture (byte value 0x04,
+    // constant across samples) and verified against a known ground-truth
+    // teleport target (.go xyz to ironforge-city decoded to the exact
+    // expected x/y/z only once this byte was accounted for).
+    const size_t minMoveSz = taNoFlags2 ? (4 + 4 + 1 + 4 * 4) : (4 + 2 + 4 + 4 * 4);
     if (packet.getRemainingSize() < minMoveSz) {
         LOG_WARNING("MSG_MOVE_TELEPORT_ACK: not enough data for movement info");
         return;
@@ -1655,6 +1783,8 @@ void MovementHandler::handleTeleportAck(network::Packet& packet) {
     if (!taNoFlags2)
         packet.readUInt16();  // moveFlags2 (WotLK only)
     uint32_t moveTime = packet.readUInt32();
+    if (taNoFlags2)
+        packet.readUInt8();  // unknown byte, pre-WotLK only (see comment above)
     float serverX = packet.readFloat();
     float serverY = packet.readFloat();
     float serverZ = packet.readFloat();
@@ -1664,6 +1794,17 @@ void MovementHandler::handleTeleportAck(network::Packet& packet) {
                 " counter=", counter,
                 " pos=(", serverX, ", ", serverY, ", ", serverZ, ")",
                 " currentPos=(", movementInfo.x, ", ", movementInfo.y, ", ", movementInfo.z, ")");
+
+    if (guid != owner_.getPlayerGuid()) {
+        glm::vec3 canonical = core::coords::serverToCanonical(glm::vec3(serverX, serverY, serverZ));
+        auto entity = owner_.getEntityManager().getEntity(guid);
+        if (entity) {
+            entity->setPosition(canonical.x, canonical.y, canonical.z,
+                                core::coords::serverToCanonicalYaw(orientation));
+        }
+        LOG_INFO("MSG_MOVE_TELEPORT_ACK for remote entity 0x", std::hex, guid, std::dec, " — ignored for local player");
+        return;
+    }
 
     glm::vec3 canonical = core::coords::serverToCanonical(glm::vec3(serverX, serverY, serverZ));
 
@@ -1690,13 +1831,16 @@ void MovementHandler::handleTeleportAck(network::Packet& packet) {
     // Clear cast bar on teleport — SpellHandler owns the casting_ flag
     if (owner_.getSpellHandler()) owner_.getSpellHandler()->resetCastState();
 
-    // Suppress area triggers for 10s after teleport. A one-shot flag is not
+    // Suppress area triggers briefly after teleport. A one-shot flag is not
     // enough — the player can leave and re-enter a trigger within seconds and
-    // get teleported again before the world has finished loading.
+    // get teleported again before the world has finished loading. Deeprun Tram
+    // (map 369) is a narrow hallway with portal triggers close to the spawn,
+    // so keep its grace window short enough that exits remain usable.
+    const bool deeprunTram = owner_.getCurrentMapId() == 369;
     owner_.activeAreaTriggersRef().clear();
-    owner_.areaTriggerCheckTimerRef() = -5.0f;
+    owner_.areaTriggerCheckTimerRef() = deeprunTram ? -1.0f : -5.0f;
     owner_.areaTriggerSuppressFirstRef() = true;
-    owner_.areaTriggerCooldownRef() = 10.0f;
+    owner_.areaTriggerCooldownRef() = deeprunTram ? 1.5f : 10.0f;
 
     if (owner_.getSocket()) {
         network::Packet ack(wireOpcode(Opcode::MSG_MOVE_TELEPORT_ACK));
@@ -1734,17 +1878,93 @@ void MovementHandler::handleNewWorld(network::Packet& packet) {
     float serverY = packet.readFloat();
     float serverZ = packet.readFloat();
     float orientation = packet.readFloat();
+    const uint32_t transferAreaTriggerId = lastAreaTriggerId_;
+    lastAreaTriggerId_ = 0;
+    postTransferReturnAreaTriggerId_ = findKnownReturnAreaTrigger(transferAreaTriggerId);
+    postTransferReturnAreaTriggerSawNear_ = false;
+    const bool hasPendingAreaTriggerDestination = pendingAreaTriggerDestinationValid_;
+    const uint32_t pendingAreaTriggerDestinationMapId = pendingAreaTriggerDestinationMapId_;
+    const glm::vec3 pendingAreaTriggerDestinationServerPos = pendingAreaTriggerDestinationServerPos_;
+    const float pendingAreaTriggerDestinationServerO = pendingAreaTriggerDestinationServerO_;
+    pendingAreaTriggerDestinationValid_ = false;
+    const auto* knownTransferDestination = findKnownAreaTriggerDestination(transferAreaTriggerId, mapId);
+
+    bool transferFallbackValid = false;
+    glm::vec3 transferFallbackServerPos(0.0f);
+    float transferFallbackServerO = orientation;
+    if (hasPendingAreaTriggerDestination && pendingAreaTriggerDestinationMapId == mapId) {
+        transferFallbackValid = true;
+        transferFallbackServerPos = pendingAreaTriggerDestinationServerPos;
+        transferFallbackServerO = pendingAreaTriggerDestinationServerO;
+    } else if (knownTransferDestination) {
+        transferFallbackValid = true;
+        transferFallbackServerPos =
+            glm::vec3(knownTransferDestination->serverX,
+                      knownTransferDestination->serverY,
+                      knownTransferDestination->serverZ);
+        transferFallbackServerO = knownTransferDestination->serverO;
+    }
+    if (transferFallbackValid) {
+        worldTransferFallbackValid_ = true;
+        worldTransferFallbackMapId_ = mapId;
+        worldTransferFallbackTriggerId_ = transferAreaTriggerId;
+        worldTransferFallbackCanonicalPos_ = core::coords::serverToCanonical(transferFallbackServerPos);
+        worldTransferFallbackCanonicalO_ = core::coords::serverToCanonicalYaw(transferFallbackServerO);
+        orientation = transferFallbackServerO;
+        LOG_WARNING("World transfer fallback armed: trigger=", transferAreaTriggerId,
+                    " map=", mapId,
+                    " canonical=(",
+                    worldTransferFallbackCanonicalPos_.x, ", ",
+                    worldTransferFallbackCanonicalPos_.y, ", ",
+                    worldTransferFallbackCanonicalPos_.z, ")");
+    } else {
+        worldTransferFallbackValid_ = false;
+    }
 
     LOG_INFO("SMSG_NEW_WORLD: mapId=", mapId,
              " pos=(", serverX, ", ", serverY, ", ", serverZ, ")",
              " orient=", orientation);
+
+    glm::vec3 receivedCanonical = core::coords::serverToCanonical(glm::vec3(serverX, serverY, serverZ));
+    const bool badEasternKingdomsNearOrigin =
+        mapId == 0 && std::abs(receivedCanonical.x) < 1000.0f && std::abs(receivedCanonical.y) < 1000.0f;
+    if (badEasternKingdomsNearOrigin) {
+        if (hasPendingAreaTriggerDestination && pendingAreaTriggerDestinationMapId == mapId) {
+            LOG_WARNING("Correcting bad SMSG_NEW_WORLD near-origin destination for area trigger ",
+                        transferAreaTriggerId,
+                        ": received server=(", serverX, ", ", serverY, ", ", serverZ,
+                        ") using pending server=(", pendingAreaTriggerDestinationServerPos.x, ", ",
+                        pendingAreaTriggerDestinationServerPos.y, ", ",
+                        pendingAreaTriggerDestinationServerPos.z, ")");
+            serverX = pendingAreaTriggerDestinationServerPos.x;
+            serverY = pendingAreaTriggerDestinationServerPos.y;
+            serverZ = pendingAreaTriggerDestinationServerPos.z;
+            orientation = pendingAreaTriggerDestinationServerO;
+            receivedCanonical = core::coords::serverToCanonical(glm::vec3(serverX, serverY, serverZ));
+        } else if (knownTransferDestination) {
+            LOG_WARNING("Correcting bad SMSG_NEW_WORLD near-origin destination for area trigger ",
+                        transferAreaTriggerId,
+                        ": received server=(", serverX, ", ", serverY, ", ", serverZ,
+                        ") using server=(", knownTransferDestination->serverX, ", ",
+                        knownTransferDestination->serverY, ", ", knownTransferDestination->serverZ, ")");
+            serverX = knownTransferDestination->serverX;
+            serverY = knownTransferDestination->serverY;
+            serverZ = knownTransferDestination->serverZ;
+            orientation = knownTransferDestination->serverO;
+            receivedCanonical = core::coords::serverToCanonical(glm::vec3(serverX, serverY, serverZ));
+        } else {
+            LOG_WARNING("SMSG_NEW_WORLD near-origin destination on map 0 without known area trigger fallback: trigger=",
+                        transferAreaTriggerId,
+                        " server=(", serverX, ", ", serverY, ", ", serverZ, ")");
+        }
+    }
 
     const bool isSameMap       = (mapId == owner_.currentMapIdRef());
     const bool isResurrection  = owner_.resurrectPendingRef();
     if (isSameMap && isResurrection) {
         LOG_INFO("SMSG_NEW_WORLD same-map resurrection — skipping world reload");
 
-        glm::vec3 canonical = core::coords::serverToCanonical(glm::vec3(serverX, serverY, serverZ));
+        glm::vec3 canonical = receivedCanonical;
         movementInfo.x = canonical.x;
         movementInfo.y = canonical.y;
         movementInfo.z = canonical.z;
@@ -1760,16 +1980,18 @@ void MovementHandler::handleNewWorld(network::Packet& packet) {
         owner_.pendingSpiritHealerGuidRef() = 0;
         owner_.resurrectCasterGuidRef()    = 0;
         owner_.corpseMapIdRef()            = 0;
+        owner_.corpsePositionValidRef()    = false;
         owner_.corpseGuidRef()             = 0;
         owner_.clearHostileAttackers();
         owner_.stopAutoAttack();
         owner_.tabCycleStaleRef() = true;
         owner_.resetCastState();
 
+        const bool deeprunTram = owner_.getCurrentMapId() == 369;
         owner_.activeAreaTriggersRef().clear();
-        owner_.areaTriggerCheckTimerRef() = -5.0f;
+        owner_.areaTriggerCheckTimerRef() = deeprunTram ? -1.0f : -5.0f;
         owner_.areaTriggerSuppressFirstRef() = true;
-        owner_.areaTriggerCooldownRef() = 10.0f;
+        owner_.areaTriggerCooldownRef() = deeprunTram ? 1.5f : 10.0f;
 
         if (owner_.getSocket()) {
             network::Packet ack(wireOpcode(Opcode::MSG_MOVE_WORLDPORT_ACK));
@@ -1788,7 +2010,7 @@ void MovementHandler::handleNewWorld(network::Packet& packet) {
         owner_.getSocket()->tracePacketsFor(std::chrono::seconds(12), "new_world");
     }
 
-    glm::vec3 canonical = core::coords::serverToCanonical(glm::vec3(serverX, serverY, serverZ));
+    glm::vec3 canonical = receivedCanonical;
     movementInfo.x = canonical.x;
     movementInfo.y = canonical.y;
     movementInfo.z = canonical.z;
@@ -1803,6 +2025,7 @@ void MovementHandler::handleNewWorld(network::Packet& packet) {
     taxiActivatePending_ = false;
     taxiClientActive_ = false;
     taxiClientPath_.clear();
+    taxiServerCompletionPending_ = false;
     taxiRecoverPending_ = false;
     taxiStartGrace_ = 0.0f;
     owner_.currentMountDisplayIdRef() = 0;
@@ -1834,9 +2057,10 @@ void MovementHandler::handleNewWorld(network::Packet& packet) {
     owner_.worldStateMapIdRef() = mapId;
     owner_.worldStateZoneIdRef() = 0;
     owner_.activeAreaTriggersRef().clear();
-    owner_.areaTriggerCheckTimerRef() = -5.0f;
+    const bool deeprunTram = mapId == 369;
+    owner_.areaTriggerCheckTimerRef() = deeprunTram ? -1.0f : -5.0f;
     owner_.areaTriggerSuppressFirstRef() = true;
-    owner_.areaTriggerCooldownRef() = 10.0f;
+    owner_.areaTriggerCooldownRef() = deeprunTram ? 1.5f : 10.0f;
     owner_.stopAutoAttack();
     owner_.resetCastState();
 
@@ -2091,6 +2315,18 @@ void MovementHandler::applyTaxiMountForCurrentNode() {
     }
 }
 
+glm::vec3 MovementHandler::evalTaxiCatmullRom(const glm::vec3& p0, const glm::vec3& p1,
+                                               const glm::vec3& p2, const glm::vec3& p3, float t) {
+    float t2 = t * t;
+    float t3 = t2 * t;
+    return 0.5f * (
+        (2.0f * p1) +
+        (-p0 + p2) * t +
+        (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
+        (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3
+    );
+}
+
 void MovementHandler::startClientTaxiPath(const std::vector<uint32_t>& pathNodes) {
     taxiClientPath_.clear();
     taxiClientIndex_ = 0;
@@ -2138,6 +2374,41 @@ void MovementHandler::startClientTaxiPath(const std::vector<uint32_t>& pathNodes
         return;
     }
 
+    // Precompute each segment's real curve arc length (see taxiClientSegmentArcLengths_'s
+    // comment for why - pacing must use this, not the straight-line chord length, to keep
+    // total flight duration in line with the server's own identical-speed spline). Sampled
+    // numerically since the Catmull-Rom curve has no closed-form arc length; 16 sub-steps
+    // is more than enough resolution for a taxi path segment's typical curvature.
+    taxiClientSegmentArcLengths_.clear();
+    taxiClientSegmentArcLengths_.reserve(taxiClientPath_.size() - 1);
+    constexpr int kArcLengthSamples = 16;
+    for (size_t i = 0; i + 1 < taxiClientPath_.size(); i++) {
+        glm::vec3 p0 = (i > 0) ? taxiClientPath_[i - 1] : taxiClientPath_[i];
+        glm::vec3 p1 = taxiClientPath_[i];
+        glm::vec3 p2 = taxiClientPath_[i + 1];
+        glm::vec3 p3 = (i + 2 < taxiClientPath_.size()) ? taxiClientPath_[i + 2] : taxiClientPath_[i + 1];
+
+        float arcLength = 0.0f;
+        glm::vec3 prev = p1;
+        for (int s = 1; s <= kArcLengthSamples; s++) {
+            float t = static_cast<float>(s) / static_cast<float>(kArcLengthSamples);
+            glm::vec3 cur = evalTaxiCatmullRom(p0, p1, p2, p3, t);
+            arcLength += glm::length(cur - prev);
+            prev = cur;
+        }
+        taxiClientSegmentArcLengths_.push_back(arcLength);
+    }
+
+    // NOTE: this only builds taxiClientPath_ as pending data - it deliberately does
+    // NOT snap the player to the path start or set taxiClientActive_. CMSG_ACTIVATETAXI
+    // can still be rejected by the server at this point; see activateTaxi()'s comment
+    // and beginTaxiFlightMotion(), which does the actual activation once
+    // SMSG_ACTIVATETAXIREPLY confirms success.
+}
+
+void MovementHandler::beginTaxiFlightMotion() {
+    if (taxiClientPath_.size() < 2) return;
+
     glm::vec3 start = taxiClientPath_[0];
     glm::vec3 dir(0.0f);
     float dirLenSq = 0.0f;
@@ -2177,48 +2448,164 @@ void MovementHandler::startClientTaxiPath(const std::vector<uint32_t>& pathNodes
     }
 
     LOG_INFO("Taxi flight started with ", taxiClientPath_.size(), " spline waypoints");
+    taxiServerCompletionPending_ = false;
     taxiClientActive_ = true;
 }
 
-void MovementHandler::updateClientTaxi(float deltaTime) {
-    if (!taxiClientActive_ || taxiClientPath_.size() < 2) return;
-    auto playerEntity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid());
+// Ends the active client-simulated taxi flight. snapToFinalWaypoint controls
+// whether the player is teleported to the known landing position first:
+// - true: natural completion (the client spline reached its own end) - our
+//   own path data is authoritative for where "arrived" means.
+// - false: an authoritative server signal (SMSG_DISMOUNT with
+//   UNIT_FLAG_TAXI_FLIGHT already cleared, or the equivalent
+//   UNIT_FIELD_MOUNTDISPLAYID update) arrived ahead of our own spline
+//   finishing.
+//
+//   The server's stop point may not match our path's precomputed final
+//   waypoint - e.g. a genuinely interrupted/mid-route stop - so this does
+//   NOT unconditionally snap there. But per AzerothCore's own
+//   FlightPathMovementGenerator::DoFinalize() (confirmed by reading its
+//   source): "update z position to ground ... this prevent cheating with
+//   landing point at lags when client side flight end early in comparison
+//   server side" - the server itself anticipates exactly this scenario and
+//   corrects the player's own authoritative position to the true
+//   destination on the terminal leg. So: if we're within a generous sanity
+//   distance of our own known final waypoint (kAuthoritativeLandingSnapDist),
+//   treat this as that same normal "client finished slightly early" case
+//   and snap there - safety net for whatever spline/server pacing drift
+//   remains despite arc-length-parameterizing taxiClientPath_'s pacing (see
+//   taxiClientSegmentArcLengths_). Beyond the sanity distance, stay
+//   conservative and leave the player where the spline currently has them,
+//   per the original caution.
+//
+// The "known final waypoint" itself is taxiNodes_[taxiDestNodeId_]'s own
+// registered position (TaxiNodes.dbc), NOT taxiClientPath_.back() (the last
+// entry of the separate TaxiPathNode.dbc waypoint trace) - live-confirmed
+// the two can disagree by 100+ yards, since a taxi path's waypoint trace
+// doesn't necessarily terminate exactly on the destination node's actual
+// coordinate. TaxiNodes.dbc's own position is what GM teleports/.gps
+// validated as accurate throughout this whole effort, so it's the correct
+// "true destination" to trust here. Falls back to taxiClientPath_.back()
+// only if the destination node can't be resolved for some reason.
+void MovementHandler::finishClientTaxiFlight(bool snapToFinalWaypoint) {
+    glm::vec3 landingPos(0.0f);
+    bool haveLandingPos = false;
+    auto destNodeIt = taxiNodes_.find(taxiDestNodeId_);
+    if (destNodeIt != taxiNodes_.end()) {
+        landingPos = core::coords::serverToCanonical(
+            glm::vec3(destNodeIt->second.x, destNodeIt->second.y, destNodeIt->second.z));
+        haveLandingPos = true;
+    } else if (!taxiClientPath_.empty()) {
+        landingPos = taxiClientPath_.back();
+        haveLandingPos = true;
+    }
 
-    auto finishTaxiFlight = [&]() {
-            if (!taxiClientPath_.empty()) {
-                const auto& landingPos = taxiClientPath_.back();
-                if (playerEntity) {
-                    playerEntity->setPosition(landingPos.x, landingPos.y, landingPos.z,
-                                              movementInfo.orientation);
-                }
-                movementInfo.x = landingPos.x;
-                movementInfo.y = landingPos.y;
-                movementInfo.z = landingPos.z;
-                LOG_INFO("Taxi landing: snapped to final waypoint (",
-                         landingPos.x, ", ", landingPos.y, ", ", landingPos.z, ")");
-            }
-            taxiClientActive_ = false;
-            onTaxiFlight_ = false;
-            taxiLandingCooldown_ = 2.0f;
+    if (!snapToFinalWaypoint && haveLandingPos) {
+        constexpr float kAuthoritativeLandingSnapDist = 300.0f;
+        glm::vec3 gap = landingPos - glm::vec3(movementInfo.x, movementInfo.y, movementInfo.z);
+        if (glm::length(gap) <= kAuthoritativeLandingSnapDist) {
+            LOG_INFO("Taxi landing (authoritative early completion): within sanity "
+                     "distance of known final waypoint, snapping there instead of "
+                     "current spline position (gap=", glm::length(gap), ")");
+            snapToFinalWaypoint = true;
+        }
+    }
+    if (snapToFinalWaypoint && haveLandingPos) {
+        auto playerEntity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid());
+        if (playerEntity) {
+            playerEntity->setPosition(landingPos.x, landingPos.y, landingPos.z,
+                                      movementInfo.orientation);
+        }
+        movementInfo.x = landingPos.x;
+        movementInfo.y = landingPos.y;
+        movementInfo.z = landingPos.z;
+        // Application's own per-frame render-position sync only runs while onTaxi
+        // is true (see its "Sync character render position" block) - by the time
+        // this function returns, onTaxiFlight_/taxiMountActive_ are already false,
+        // so that sync won't pick up this correction. Push it to the renderer
+        // directly instead - see taxiLandingPositionCallbackRef()'s comment.
+        if (owner_.taxiLandingPositionCallbackRef()) {
+            owner_.taxiLandingPositionCallbackRef()(landingPos.x, landingPos.y, landingPos.z);
+        }
+        LOG_INFO("Taxi landing: snapped to final waypoint (",
+                 landingPos.x, ", ", landingPos.y, ", ", landingPos.z, ")");
+    }
+    taxiClientActive_ = false;
+    onTaxiFlight_ = false;
+    taxiLandingCooldown_ = 2.0f;
+    if (taxiMountActive_ && owner_.mountCallbackRef()) {
+        owner_.mountCallbackRef()(0);
+    }
+    taxiMountActive_ = false;
+    taxiMountDisplayId_ = 0;
+    owner_.currentMountDisplayIdRef() = 0;
+    // Some WotLK servers expose the taxi mount through vehicle data.
+    // Clear that cached ID at landing so the dismount control does not
+    // remain visible after the flight has completed.
+    owner_.vehicleIdRef() = 0;
+    taxiClientPath_.clear();
+    taxiDestNodeId_ = 0;
+    taxiServerCompletionPending_ = false;
+    taxiRecoverPending_ = false;
+    movementInfo.flags = 0;
+    movementInfo.flags2 = 0;
+    if (owner_.getSocket()) {
+        sendMovement(Opcode::MSG_MOVE_STOP);
+        sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
+    }
+    LOG_INFO("Taxi flight landed (client path)");
+}
+
+void MovementHandler::deferServerTaxiCompletion() {
+    if (!taxiClientActive_) return;
+    taxiServerCompletionPending_ = true;
+}
+
+bool MovementHandler::isNearTaxiDestination(float maxDistance) const {
+    if (!taxiClientActive_ || taxiClientPath_.empty()) return false;
+
+    const glm::vec3& destination = taxiClientPath_.back();
+    const float dx = movementInfo.x - destination.x;
+    const float dy = movementInfo.y - destination.y;
+    const float dz = movementInfo.z - destination.z;
+    return dx * dx + dy * dy + dz * dz <= maxDistance * maxDistance;
+}
+
+void MovementHandler::updateClientTaxi(float deltaTime) {
+    // Live-confirmed: a CMSG_ACTIVATETAXI the server can't make sense of (e.g.
+    // a stale start node vs. the player's actual position) can go completely
+    // unanswered - no SMSG_ACTIVATETAXIREPLY at all, success or failure. Before
+    // activation was deferred to the reply (see activateTaxi()'s comment), the
+    // speculative flight start accidentally "recovered" from this since it
+    // never waited on a reply in the first place. Now that it correctly does,
+    // a dropped reply left taxiActivatePending_ true forever - every future
+    // activateTaxi() call silently no-ops on its pending-guard, permanently
+    // soft-locking the player's taxi system until relog. Time out and clear
+    // pending state the same way an explicit failure reply would.
+    if (taxiActivatePending_) {
+        taxiActivateTimer_ += deltaTime;
+        if (taxiActivateTimer_ > kTaxiActivateReplyTimeoutSeconds) {
+            LOG_WARNING("Taxi activation reply timed out after ",
+                        kTaxiActivateReplyTimeoutSeconds, "s - clearing pending state");
+            taxiActivatePending_ = false;
+            taxiActivateTimer_ = 0.0f;
+            taxiClientPath_.clear();
+            taxiClientIndex_ = 0;
+            taxiClientSegmentProgress_ = 0.0f;
             if (taxiMountActive_ && owner_.mountCallbackRef()) {
                 owner_.mountCallbackRef()(0);
             }
             taxiMountActive_ = false;
             taxiMountDisplayId_ = 0;
-            owner_.currentMountDisplayIdRef() = 0;
-            taxiClientPath_.clear();
-            taxiRecoverPending_ = false;
-            movementInfo.flags = 0;
-            movementInfo.flags2 = 0;
-            if (owner_.getSocket()) {
-                sendMovement(Opcode::MSG_MOVE_STOP);
-                sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
-            }
-            LOG_INFO("Taxi flight landed (client path)");
-    };
+            onTaxiFlight_ = false;
+        }
+    }
+
+    if (!taxiClientActive_ || taxiClientPath_.size() < 2) return;
+    auto playerEntity = owner_.getEntityManager().getEntity(owner_.getPlayerGuid());
 
     if (taxiClientIndex_ + 1 >= taxiClientPath_.size()) {
-        finishTaxiFlight();
+        finishClientTaxiFlight(/*snapToFinalWaypoint=*/true);
         return;
     }
 
@@ -2231,7 +2618,7 @@ void MovementHandler::updateClientTaxi(float deltaTime) {
 
     while (true) {
         if (taxiClientIndex_ + 1 >= taxiClientPath_.size()) {
-            finishTaxiFlight();
+            finishClientTaxiFlight(/*snapToFinalWaypoint=*/true);
             return;
         }
 
@@ -2244,7 +2631,12 @@ void MovementHandler::updateClientTaxi(float deltaTime) {
             taxiClientIndex_++;
             continue;
         }
-        segmentLen = std::sqrt(segLenSq);
+        // Pace by the curve's real arc length, not the straight-line chord -
+        // see taxiClientSegmentArcLengths_'s comment. Fall back to the chord
+        // length only if the precomputed array is somehow missing/stale.
+        segmentLen = (taxiClientIndex_ < taxiClientSegmentArcLengths_.size())
+            ? taxiClientSegmentArcLengths_[taxiClientIndex_]
+            : std::sqrt(segLenSq);
 
         if (remainingDistance >= segmentLen) {
             remainingDistance -= segmentLen;
@@ -2264,15 +2656,9 @@ void MovementHandler::updateClientTaxi(float deltaTime) {
     glm::vec3 p3 = (taxiClientIndex_ + 2 < taxiClientPath_.size()) ?
                    taxiClientPath_[taxiClientIndex_ + 2] : end;
 
-    float t2 = t * t;
-    float t3 = t2 * t;
-    glm::vec3 nextPos = 0.5f * (
-        (2.0f * p1) +
-        (-p0 + p2) * t +
-        (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t2 +
-        (-p0 + 3.0f * p1 - 3.0f * p2 + p3) * t3
-    );
+    glm::vec3 nextPos = evalTaxiCatmullRom(p0, p1, p2, p3, t);
 
+    float t2 = t * t;
     glm::vec3 tangent = 0.5f * (
         (-p0 + p2) +
         2.0f * (2.0f * p0 - 5.0f * p1 + 4.0f * p2 - p3) * t +
@@ -2310,6 +2696,16 @@ void MovementHandler::updateClientTaxi(float deltaTime) {
     movementInfo.z = nextPos.z;
     movementInfo.orientation = smoothOrientation;
 
+    // A server completion packet can arrive much earlier than the local DBC
+    // spline endpoint (observed on CMaNGOS), and it is commonly sent only once.
+    // Do not land at the packet's early position, but also do not discard it:
+    // consume it inside a small landing radius so the mount comes off promptly
+    // rather than lingering through the tail of a mismatched local path.
+    if (taxiServerCompletionPending_ && isNearTaxiDestination()) {
+        finishClientTaxiFlight(/*snapToFinalWaypoint=*/true);
+        return;
+    }
+
     if (owner_.taxiOrientationCallbackRef()) {
         glm::vec3 renderTangent = core::coords::canonicalToRender(tangent);
         float renderYaw = std::atan2(renderTangent.y, renderTangent.x);
@@ -2340,6 +2736,9 @@ void MovementHandler::handleActivateTaxiReply(network::Packet& packet) {
         taxiActivatePending_ = false;
         taxiActivateTimer_ = 0.0f;
         applyTaxiMountForCurrentNode();
+        // Now that the server has confirmed, actually move the player to the path
+        // start and start advancing the spline (see activateTaxi()'s comment).
+        beginTaxiFlightMotion();
         if (owner_.getSocket()) {
             sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
         }
@@ -2355,6 +2754,13 @@ void MovementHandler::handleActivateTaxiReply(network::Packet& packet) {
         owner_.addSystemChatMessage("Cannot take that flight path.");
         taxiActivatePending_ = false;
         taxiActivateTimer_ = 0.0f;
+        // Clear the pending path data built speculatively by activateTaxi() -
+        // it was never committed (taxiClientActive_ never went true), but drop it
+        // explicitly so a retry can't somehow pick up stale waypoints.
+        taxiClientPath_.clear();
+        taxiClientIndex_ = 0;
+        taxiClientSegmentProgress_ = 0.0f;
+        taxiDestNodeId_ = 0;
         if (taxiMountActive_ && owner_.mountCallbackRef()) {
             owner_.mountCallbackRef()(0);
         }
@@ -2372,6 +2778,7 @@ void MovementHandler::closeTaxi() {
     }
 
     if (taxiMountActive_ && owner_.mountCallbackRef()) {
+        LOG_INFO("closeTaxi: clearing taxi mount");
         owner_.mountCallbackRef()(0);
     }
     taxiMountActive_ = false;
@@ -2424,6 +2831,8 @@ void MovementHandler::activateTaxi(uint32_t destNodeId) {
 
     uint32_t startNode = currentTaxiData_.nearestNode;
     if (startNode == 0 || destNodeId == 0 || startNode == destNodeId) return;
+
+    taxiDestNodeId_ = destNodeId;
 
     if (owner_.isMounted()) {
         LOG_INFO("Taxi activate: dismounting current mount");
@@ -2502,12 +2911,16 @@ void MovementHandler::activateTaxi(uint32_t destNodeId) {
     taxiWindowOpen_ = false;
     taxiActivatePending_ = true;
     taxiActivateTimer_ = 0.0f;
-    taxiStartGrace_ = 2.0f;
-    if (!onTaxiFlight_) {
-        onTaxiFlight_ = true;
-        sanitizeMovementForTaxi();
-        applyTaxiMountForCurrentNode();
-    }
+    // Do NOT mount, set onTaxiFlight_, or activate the client spline here.
+    // CMSG_ACTIVATETAXI can be rejected by the server (insufficient gold, invalid
+    // route, distance/state restrictions). Starting the flight speculatively meant
+    // a rejection reply became indistinguishable from a stale/duplicate one once
+    // updateClientTaxi() started running unconditionally every frame - the client
+    // would just keep flying an unauthorized route. Everything that actually starts
+    // the flight (mount, onTaxiFlight_, taxiClientActive_) now happens only in the
+    // success branch of handleActivateTaxiReply(), once the server confirms.
+    // taxiClientPath_ is still built below as pending data - see
+    // startClientTaxiPath()'s comment.
     if (owner_.getSocket()) {
         sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
     }
@@ -2551,10 +2964,16 @@ void MovementHandler::activateTaxi(uint32_t destNodeId) {
 
 void MovementHandler::loadAreaTriggerDbc() {
     if (owner_.areaTriggerDbcLoadedRef()) return;
-    owner_.areaTriggerDbcLoadedRef() = true;
 
     auto* am = owner_.services().assetManager;
+    // Don't latch "loaded" until the asset manager is actually ready - the
+    // first checkAreaTriggers() tick can land well before asset manager
+    // init finishes (observed in headless mode), and latching here first
+    // would permanently strand areaTriggersRef() empty with no retry and
+    // no warning, silently disabling every area trigger for the process's
+    // lifetime.
     if (!am || !am->isInitialized()) return;
+    owner_.areaTriggerDbcLoadedRef() = true;
 
     auto dbc = am->loadDBC("AreaTrigger.dbc");
     if (!dbc || !dbc->isLoaded()) {
@@ -2598,11 +3017,46 @@ void MovementHandler::checkAreaTriggers() {
     // avoid firing Alterac/Hillsbrad triggers and causing a rogue teleport.
     if (owner_.getCurrentMapId() == 0 &&
         std::abs(px) < 1000.0f && std::abs(py) < 1000.0f) {
-        LOG_WARNING("checkAreaTriggers: position near map origin (", px, ", ", py, ", ", pz,
-                    ") on map 0 — skipping to avoid rogue teleport. onTransport=",
-                    owner_.isOnTransport(), " transportGuid=0x", std::hex,
-                    owner_.playerTransportGuidRef(), std::dec);
-        return;
+        if (!restoreWorldTransferFallbackIfNearOrigin("checkAreaTriggers")) {
+            LOG_WARNING("checkAreaTriggers: position near map origin (", px, ", ", py, ", ", pz,
+                        ") on map 0 — skipping to avoid rogue teleport. onTransport=",
+                        owner_.isOnTransport(), " transportGuid=0x", std::hex,
+                        owner_.playerTransportGuidRef(), std::dec);
+            return;
+        }
+    }
+
+    const float checkedPx = movementInfo.x;
+    const float checkedPy = movementInfo.y;
+    const float checkedPz = movementInfo.z;
+
+    // Swept-path samples: also test points between the previous check position
+    // and the current one, so fast (mounted) movement cannot step across a
+    // small portal box between 0.25s polls — the Deeprun entrance trigger only
+    // fired intermittently when ridden into at mount speed.
+    glm::vec3 sweepSamples[10];
+    int sweepCount = 0;
+    {
+        const glm::vec3 cur(checkedPx, checkedPy, checkedPz);
+        const bool sameMap = lastAreaTriggerCheckValid_ &&
+                             lastAreaTriggerCheckMapId_ == owner_.currentMapIdRef();
+        if (sameMap) {
+            const glm::vec3 d = cur - lastAreaTriggerCheckPos_;
+            const float movedSq = d.x * d.x + d.y * d.y + d.z * d.z;
+            // Skip sweep on teleport-sized jumps; only bridge normal movement.
+            if (movedSq > 1.0f && movedSq < 50.0f * 50.0f) {
+                const float moved = std::sqrt(movedSq);
+                const int steps = std::min(8, static_cast<int>(moved));
+                for (int s = 1; s <= steps; ++s) {
+                    const float t = static_cast<float>(s) / static_cast<float>(steps + 1);
+                    sweepSamples[sweepCount++] = lastAreaTriggerCheckPos_ + d * t;
+                }
+            }
+        }
+        sweepSamples[sweepCount++] = cur;
+        lastAreaTriggerCheckPos_ = cur;
+        lastAreaTriggerCheckMapId_ = owner_.currentMapIdRef();
+        lastAreaTriggerCheckValid_ = true;
     }
 
     // Time-based cooldown after teleport/world entry — suppress ALL trigger
@@ -2620,52 +3074,147 @@ void MovementHandler::checkAreaTriggers() {
     for (const auto& at : owner_.areaTriggersRef()) {
         if (at.mapId != owner_.currentMapIdRef()) continue;
 
+        auto insideTrigger = [&at](float qx, float qy, float qz) -> bool {
+            if (at.radius > 0.0f) {
+                // Sphere trigger — use actual DBC radius
+                float dx = qx - at.x;
+                float dy = qy - at.y;
+                float dz = qz - at.z;
+                float distSq = dx * dx + dy * dy + dz * dz;
+                return distSq <= at.radius * at.radius;
+            }
+            if (at.boxLength > 0.0f || at.boxWidth > 0.0f || at.boxHeight > 0.0f) {
+                // Box trigger. AreaTrigger.dbc stores box axes in server-space
+                // X/Y. The trigger center is cached in canonical space, so swap
+                // deltas back to server-space before applying length/width/yaw.
+                float serverDx = qy - at.y;
+                float serverDy = qx - at.x;
+                float dz = qz - at.z;
+
+                // Rotate into box-local space
+                float cosYaw = std::cos(-at.boxYaw);
+                float sinYaw = std::sin(-at.boxYaw);
+                float localX = serverDx * cosYaw - serverDy * sinYaw;
+                float localY = serverDx * sinYaw + serverDy * cosYaw;
+
+                return std::abs(localX) <= at.boxLength * 0.5f &&
+                       std::abs(localY) <= at.boxWidth * 0.5f &&
+                       std::abs(dz) <= at.boxHeight * 0.5f;
+            }
+            return false;
+        };
+
         bool inside = false;
-        if (at.radius > 0.0f) {
-            // Sphere trigger — use actual DBC radius
-            float dx = px - at.x;
-            float dy = py - at.y;
-            float dz = pz - at.z;
-            float distSq = dx * dx + dy * dy + dz * dz;
-            inside = (distSq <= at.radius * at.radius);
-        } else if (at.boxLength > 0.0f || at.boxWidth > 0.0f || at.boxHeight > 0.0f) {
-            // Box trigger — use actual DBC dimensions
-            float effLength = at.boxLength;
-            float effWidth = at.boxWidth;
-            float effHeight = at.boxHeight;
-
-            float dx = px - at.x;
-            float dy = py - at.y;
-            float dz = pz - at.z;
-
-            // Rotate into box-local space
-            float cosYaw = std::cos(-at.boxYaw);
-            float sinYaw = std::sin(-at.boxYaw);
-            float localX = dx * cosYaw - dy * sinYaw;
-            float localY = dx * sinYaw + dy * cosYaw;
-
-            inside = (std::abs(localX) <= effLength * 0.5f &&
-                      std::abs(localY) <= effWidth * 0.5f &&
-                      std::abs(dz) <= effHeight * 0.5f);
+        for (int s = 0; s < sweepCount && !inside; ++s) {
+            inside = insideTrigger(sweepSamples[s].x, sweepSamples[s].y, sweepSamples[s].z);
         }
 
         if (inside) {
             if (owner_.activeAreaTriggersRef().count(at.id) == 0) {
-                owner_.activeAreaTriggersRef().insert(at.id);
-
-                if (suppressFirst || cooldownActive) {
-                    LOG_WARNING("AreaTrigger suppressed (post-transfer): AT", at.id,
+                const bool suppressCurrentTrigger =
+                    suppressFirst || cooldownActive || postTransferReturnAreaTriggerId_ == at.id;
+                if (suppressFirst) {
+                    // If we spawn already inside a portal trigger, arm it as
+                    // active so cooldown expiry cannot immediately bounce us
+                    // back through the destination portal. The player must
+                    // leave and re-enter before it can fire.
+                    if (postTransferReturnAreaTriggerId_ == at.id) {
+                        postTransferReturnAreaTriggerSawNear_ = true;
+                    }
+                    owner_.activeAreaTriggersRef().insert(at.id);
+                    LOG_INFO("AreaTrigger armed on post-transfer spawn: AT", at.id,
                                 " cooldown=", owner_.areaTriggerCooldownRef());
+                } else if (postTransferReturnAreaTriggerId_ == at.id) {
+                    // After a map transfer, the destination can place or
+                    // nudge the player into the paired return trigger after
+                    // the normal grace window has elapsed. Arm that trigger
+                    // until the player leaves it once; a later re-entry can
+                    // then intentionally fire it.
+                    postTransferReturnAreaTriggerSawNear_ = true;
+                    owner_.activeAreaTriggersRef().insert(at.id);
+                    LOG_WARNING("AreaTrigger armed for post-transfer return portal: AT", at.id,
+                                " cooldown=", owner_.areaTriggerCooldownRef());
+                } else if (cooldownActive) {
+                    // Do not mark ordinary cooldown-suppressed triggers active.
+                    // If the player walks into a trigger during the cooldown,
+                    // it should fire once the grace window ends.
+                    LOG_DEBUG("AreaTrigger cooldown suppressed: AT", at.id,
+                              " cooldown=", owner_.areaTriggerCooldownRef());
+                } else {
+                    owner_.activeAreaTriggersRef().insert(at.id);
+                }
+
+                if (suppressCurrentTrigger) {
+                    // Suppressed above; if suppressFirst inserted the trigger,
+                    // it will not fire until the player leaves/re-enters.
                 } else {
                     network::Packet pkt(wireOpcode(Opcode::CMSG_AREATRIGGER));
                     pkt.writeUInt32(at.id);
+                    lastAreaTriggerId_ = at.id;
+                    if (const auto* dest = findKnownAreaTriggerDestinationByTrigger(at.id)) {
+                        pendingAreaTriggerDestinationValid_ = true;
+                        pendingAreaTriggerDestinationMapId_ = dest->mapId;
+                        pendingAreaTriggerDestinationServerPos_ =
+                            glm::vec3(dest->serverX, dest->serverY, dest->serverZ);
+                        pendingAreaTriggerDestinationServerO_ = dest->serverO;
+                    }
                     owner_.getSocket()->send(pkt);
+                    const float dx = checkedPx - at.x;
+                    const float dy = checkedPy - at.y;
                     LOG_WARNING("Fired CMSG_AREATRIGGER: id=", at.id,
-                                " pos=(", px, ", ", py, ", ", pz, ")",
-                                " trigger=(", at.x, ", ", at.y, ", ", at.z, ")");
+                                " pos=(", checkedPx, ", ", checkedPy, ", ", checkedPz, ")",
+                                " trigger=(", at.x, ", ", at.y, ", ", at.z, ")",
+                                " dist2d=", std::sqrt(dx * dx + dy * dy));
                 }
             }
         } else {
+            if (postTransferReturnAreaTriggerId_ == at.id) {
+                const float dx = checkedPx - at.x;
+                const float dy = checkedPy - at.y;
+                const float dz = checkedPz - at.z;
+                const float distSq = dx * dx + dy * dy + dz * dz;
+                const float triggerExtent = std::max({
+                    at.radius,
+                    at.boxLength * 0.5f,
+                    at.boxWidth * 0.5f,
+                    at.boxHeight * 0.5f,
+                    12.0f
+                });
+                const float clearDistance = triggerExtent + 8.0f;
+                if (distSq <= clearDistance * clearDistance) {
+                    postTransferReturnAreaTriggerSawNear_ = true;
+                    // A single outside sample near a destination portal is not
+                    // enough to prove the player intentionally left it. Deeprun
+                    // can report one outside tick and then drift back inside,
+                    // which causes an immediate bounce. Keep the return portal
+                    // armed until the player is comfortably clear.
+                    owner_.activeAreaTriggersRef().insert(at.id);
+                    LOG_DEBUG("AreaTrigger post-transfer return portal retained near trigger: AT", at.id,
+                              " dist=", std::sqrt(distSq),
+                              " clear=", clearDistance);
+                    continue;
+                }
+
+                if (!postTransferReturnAreaTriggerSawNear_ && distSq > 1000.0f * 1000.0f) {
+                    // During map transfer there can be a tick where the current
+                    // map has switched but movementInfo still contains the old
+                    // map's coordinates. That looks thousands of yards away
+                    // from the destination trigger and must not clear the guard
+                    // before the destination position arrives.
+                    owner_.activeAreaTriggersRef().insert(at.id);
+                    // Fires every frame for the brief window between a map switch and
+                    // the destination position arriving - routine, not exceptional.
+                    LOG_DEBUG("AreaTrigger post-transfer return portal waiting for destination position: AT",
+                                at.id, " dist=", std::sqrt(distSq));
+                    continue;
+                }
+
+                postTransferReturnAreaTriggerId_ = 0;
+                postTransferReturnAreaTriggerSawNear_ = false;
+                LOG_INFO("AreaTrigger post-transfer return portal cleared after leaving: AT", at.id,
+                            " dist=", std::sqrt(distSq));
+            }
+
             // Player left the trigger — allow re-fire on re-entry
             owner_.activeAreaTriggersRef().erase(at.id);
         }
@@ -2810,11 +3359,75 @@ void MovementHandler::cancelFollow() {
         return;
     }
     owner_.followTargetGuidRef() = 0;
+    if (followMoveMoving_) {
+        sendMovement(Opcode::MSG_MOVE_STOP);
+        followMoveMoving_ = false;
+    }
     if (owner_.autoFollowCallbackRef()) {
         owner_.autoFollowCallbackRef()(nullptr);
     }
     owner_.addSystemChatMessage("You stop following.");
     owner_.fireAddonEvent("AUTOFOLLOW_END", {});
+}
+
+// Same straight-line step used by the headless client's single-shot
+// /movement/goto (updateMovementTask() in tools/headless_client/main.cpp),
+// but the target position is read fresh from the live entity every call
+// instead of a stored waypoint, and stops at kFollowStopDistance rather
+// than snapping onto the target.
+void MovementHandler::updateFollowMovement(float deltaTime) {
+    const uint64_t guid = owner_.followTargetGuidRef();
+    if (guid == 0) {
+        return;
+    }
+    if (owner_.getState() != WorldState::IN_WORLD) {
+        return;
+    }
+    if (isPlayerRooted() || !isServerMovementAllowed() || isOnTaxiFlight()) {
+        if (followMoveMoving_) {
+            sendMovement(Opcode::MSG_MOVE_STOP);
+            followMoveMoving_ = false;
+        }
+        return;
+    }
+
+    auto target = owner_.getEntityManager().getEntity(guid);
+    if (!target) {
+        // cancelFollow() (called from GameHandler::update()'s
+        // followRenderPos_ refresh) handles the disappeared-target case;
+        // just stay quiet here rather than duplicate that check.
+        return;
+    }
+
+    constexpr float kFollowStopDistance = 1.0f;
+    const float dx = target->getX() - movementInfo.x;
+    const float dy = target->getY() - movementInfo.y;
+    const float dz = target->getZ() - movementInfo.z;
+    const float horizontalDist = std::sqrt(dx * dx + dy * dy);
+    const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+
+    if (distance <= kFollowStopDistance) {
+        if (followMoveMoving_) {
+            sendMovement(Opcode::MSG_MOVE_STOP);
+            followMoveMoving_ = false;
+        }
+        return;
+    }
+
+    if (horizontalDist > 0.001f) {
+        setOrientation(std::atan2(-dy, dx));
+        sendMovement(Opcode::MSG_MOVE_SET_FACING);
+    }
+    if (!followMoveMoving_) {
+        sendMovement(Opcode::MSG_MOVE_START_FORWARD);
+        followMoveMoving_ = true;
+    }
+
+    const float speed = std::max(0.1f, getServerRunSpeed());
+    const float step = std::min(distance - kFollowStopDistance, speed * std::max(0.0f, deltaTime));
+    const float t = distance > 0.001f ? (step / distance) : 0.0f;
+    setPosition(movementInfo.x + dx * t, movementInfo.y + dy * t, movementInfo.z + dz * t);
+    sendMovement(Opcode::MSG_MOVE_HEARTBEAT);
 }
 
 } // namespace game

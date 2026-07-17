@@ -20,7 +20,7 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 if(WIN32)
     # Needed for Vulkan Win32 external memory/semaphore handle types used by FSR3 interop.
-    add_compile_definitions(VK_USE_PLATFORM_WIN32_KHR)
+    add_compile_definitions(VK_USE_PLATFORM_WIN32_KHR WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
 # Options
@@ -77,6 +77,7 @@ if(WOWEE_ENABLE_AMD_FSR2 AND EXISTS ${WOWEE_AMD_FSR2_HEADER} AND EXISTS ${WOWEE_
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(wowee_fsr2_amd_vk PRIVATE
             "-include${WOWEE_FFX_COMPAT_HEADER}"
+            -Wno-deprecated-declarations
         )
     elseif(MSVC)
         target_compile_options(wowee_fsr2_amd_vk PRIVATE
@@ -393,7 +394,7 @@ endif()
 # GLM GTX extensions (quaternion, norm, etc.) require this flag on newer GLM versions
 add_compile_definitions(GLM_ENABLE_EXPERIMENTAL GLM_FORCE_DEPTH_ZERO_TO_ONE)
 if(WIN32)
-    add_compile_definitions(NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
 # SPIR-V shader compilation via glslc
@@ -408,7 +409,11 @@ endif()
 # Function to compile GLSL shaders to SPIR-V
 function(compile_shaders TARGET_NAME)
     set(SHADER_DIR ${CMAKE_CURRENT_SOURCE_DIR}/assets/shaders)
-    set(SPV_DIR ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/assets/shaders)
+    # Compile in place, next to the GLSL. The .spv files are tracked (they are the
+    # fallback when glslc is absent), and the POST_BUILD step below copies the whole
+    # source assets/ tree over the runtime one — so compiling into the runtime tree
+    # would just be overwritten by the committed .spv, silently running stale shaders.
+    set(SPV_DIR ${SHADER_DIR})
     file(MAKE_DIRECTORY ${SPV_DIR})
 
     file(GLOB GLSL_SOURCES "${SHADER_DIR}/*.glsl")
@@ -563,6 +568,7 @@ set(WOWEE_SOURCES
     src/game/world_packets_world.cpp
     src/game/world_packets_economy.cpp
     src/game/spline_packet.cpp
+    src/game/faction_hostility.cpp
     src/game/packet_parsers_tbc.cpp
     src/game/packet_parsers_classic.cpp
     src/game/character.cpp
@@ -577,6 +583,7 @@ set(WOWEE_SOURCES
     src/audio/activity_sound_manager.cpp
     src/audio/mount_sound_manager.cpp
     src/audio/npc_voice_manager.cpp
+    src/audio/player_voice_manager.cpp
     src/audio/ambient_sound_manager.cpp
     src/audio/ui_sound_manager.cpp
     src/audio/combat_sound_manager.cpp
@@ -772,6 +779,7 @@ set(WOWEE_SOURCES
     src/rendering/weather.cpp
     src/rendering/lightning.cpp
     src/rendering/lighting_manager.cpp
+    src/rendering/zone_ambience.cpp
     src/rendering/sky_system.cpp
     src/rendering/character_renderer.cpp
     src/rendering/character_preview.cpp
@@ -868,6 +876,7 @@ set(WOWEE_SOURCES
     src/ui/social_panel.cpp
     src/ui/action_bar_panel.cpp
     src/ui/window_manager.cpp
+    src/ui/crafting_window.cpp
     src/ui/inventory_screen.cpp
     src/ui/quest_log_screen.cpp
     src/ui/spellbook_screen.cpp
@@ -929,6 +938,7 @@ set(WOWEE_HEADERS
     include/audio/activity_sound_manager.hpp
     include/audio/mount_sound_manager.hpp
     include/audio/npc_voice_manager.hpp
+    include/audio/player_voice_manager.hpp
     include/audio/ambient_sound_manager.hpp
     include/audio/ui_sound_manager.hpp
     include/audio/combat_sound_manager.hpp
@@ -1076,10 +1086,31 @@ if(GLSLC)
     compile_shaders(wowee)
 endif()
 
+# Version header generated from `git describe`. Regenerated on every build (the
+# script rewrites the header only when the version changed), so tagging a release
+# is enough to update the version shown in the client.
+set(WOWEE_VERSION_HEADER ${CMAKE_BINARY_DIR}/generated/core/version.hpp)
+set(WOWEE_VERSION_SCRIPT_ARGS
+    -DSRC_DIR=${CMAKE_SOURCE_DIR}
+    -DIN_FILE=${CMAKE_SOURCE_DIR}/include/core/version.hpp.in
+    -DOUT_FILE=${WOWEE_VERSION_HEADER}
+    -P ${CMAKE_SOURCE_DIR}/cmake/GitVersion.cmake
+)
+# Once now, so the header exists before the first compile.
+execute_process(COMMAND ${CMAKE_COMMAND} ${WOWEE_VERSION_SCRIPT_ARGS})
+add_custom_target(wowee_version ALL
+    COMMAND ${CMAKE_COMMAND} ${WOWEE_VERSION_SCRIPT_ARGS}
+    BYPRODUCTS ${WOWEE_VERSION_HEADER}
+    COMMENT "Resolving version from git"
+    VERBATIM
+)
+add_dependencies(wowee wowee_version)
+
 # Include directories
 target_include_directories(wowee PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
 )
 # Vendored headers as SYSTEM to suppress third-party warnings
 target_include_directories(wowee SYSTEM PRIVATE
@@ -1152,8 +1183,11 @@ if(HAVE_UNICORN)
     target_compile_definitions(wowee PRIVATE HAVE_UNICORN)
 endif()
 
-# Link GLM if found
-if(TARGET glm::glm)
+# Prefer GLM's explicit header-only target. GLM 1.0 may build glm::glm as a
+# shared library, which creates an unnecessary runtime dependency in app bundles.
+if(TARGET glm::glm-header-only)
+    target_link_libraries(wowee PRIVATE glm::glm-header-only)
+elseif(TARGET glm::glm)
     target_link_libraries(wowee PRIVATE glm::glm)
 elseif(glm_FOUND)
     target_include_directories(wowee PRIVATE ${GLM_INCLUDE_DIRS})
@@ -1347,11 +1381,20 @@ if(STORMLIB_LIBRARY AND STORMLIB_INCLUDE_DIR)
     if(WIN32)
         find_library(WININET_LIB wininet)
         find_library(BZ2_LIB bz2)
+        find_library(TOMCRYPT_LIB NAMES tomcrypt libtomcrypt)
+        find_library(TOMMATH_LIB NAMES tommath libtommath)
         if(WININET_LIB)
             target_link_libraries(asset_extract PRIVATE ${WININET_LIB})
         endif()
         if(BZ2_LIB)
             target_link_libraries(asset_extract PRIVATE ${BZ2_LIB})
+        endif()
+        if(TOMCRYPT_LIB AND TOMMATH_LIB)
+            # Static StormLib exposes its LibTomCrypt/LibTomMath dependencies.
+            target_link_libraries(asset_extract PRIVATE ${TOMCRYPT_LIB} ${TOMMATH_LIB})
+        else()
+            message(FATAL_ERROR
+                "Static StormLib on Windows requires LibTomCrypt and LibTomMath")
         endif()
     endif()
     set_target_properties(asset_extract PROPERTIES
@@ -1949,7 +1992,9 @@ target_link_libraries(wowee_editor PRIVATE
     imgui
     vk-bootstrap
 )
-if(TARGET glm::glm)
+if(TARGET glm::glm-header-only)
+    target_link_libraries(wowee_editor PRIVATE glm::glm-header-only)
+elseif(TARGET glm::glm)
     target_link_libraries(wowee_editor PRIVATE glm::glm)
 elseif(glm_FOUND)
     target_include_directories(wowee_editor PRIVATE ${GLM_INCLUDE_DIRS})

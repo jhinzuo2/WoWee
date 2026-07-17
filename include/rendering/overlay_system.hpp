@@ -64,6 +64,13 @@ private:
     float selCircleRadius_ = 1.5f;
     bool selCircleVisible_ = false;
 
+    // Floor-snap cache: the terrain/WMO/M2 floor queries are collision
+    // raycasts, so reuse the result while the target stands still. Refreshed
+    // periodically in case world geometry streams in around the target.
+    glm::vec3 selCircleFloorCachePos_{0.0f};
+    float selCircleFloorCacheZ_ = 0.0f;
+    int selCircleFloorCacheAge_ = -1;  // -1 = invalid; counts frames since query
+
     // Fullscreen overlay resources
     VkPipeline overlayPipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout overlayPipelineLayout_ = VK_NULL_HANDLE;

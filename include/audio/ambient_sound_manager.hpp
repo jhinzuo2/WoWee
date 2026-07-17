@@ -180,14 +180,13 @@ private:
     float oceanLoopTime_ = 0.0f;
     float zoneLoopTime_ = 0.0f;
     float cityLoopTime_ = 0.0f;
-    float bellTollDelay_ = 0.0f;  // Delay between individual bell tolls
-    int lastHourTolled_ = -1;  // Track last hour we tolled for
-    int remainingTolls_ = 0;  // Number of tolls left to play
+    float bellTollTime_ = 0.0f;
     bool wasIndoor_ = false;
     bool wasBlacksmith_ = false;
     bool wasSwimming_ = false;
     bool initialized_ = false;
     WeatherType currentWeather_ = WeatherType::NONE;
+    uint32_t currentZoneId_ = 0;
     ZoneType currentZone_ = ZoneType::NONE;
     CityType currentCity_ = CityType::NONE;
 

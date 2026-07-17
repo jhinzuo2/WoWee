@@ -1,4 +1,5 @@
 #include "core/transport_callback_handler.hpp"
+#include "core/appearance_composer.hpp"
 #include "core/entity_spawner.hpp"
 #include "core/world_loader.hpp"
 #include "core/coordinates.hpp"
@@ -20,11 +21,13 @@ TransportCallbackHandler::TransportCallbackHandler(
     EntitySpawner& entitySpawner,
     rendering::Renderer& renderer,
     game::GameHandler& gameHandler,
-    WorldLoader* worldLoader)
+    WorldLoader* worldLoader,
+    AppearanceComposer* appearanceComposer)
     : entitySpawner_(entitySpawner)
     , renderer_(renderer)
     , gameHandler_(gameHandler)
     , worldLoader_(worldLoader)
+    , appearanceComposer_(appearanceComposer)
 {
 }
 
@@ -44,6 +47,12 @@ void TransportCallbackHandler::setupCallbacks() {
         }
         // Queue the mount for processing in the next update() frame
         entitySpawner_.setMountDisplayId(mountDisplayId);
+
+        // Mounting stows drawn weapons, matching the original client.
+        if (appearanceComposer_ && !appearanceComposer_->isWeaponsSheathed()) {
+            appearanceComposer_->setWeaponsSheathed(true);
+            appearanceComposer_->loadEquippedWeapons();
+        }
     });
 
     // Taxi precache callback - preload terrain tiles along flight path
@@ -111,6 +120,20 @@ void TransportCallbackHandler::setupCallbacks() {
         }
     });
 
+    // Taxi landing position correction callback - see its declaration comment in
+    // game_handler.hpp for why this exists (Application's own per-frame render
+    // sync stops as soon as onTaxi goes false, which happens before this fires).
+    gameHandler_.setTaxiLandingPositionCallback([this](float x, float y, float z) {
+        glm::vec3 renderPos = core::coords::canonicalToRender(glm::vec3(x, y, z));
+        renderer_.getCharacterPosition() = renderPos;
+        if (renderer_.getCameraController()) {
+            glm::vec3* followTarget = renderer_.getCameraController()->getFollowTargetMutable();
+            if (followTarget) {
+                *followTarget = renderPos;
+            }
+        }
+    });
+
     // Taxi flight start callback - keep non-blocking to avoid hitching at takeoff.
     gameHandler_.setTaxiFlightStartCallback([this]() {
         if (renderer_.getTerrainManager() && renderer_.getM2Renderer()) {
@@ -173,70 +196,12 @@ void TransportCallbackHandler::setupCallbacks() {
                 auto it = goInstances3.find(guid);
                 if (it != goInstances3.end()) {
                     uint32_t wmoInstanceId = it->second.instanceId;
-
-                    // TransportAnimation.dbc is indexed by GameObject entry
-                    uint32_t pathId = entry;
                     const bool preferServerData = gameHandler_.hasServerTransportUpdate(guid);
-
                     // Coordinates are already canonical (converted in game_handler.cpp)
                     glm::vec3 canonicalSpawnPos(x, y, z);
-
-                    // Check if we have a real usable path, otherwise remap/infer/fall back to stationary.
-                    const bool shipOrZeppelinDisplay =
-                        (displayId == 3015 || displayId == 3031 || displayId == 7546 ||
-                         displayId == 7446 || displayId == 1587 || displayId == 2454 ||
-                         displayId == 807 || displayId == 808);
-                    bool hasUsablePath = transportManager->hasPathForEntry(entry);
-                    if (shipOrZeppelinDisplay) {
-                        hasUsablePath = transportManager->hasUsableMovingPathForEntry(entry, 25.0f);
-                    }
-
-                    if (preferServerData) {
-                        // Strict server-authoritative mode: no inferred/remapped fallback routes.
-                        if (!hasUsablePath) {
-                            std::vector<glm::vec3> path = { canonicalSpawnPos };
-                            transportManager->loadPathFromNodes(pathId, path, false, 0.0f);
-                            LOG_INFO("Auto-spawned transport in strict server-first mode (stationary fallback): entry=", entry,
-                                     " displayId=", displayId, " wmoInstance=", wmoInstanceId);
-                        } else {
-                            LOG_INFO("Auto-spawned transport in server-first mode with entry DBC path: entry=", entry,
-                                     " displayId=", displayId, " wmoInstance=", wmoInstanceId);
-                        }
-                    } else if (!hasUsablePath) {
-                        bool allowZOnly = (displayId == 455 || displayId == 462);
-                        uint32_t inferredPath = transportManager->inferDbcPathForSpawn(
-                            canonicalSpawnPos, 1200.0f, allowZOnly);
-                        if (inferredPath != 0) {
-                            pathId = inferredPath;
-                            LOG_INFO("Auto-spawned transport with inferred path: entry=", entry,
-                                     " inferredPath=", pathId, " displayId=", displayId,
-                                     " wmoInstance=", wmoInstanceId);
-                        } else {
-                            uint32_t remappedPath = transportManager->pickFallbackMovingPath(entry, displayId);
-                            if (remappedPath != 0) {
-                                pathId = remappedPath;
-                                LOG_INFO("Auto-spawned transport with remapped fallback path: entry=", entry,
-                                         " remappedPath=", pathId, " displayId=", displayId,
-                                         " wmoInstance=", wmoInstanceId);
-                            } else {
-                                std::vector<glm::vec3> path = { canonicalSpawnPos };
-                                transportManager->loadPathFromNodes(pathId, path, false, 0.0f);
-                                LOG_INFO("Auto-spawned transport with stationary path: entry=", entry,
-                                         " displayId=", displayId, " wmoInstance=", wmoInstanceId);
-                            }
-                        }
-                    } else {
-                        LOG_INFO("Auto-spawned transport with real path: entry=", entry,
-                                 " displayId=", displayId, " wmoInstance=", wmoInstanceId);
-                    }
-
-                    transportManager->registerTransport(guid, wmoInstanceId, pathId, canonicalSpawnPos, entry);
-                    // Keep type in sync with the spawned instance; needed for M2 lift boarding/motion.
-                    if (!it->second.isWmo) {
-                        if (auto* tr = transportManager->getTransport(guid)) {
-                            tr->isM2 = true;
-                        }
-                    }
+                    const bool isM2Transport = !it->second.isWmo;
+                    transportManager->resolveAndRegisterSpawn(guid, entry, displayId, canonicalSpawnPos,
+                                                              wmoInstanceId, isM2Transport, preferServerData);
                 } else {
                     entitySpawner_.setTransportPendingMove(guid, x, y, z, orientation);
                     LOG_DEBUG("Cannot auto-spawn transport 0x", std::hex, guid, std::dec,

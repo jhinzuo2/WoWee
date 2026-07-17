@@ -1,5 +1,7 @@
 #pragma once
 
+#include "game/protocol_constants.hpp"
+
 #include <cstdint>
 #include <cmath>
 #include <string>
@@ -9,6 +11,8 @@
 #include <unordered_map>
 #include <memory>
 #include <optional>
+#include <mutex>
+#include <chrono>
 #include "math/spline.hpp"
 #include "game/flat_field_map.hpp"
 
@@ -42,6 +46,21 @@ enum class TypeMask : uint16_t {
     DYNAMICOBJECT = 0x0040,
     CORPSE = 0x0080
 };
+
+// UNIT_DYNAMIC_FLAGS values shared by the supported legacy expansions.
+// Keep these named: 0x08 is TAPPED_BY_PLAYER, while the actual DEAD bit is
+// 0x20. Confusing the two leaves pre-existing corpses standing after login.
+inline constexpr uint32_t UNIT_DYNFLAG_LOOTABLE         = 0x00000001;
+inline constexpr uint32_t UNIT_DYNFLAG_TAPPED           = 0x00000004;
+inline constexpr uint32_t UNIT_DYNFLAG_TAPPED_BY_PLAYER = 0x00000008;
+inline constexpr uint32_t UNIT_DYNFLAG_DEAD             = 0x00000020;
+
+/// CREATE updates may omit zero-valued health. In that case the dynamic corpse
+/// flags are the authoritative indication that the unit must spawn dead.
+inline bool isUnitCorpseState(uint32_t health, uint32_t maxHealth, uint32_t dynamicFlags) {
+    return (maxHealth > 0 && health == 0) ||
+           (dynamicFlags & (UNIT_DYNFLAG_DEAD | UNIT_DYNFLAG_LOOTABLE)) != 0;
+}
 
 /**
  * Update types for SMSG_UPDATE_OBJECT
@@ -322,6 +341,9 @@ public:
     uint8_t getPowerType() const { return powerType; }
     void setPowerType(uint8_t t) { powerType = t; }
 
+    uint32_t getAuraState() const { return auraState; }
+    void setAuraState(uint32_t state) { auraState = state; }
+
     // Level
     uint32_t getLevel() const { return level; }
     void setLevel(uint32_t l) { level = l; }
@@ -341,6 +363,11 @@ public:
     // Unit flags (UNIT_FIELD_FLAGS, index 59)
     uint32_t getUnitFlags() const { return unitFlags; }
     void setUnitFlags(uint32_t f) { unitFlags = f; }
+
+    // Client presentation flags (byte 2 of UNIT_FIELD_BYTES_1).
+    uint8_t getVisibilityFlags() const { return visibilityFlags; }
+    void setVisibilityFlags(uint8_t f) { visibilityFlags = f; }
+    bool hasCreepVisibility() const { return (visibilityFlags & UNIT_VIS_FLAG_CREEP) != 0; }
 
     // Dynamic flags (UNIT_DYNAMIC_FLAGS, index 147)
     uint32_t getDynamicFlags() const { return dynamicFlags; }
@@ -370,11 +397,13 @@ protected:
     uint32_t powers[7] = {};     // Indexed by power type (0=mana,1=rage,2=focus,3=energy,4=happiness,5=runes,6=runic)
     uint32_t maxPowers[7] = {};  // Max values per power type
     uint8_t powerType = 0;       // Active power type
+    uint32_t auraState = 0;      // UNIT_FIELD_AURASTATE reactive opportunity mask
     uint32_t level = 1;
     uint32_t entry = 0;
     uint32_t displayId = 0;
     uint32_t mountDisplayId = 0;
     uint32_t unitFlags = 0;
+    uint8_t visibilityFlags = 0;
     uint32_t dynamicFlags = 0;
     uint32_t npcFlags = 0;
     uint32_t npcEmoteState = 0;
@@ -434,25 +463,58 @@ public:
     // Check if entity exists
     bool hasEntity(uint64_t guid) const;
 
-    // Get all entities
+    // Main-thread spatial query. The cell index is refreshed at most four times
+    // per second, avoiding a full entity-map distance scan every rendered frame.
+    std::vector<std::shared_ptr<Entity>> getEntitiesNear(float x, float y, float radius) const;
+    void getEntitiesNear(float x, float y, float radius,
+                         std::vector<std::shared_ptr<Entity>>& out) const;
+
+    // Get all entities. MAIN-THREAD-ONLY: mutations happen via dispatchQueuedPackets()
+    // on the main thread, and this reference is not lock-protected. Callers on any
+    // other thread (e.g. the headless HTTP API thread) must use snapshotEntities()
+    // instead, which is safe to call from anywhere.
     const std::unordered_map<uint64_t, std::shared_ptr<Entity>>& getEntities() const {
         return entities;
     }
 
+    // Thread-safe copy of all tracked entities, safe to call from any thread.
+    std::vector<std::shared_ptr<Entity>> snapshotEntities() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        std::vector<std::shared_ptr<Entity>> snapshot;
+        snapshot.reserve(entities.size());
+        for (const auto& [guid, entity] : entities) {
+            snapshot.push_back(entity);
+        }
+        return snapshot;
+    }
+
     // Clear all entities
     void clear() {
+        std::lock_guard<std::mutex> lock(mutex_);
         entities.clear();
+        spatialCells_.clear();
+        spatialDirty_ = true;
     }
 
     // Get entity count
     size_t getEntityCount() const {
+        std::lock_guard<std::mutex> lock(mutex_);
         return entities.size();
     }
 
 private:
-    // MAIN-THREAD-ONLY: all entity map mutations happen via dispatchQueuedPackets()
-    // which runs on the main thread.  Do NOT access from the async network pump thread.
+    // MAIN-THREAD-ONLY for getEntities(): all entity map mutations happen via
+    // dispatchQueuedPackets() on the main thread. mutex_ guards addEntity/removeEntity/
+    // getEntity/hasEntity/snapshotEntities so those are safe to call cross-thread (the
+    // headless HTTP API thread reads player HP and nearby entities this way); it is not
+    // taken by the unlocked getEntities() reference accessor above, which remains
+    // main-thread-only.
+    mutable std::mutex mutex_;
     std::unordered_map<uint64_t, std::shared_ptr<Entity>> entities;
+    static constexpr float kSpatialCellSize = 64.0f;
+    mutable std::unordered_map<int64_t, std::vector<std::shared_ptr<Entity>>> spatialCells_;
+    mutable std::chrono::steady_clock::time_point lastSpatialRebuild_{};
+    mutable bool spatialDirty_ = true;
 };
 
 } // namespace game

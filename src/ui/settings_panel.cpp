@@ -9,6 +9,7 @@
 #include "ui/keybinding_manager.hpp"
 #include "core/application.hpp"
 #include "core/logger.hpp"
+#include "core/version.hpp"
 #include "rendering/renderer.hpp"
 #include "rendering/post_process_pipeline.hpp"
 #include "rendering/camera.hpp"
@@ -28,6 +29,7 @@
 #include "audio/movement_sound_manager.hpp"
 #include "audio/footstep_manager.hpp"
 #include "audio/npc_voice_manager.hpp"
+#include "audio/player_voice_manager.hpp"
 #include "audio/mount_sound_manager.hpp"
 #include "audio/activity_sound_manager.hpp"
 #include <imgui.h>
@@ -38,6 +40,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace wowee { namespace ui {
@@ -45,6 +48,16 @@ namespace wowee { namespace ui {
 void SettingsPanel::renderSettingsInterfaceTab(std::function<void()> saveCallback) {
 ImGui::Spacing();
 ImGui::BeginChild("InterfaceSettings", ImVec2(0, 360), true);
+
+ImGui::SeparatorText("Buff Bar");
+ImGui::Spacing();
+ImGui::SetNextItemWidth(200.0f);
+if (ImGui::SliderFloat("Buff Bar Scale", &pendingBuffBarScale, 0.75f, 1.5f, "%.2fx")) {
+    saveCallback();
+}
+ImGui::SameLine();
+ImGui::TextDisabled("(on top of automatic resolution scaling)");
+ImGui::Spacing();
 
 ImGui::SeparatorText("Action Bars");
 ImGui::Spacing();
@@ -54,15 +67,15 @@ if (ImGui::SliderFloat("Action Bar Scale", &pendingActionBarScale, 0.5f, 1.5f, "
 }
 ImGui::Spacing();
 
-if (ImGui::Checkbox("Show Second Action Bar", &pendingShowActionBar2)) {
+if (ImGui::Checkbox("Show Bottom Left Bar", &pendingShowActionBar2)) {
     saveCallback();
 }
 ImGui::SameLine();
-ImGui::TextDisabled("(Shift+1 through Shift+=)");
+ImGui::TextDisabled("(client action page 6)");
 
 if (pendingShowActionBar2) {
     ImGui::Spacing();
-    ImGui::TextUnformatted("Second Bar Position Offset");
+    ImGui::TextUnformatted("Bottom Left Bar Position Offset");
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderFloat("Horizontal##bar2x", &pendingActionBar2OffsetX, -600.0f, 600.0f, "%.0f px")) {
         saveCallback();
@@ -83,7 +96,7 @@ if (ImGui::Checkbox("Show Right Side Bar", &pendingShowRightBar)) {
     saveCallback();
 }
 ImGui::SameLine();
-ImGui::TextDisabled("(Slots 25-36)");
+ImGui::TextDisabled("(client action page 3)");
 if (pendingShowRightBar) {
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderFloat("Vertical Offset##rbar", &pendingRightBarOffsetY, -400.0f, 400.0f, "%.0f px")) {
@@ -96,13 +109,20 @@ if (ImGui::Checkbox("Show Left Side Bar", &pendingShowLeftBar)) {
     saveCallback();
 }
 ImGui::SameLine();
-ImGui::TextDisabled("(Slots 37-48)");
+ImGui::TextDisabled("(client action page 4)");
 if (pendingShowLeftBar) {
     ImGui::SetNextItemWidth(160.0f);
     if (ImGui::SliderFloat("Vertical Offset##lbar", &pendingLeftBarOffsetY, -400.0f, 400.0f, "%.0f px")) {
         saveCallback();
     }
 }
+
+ImGui::Spacing();
+if (ImGui::Checkbox("Show Micro Menu Buttons", &pendingShowMicroMenu)) {
+    saveCallback();
+}
+ImGui::SameLine();
+ImGui::TextDisabled("(bottom-left window shortcuts)");
 
 ImGui::Spacing();
 ImGui::SeparatorText("Nameplates");
@@ -192,6 +212,17 @@ if (ImGui::SliderFloat("Camera Stiffness", &pendingCameraStiffness, 5.0f, 100.0f
     saveCallback();
 }
 ImGui::SetItemTooltip("Higher = tighter camera with less sway. Default: 30");
+if (ImGui::Checkbox("Smooth Camera Follow", &pendingSmoothCameraFollow)) {
+    if (renderer) {
+        if (auto* cameraController = renderer->getCameraController()) {
+            cameraController->setSmoothCameraFollow(pendingSmoothCameraFollow);
+        }
+    }
+    saveCallback();
+}
+ImGui::SetItemTooltip("Camera keeps drifting toward its position even while turning,\n"
+                      "for a floaty, slightly detached follow. Off = turning moves the\n"
+                      "camera 1:1 with your input.");
 if (ImGui::SliderFloat("Camera Pivot Height", &pendingPivotHeight, 0.0f, 3.0f, "%.1f")) {
     if (renderer) {
         if (auto* cameraController = renderer->getCameraController()) {
@@ -203,6 +234,15 @@ if (ImGui::SliderFloat("Camera Pivot Height", &pendingPivotHeight, 0.0f, 3.0f, "
 ImGui::SetItemTooltip("Height of camera orbit point above feet. Lower = less detached feel. Default: 1.8");
 if (ImGui::IsItemHovered())
     ImGui::SetTooltip("Allow the camera to zoom out further than normal");
+
+if (ImGui::Checkbox("Idle Camera Orbit", &pendingIdleCameraOrbit)) {
+    if (renderer) {
+        if (auto* cameraController = renderer->getCameraController()) {
+            cameraController->setIdleOrbitEnabled(pendingIdleCameraOrbit);
+        }
+    }
+    saveCallback();
+}
 
 if (ImGui::SliderFloat("Field of View", &pendingFov, 45.0f, 110.0f, "%.0f°")) {
     if (renderer) {
@@ -246,6 +286,14 @@ if (ImGui::Checkbox("Square Minimap", &pendingMinimapSquare)) {
 }
 if (ImGui::Checkbox("Show Nearby NPC Dots", &pendingMinimapNpcDots)) {
     minimapNpcDots_ = pendingMinimapNpcDots;
+    saveCallback();
+}
+if (ImGui::Checkbox("Show Minimap Clock", &pendingShowMinimapClock)) {
+    showMinimapClock_ = pendingShowMinimapClock;
+    saveCallback();
+}
+if (ImGui::Checkbox("Show Minimap Coordinates", &pendingShowMinimapCoordinates)) {
+    showMinimapCoordinates_ = pendingShowMinimapCoordinates;
     saveCallback();
 }
 // Zoom controls
@@ -308,23 +356,30 @@ if (ImGui::Button("Restore Gameplay Defaults", ImVec2(-1, 0))) {
     pendingMouseSensitivity = 0.2f;
     pendingInvertMouse = false;
     pendingExtendedZoom = false;
+    pendingSmoothCameraFollow = false;
     pendingUiOpacity = 65;
     pendingMinimapRotate = false;
     pendingMinimapSquare = false;
     pendingMinimapNpcDots = false;
+    pendingShowMinimapClock = false;
+    pendingShowMinimapCoordinates = false;
     pendingSeparateBags = true;
     inventoryScreen.setSeparateBags(true);
     pendingShowKeyring = true;
     inventoryScreen.setShowKeyring(true);
+    pendingShowMicroMenu = false;
     uiOpacity_ = 0.65f;
     minimapRotate_ = false;
     minimapSquare_ = false;
     minimapNpcDots_ = false;
+    showMinimapClock_ = false;
+    showMinimapCoordinates_ = false;
     if (renderer) {
         if (auto* cameraController = renderer->getCameraController()) {
             cameraController->setMouseSensitivity(pendingMouseSensitivity);
             cameraController->setInvertMouse(pendingInvertMouse);
             cameraController->setExtendedZoom(pendingExtendedZoom);
+            cameraController->setSmoothCameraFollow(pendingSmoothCameraFollow);
         }
         if (auto* minimap = renderer->getMinimap()) {
             minimap->setRotateWithCamera(minimapRotate_);
@@ -516,6 +571,13 @@ if (ImGui::SliderInt("##NpcVoiceVolume", &pendingNpcVoiceVolume, 0, 100, "%d%%")
 }
 
 ImGui::Spacing();
+if (ImGui::Checkbox("Character Speech", &pendingCharacterSpeech)) {
+    applyAudioSettings();
+}
+if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("Your character speaks error responses (\"I can't do that\", \"Not enough mana\")");
+
+ImGui::Spacing();
 ImGui::Text("Mount Sounds");
 if (ImGui::SliderInt("##MountVolume", &pendingMountVolume, 0, 100, "%d%%")) {
     applyAudioSettings();
@@ -542,6 +604,7 @@ if (ImGui::Button("Restore Audio Defaults", ImVec2(-1, 0))) {
     pendingNpcVoiceVolume = 100;
     pendingMountVolume = 100;
     pendingActivityVolume = 100;
+    pendingCharacterSpeech = true;
     applyAudioSettings();
 }
 
@@ -641,21 +704,33 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
                 cameraController->setExtendedZoom(pendingExtendedZoom);
                 cameraController->setCameraSmoothSpeed(pendingCameraStiffness);
                 cameraController->setPivotHeight(pendingPivotHeight);
+                cameraController->setIdleOrbitEnabled(pendingIdleCameraOrbit);
+                cameraController->setSmoothCameraFollow(pendingSmoothCameraFollow);
             }
         }
         pendingResIndex = 0;
         int curW = window->getWidth();
         int curH = window->getHeight();
+        if (!displaySettingsLoaded_) {
+            pendingResolutionWidth = curW;
+            pendingResolutionHeight = curH;
+        }
+        long long bestDistance = std::numeric_limits<long long>::max();
         for (int i = 0; i < kResCount; i++) {
-            if (kResolutions[i][0] == curW && kResolutions[i][1] == curH) {
+            const long long dx = static_cast<long long>(kResolutions[i][0]) - pendingResolutionWidth;
+            const long long dy = static_cast<long long>(kResolutions[i][1]) - pendingResolutionHeight;
+            const long long distance = dx * dx + dy * dy;
+            if (distance < bestDistance) {
+                bestDistance = distance;
                 pendingResIndex = i;
-                break;
             }
         }
         pendingUiOpacity = static_cast<int>(std::lround(uiOpacity_ * 100.0f));
         pendingMinimapRotate = minimapRotate_;
         pendingMinimapSquare = minimapSquare_;
         pendingMinimapNpcDots = minimapNpcDots_;
+        pendingShowMinimapClock = showMinimapClock_;
+        pendingShowMinimapCoordinates = showMinimapCoordinates_;
         pendingShowLatencyMeter = showLatencyMeter_;
         if (renderer) {
             if (auto* minimap = renderer->getMinimap()) {
@@ -682,6 +757,14 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
 
     if (ImGui::Begin("##SettingsWindow", nullptr, flags)) {
         ImGui::Text("Settings");
+        ImGui::SameLine();
+        {
+            // Right-align the build version against the window's content edge.
+            const char* version = core::kVersionString;
+            float versionWidth = ImGui::CalcTextSize(version).x;
+            ImGui::SetCursorPosX(ImGui::GetWindowContentRegionMax().x - versionWidth);
+            ImGui::TextDisabled("%s", version);
+        }
         ImGui::Separator();
 
         if (ImGui::BeginTabBar("SettingsTabs", ImGuiTabBarFlags_None)) {
@@ -711,6 +794,9 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
 
                 if (ImGui::Checkbox("Fullscreen", &pendingFullscreen)) {
                     window->setFullscreen(pendingFullscreen);
+                    if (pendingFullscreen) {
+                        window->applyResolution(pendingResolutionWidth, pendingResolutionHeight);
+                    }
                     updateGraphicsPresetFromCurrentSettings();
                     saveCallback();
                 }
@@ -718,6 +804,16 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
                     window->setVsync(pendingVsync);
                     updateGraphicsPresetFromCurrentSettings();
                     saveCallback();
+                }
+                ImGui::SetNextItemWidth(240.0f);
+                if (ImGui::SliderFloat("View Distance", &pendingViewDistance,
+                                       400.0f, 2400.0f, "%.0f")) {
+                    if (renderer) renderer->setViewDistance(pendingViewDistance);
+                    updateGraphicsPresetFromCurrentSettings();
+                    saveCallback();
+                }
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Controls terrain, world-object, and doodad draw distance.");
                 }
                 if (ImGui::Checkbox("Shadows", &pendingShadows)) {
                     if (renderer) renderer->setShadowsEnabled(pendingShadows);
@@ -772,6 +868,10 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
                         }
                     }
                 }
+                // AMD FidelityFX is not exposed on macOS/MoltenVK. Keep the
+                // controls and experimental frame-generation path off that
+                // platform rather than advertising unsupported settings.
+#ifndef __APPLE__
                 // FSR Upscaling
                 {
                     // FSR mode selection: Off, FSR 1.0 (Spatial), FSR 3.x (Temporal)
@@ -854,6 +954,7 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
                         }
                     }
                 }
+#endif
                 if (ImGui::SliderInt("Ground Clutter Density", &pendingGroundClutterDensity, 0, 150, "%d%%")) {
                     if (renderer) {
                         if (auto* tm = renderer->getTerrainManager()) {
@@ -920,7 +1021,9 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
                     resItems[i] = resBuf[i];
                 }
                 if (ImGui::Combo(resLabel, &pendingResIndex, resItems, kResCount)) {
-                    window->applyResolution(kResolutions[pendingResIndex][0], kResolutions[pendingResIndex][1]);
+                    pendingResolutionWidth = kResolutions[pendingResIndex][0];
+                    pendingResolutionHeight = kResolutions[pendingResIndex][1];
+                    window->applyResolution(pendingResolutionWidth, pendingResolutionHeight);
                     saveCallback();
                 }
 
@@ -950,10 +1053,12 @@ void SettingsPanel::renderSettingsWindow(InventoryScreen& inventoryScreen, ChatP
                     pendingPOM = true;
                     pendingPOMQuality = 1;
                     pendingResIndex = defaultResIndex;
+                    pendingResolutionWidth = kDefaultResW;
+                    pendingResolutionHeight = kDefaultResH;
                     pendingBrightness = 50;
                     window->setFullscreen(pendingFullscreen);
                     window->setVsync(pendingVsync);
-                    window->applyResolution(kResolutions[pendingResIndex][0], kResolutions[pendingResIndex][1]);
+                    window->applyResolution(pendingResolutionWidth, pendingResolutionHeight);
                     if (renderer) renderer->getPostProcessPipeline()->setBrightness(1.0f);
                     pendingWaterRefraction = false;
                     if (renderer) {
@@ -1059,6 +1164,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
     // Define preset values based on quality level
     switch (preset) {
         case GraphicsPreset::LOW: {
+            pendingViewDistance = 600.0f;
             pendingShadows = false;
             pendingShadowDistance = 100.0f;
             pendingAntiAliasing = 0;  // Off
@@ -1066,6 +1172,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             pendingPOM = false;
             pendingGroundClutterDensity = 25;
             if (renderer) {
+                renderer->setViewDistance(pendingViewDistance);
                 renderer->setShadowsEnabled(false);
                 renderer->setMsaaSamples(VK_SAMPLE_COUNT_1_BIT);
                 if (auto* wr = renderer->getWMORenderer()) {
@@ -1083,6 +1190,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             break;
         }
         case GraphicsPreset::MEDIUM: {
+            pendingViewDistance = 1000.0f;
             pendingShadows = true;
             pendingShadowDistance = 200.0f;
             pendingAntiAliasing = 1;  // 2x MSAA
@@ -1092,6 +1200,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             pendingPOMQuality = 0;  // Low
             pendingGroundClutterDensity = 60;
             if (renderer) {
+                renderer->setViewDistance(pendingViewDistance);
                 renderer->setShadowsEnabled(true);
                 renderer->setShadowDistance(200.0f);
                 renderer->setMsaaSamples(VK_SAMPLE_COUNT_2_BIT);
@@ -1114,6 +1223,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             break;
         }
         case GraphicsPreset::HIGH: {
+            pendingViewDistance = 1600.0f;
             pendingShadows = true;
             pendingShadowDistance = 350.0f;
             pendingAntiAliasing = 2;  // 4x MSAA
@@ -1123,6 +1233,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             pendingPOMQuality = 1;  // Medium
             pendingGroundClutterDensity = 100;
             if (renderer) {
+                renderer->setViewDistance(pendingViewDistance);
                 renderer->setShadowsEnabled(true);
                 renderer->setShadowDistance(350.0f);
                 renderer->setMsaaSamples(VK_SAMPLE_COUNT_4_BIT);
@@ -1145,6 +1256,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             break;
         }
         case GraphicsPreset::ULTRA: {
+            pendingViewDistance = 2400.0f;
             pendingShadows = true;
             pendingShadowDistance = 500.0f;
             pendingAntiAliasing = 3;  // 8x MSAA
@@ -1155,6 +1267,7 @@ void SettingsPanel::applyGraphicsPreset(GraphicsPreset preset) {
             pendingPOMQuality = 2;  // High
             pendingGroundClutterDensity = 150;
             if (renderer) {
+                renderer->setViewDistance(pendingViewDistance);
                 renderer->setShadowsEnabled(true);
                 renderer->setShadowDistance(500.0f);
                 renderer->setMsaaSamples(VK_SAMPLE_COUNT_8_BIT);
@@ -1192,18 +1305,22 @@ void SettingsPanel::updateGraphicsPresetFromCurrentSettings() {
     auto matchesPreset = [this](GraphicsPreset preset) -> bool {
         switch (preset) {
             case GraphicsPreset::LOW:
-                return !pendingShadows && pendingAntiAliasing == 0 && !pendingNormalMapping && !pendingPOM &&
+                return pendingViewDistance >= 580.0f && pendingViewDistance <= 620.0f &&
+                       !pendingShadows && pendingAntiAliasing == 0 && !pendingNormalMapping && !pendingPOM &&
                        pendingGroundClutterDensity <= 30;
             case GraphicsPreset::MEDIUM:
-                return pendingShadows && pendingShadowDistance >= 180 && pendingShadowDistance <= 220 &&
+                return pendingViewDistance >= 980.0f && pendingViewDistance <= 1020.0f &&
+                       pendingShadows && pendingShadowDistance >= 180 && pendingShadowDistance <= 220 &&
                        pendingAntiAliasing == 1 && pendingNormalMapping && pendingPOM &&
                        pendingGroundClutterDensity >= 50 && pendingGroundClutterDensity <= 70;
             case GraphicsPreset::HIGH:
-                return pendingShadows && pendingShadowDistance >= 330 && pendingShadowDistance <= 370 &&
+                return pendingViewDistance >= 1580.0f && pendingViewDistance <= 1620.0f &&
+                       pendingShadows && pendingShadowDistance >= 330 && pendingShadowDistance <= 370 &&
                        pendingAntiAliasing == 2 && pendingNormalMapping && pendingPOM &&
                        pendingGroundClutterDensity >= 90 && pendingGroundClutterDensity <= 110;
             case GraphicsPreset::ULTRA:
-                return pendingShadows && pendingShadowDistance >= 480 && pendingAntiAliasing == 3 &&
+                return pendingViewDistance >= 2380.0f && pendingShadows &&
+                       pendingShadowDistance >= 480 && pendingAntiAliasing == 3 &&
                        pendingFXAA && pendingNormalMapping && pendingPOM && pendingGroundClutterDensity >= 140;
             default:
                 return false;
@@ -1256,6 +1373,8 @@ void SettingsPanel::applyAudioVolumes(audio::AudioCoordinator* ac) {
         footstep->setVolumeScale(pendingFootstepVolume / 100.0f);
     if (auto* npcVoice = ac->getNpcVoiceManager())
         npcVoice->setVolumeScale(pendingNpcVoiceVolume / 100.0f);
+    if (auto* playerVoice = ac->getPlayerVoiceManager())
+        playerVoice->setEnabled(pendingCharacterSpeech);
     if (auto* mount = ac->getMountSoundManager())
         mount->setVolumeScale(pendingMountVolume / 100.0f);
     if (auto* activity = ac->getActivitySoundManager())

@@ -29,11 +29,10 @@ bool GameStateAdapter::isCasting() const   { return gameHandler_.isCasting(); }
 bool GameStateAdapter::isChanneling() const { return gameHandler_.isChanneling(); }
 
 bool GameStateAdapter::isStealthed() const {
-    // Check UNIT_FLAG_SNEAKING (0x02000000) on player's Unit
     auto pe = gameHandler_.getEntityManager().getEntity(gameHandler_.getPlayerGuid());
     if (!pe) return false;
     auto pu = std::dynamic_pointer_cast<game::Unit>(pe);
-    return pu && (pu->getUnitFlags() & 0x02000000u) != 0;
+    return pu && pu->hasCreepVisibility();
 }
 
 bool GameStateAdapter::hasPet() const   { return gameHandler_.hasPet(); }

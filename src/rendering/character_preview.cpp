@@ -11,22 +11,164 @@
 #include "pipeline/m2_loader.hpp"
 #include "pipeline/dbc_loader.hpp"
 #include "pipeline/dbc_layout.hpp"
+#include "core/appearance_composer.hpp"
 #include "core/logger.hpp"
 #include "core/application.hpp"
 #include <imgui.h>
 #include <backends/imgui_impl_vulkan.h>
 #include <glm/gtc/matrix_transform.hpp>
 #include <algorithm>
+#include <cmath>
+#include <limits>
+#include <unordered_map>
 #include <unordered_set>
 #include <cstring>
 
 namespace wowee {
 namespace rendering {
 
+namespace {
+
+bool isFiniteVec3(const glm::vec3& v) {
+    return std::isfinite(v.x) && std::isfinite(v.y) && std::isfinite(v.z);
+}
+
+void frameCameraForModelBounds(Camera& camera, const glm::vec3& boundMin, const glm::vec3& boundMax) {
+    if (!isFiniteVec3(boundMin) || !isFiniteVec3(boundMax)) {
+        return;
+    }
+
+    const glm::vec3 extent = boundMax - boundMin;
+    if (extent.z <= 0.0f) {
+        return;
+    }
+
+    const float fovY = glm::radians(camera.getFovDegrees());
+    const float tanHalfY = std::tan(fovY * 0.5f);
+    if (!std::isfinite(tanHalfY) || tanHalfY <= 0.0f) {
+        return;
+    }
+
+    const float tanHalfX = tanHalfY * std::max(camera.getAspectRatio(), 0.1f);
+    const float height = std::max(extent.z, 0.1f);
+    const float width = std::max(std::max(extent.x, extent.y), 0.1f);
+    const float margin = 1.50f;
+    const float distanceForHeight = (height * margin) / (2.0f * tanHalfY);
+    const float distanceForWidth = (width * margin) / (2.0f * tanHalfX);
+    const float distance = std::max({4.5f, distanceForHeight, distanceForWidth});
+    const float centerZ = (boundMin.z + boundMax.z) * 0.5f;
+
+    camera.setPosition(glm::vec3(0.0f, distance, centerZ));
+    camera.setRotation(270.0f, 0.0f);
+}
+
+} // namespace
+
 CharacterPreview::CharacterPreview() = default;
 
 CharacterPreview::~CharacterPreview() {
     shutdown();
+}
+
+void CharacterPreview::ensureAppearanceGeosetsLoaded() {
+    if (appearanceGeosetsLoaded_ || !assetManager_) {
+        return;
+    }
+
+    appearanceGeosetsLoaded_ = true;
+    hairGeosetMap_.clear();
+    facialHairGeosetMap_.clear();
+
+    // CharHairGeosets.dbc maps (race, sex, hairStyleId) to the group-0
+    // scalp/hair submesh. Activating every group-0 submesh draws all hair
+    // variants at once, which shows up as flickering magenta patches.
+    if (auto chg = assetManager_->loadDBC("CharHairGeosets.dbc"); chg && chg->isLoaded()) {
+        const auto* chgL = pipeline::getActiveDBCLayout()
+            ? pipeline::getActiveDBCLayout()->getLayout("CharHairGeosets") : nullptr;
+        for (uint32_t i = 0; i < chg->getRecordCount(); i++) {
+            uint32_t raceId = chg->getUInt32(i, chgL ? (*chgL)["RaceID"] : 1);
+            uint32_t sexId = chg->getUInt32(i, chgL ? (*chgL)["SexID"] : 2);
+            uint32_t variation = chg->getUInt32(i, chgL ? (*chgL)["Variation"] : 3);
+            uint32_t geosetId = chg->getUInt32(i, chgL ? (*chgL)["GeosetID"] : 4);
+            const bool useDefaultScalp = chg->getFieldCount() > 5 && chg->getUInt32(i, 5) != 0;
+            uint32_t key = (raceId << 16) | (sexId << 8) | variation;
+            hairGeosetMap_[key] = static_cast<uint16_t>(useDefaultScalp ? 1 : geosetId);
+        }
+        LOG_INFO("CharacterPreview: loaded ", hairGeosetMap_.size(), " hair geoset mappings");
+    }
+
+    if (auto cfh = assetManager_->loadDBC("CharacterFacialHairStyles.dbc"); cfh && cfh->isLoaded()) {
+        const auto* cfhL = pipeline::getActiveDBCLayout()
+            ? pipeline::getActiveDBCLayout()->getLayout("CharacterFacialHairStyles") : nullptr;
+        for (uint32_t i = 0; i < cfh->getRecordCount(); i++) {
+            uint32_t raceId = cfh->getUInt32(i, cfhL ? (*cfhL)["RaceID"] : 0);
+            uint32_t sexId = cfh->getUInt32(i, cfhL ? (*cfhL)["SexID"] : 1);
+            uint32_t variation = cfh->getUInt32(i, cfhL ? (*cfhL)["Variation"] : 2);
+            uint32_t key = (raceId << 16) | (sexId << 8) | variation;
+
+            FacialHairGeosets geosets;
+            geosets.geoset100 = static_cast<uint16_t>(cfh->getUInt32(i, cfhL ? (*cfhL)["Geoset100"] : 3));
+            geosets.geoset300 = static_cast<uint16_t>(cfh->getUInt32(i, cfhL ? (*cfhL)["Geoset300"] : 4));
+            geosets.geoset200 = static_cast<uint16_t>(cfh->getUInt32(i, cfhL ? (*cfhL)["Geoset200"] : 5));
+            facialHairGeosetMap_[key] = geosets;
+        }
+        LOG_INFO("CharacterPreview: loaded ", facialHairGeosetMap_.size(), " facial hair geoset mappings");
+    }
+}
+
+uint16_t CharacterPreview::selectedHairScalpGeoset() const {
+    const uint8_t raceId = static_cast<uint8_t>(race_);
+    const uint8_t sexId = (gender_ == game::Gender::FEMALE ||
+                           (gender_ == game::Gender::NONBINARY && useFemaleModel_)) ? 1u : 0u;
+    const uint32_t key = (static_cast<uint32_t>(raceId) << 16) |
+                         (static_cast<uint32_t>(sexId) << 8) |
+                         static_cast<uint32_t>(hairStyle_);
+
+    auto it = hairGeosetMap_.find(key);
+    if (it != hairGeosetMap_.end() && it->second > 0) {
+        return it->second;
+    }
+
+    // Last-resort heuristic for incomplete data sets. The DBC path above is
+    // expected for real clients and is much more reliable than this fallback.
+    return static_cast<uint16_t>(std::max<uint8_t>(hairStyle_ + 1, 1));
+}
+
+std::unordered_set<uint16_t> CharacterPreview::buildBaseGeosets() {
+    ensureAppearanceGeosetsLoaded();
+
+    const uint8_t raceId = static_cast<uint8_t>(race_);
+    const uint8_t sexId = (gender_ == game::Gender::FEMALE ||
+                           (gender_ == game::Gender::NONBINARY && useFemaleModel_)) ? 1u : 0u;
+    const uint16_t selectedHairScalp = selectedHairScalpGeoset();
+
+    std::unordered_set<uint16_t> activeGeosets;
+    activeGeosets.insert(0); // body base
+    activeGeosets.insert(selectedHairScalp);
+
+    const uint32_t facialKey = (static_cast<uint32_t>(raceId) << 16) |
+                               (static_cast<uint32_t>(sexId) << 8) |
+                               static_cast<uint32_t>(facialHair_);
+    auto itFacial = facialHairGeosetMap_.find(facialKey);
+    if (itFacial != facialHairGeosetMap_.end()) {
+        activeGeosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(itFacial->second.geoset100, 1)));
+        activeGeosets.insert(static_cast<uint16_t>(200 + std::max<uint16_t>(itFacial->second.geoset200, 1)));
+        activeGeosets.insert(static_cast<uint16_t>(300 + std::max<uint16_t>(itFacial->second.geoset300, 1)));
+    } else {
+        activeGeosets.insert(101);
+        activeGeosets.insert(201);
+        activeGeosets.insert(301);
+    }
+
+    activeGeosets.insert(core::kGeosetBareForearms);
+    activeGeosets.insert(core::kGeosetBareShins);
+    activeGeosets.insert(core::kGeosetDefaultEars);
+    activeGeosets.insert(core::kGeosetBareSleeves);
+    activeGeosets.insert(core::kGeosetDefaultKneepads);
+    activeGeosets.insert(core::kGeosetBarePants);
+    activeGeosets.insert(core::kGeosetNoCape);
+    activeGeosets.insert(core::kGeosetBareFeet);
+    return activeGeosets;
 }
 
 bool CharacterPreview::initialize(pipeline::AssetManager* am) {
@@ -365,6 +507,7 @@ bool CharacterPreview::loadCharacter(game::Race race, game::Gender gender,
     }
 
     auto model = pipeline::M2Loader::load(m2Data);
+    if (model.name.empty()) model.name = m2Path;
 
     // M2 version 264+ (WotLK) stores submesh/bone data in external .skin files.
     // Earlier versions (Classic ≤256, TBC ≤263) have skin data embedded in the M2.
@@ -379,9 +522,32 @@ bool CharacterPreview::loadCharacter(game::Race race, game::Gender gender,
         return false;
     }
 
+    if (camera_) {
+        glm::vec3 frameMin = model.boundMin;
+        glm::vec3 frameMax = model.boundMax;
+        if (!model.vertices.empty()) {
+            glm::vec3 tightMin(std::numeric_limits<float>::max());
+            glm::vec3 tightMax(-std::numeric_limits<float>::max());
+            for (const auto& v : model.vertices) {
+                if (!isFiniteVec3(v.position)) continue;
+                tightMin = glm::min(tightMin, v.position);
+                tightMax = glm::max(tightMax, v.position);
+            }
+            if (tightMin.x <= tightMax.x && tightMin.y <= tightMax.y && tightMin.z <= tightMax.z) {
+                frameMin = tightMin;
+                frameMax = tightMax;
+            }
+        }
+        frameCameraForModelBounds(*camera_, frameMin, frameMax);
+        modelBoundMinZ_ = frameMin.z;
+        modelBoundMaxZ_ = frameMax.z;
+        fullBodyDistance_ = camera_->getPosition().y;
+    }
+
     // Look up CharSections.dbc for all appearance textures
     uint32_t targetRaceId = static_cast<uint32_t>(race);
-    uint32_t targetSexId = (gender == game::Gender::FEMALE) ? 1u : 0u;
+    uint32_t targetSexId = (gender == game::Gender::FEMALE ||
+                            (gender == game::Gender::NONBINARY && useFemaleModel)) ? 1u : 0u;
 
     std::string faceLowerPath;
     std::string faceUpperPath;
@@ -564,35 +730,18 @@ bool CharacterPreview::loadCharacter(game::Race race, game::Gender gender,
         return false;
     }
 
-    // Set default geosets (naked character)
-    std::unordered_set<uint16_t> activeGeosets;
-    // Body parts (group 0: IDs 0-99, vanilla models use up to 27)
-    for (uint16_t i = 0; i <= 99; i++) {
-        activeGeosets.insert(i);
-    }
-    // Hair style geoset: group 1 = 100 + variation + 1
-    activeGeosets.insert(static_cast<uint16_t>(100 + hairStyle + 1));
-    // Facial hair geoset: group 2 = 200 + variation + 1
-    activeGeosets.insert(static_cast<uint16_t>(200 + facialHair + 1));
-    activeGeosets.insert(401);   // Bare forearms (no gloves) — group 4
-    activeGeosets.insert(502);   // Bare shins (no boots) — group 5
-    activeGeosets.insert(702);   // Ears: default
-    activeGeosets.insert(801);   // Bare wrists (no sleeves) — group 8
-    activeGeosets.insert(902);   // Kneepads: default — group 9
-    activeGeosets.insert(1301);  // Bare legs (no pants) — group 13
-    activeGeosets.insert(1502);  // No cloak — group 15
-    activeGeosets.insert(2002);  // Bare feet mesh — group 20
-    charRenderer_->setActiveGeosets(instanceId_, activeGeosets);
-
-    // Play idle animation (Stand = animation ID 0)
-    charRenderer_->playAnimation(instanceId_, rendering::anim::STAND, true);
-
-    // Cache core appearance for later equipment geosets.
+    // Cache core appearance before geoset selection; the DBC resolver uses it.
     race_ = race;
     gender_ = gender;
     useFemaleModel_ = useFemaleModel;
     hairStyle_ = hairStyle;
     facialHair_ = facialHair;
+
+    std::unordered_set<uint16_t> activeGeosets = buildBaseGeosets();
+    charRenderer_->setActiveGeosets(instanceId_, activeGeosets);
+
+    // Play idle animation (Stand = animation ID 0)
+    charRenderer_->playAnimation(instanceId_, rendering::anim::STAND, true);
 
     // Cache the type-1 texture slot index so applyEquipment can update it.
     skinTextureSlotIndex_ = 0;
@@ -604,6 +753,7 @@ bool CharacterPreview::loadCharacter(game::Race race, game::Gender gender,
     }
 
     modelLoaded_ = true;
+    loadRacialBackdrop(race);
     LOG_INFO("CharacterPreview: loaded ", m2Path,
              " skin=", static_cast<int>(skin), " face=", static_cast<int>(face),
              " hair=", static_cast<int>(hairStyle), " hairColor=", static_cast<int>(hairColor),
@@ -615,6 +765,16 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
     if (!modelLoaded_ || instanceId_ == 0 || !charRenderer_ || !assetManager_ || !assetManager_->isInitialized()) {
         return false;
     }
+
+    // Weapons first, and unconditionally: they depend on nothing below, while the
+    // geoset/skin work that follows bails out early on characters whose body skin
+    // could not be composited. Attaching last meant those characters showed no
+    // weapon at all — and kept the previously selected character's weapon and
+    // enchant, since detaching happens here too.
+    attachWeapons(equipment);
+
+    charRenderer_->clearTextureSlotOverride(instanceId_, static_cast<uint16_t>(skinTextureSlotIndex_));
+    charRenderer_->setGroupTextureOverride(instanceId_, 15, nullptr);
 
     auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
     if (!displayInfoDbc || !displayInfoDbc->isLoaded()) {
@@ -642,89 +802,127 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
         return 0;
     };
 
-    auto getGeosetGroup = [&](uint32_t displayInfoId, int groupField) -> uint32_t {
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    const uint32_t geosetGroup1Field = idiL ? (*idiL)["GeosetGroup1"] : 7u;
+    const uint32_t geosetGroup3Field = idiL ? (*idiL)["GeosetGroup3"] : 9u;
+
+    auto getGeosetGroup = [&](uint32_t displayInfoId, uint32_t fieldIdx) -> uint32_t {
         if (displayInfoId == 0) return 0;
         int32_t recIdx = displayInfoDbc->findRecordById(displayInfoId);
         if (recIdx < 0) return 0;
-        uint32_t val = displayInfoDbc->getUInt32(static_cast<uint32_t>(recIdx), 7 + groupField);
-        return val;
+        return displayInfoDbc->getUInt32(static_cast<uint32_t>(recIdx), fieldIdx);
     };
 
     // --- Geosets ---
     // M2 geoset IDs encode body part group × 100 + variant (e.g., 801 = group 8
     // (sleeves) variant 1, 1301 = group 13 (pants) variant 1). ItemDisplayInfo.dbc
     // provides the variant offset per equipped item; base IDs are per-group constants.
-    std::unordered_set<uint16_t> geosets;
-    for (uint16_t i = 0; i <= 99; i++) geosets.insert(i);
-    geosets.insert(static_cast<uint16_t>(100 + hairStyle_ + 1));    // Hair style
-    geosets.insert(static_cast<uint16_t>(200 + facialHair_ + 1));  // Facial hair
-    geosets.insert(701);   // Ears
-    geosets.insert(902);   // Kneepads: default (group 9)
-    geosets.insert(2002);  // Bare feet mesh (group 20 = CG_FEET)
+    std::unordered_set<uint16_t> geosets = buildBaseGeosets();
+
+    auto eraseGroup = [&](uint16_t group) {
+        for (auto it = geosets.begin(); it != geosets.end();) {
+            if ((*it / 100) == group) {
+                it = geosets.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    };
 
     // CharGeosets: group 4=gloves(forearm), 5=boots(shin), 8=sleeves, 13=pants
-    uint16_t geosetGloves = 401;   // Bare forearms (group 4)
-    uint16_t geosetBoots = 502;    // Bare shins (group 5)
-    uint16_t geosetSleeves = 801;  // Bare wrists (group 8)
-    uint16_t geosetPants = 1301;   // Bare legs (group 13)
+    std::unordered_set<uint16_t> modelGeosets;
+    if (const auto* modelData = charRenderer_->getModelData(PREVIEW_MODEL_ID)) {
+        for (const auto& batch : modelData->batches) {
+            modelGeosets.insert(batch.submeshId);
+        }
+    }
+
+    auto pickGeoset = [&](uint16_t preferred, uint16_t fallback) -> uint16_t {
+        if (preferred != 0 && modelGeosets.count(preferred) > 0) return preferred;
+        if (fallback != 0 && modelGeosets.count(fallback) > 0) return fallback;
+        return 0;
+    };
+
+    auto lowestInGroup = [&](uint16_t group) -> uint16_t {
+        uint16_t best = 0;
+        for (uint16_t g : modelGeosets) {
+            if (g / 100 == group && (best == 0 || g < best)) best = g;
+        }
+        return best;
+    };
+
+    uint16_t geosetGloves = pickGeoset(core::kGeosetBareForearms, core::kGeosetBareForearms);
+    uint16_t geosetBoots = pickGeoset(core::kGeosetBareShins, lowestInGroup(5));
+    uint16_t geosetSleeves = pickGeoset(core::kGeosetBareSleeves, core::kGeosetBareSleeves);
+    uint16_t geosetPants = pickGeoset(core::kGeosetBarePants, core::kGeosetBarePants);
 
     // Chest/Shirt/Robe → group 8 (sleeves)
     {
         uint32_t did = findDisplayId({4, 5, 20});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetSleeves = static_cast<uint16_t>(801 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetSleeves = pickGeoset(static_cast<uint16_t>(core::kGeosetBareSleeves + gg), core::kGeosetBareSleeves);
         // Robe kilt legs
-        uint32_t gg3 = getGeosetGroup(did, 2);
-        if (gg3 > 0) geosetPants = static_cast<uint16_t>(1301 + gg3);
+        uint32_t gg3 = getGeosetGroup(did, geosetGroup3Field);
+        if (gg3 > 0) geosetPants = pickGeoset(static_cast<uint16_t>(core::kGeosetBarePants + gg3), core::kGeosetBarePants);
     }
     // Legs → group 13 (trousers)
     {
         uint32_t did = findDisplayId({7});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetPants = static_cast<uint16_t>(1301 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetPants = pickGeoset(static_cast<uint16_t>(core::kGeosetBarePants + gg), core::kGeosetBarePants);
     }
     // Boots → group 5 (shins)
     {
         uint32_t did = findDisplayId({8});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetBoots = static_cast<uint16_t>(501 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetBoots = pickGeoset(static_cast<uint16_t>(501 + gg), lowestInGroup(5));
     }
     // Gloves → group 4 (forearms)
     {
         uint32_t did = findDisplayId({10});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetGloves = static_cast<uint16_t>(401 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetGloves = pickGeoset(static_cast<uint16_t>(core::kGeosetBareForearms + gg), core::kGeosetBareForearms);
     }
     // Wrists/Bracers → group 8 (sleeves, only if chest/shirt didn't set it)
     {
         uint32_t did = findDisplayId({9});
-        if (did != 0 && geosetSleeves == 801) {
-            uint32_t gg = getGeosetGroup(did, 0);
-            if (gg > 0) geosetSleeves = static_cast<uint16_t>(801 + gg);
+        if (did != 0 && geosetSleeves == pickGeoset(core::kGeosetBareSleeves, core::kGeosetBareSleeves)) {
+            uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+            if (gg > 0) geosetSleeves = pickGeoset(static_cast<uint16_t>(core::kGeosetBareSleeves + gg), core::kGeosetBareSleeves);
         }
     }
     // Belt → group 18 (buckle)
     uint16_t geosetBelt = 0;
     {
         uint32_t did = findDisplayId({6});
-        uint32_t gg = getGeosetGroup(did, 0);
-        if (gg > 0) geosetBelt = static_cast<uint16_t>(1801 + gg);
+        uint32_t gg = getGeosetGroup(did, geosetGroup1Field);
+        if (gg > 0) geosetBelt = pickGeoset(static_cast<uint16_t>(1801 + gg), 0);
     }
 
-    geosets.insert(geosetGloves);
-    geosets.insert(geosetBoots);
-    geosets.insert(geosetSleeves);
-    geosets.insert(geosetPants);
+    eraseGroup(4);
+    eraseGroup(5);
+    eraseGroup(8);
+    eraseGroup(13);
+    eraseGroup(15);
+    eraseGroup(18);
+    if (geosetGloves != 0) geosets.insert(geosetGloves);
+    if (geosetBoots != 0) geosets.insert(geosetBoots);
+    if (geosetSleeves != 0) geosets.insert(geosetSleeves);
+    if (geosetPants != 0) geosets.insert(geosetPants);
     if (geosetBelt != 0) geosets.insert(geosetBelt);
-    geosets.insert(hasInvType({16}) ? 1502 : 1501); // Cloak mesh toggle (visual may still be limited)
-    if (hasInvType({19})) geosets.insert(1201);     // Tabard mesh toggle
-
-    // Hide hair under helmets (helmets are separate models; this still avoids hair clipping)
-    if (hasInvType({1})) {
-        geosets.erase(static_cast<uint16_t>(100 + hairStyle_ + 1));
-        geosets.insert(1);   // Bald scalp cap
-        geosets.insert(101); // Default group-1 connector
+    uint16_t geosetCape = pickGeoset(
+        hasInvType({16}) ? core::kGeosetWithCape : core::kGeosetNoCape,
+        core::kGeosetNoCape);
+    if (geosetCape != 0) geosets.insert(geosetCape); // Cloak mesh toggle (visual may still be limited)
+    if (hasInvType({19})) {
+        uint16_t geosetTabard = pickGeoset(core::kGeosetDefaultTabard, 0);
+        if (geosetTabard != 0) geosets.insert(geosetTabard);
     }
+
+    // Keep hair visible in the preview. The in-world renderer can hide hair
+    // because it attaches helmet models, but this preview path does not yet
+    // render head-slot attachments; hiding hair here leaves bald characters.
 
     charRenderer_->setActiveGeosets(instanceId_, geosets);
 
@@ -738,8 +936,6 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
     };
 
     // Texture component region fields — use DBC layout when available, fall back to binary offsets.
-    const auto* idiL = pipeline::getActiveDBCLayout()
-        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
     uint32_t texRegionFields[8];
     pipeline::getItemDisplayInfoTextureFields(*displayInfoDbc, idiL, texRegionFields);
 
@@ -779,7 +975,7 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
     if (!regionLayers.empty()) {
         VkTexture* newTex = charRenderer_->compositeWithRegions(bodySkinPath_, baseLayers_, regionLayers);
         if (newTex != nullptr) {
-            charRenderer_->setModelTexture(PREVIEW_MODEL_ID, skinTextureSlotIndex_, newTex);
+            charRenderer_->setTextureSlotOverride(instanceId_, static_cast<uint16_t>(skinTextureSlotIndex_), newTex);
         }
     }
 
@@ -872,6 +1068,227 @@ bool CharacterPreview::applyEquipment(const std::vector<game::EquipmentItem>& eq
     return true;
 }
 
+bool CharacterPreview::loadPreviewM2(const std::string& m2Path, pipeline::M2Model& outModel) {
+    if (!assetManager_) return false;
+
+    auto m2Data = assetManager_->readFile(m2Path);
+    if (m2Data.empty()) return false;
+
+    outModel = pipeline::M2Loader::load(m2Data);
+    if (outModel.name.empty()) outModel.name = m2Path;
+
+    // WotLK-era models (version 264+) keep submesh data in an external .skin.
+    std::string skinPath = m2Path;
+    size_t dot = skinPath.rfind('.');
+    if (dot != std::string::npos) skinPath = skinPath.substr(0, dot);
+    skinPath += "00.skin";
+    auto skinData = assetManager_->readFile(skinPath);
+    if (!skinData.empty() && outModel.version >= 264) {
+        pipeline::M2Loader::loadSkin(skinData, outModel);
+    }
+    return outModel.isValid();
+}
+
+void CharacterPreview::attachWeapons(const std::vector<game::EquipmentItem>& equipment) {
+    if (!charRenderer_ || !assetManager_ || instanceId_ == 0) return;
+
+    // Attachment 1 = right hand, 2 = left hand.
+    charRenderer_->detachWeapon(instanceId_, 1);
+    charRenderer_->detachWeapon(instanceId_, 2);
+
+    auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
+    if (!displayInfoDbc || !displayInfoDbc->isLoaded()) return;
+
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    const uint32_t modelField   = idiL ? (*idiL)["LeftModel"]        : 1u;
+    const uint32_t textureField = idiL ? (*idiL)["LeftModelTexture"] : 3u;
+
+    struct WeaponSlot {
+        std::initializer_list<uint8_t> invTypes;
+        uint32_t attachmentId;
+    };
+    // Main hand also covers two-handers and ranged; off hand covers shields and held items.
+    const WeaponSlot slots[] = {
+        { {13, 17, 21, 15, 25, 26}, 1 },
+        { {14, 22, 23},             2 },
+    };
+
+    for (const auto& ws : slots) {
+        uint32_t displayId = 0;
+        uint32_t itemVisualId = 0;
+        for (const auto& item : equipment) {
+            if (item.displayModel == 0) continue;
+            for (uint8_t t : ws.invTypes) {
+                if (item.inventoryType == t) {
+                    displayId = item.displayModel;
+                    // SMSG_CHAR_ENUM already reports the enchant as its ItemVisual id.
+                    itemVisualId = item.enchantment;
+                    break;
+                }
+            }
+            if (displayId != 0) break;
+        }
+        if (displayId == 0) continue;
+
+        int32_t recIdx = displayInfoDbc->findRecordById(displayId);
+        if (recIdx < 0) continue;
+
+        std::string modelName = displayInfoDbc->getString(static_cast<uint32_t>(recIdx), modelField);
+        std::string textureName = displayInfoDbc->getString(static_cast<uint32_t>(recIdx), textureField);
+        if (modelName.empty()) continue;
+
+        // DBC names the .mdx; the shipped assets are .m2.
+        size_t dot = modelName.rfind('.');
+        std::string modelFile = (dot != std::string::npos ? modelName.substr(0, dot) : modelName) + ".m2";
+
+        pipeline::M2Model weaponModel;
+        std::string m2Path = "Item\\ObjectComponents\\Weapon\\" + modelFile;
+        if (!loadPreviewM2(m2Path, weaponModel)) {
+            m2Path = "Item\\ObjectComponents\\Shield\\" + modelFile;
+            if (!loadPreviewM2(m2Path, weaponModel)) {
+                LOG_WARNING("CharacterPreview: failed to load weapon model ", modelFile);
+                continue;
+            }
+        }
+
+        std::string texturePath;
+        if (!textureName.empty()) {
+            texturePath = "Item\\ObjectComponents\\Weapon\\" + textureName + ".blp";
+            if (!assetManager_->fileExists(texturePath)) {
+                texturePath = "Item\\ObjectComponents\\Shield\\" + textureName + ".blp";
+            }
+        }
+
+        const uint32_t weaponModelId = previewModelIdFor(m2Path);
+        if (!charRenderer_->attachWeapon(instanceId_, ws.attachmentId, weaponModel,
+                                         weaponModelId, texturePath)) {
+            continue;
+        }
+        attachWeaponEnchantVisual(ws.attachmentId, itemVisualId);
+    }
+}
+
+uint32_t CharacterPreview::previewModelIdFor(const std::string& assetKey) {
+    auto it = previewModelIds_.find(assetKey);
+    if (it != previewModelIds_.end()) return it->second;
+    uint32_t id = nextPreviewModelId_++;
+    previewModelIds_.emplace(assetKey, id);
+    return id;
+}
+
+void CharacterPreview::attachWeaponEnchantVisual(uint32_t attachmentId, uint32_t itemVisualId) {
+    if (itemVisualId == 0 || !charRenderer_ || !assetManager_) return;
+
+    auto visualsDbc = assetManager_->loadDBC("ItemVisuals.dbc");
+    auto effectsDbc = assetManager_->loadDBC("ItemVisualEffects.dbc");
+    if (!visualsDbc || !visualsDbc->isLoaded() || !effectsDbc || !effectsDbc->isLoaded()) return;
+
+    auto effectModels = pipeline::resolveItemVisualModels(itemVisualId, visualsDbc.get(),
+                                                          effectsDbc.get());
+
+    for (uint32_t visualSlot = 0; visualSlot < effectModels.size(); ++visualSlot) {
+        const std::string& modelName = effectModels[visualSlot];
+        if (modelName.empty()) continue;
+
+        std::string m2Path = modelName;
+        size_t dot = m2Path.rfind('.');
+        m2Path = (dot != std::string::npos ? m2Path.substr(0, dot) : m2Path) + ".m2";
+
+        pipeline::M2Model effectModel;
+        if (!loadPreviewM2(m2Path, effectModel)) {
+            LOG_WARNING("CharacterPreview: failed to load enchant visual ", m2Path);
+            continue;
+        }
+        charRenderer_->attachWeaponEffect(instanceId_, attachmentId, visualSlot,
+                                          effectModel, previewModelIdFor(m2Path));
+    }
+}
+
+void CharacterPreview::loadRacialBackdrop(game::Race race) {
+    if (!charRenderer_ || !assetManager_) return;
+    if (backdropRace_ == static_cast<int>(race) && backdropInstanceId_ != 0) {
+        // Appearance changes recreate the character instance but keep the racial
+        // scene. Reapply its stand mark and camera rig to the new instance.
+        applyPreviewView();
+        return;
+    }
+
+    if (backdropInstanceId_ != 0) {
+        charRenderer_->removeInstance(backdropInstanceId_);
+        backdropInstanceId_ = 0;
+    }
+    backdropRace_ = static_cast<int>(race);
+    previewStandPosition_ = glm::vec3(0.0f);
+    previewViewDirection_ = glm::vec3(0.0f, 1.0f, 0.0f);
+    modelYaw_ = 90.0f;
+    applyPreviewView();
+
+    // The glue screens each stand the character in their racial home — humans in
+    // Stormwind, orcs in Durotar, and so on. Undead reuse the Scourge scene.
+    const char* sceneName = nullptr;
+    switch (race) {
+        case game::Race::HUMAN:     sceneName = "UI_Human";    break;
+        case game::Race::ORC:       sceneName = "UI_Orc";      break;
+        case game::Race::DWARF:     sceneName = "UI_Dwarf";    break;
+        case game::Race::NIGHT_ELF: sceneName = "UI_NightElf"; break;
+        case game::Race::UNDEAD:    sceneName = "UI_Scourge";  break;
+        case game::Race::TAUREN:    sceneName = "UI_Tauren";   break;
+        case game::Race::GNOME:     sceneName = "UI_Gnome";    break;
+        case game::Race::TROLL:     sceneName = "UI_Troll";    break;
+        case game::Race::BLOOD_ELF: sceneName = "UI_BloodElf"; break;
+        case game::Race::DRAENEI:   sceneName = "UI_Draenei";  break;
+        default: break;
+    }
+    if (!sceneName) return;
+
+    std::string scenePath = std::string("Interface\\Glues\\Models\\") + sceneName + "\\" +
+                            sceneName + ".m2";
+    pipeline::M2Model sceneModel;
+    if (!loadPreviewM2(scenePath, sceneModel)) {
+        LOG_WARNING("CharacterPreview: no racial backdrop at ", scenePath);
+        return;
+    }
+
+    // These scenes are authored in their own space — the human one sits ~230 units
+    // from its origin — and carry the camera and the spot the character stands on.
+    // Without both there is no way to place the scene, so leave it out entirely
+    // rather than drop geometry somewhere off-screen.
+    if (sceneModel.cameras.empty()) {
+        LOG_WARNING("CharacterPreview: racial backdrop ", scenePath, " has no camera; skipping");
+        return;
+    }
+    const auto& sceneCam = sceneModel.cameras[0];
+
+    // Attachment 0 is the character's mark on the scene's ground.
+    glm::vec3 standPos = sceneCam.targetBase;
+    for (const auto& att : sceneModel.attachments) {
+        if (att.id == 0) { standPos = att.position; break; }
+    }
+
+    if (!charRenderer_->loadModel(sceneModel, PREVIEW_BACKDROP_MODEL_ID)) {
+        LOG_WARNING("CharacterPreview: failed to load racial backdrop ", scenePath);
+        return;
+    }
+
+    backdropInstanceId_ = charRenderer_->createInstance(PREVIEW_BACKDROP_MODEL_ID, glm::vec3(0.0f));
+    if (backdropInstanceId_ == 0) return;
+    charRenderer_->setInstanceSceneModel(backdropInstanceId_, true);
+
+    // Keep the character on the scene's authored stand mark and use the scene
+    // camera only for viewing direction. Distance and focus come from our portrait
+    // rig so scroll-wheel zoom can move naturally toward the face.
+    glm::vec3 toCamera = sceneCam.positionBase - sceneCam.targetBase;
+    if (glm::length(toCamera) < 0.001f) toCamera = glm::vec3(0.0f, 1.0f, 0.0f);
+    previewStandPosition_ = standPos;
+    previewViewDirection_ = glm::normalize(toCamera);
+    modelYaw_ = glm::degrees(std::atan2(previewViewDirection_.y, previewViewDirection_.x));
+    applyPreviewView();
+
+    LOG_INFO("CharacterPreview: racial backdrop ", scenePath,
+             " stand=(", standPos.x, ",", standPos.y, ",", standPos.z, ")");
+}
+
 void CharacterPreview::update(float deltaTime) {
     if (charRenderer_ && modelLoaded_) {
         charRenderer_->update(deltaTime);
@@ -906,14 +1323,22 @@ void CharacterPreview::compositePass(VkCommandBuffer cmd, uint32_t frameIndex) {
     // No fog in preview
     ubo.fogColor = glm::vec4(0.05f, 0.05f, 0.1f, 0.0f);
     ubo.fogParams = glm::vec4(9999.0f, 10000.0f, 0.0f, 0.0f);
-    // Enable shadows for visual depth in preview (strength=0.5 for subtle effect)
-    ubo.shadowParams = glm::vec4(1.0f, 0.5f, 0.0f, 0.0f);
+    // Off-screen preview has no real shadow pass/light-space setup. Sampling
+    // the global shadow binding here can produce unstable fragments on some
+    // drivers, so keep the portrait on studio lighting only.
+    ubo.shadowParams = glm::vec4(0.0f);
 
     std::memcpy(previewUBOMapped_[fi], &ubo, sizeof(GPUPerFrameData));
 
     // Begin off-screen render pass
     VkClearColorValue clearColor = {{0.05f, 0.05f, 0.1f, 1.0f}};
     renderTarget_->beginPass(cmd, clearColor);
+
+    // Preview rendering bypasses Renderer::renderWorld(), so it must run the
+    // same resource-preparation hook itself after server appearance data has
+    // produced bone matrices. This preserves lazy data loading while keeping
+    // GPU allocation outside CharacterRenderer::render().
+    charRenderer_->prepareRender(fi);
 
     // Render the character model
     charRenderer_->render(cmd, previewPerFrameSet_[fi], *camera_);
@@ -926,6 +1351,45 @@ void CharacterPreview::compositePass(VkCommandBuffer cmd, uint32_t frameIndex) {
 void CharacterPreview::rotate(float yawDelta) {
     modelYaw_ += yawDelta;
     if (instanceId_ > 0 && charRenderer_) {
+        charRenderer_->setInstanceRotation(instanceId_, glm::vec3(0.0f, 0.0f, modelYaw_));
+    }
+}
+
+void CharacterPreview::zoom(float wheelDelta) {
+    if (!std::isfinite(wheelDelta) || wheelDelta == 0.0f) return;
+    zoomLevel_ = std::clamp(zoomLevel_ + wheelDelta * 0.12f, 0.0f, 1.0f);
+    applyPreviewView();
+}
+
+void CharacterPreview::resetView() {
+    zoomLevel_ = 0.0f;
+    applyPreviewView();
+}
+
+void CharacterPreview::applyPreviewView() {
+    if (!camera_) return;
+
+    const float modelHeight = std::max(modelBoundMaxZ_ - modelBoundMinZ_, 0.1f);
+    const float bodyFocusZ = (modelBoundMinZ_ + modelBoundMaxZ_) * 0.5f;
+    const float faceFocusZ = modelBoundMinZ_ + modelHeight * 0.82f;
+    const float focusZ = bodyFocusZ + (faceFocusZ - bodyFocusZ) * zoomLevel_;
+
+    // Stay outside the near plane while getting close enough to inspect facial
+    // textures and hair. Large races retain proportionally more distance.
+    const float faceDistance = std::max(1.15f, modelHeight * 0.70f);
+    const float distance = fullBodyDistance_ +
+                           (std::min(faceDistance, fullBodyDistance_) - fullBodyDistance_) * zoomLevel_;
+    const glm::vec3 focus = previewStandPosition_ + glm::vec3(0.0f, 0.0f, focusZ);
+    const glm::vec3 camPos = focus + previewViewDirection_ * distance;
+    camera_->setPosition(camPos);
+
+    const glm::vec3 forward = glm::normalize(focus - camPos);
+    const float yaw = glm::degrees(std::atan2(forward.y, forward.x));
+    const float pitch = glm::degrees(std::asin(std::clamp(forward.z, -1.0f, 1.0f)));
+    camera_->setRotation(yaw, pitch);
+
+    if (instanceId_ > 0 && charRenderer_) {
+        charRenderer_->setInstancePosition(instanceId_, previewStandPosition_);
         charRenderer_->setInstanceRotation(instanceId_, glm::vec3(0.0f, 0.0f, modelYaw_));
     }
 }

@@ -80,13 +80,13 @@ bool WardenModule::load(const std::vector<uint8_t>& moduleData,
 
     // Step 1: Verify MD5 hash
     if (!verifyMD5(moduleData, md5Hash)) {
-        LOG_ERROR("WardenModule: MD5 verification failed; continuing in compatibility mode");
+        LOG_WARNING("WardenModule: MD5 verification failed; continuing in compatibility mode");
     }
     LOG_INFO("WardenModule: MD5 verified");
 
     // Step 2: RC4 decrypt (Warden protocol-required legacy RC4; server-mandated, cannot be changed)
     if (!decryptRC4(moduleData, rc4Key, decryptedData_)) { // codeql[cpp/weak-cryptographic-algorithm]
-        LOG_ERROR("WardenModule: RC4 decryption failed; using raw module bytes fallback");
+        LOG_WARNING("WardenModule: RC4 decryption failed; using raw module bytes fallback");
         decryptedData_ = moduleData;
     }
     LOG_INFO("WardenModule: RC4 decrypted (", decryptedData_.size(), " bytes)");
@@ -105,26 +105,32 @@ bool WardenModule::load(const std::vector<uint8_t>& moduleData,
         dataWithoutSig = decryptedData_;
     }
     if (!decompressZlib(dataWithoutSig, decompressedData_)) {
-        LOG_ERROR("WardenModule: zlib decompression failed; using decrypted bytes fallback");
+        LOG_WARNING("WardenModule: zlib decompression failed; using decrypted bytes fallback");
         decompressedData_ = decryptedData_;
     }
 
     // Step 5: Parse custom executable format
     if (!parseExecutableFormat(decompressedData_)) {
-        LOG_ERROR("WardenModule: Executable format parsing failed; continuing with minimal module image");
+        LOG_WARNING("WardenModule: Executable format parsing failed; continuing with minimal module image");
     }
 
     // Step 6: Apply relocations
     if (!applyRelocations()) {
-        LOG_ERROR("WardenModule: Address relocations failed; continuing with unrelocated image");
+        LOG_WARNING("WardenModule: Address relocations failed; continuing with unrelocated image");
     }
 
     // Step 7+8: Initialize module (creates emulator) then bind APIs (patches IAT).
     // API binding must happen after emulator setup (needs stub addresses) but before
     // the module entry point is called (needs resolved imports). Both are handled
     // inside initializeModule().
-    if (!initializeModule()) {
-        LOG_ERROR("WardenModule: Module initialization failed; continuing with stub callbacks");
+    // Only emulate a module that actually unpacked. Feeding the raw payload to the x86
+    // emulator executes garbage: it faults on an unmapped read and lands on the stub
+    // callbacks anyway, having spun up Unicorn and mapped memory for nothing.
+    if (!moduleImageUsable_) {
+        LOG_WARNING("WardenModule: module did not unpack into an executable image "
+                    "(server module is not a genuine Blizzard module?) — using stub callbacks");
+    } else if (!initializeModule()) {
+        LOG_WARNING("WardenModule: Module initialization failed; continuing with stub callbacks");
     }
 
     // Module loading pipeline complete!

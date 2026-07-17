@@ -107,8 +107,13 @@ network::Packet SendMailPacket::build(uint64_t mailboxGuid, const std::string& r
         packet.writeUInt8(i);            // attachment slot index
         packet.writeUInt64(itemGuids[i]);
     }
-    packet.writeUInt64(money);
-    packet.writeUInt64(cod);
+    // WotLK represents both values as uint32, followed by the legacy
+    // uint64/uint8 zero fields.  Writing the values as uint64 shifts COD into
+    // the unknown fields and leaves the server one byte short.
+    packet.writeUInt32(static_cast<uint32_t>(money));
+    packet.writeUInt32(static_cast<uint32_t>(cod));
+    packet.writeUInt64(0);
+    packet.writeUInt8(0);
     return packet;
 }
 
@@ -167,10 +172,14 @@ bool PacketParsers::parseMailList(network::Packet& packet, std::vector<MailMessa
         size_t startPos = packet.getReadPos();
 
         MailMessage msg;
-        if (remaining < static_cast<size_t>(msgSize) + 2) {
-            LOG_WARNING("Mail entry ", i, " truncated");
+        // The WotLK wire value includes its own uint16 size field, so only
+        // msgSize - 2 bytes remain after reading it.
+        if (msgSize < 2 || remaining < static_cast<size_t>(msgSize)) {
+            LOG_WARNING("Mail entry ", static_cast<int>(i), " truncated");
             break;
         }
+        const size_t payloadSize = static_cast<size_t>(msgSize) - 2;
+        const size_t entryEnd = startPos + payloadSize;
 
         msg.messageId = packet.readUInt32();
         msg.messageType = packet.readUInt8();
@@ -182,11 +191,10 @@ bool PacketParsers::parseMailList(network::Packet& packet, std::vector<MailMessa
             default: msg.senderEntry = packet.readUInt32(); break;
         }
 
-        msg.cod = packet.readUInt64();
-        packet.readUInt32(); // item text id
-        packet.readUInt32(); // unknown
+        msg.cod = packet.readUInt32();
+        packet.readUInt32(); // unknown (was item text id before 3.3.3)
         msg.stationeryId = packet.readUInt32();
-        msg.money = packet.readUInt64();
+        msg.money = packet.readUInt32();
         msg.flags = packet.readUInt32();
         msg.expirationTime = packet.readFloat();
         msg.mailTemplateId = packet.readUInt32();
@@ -222,11 +230,11 @@ bool PacketParsers::parseMailList(network::Packet& packet, std::vector<MailMessa
         inbox.push_back(std::move(msg));
 
         // Skip unread bytes
-        size_t consumed = packet.getReadPos() - startPos;
-        if (consumed < msgSize) {
-            size_t skip = msgSize - consumed;
-            for (size_t s = 0; s < skip && packet.hasData(); ++s)
-                packet.readUInt8();
+        if (packet.getReadPos() < entryEnd) {
+            packet.setReadPos(entryEnd);
+        } else if (packet.getReadPos() > entryEnd) {
+            LOG_WARNING("Mail entry ", static_cast<int>(i),
+                        " exceeded declared size by ", packet.getReadPos() - entryEnd, " bytes");
         }
     }
 
@@ -481,8 +489,9 @@ network::Packet AuctionListItemsPacket::build(
     p.writeUInt32(quality);
     p.writeUInt8(usableOnly);
     p.writeUInt8(0);  // getAll (0 = normal search)
-    p.writeUInt8(exactMatch);
-    // Sort columns (0 = none)
+    // WotLK has no exact-match field here; the next byte is the sort count.
+    // Keep the API argument for callers shared with older server profiles.
+    (void)exactMatch;
     p.writeUInt8(0);
     return p;
 }
@@ -546,12 +555,17 @@ network::Packet AuctionListBidderItemsPacket::build(
 }
 
 bool AuctionListResultParser::parse(network::Packet& packet, AuctionListResult& data, int numEnchantSlots) {
-    // Per-entry fixed size: auctionId(4) + itemEntry(4) + enchantSlots×3×4 +
-    //   randProp(4) + suffix(4) + stack(4) + charges(4) + flags(4) +
-    //   ownerGuid(8) + startBid(4) + outbid(4) + buyout(4) + expire(4) +
-    //   bidderGuid(8) + curBid(4)
-    // Classic: numEnchantSlots=1 → 80 bytes/entry
-    // TBC/WotLK: numEnchantSlots=3 → 104 bytes/entry
+    // Entry layout, verified against the servers' BuildAuctionInfo
+    // (vmangos / cmangos-tbc / AzerothCore):
+    //   auctionId(4) + itemEntry(4)
+    //   Vanilla (numEnchantSlots=1): enchantId(4) only — no duration/charges
+    //   TBC/WotLK: numEnchantSlots × [id(4)+duration(4)+charges(4)]
+    //     (TBC inspects 6 slots; WotLK 7 — PRISMATIC was added in 3.x)
+    //   randProp(4) + suffix(4) + stack(4) + spellCharges(4) +
+    //   flags(4, TBC/WotLK only) + ownerGuid(8) + startBid(4) + outbid(4) +
+    //   buyout(4) + expire(4) + bidderGuid(8) + curBid(4)
+    // → 64 bytes/entry vanilla, 136 TBC, 148 WotLK
+    const bool vanillaLayout = numEnchantSlots <= 1;
     if (!packet.hasRemaining(4)) return false;
 
     uint32_t count = packet.readUInt32();
@@ -565,27 +579,31 @@ bool AuctionListResultParser::parse(network::Packet& packet, AuctionListResult& 
     data.auctions.clear();
     data.auctions.reserve(count);
 
-    const size_t minPerEntry = static_cast<size_t>(8 + numEnchantSlots * 12 + 28 + 8 + 8);
+    const size_t minPerEntry = vanillaLayout
+        ? 64
+        : static_cast<size_t>(8 + numEnchantSlots * 12 + 20 + 8 + 16 + 8 + 4);
     for (uint32_t i = 0; i < count; ++i) {
         if (!packet.hasRemaining(minPerEntry)) break;
         AuctionEntry e;
         e.auctionId = packet.readUInt32();
         e.itemEntry = packet.readUInt32();
-        // First enchant slot always present
+        // Vanilla sends only the permanent enchant id; TBC/WotLK send
+        // id/duration/charges triplets for every inspected slot.
         e.enchantId = packet.readUInt32();
-        packet.readUInt32(); // enchant1 duration
-        packet.readUInt32(); // enchant1 charges
-        // Extra enchant slots for TBC/WotLK
-        for (int s = 1; s < numEnchantSlots; ++s) {
-            packet.readUInt32(); // enchant N id
-            packet.readUInt32(); // enchant N duration
-            packet.readUInt32(); // enchant N charges
+        if (!vanillaLayout) {
+            packet.readUInt32(); // enchant1 duration
+            packet.readUInt32(); // enchant1 charges
+            for (int s = 1; s < numEnchantSlots; ++s) {
+                packet.readUInt32(); // enchant N id
+                packet.readUInt32(); // enchant N duration
+                packet.readUInt32(); // enchant N charges
+            }
         }
         e.randomPropertyId = packet.readUInt32();
         e.suffixFactor     = packet.readUInt32();
         e.stackCount       = packet.readUInt32();
-        packet.readUInt32(); // item charges
-        packet.readUInt32(); // item flags (unused)
+        packet.readUInt32(); // item spell charges
+        if (!vanillaLayout) packet.readUInt32(); // item flags (server always writes 0)
         e.ownerGuid        = packet.readUInt64();
         e.startBid         = packet.readUInt32();
         e.minBidIncrement  = packet.readUInt32();
@@ -596,10 +614,10 @@ bool AuctionListResultParser::parse(network::Packet& packet, AuctionListResult& 
         data.auctions.push_back(e);
     }
 
-    if (packet.hasRemaining(8)) {
-        data.totalCount = packet.readUInt32();
-        data.searchDelay = packet.readUInt32();
-    }
+    // Trailer: totalCount everywhere; TBC/WotLK append a search-delay field
+    // (vanilla ends after totalCount, so read the two independently).
+    if (packet.hasRemaining(4)) data.totalCount = packet.readUInt32();
+    if (packet.hasRemaining(4)) data.searchDelay = packet.readUInt32();
     return true;
 }
 
@@ -653,12 +671,15 @@ network::Packet SetTitlePacket::build(int32_t titleBit) {
     return p;
 }
 
-network::Packet AlterAppearancePacket::build(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair) {
-    // CMSG_ALTER_APPEARANCE: uint32 hairStyle + uint32 hairColor + uint32 facialHair
+network::Packet AlterAppearancePacket::build(uint32_t hairStyleEntry, uint32_t hairColor,
+                                              uint32_t facialHairEntry, uint32_t skinColorEntry) {
+    // WotLK: BarberShopStyle hair entry + raw color + BarberShopStyle facial
+    // entry + optional BarberShopStyle skin entry (zero means unchanged).
     network::Packet p(wireOpcode(Opcode::CMSG_ALTER_APPEARANCE));
-    p.writeUInt32(hairStyle);
+    p.writeUInt32(hairStyleEntry);
     p.writeUInt32(hairColor);
-    p.writeUInt32(facialHair);
+    p.writeUInt32(facialHairEntry);
+    p.writeUInt32(skinColorEntry);
     return p;
 }
 

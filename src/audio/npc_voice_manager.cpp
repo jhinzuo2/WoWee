@@ -1,6 +1,7 @@
 #include "audio/npc_voice_manager.hpp"
 #include "audio/audio_engine.hpp"
 #include "pipeline/asset_manager.hpp"
+#include "pipeline/dbc_loader.hpp"
 #include "core/logger.hpp"
 #include <glm/glm.hpp>
 
@@ -35,6 +36,7 @@ bool NpcVoiceManager::initialize(pipeline::AssetManager* assets) {
     LOG_INFO("===================================");
 
     loadVoiceSounds();
+    loadCreatureAggroSounds();
 
     int totalSamples = 0;
     for (const auto& [type, samples] : greetingLibrary_) totalSamples += samples.size();
@@ -54,7 +56,11 @@ void NpcVoiceManager::shutdown() {
     pissedLibrary_.clear();
     aggroLibrary_.clear();
     fleeLibrary_.clear();
+    creatureAggroSoundByDisplay_.clear();
+    creatureAttackSoundByDisplay_.clear();
     lastPlayTime_.clear();
+    lastAggroTime_.clear();
+    lastCombatVocalTime_.clear();
     clickCount_.clear();
     assetManager_ = nullptr;
 }
@@ -309,6 +315,84 @@ void NpcVoiceManager::loadVoiceSounds() {
     loadCombatFlat(fleeLibrary_, VoiceType::DRAENEI_FEMALE, "Draenei", "DraeneiFemale", "Flee", 3);
 }
 
+void NpcVoiceManager::loadCreatureAggroSounds() {
+    if (!assetManager_) return;
+
+    auto displayDbc = assetManager_->loadDBC("CreatureDisplayInfo.dbc");
+    auto modelDbc = assetManager_->loadDBC("CreatureModelData.dbc");
+    auto soundDbc = assetManager_->loadDBC("CreatureSoundData.dbc");
+    if (!displayDbc || !displayDbc->isLoaded() ||
+        !modelDbc || !modelDbc->isLoaded() ||
+        !soundDbc || !soundDbc->isLoaded()) {
+        LOG_WARNING("NPC voice: creature aggro DBC data unavailable");
+        return;
+    }
+
+    // Fixed-skin creature models (including the Defias HumanThief model) keep
+    // their sound set on CreatureModelData, while customizable displays can
+    // override it directly in CreatureDisplayInfo. These fields are stable in
+    // Classic, TBC, and WotLK.
+    std::unordered_map<uint32_t, uint32_t> soundSetByModel;
+    for (uint32_t row = 0; row < modelDbc->getRecordCount(); ++row) {
+        const uint32_t modelId = modelDbc->getUInt32(row, 0);
+        const uint32_t creatureSoundId = modelDbc->getUInt32(row, 13);
+        if (modelId != 0 && creatureSoundId != 0)
+            soundSetByModel[modelId] = creatureSoundId;
+    }
+
+    for (uint32_t row = 0; row < displayDbc->getRecordCount(); ++row) {
+        const uint32_t displayId = displayDbc->getUInt32(row, 0);
+        const uint32_t modelId = displayDbc->getUInt32(row, 1);
+        uint32_t creatureSoundId = displayDbc->getUInt32(row, 2);
+        if (creatureSoundId == 0) {
+            auto modelSound = soundSetByModel.find(modelId);
+            if (modelSound != soundSetByModel.end())
+                creatureSoundId = modelSound->second;
+        }
+        if (displayId == 0 || creatureSoundId == 0) continue;
+
+        const int32_t soundRow = soundDbc->findRecordById(creatureSoundId);
+        if (soundRow < 0) continue;
+        const uint32_t soundDataRow = static_cast<uint32_t>(soundRow);
+        const uint32_t attackSoundId = soundDbc->getUInt32(soundDataRow, 1);
+        const uint32_t aggroSoundId = soundDbc->getUInt32(soundDataRow, 10);
+        if (attackSoundId != 0)
+            creatureAttackSoundByDisplay_[displayId] = attackSoundId;
+        if (aggroSoundId != 0)
+            creatureAggroSoundByDisplay_[displayId] = aggroSoundId;
+    }
+
+    LOG_INFO("NPC voice: loaded ", creatureAggroSoundByDisplay_.size(),
+             " model-specific aggro sounds and ",
+             creatureAttackSoundByDisplay_.size(), " combat vocal banks");
+}
+
+bool NpcVoiceManager::playSoundEntry(uint32_t soundId, const glm::vec3& position) {
+    if (!assetManager_ || !AudioEngine::instance().isInitialized() || soundId == 0)
+        return false;
+
+    auto dbc = assetManager_->loadDBC("SoundEntries.dbc");
+    if (!dbc || !dbc->isLoaded()) return false;
+    const int32_t rowIndex = dbc->findRecordById(soundId);
+    if (rowIndex < 0) return false;
+
+    const uint32_t row = static_cast<uint32_t>(rowIndex);
+    const std::string directory = dbc->getString(row, 23);
+    std::vector<std::string> paths;
+    for (uint32_t field = 3; field <= 12; ++field) {
+        const std::string filename = dbc->getString(row, field);
+        if (filename.empty()) continue;
+        std::string path = directory.empty() ? filename : directory + "\\" + filename;
+        if (assetManager_->fileExists(path)) paths.push_back(std::move(path));
+    }
+    if (paths.empty()) return false;
+
+    std::uniform_int_distribution<size_t> choice(0, paths.size() - 1);
+    std::uniform_real_distribution<float> pitch(0.98f, 1.02f);
+    return AudioEngine::instance().playSound3D(
+        paths[choice(rng_)], position, volumeScale_, pitch(rng_), 60.0f);
+}
+
 bool NpcVoiceManager::loadSound(const std::string& path, VoiceSample& sample) {
     if (!assetManager_) return false;
 
@@ -421,8 +505,41 @@ void NpcVoiceManager::playPissed(uint64_t npcGuid, VoiceType voiceType, const gl
     }
 }
 
-void NpcVoiceManager::playAggro(uint64_t npcGuid, VoiceType voiceType, const glm::vec3& position) {
+void NpcVoiceManager::playAggro(uint64_t npcGuid, uint32_t displayId,
+                                VoiceType voiceType, const glm::vec3& position) {
+    const auto now = std::chrono::steady_clock::now();
+    auto recent = lastAggroTime_.find(npcGuid);
+    if (recent != lastAggroTime_.end() &&
+        std::chrono::duration<float>(now - recent->second).count() < AGGRO_COOLDOWN) {
+        return;
+    }
+
+    auto specific = creatureAggroSoundByDisplay_.find(displayId);
+    if (specific != creatureAggroSoundByDisplay_.end() &&
+        playSoundEntry(specific->second, position)) {
+        lastAggroTime_[npcGuid] = now;
+        lastPlayTime_[npcGuid] = now;
+        return;
+    }
+
+    lastAggroTime_[npcGuid] = now;
     playSound(npcGuid, voiceType, SoundCategory::AGGRO, position);
+}
+
+void NpcVoiceManager::playCombatAttack(uint64_t npcGuid, uint32_t displayId,
+                                       const glm::vec3& position) {
+    const auto sound = creatureAttackSoundByDisplay_.find(displayId);
+    if (sound == creatureAttackSoundByDisplay_.end()) return;
+
+    const auto now = std::chrono::steady_clock::now();
+    auto recent = lastCombatVocalTime_.find(npcGuid);
+    if (recent != lastCombatVocalTime_.end() &&
+        std::chrono::duration<float>(now - recent->second).count() < COMBAT_VOCAL_COOLDOWN) {
+        return;
+    }
+
+    if (playSoundEntry(sound->second, position))
+        lastCombatVocalTime_[npcGuid] = now;
 }
 
 void NpcVoiceManager::playFlee(uint64_t npcGuid, VoiceType voiceType, const glm::vec3& position) {

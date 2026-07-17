@@ -110,6 +110,13 @@ void SkySystem::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
         skybox_->render(cmd, perFrameSet, params);
     }
 
+    // Original client sky M2s supply their own celestial bodies, clouds, and
+    // nebula layers. The caller draws that model over the gradient underlay.
+    if (params.useOriginalSkybox) {
+        if (starField_) starField_->setEnabled(false);
+        return;
+    }
+
     // --- Procedural stars (debug / fallback) ---
     bool renderProceduralStars = false;
     if (debugSkyMode_) {

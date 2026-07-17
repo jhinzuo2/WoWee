@@ -70,22 +70,10 @@ AnimCapabilitySet AnimCapabilityProbe::probe(Renderer* renderer, uint32_t instan
         caps.resolvedWalkBackwards = pick(walkBackCands, 2);
         caps.hasWalkBackwards = (caps.resolvedWalkBackwards != 0);
     }
-    {
-        static const uint32_t strafeLeftCands[] = {anim::SHUFFLE_LEFT, anim::RUN_LEFT, anim::WALK};
-        caps.resolvedStrafeLeft = pick(strafeLeftCands, 3);
-    }
-    {
-        static const uint32_t strafeRightCands[] = {anim::SHUFFLE_RIGHT, anim::RUN_RIGHT, anim::WALK};
-        caps.resolvedStrafeRight = pick(strafeRightCands, 3);
-    }
-    {
-        static const uint32_t runLeftCands[] = {anim::RUN_LEFT, anim::RUN};
-        caps.resolvedRunLeft = pick(runLeftCands, 2);
-    }
-    {
-        static const uint32_t runRightCands[] = {anim::RUN_RIGHT, anim::RUN};
-        caps.resolvedRunRight = pick(runRightCands, 2);
-    }
+    // Note: no resolvedStrafeLeft/Right or resolvedRunLeft/Right here --
+    // strafing (pure or diagonal) reuses plain Walk/Run and the renderer's
+    // torso-bone rotation (CharacterRenderer::setInstanceTorsoYaw) for the
+    // visual angle. See LocomotionFSM::resolve().
 
     // ── Jump ────────────────────────────────────────────────────────────
     caps.resolvedJumpStart = has(anim::JUMP_START) ? anim::JUMP_START : 0;

@@ -218,13 +218,12 @@ bool OpcodeTable::loadFromJson(const std::string& path) {
     // Resolved JSON inheritance is the single source of truth for opcode mappings.
     // Load into a scratch map (the recursive loader supports add/remove via
     // _extends/_remove), then bake it into the flat vector for fast toWire().
-    logicalToWire_.clear();
-    logicalToWireSize_ = 0;
-    wireToLogical_.clear();
+    // Load into temporaries so a failed reload doesn't wipe the working table.
     std::unordered_map<uint16_t, uint16_t> scratch;
+    std::unordered_map<uint16_t, uint16_t> newWireToLogical;
     std::unordered_set<std::string> loadingStack;
     if (!loadOpcodeJsonRecursive(std::filesystem::path(path),
-                                 scratch, wireToLogical_, loadingStack) ||
+                                 scratch, newWireToLogical, loadingStack) ||
         scratch.empty()) {
         LOG_WARNING("OpcodeTable: no opcodes loaded from ", path);
         return false;
@@ -236,10 +235,13 @@ bool OpcodeTable::loadFromJson(const std::string& path) {
     for (const auto& [logical, _wire] : scratch) {
         if (logical > maxIdx) maxIdx = logical;
     }
-    logicalToWire_.assign(static_cast<size_t>(maxIdx) + 1, 0xFFFF);
+    std::vector<uint16_t> newLogicalToWire(static_cast<size_t>(maxIdx) + 1, 0xFFFF);
     for (const auto& [logical, wire] : scratch) {
-        logicalToWire_[logical] = wire;
+        newLogicalToWire[logical] = wire;
     }
+
+    logicalToWire_ = std::move(newLogicalToWire);
+    wireToLogical_ = std::move(newWireToLogical);
     logicalToWireSize_ = scratch.size();
 
     LOG_INFO("OpcodeTable: loaded ", logicalToWireSize_, " opcodes from ", path);

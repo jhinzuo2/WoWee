@@ -3,14 +3,73 @@
 #include "core/logger.hpp"
 #include "rendering/renderer.hpp"
 #include "rendering/character_renderer.hpp"
+#include "rendering/animation_controller.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/m2_loader.hpp"
 #include "pipeline/dbc_loader.hpp"
 #include "pipeline/dbc_layout.hpp"
 #include "game/game_handler.hpp"
+#include <glm/gtc/matrix_transform.hpp>
 
 namespace wowee {
 namespace core {
+
+namespace {
+
+constexpr uint32_t kAttachShield = 0;
+constexpr uint32_t kAttachRightHand = 1;
+constexpr uint32_t kAttachLeftHand = 2;
+constexpr uint32_t kAttachRightHip = 9;
+constexpr uint32_t kAttachLeftHip = 10;
+constexpr uint32_t kAttachBack = 12;
+
+uint32_t weaponAttachment(bool sheathed, game::EquipSlot slot, uint8_t inventoryType) {
+    if (!sheathed) {
+        return slot == game::EquipSlot::OFF_HAND ? kAttachLeftHand : kAttachRightHand;
+    }
+
+    if (inventoryType == game::InvType::TWO_HAND) return kAttachBack;
+    if (inventoryType == game::InvType::SHIELD) return kAttachShield;
+    if (inventoryType == game::InvType::ONE_HAND ||
+        inventoryType == game::InvType::MAIN_HAND) {
+        return slot == game::EquipSlot::OFF_HAND ? kAttachLeftHip : kAttachRightHip;
+    }
+
+    // Holdables and other items with no sheath position are hidden, matching
+    // the original client rather than pinning books/orbs to an arbitrary bone.
+    return UINT32_MAX;
+}
+
+glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
+                               uint8_t inventoryType) {
+    glm::mat4 transform(1.0f);
+    if (!sheathed || inventoryType == game::InvType::SHIELD) return transform;
+
+    if (inventoryType == game::InvType::TWO_HAND) {
+        // Weapon models are authored for a hand with their long axis pointing
+        // forward. Stand that axis up, cant it across the back, and move it off
+        // the spine so the grip sits below the opposite shoulder.
+        // Weapon models are authored along local X, which is also the character's
+        // front/back axis. First rotate weapon X completely onto character Z, then
+        // cant that vertical axis within the Y/Z back plane. This ordering is
+        // important: rotating around X cannot change an X-aligned blade.
+        // The final innermost roll spins the blade about its own long axis so
+        // the flat rests against the back instead of the sharp edge.
+        // Values tuned against the live attachment frame. Its Z axis moves the
+        // weapon laterally rather than vertically.
+        transform = glm::translate(transform, glm::vec3(-0.03f, -0.10f, 0.0f));
+        transform = glm::rotate(transform, glm::radians(33.0f), glm::vec3(1, 0, 0));
+        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(0, 1, 0));
+        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(1, 0, 0));
+    } else {
+        // Hip-sheathed one-handers have the same X-aligned long axis. Rotate it
+        // onto -Z so the blade points down alongside the leg.
+        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(0, 1, 0));
+    }
+    return transform;
+}
+
+} // namespace
 
 AppearanceComposer::AppearanceComposer(rendering::Renderer* renderer,
                                        pipeline::AssetManager* assetManager,
@@ -246,7 +305,6 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
 
     // Look up the correct hair scalp geoset from CharHairGeosets.dbc
     uint16_t selectedHairScalp = 1; // default
-    std::unordered_set<uint16_t> allHairScalpGeosets;
     if (entitySpawner_) {
         const auto& hairMap = entitySpawner_->getHairGeosetMap();
         uint32_t hairKey = (static_cast<uint32_t>(raceId) << 16) |
@@ -255,30 +313,16 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
         auto it = hairMap.find(hairKey);
         if (it != hairMap.end() && it->second > 0)
             selectedHairScalp = it->second;
-
-        // Collect all hair scalp geosets for this race/sex to exclude the others
-        for (const auto& [k, v] : hairMap) {
-            if (static_cast<uint8_t>((k >> 16) & 0xFF) == raceId &&
-                static_cast<uint8_t>((k >> 8) & 0xFF) == sexId &&
-                v > 0 && v < 100)
-                allHairScalpGeosets.insert(v);
-        }
     }
 
-    // Group 0: add body base submeshes (0) but exclude other hair scalp variants
+    // Group 0: body base plus exactly one selected hair scalp. Do not enable
+    // every non-mapped group-0 submesh as a fallback; if the hair DBC map is
+    // unavailable or incomplete, that path activates multiple hair variants.
     activeGeosets.insert(0);  // body base
     activeGeosets.insert(selectedHairScalp);
-    // Some models have additional non-hair body submeshes (e.g. earrings, jaw);
-    // these are typically < 100 and NOT in the hair geoset set
-    for (uint16_t i = 1; i < 100; i++) {
-        if (allHairScalpGeosets.count(i) == 0)
-            activeGeosets.insert(i);  // not a hair geoset, safe to include
-    }
 
-    // Hair connector: group 1 = 100 + geoset
-    activeGeosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(selectedHairScalp, 1)));
-
-    // Facial hair geosets from CharacterFacialHairStyles.dbc
+    // Groups 1xx, 2xx and 3xx are independent facial-feature channels from
+    // CharacterFacialHairStyles. They must not be derived from the hairstyle.
     if (entitySpawner_) {
         const auto& facialMap = entitySpawner_->getFacialHairGeosetMap();
         uint32_t facialKey = (static_cast<uint32_t>(raceId) << 16) |
@@ -286,13 +330,16 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
                              static_cast<uint32_t>(facialId);
         auto it = facialMap.find(facialKey);
         if (it != facialMap.end()) {
+            activeGeosets.insert(static_cast<uint16_t>(100 + std::max<uint16_t>(it->second.geoset100, 1)));
             activeGeosets.insert(static_cast<uint16_t>(200 + std::max<uint16_t>(it->second.geoset200, 1)));
             activeGeosets.insert(static_cast<uint16_t>(300 + std::max<uint16_t>(it->second.geoset300, 1)));
         } else {
+            activeGeosets.insert(101);
             activeGeosets.insert(201);
             activeGeosets.insert(301);
         }
     } else {
+        activeGeosets.insert(101);
         activeGeosets.insert(201);
         activeGeosets.insert(301);
     }
@@ -308,10 +355,63 @@ std::unordered_set<uint16_t> AppearanceComposer::buildDefaultPlayerGeosets(uint8
     return activeGeosets;
 }
 
+void AppearanceComposer::applyEnchantVisuals(uint32_t charInstanceId, int equipSlotIndex,
+                                             uint32_t attachmentId) {
+    auto* charRenderer = renderer_ ? renderer_->getCharacterRenderer() : nullptr;
+    if (!charRenderer || !gameHandler_ || !assetManager_ || !entitySpawner_) return;
+
+    charRenderer->detachWeaponEffects(charInstanceId, attachmentId);
+
+    uint64_t itemGuid = gameHandler_->getEquipSlotGuid(equipSlotIndex);
+    if (itemGuid == 0) return;
+
+    // A temporary enchant (sharpening stone, oil) masks the permanent one's visual.
+    auto [permEnchantId, tempEnchantId] = gameHandler_->getItemEnchantIds(itemGuid);
+    uint32_t enchantId = (tempEnchantId != 0) ? tempEnchantId : permEnchantId;
+    if (enchantId == 0) return;
+
+    auto sieDbc     = assetManager_->loadDBC("SpellItemEnchantment.dbc");
+    auto visualsDbc = assetManager_->loadDBC("ItemVisuals.dbc");
+    auto effectsDbc = assetManager_->loadDBC("ItemVisualEffects.dbc");
+    if (!sieDbc || !sieDbc->isLoaded() || !visualsDbc || !visualsDbc->isLoaded() ||
+        !effectsDbc || !effectsDbc->isLoaded()) {
+        return;
+    }
+
+    const auto* sieL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("SpellItemEnchantment") : nullptr;
+    auto effectModels = pipeline::resolveEnchantItemVisuals(enchantId, sieDbc.get(),
+                                                            visualsDbc.get(), effectsDbc.get(), sieL);
+
+    for (uint32_t visualSlot = 0; visualSlot < effectModels.size(); ++visualSlot) {
+        const std::string& modelName = effectModels[visualSlot];
+        if (modelName.empty()) continue;
+
+        // DBC stores .mdx paths; the shipped assets are .m2.
+        std::string m2Path = modelName;
+        size_t dotPos = m2Path.rfind('.');
+        m2Path = (dotPos != std::string::npos ? m2Path.substr(0, dotPos) : m2Path) + ".m2";
+
+        pipeline::M2Model effectModel;
+        if (!loadWeaponM2(m2Path, effectModel)) {
+            LOG_WARNING("Enchant visual: failed to load ", m2Path);
+            continue;
+        }
+
+        uint32_t effectModelId = entitySpawner_->allocateWeaponModelId();
+        if (charRenderer->attachWeaponEffect(charInstanceId, attachmentId, visualSlot,
+                                             effectModel, effectModelId)) {
+            LOG_INFO("Enchant visual: ", m2Path, " on attachment ", attachmentId,
+                     " (enchant ", enchantId, ", visual slot ", visualSlot, ")");
+        }
+    }
+}
+
 bool AppearanceComposer::loadWeaponM2(const std::string& m2Path, pipeline::M2Model& outModel) {
     auto m2Data = assetManager_->readFile(m2Path);
     if (m2Data.empty()) return false;
     outModel = pipeline::M2Loader::load(m2Data);
+    if (outModel.name.empty()) outModel.name = m2Path;
     // Load skin (WotLK+ M2 format): strip .m2, append 00.skin
     std::string skinPath = m2Path;
     size_t dotPos = skinPath.rfind('.');
@@ -324,7 +424,17 @@ bool AppearanceComposer::loadWeaponM2(const std::string& m2Path, pipeline::M2Mod
 }
 
 void AppearanceComposer::loadEquippedWeapons() {
+    // Equipment refreshes can arrive during a gather cast. Keep the temporary
+    // tool authoritative until the cast-end callback restores real equipment.
+    const uint32_t currentInstanceId = renderer_ ? renderer_->getCharacterInstanceId() : 0;
+    if (showingMiningPick_ && currentInstanceId == miningPickInstanceId_) return;
+    if (showingMiningPick_) {
+        showingMiningPick_ = false;
+        miningPickInstanceId_ = 0;
+    }
     showingRanged_ = false;
+    if (renderer_ && renderer_->getAnimationController())
+        renderer_->getAnimationController()->setRangedWeaponActive(false);
     if (!renderer_ || !renderer_->getCharacterRenderer() || !assetManager_ || !assetManager_->isInitialized())
         return;
     if (!gameHandler_) return;
@@ -341,22 +451,25 @@ void AppearanceComposer::loadEquippedWeapons() {
         LOG_WARNING("loadEquippedWeapons: failed to load ItemDisplayInfo.dbc");
         return;
     }
-    // Mapping: EquipSlot → attachment ID (1=RightHand, 2=LeftHand)
+    // Mapping: EquipSlot → held attachment. Sheathed attachment is resolved
+    // from the item's InventoryType below.
     struct WeaponSlot {
         game::EquipSlot slot;
         uint32_t attachmentId;
     };
     WeaponSlot weaponSlots[] = {
-        { game::EquipSlot::MAIN_HAND, 1 },
-        { game::EquipSlot::OFF_HAND,  2 },
+        { game::EquipSlot::MAIN_HAND, kAttachRightHand },
+        { game::EquipSlot::OFF_HAND,  kAttachLeftHand },
     };
 
-    if (weaponsSheathed_) {
-        for (const auto& ws : weaponSlots) {
-            charRenderer->detachWeapon(charInstanceId, ws.attachmentId);
-        }
-        charRenderer->detachWeapon(charInstanceId, 1); // ranged may also use right hand
-        return;
+    // Equipment reloads and Z toggles can move models between these points.
+    // Clear both held and sheathed locations so old copies never remain behind.
+    const uint32_t weaponAttachmentPoints[] = {
+        kAttachShield, kAttachRightHand, kAttachLeftHand,
+        kAttachRightHip, kAttachLeftHip, kAttachBack
+    };
+    for (uint32_t attachmentId : weaponAttachmentPoints) {
+        charRenderer->detachWeapon(charInstanceId, attachmentId);
     }
 
     bool rightHandFilled = false;
@@ -369,6 +482,10 @@ void AppearanceComposer::loadEquippedWeapons() {
             charRenderer->detachWeapon(charInstanceId, ws.attachmentId);
             continue;
         }
+
+        const uint32_t attachmentId = weaponAttachment(
+            weaponsSheathed_, ws.slot, equipSlot.item.inventoryType);
+        if (attachmentId == UINT32_MAX) continue;
 
         uint32_t displayInfoId = equipSlot.item.displayInfoId;
         int32_t recIdx = displayInfoDbc->findRecordById(displayInfoId);
@@ -421,11 +538,16 @@ void AppearanceComposer::loadEquippedWeapons() {
         }
 
         uint32_t weaponModelId = entitySpawner_->allocateWeaponModelId();
-        bool ok = charRenderer->attachWeapon(charInstanceId, ws.attachmentId,
-                                              weaponModel, weaponModelId, texturePath);
+        const glm::mat4 localTransform = weaponLocalTransform(
+            weaponsSheathed_, ws.slot, equipSlot.item.inventoryType);
+        bool ok = charRenderer->attachWeapon(charInstanceId, attachmentId,
+                                              weaponModel, weaponModelId, texturePath,
+                                              localTransform);
         if (ok) {
-            LOG_INFO("Equipped weapon: ", m2Path, " at attachment ", ws.attachmentId);
-            if (ws.attachmentId == 1) rightHandFilled = true;
+            LOG_INFO("Equipped weapon: ", m2Path, " at attachment ", attachmentId,
+                     weaponsSheathed_ ? " (sheathed)" : " (held)");
+            if (ws.slot == game::EquipSlot::MAIN_HAND) rightHandFilled = true;
+            applyEnchantVisuals(charInstanceId, static_cast<int>(ws.slot), attachmentId);
         }
     }
 
@@ -468,10 +590,18 @@ void AppearanceComposer::loadEquippedWeapons() {
                     }
 
                     uint32_t weaponModelId = entitySpawner_->allocateWeaponModelId();
-                    bool ok = charRenderer->attachWeapon(charInstanceId, 1,
-                                                          weaponModel, weaponModelId, texturePath);
+                    const uint32_t rangedAttachment = weaponsSheathed_
+                        ? kAttachBack : kAttachRightHand;
+                    const glm::mat4 localTransform = weaponsSheathed_
+                        ? weaponLocalTransform(true, game::EquipSlot::MAIN_HAND,
+                                               game::InvType::TWO_HAND)
+                        : glm::mat4(1.0f);
+                    bool ok = charRenderer->attachWeapon(charInstanceId, rangedAttachment,
+                                                          weaponModel, weaponModelId, texturePath,
+                                                          localTransform);
                     if (ok) {
-                        LOG_INFO("Equipped ranged weapon: ", m2Path, " at attachment 1 (right hand)");
+                        LOG_INFO("Equipped ranged weapon: ", m2Path, " at attachment ",
+                                 rangedAttachment, weaponsSheathed_ ? " (sheathed)" : " (held)");
                     }
                 }
             }
@@ -479,9 +609,160 @@ void AppearanceComposer::loadEquippedWeapons() {
     }
 }
 
+void AppearanceComposer::showMiningPick(bool show) {
+    if (show == showingMiningPick_) return;
+
+    if (!show) {
+        showingMiningPick_ = false;
+        miningPickInstanceId_ = 0;
+        loadEquippedWeapons();
+        return;
+    }
+
+    if (!renderer_ || !renderer_->getCharacterRenderer() || !assetManager_ ||
+        !assetManager_->isInitialized() || !entitySpawner_) {
+        return;
+    }
+
+    auto* charRenderer = renderer_->getCharacterRenderer();
+    const uint32_t charInstanceId = renderer_->getCharacterInstanceId();
+    if (charInstanceId == 0) return;
+
+    // Item 2901 (Mining Pick) resolves to ItemDisplayInfo 6568 in the WotLK DBC.
+    constexpr uint32_t kMiningPickDisplayId = 6568;
+    auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
+    if (!displayInfoDbc) return;
+
+    const int32_t recIdx = displayInfoDbc->findRecordById(kMiningPickDisplayId);
+    if (recIdx < 0) {
+        LOG_WARNING("showMiningPick: displayInfoId ", kMiningPickDisplayId,
+                    " not found in DBC");
+        return;
+    }
+
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    std::string modelName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModel"] : 1);
+    std::string textureName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModelTexture"] : 3);
+    if (modelName.empty()) return;
+
+    const size_t dotPos = modelName.rfind('.');
+    std::string modelFile = dotPos == std::string::npos
+        ? modelName + ".m2" : modelName.substr(0, dotPos) + ".m2";
+    const std::string m2Path = "Item\\ObjectComponents\\Weapon\\" + modelFile;
+
+    pipeline::M2Model pickModel;
+    if (!loadWeaponM2(m2Path, pickModel)) {
+        LOG_WARNING("showMiningPick: failed to load ", m2Path);
+        return;
+    }
+
+    std::string texturePath;
+    if (!textureName.empty()) {
+        texturePath = "Item\\ObjectComponents\\Weapon\\" + textureName + ".blp";
+    }
+
+    charRenderer->detachWeapon(charInstanceId, kAttachRightHand);
+    const uint32_t modelId = entitySpawner_->allocateWeaponModelId();
+    if (charRenderer->attachWeapon(charInstanceId, kAttachRightHand, pickModel,
+                                   modelId, texturePath)) {
+        showingMiningPick_ = true;
+        miningPickInstanceId_ = charInstanceId;
+        showingRanged_ = false;
+        if (renderer_->getAnimationController())
+            renderer_->getAnimationController()->setRangedWeaponActive(false);
+        LOG_INFO("Mining pick attached at right hand: ", m2Path);
+    } else {
+        // Do not leave the player empty-handed if the temporary model failed.
+        loadEquippedWeapons();
+    }
+}
+
+void AppearanceComposer::showFishingPole(bool show) {
+    if (show == showingFishingPole_) return;
+
+    if (!show) {
+        showingFishingPole_ = false;
+        loadEquippedWeapons();
+        return;
+    }
+    if (!renderer_ || !renderer_->getCharacterRenderer() || !gameHandler_ ||
+        !assetManager_ || !assetManager_->isInitialized() || !entitySpawner_) {
+        return;
+    }
+
+    const auto isFishingPole = [this](const game::ItemSlot& slot) {
+        if (slot.empty()) return false;
+        if (slot.item.subclassName == "Fishing Pole") return true;
+        const auto* info = gameHandler_->getItemInfo(slot.item.itemId);
+        return info && info->valid && info->itemClass == 2 && info->subClass == 20;
+    };
+
+    const game::ItemSlot* pole = nullptr;
+    const auto& inventory = gameHandler_->getInventory();
+    const auto& mainHand = inventory.getEquipSlot(game::EquipSlot::MAIN_HAND);
+    if (isFishingPole(mainHand)) pole = &mainHand;
+    for (int i = 0; !pole && i < inventory.getBackpackSize(); ++i) {
+        const auto& slot = inventory.getBackpackSlot(i);
+        if (isFishingPole(slot)) pole = &slot;
+    }
+    for (int bag = 0; !pole && bag < game::Inventory::NUM_BAG_SLOTS; ++bag) {
+        for (int slotIndex = 0; !pole && slotIndex < inventory.getBagSize(bag); ++slotIndex) {
+            const auto& slot = inventory.getBagSlot(bag, slotIndex);
+            if (isFishingPole(slot)) pole = &slot;
+        }
+    }
+    if (!pole || pole->item.displayInfoId == 0) {
+        LOG_WARNING("showFishingPole: no fishing pole with display data found in inventory");
+        return;
+    }
+
+    auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
+    if (!displayInfoDbc) return;
+    const int32_t recIdx = displayInfoDbc->findRecordById(pole->item.displayInfoId);
+    if (recIdx < 0) return;
+
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    std::string modelName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModel"] : 1);
+    std::string textureName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModelTexture"] : 3);
+    if (modelName.empty()) return;
+
+    const size_t dotPos = modelName.rfind('.');
+    const std::string modelFile = dotPos == std::string::npos
+        ? modelName + ".m2" : modelName.substr(0, dotPos) + ".m2";
+    std::string m2Path = "Item\\ObjectComponents\\Weapon\\" + modelFile;
+    pipeline::M2Model poleModel;
+    if (!loadWeaponM2(m2Path, poleModel)) return;
+
+    std::string texturePath;
+    if (!textureName.empty()) {
+        texturePath = "Item\\ObjectComponents\\Weapon\\" + textureName + ".blp";
+    }
+
+    auto* charRenderer = renderer_->getCharacterRenderer();
+    const uint32_t charInstanceId = renderer_->getCharacterInstanceId();
+    if (charInstanceId == 0) return;
+    charRenderer->detachWeapon(charInstanceId, kAttachRightHand);
+    const uint32_t modelId = entitySpawner_->allocateWeaponModelId();
+    if (charRenderer->attachWeapon(charInstanceId, kAttachRightHand, poleModel,
+                                   modelId, texturePath)) {
+        showingFishingPole_ = true;
+        showingRanged_ = false;
+        if (renderer_->getAnimationController())
+            renderer_->getAnimationController()->setRangedWeaponActive(false);
+        LOG_INFO("Fishing pole attached at right hand: ", m2Path);
+    } else {
+        loadEquippedWeapons();
+    }
+}
+
 void AppearanceComposer::showRangedWeapon(bool show) {
     if (show == showingRanged_) return;
-    showingRanged_ = show;
 
     if (!renderer_ || !renderer_->getCharacterRenderer() || !gameHandler_ || !assetManager_ || !assetManager_->isInitialized())
         return;
@@ -491,6 +772,9 @@ void AppearanceComposer::showRangedWeapon(bool show) {
     if (charInstanceId == 0) return;
 
     if (!show) {
+        showingRanged_ = false;
+        if (renderer_->getAnimationController())
+            renderer_->getAnimationController()->setRangedWeaponActive(false);
         // Swap back to normal melee weapons
         loadEquippedWeapons();
         return;
@@ -540,6 +824,9 @@ void AppearanceComposer::showRangedWeapon(bool show) {
     uint32_t weaponModelId = entitySpawner_->allocateWeaponModelId();
     bool ok = charRenderer->attachWeapon(charInstanceId, 1, weaponModel, weaponModelId, texturePath);
     if (ok) {
+        showingRanged_ = true;
+        if (renderer_->getAnimationController())
+            renderer_->getAnimationController()->setRangedWeaponActive(true);
         LOG_INFO("Swapped to ranged weapon: ", m2Path, " at attachment 1 (right hand)");
     }
 }

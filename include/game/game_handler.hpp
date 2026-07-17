@@ -49,6 +49,7 @@ namespace wowee::game {
 
 namespace wowee {
 namespace network { class WorldSocket; class Packet; }
+namespace audio { enum class PlayerErrorSpeech : uint8_t; }
 
 namespace game {
 
@@ -318,7 +319,10 @@ public:
     }
 
     // Emote animation callback: (entityGuid, animationId)
-    using EmoteAnimCallback = std::function<void(uint64_t, uint32_t)>;
+    // guid, animId, isState. isState marks persistent STATE_ emotes (from
+    // UNIT_NPC_EMOTESTATE or state-type SMSG_EMOTE) that loop until cleared;
+    // one-shots play once and return to the prior state.
+    using EmoteAnimCallback = std::function<void(uint64_t, uint32_t, bool)>;
     void setEmoteAnimCallback(EmoteAnimCallback cb) { emoteAnimCallback_ = std::move(cb); }
 
     /**
@@ -431,8 +435,10 @@ public:
 
     using InspectArenaTeam = game::InspectArenaTeam;
     using InspectResult = game::InspectResult;
-    const InspectResult* getInspectResult() const {
-        return inspectResult_.guid ? &inspectResult_ : nullptr;
+    const InspectResult* getInspectResult() const;
+    const std::array<uint32_t, 19>* getOtherPlayerVisibleEquipment(uint64_t guid) const {
+        auto it = otherPlayerVisibleItemEntries_.find(guid);
+        return (it != otherPlayerVisibleItemEntries_.end()) ? &it->second : nullptr;
     }
 
     // Server info commands
@@ -485,8 +491,9 @@ public:
     // Network latency (milliseconds, updated each PONG response)
     uint32_t getLatencyMs() const { return lastLatency; }
 
-    // Logout commands
-    void requestLogout();
+    // Logout commands. exitAfterLogout: /quit and /exit leave the game; /logout and
+    // /camp drop back to character select.
+    void requestLogout(bool exitAfterLogout = false);
     void cancelLogout();
 
     // Instance difficulty
@@ -797,6 +804,7 @@ public:
 
     bool isCasting() const { return spellHandler_ ? spellHandler_->isCasting() : false; }
     bool isChanneling() const { return spellHandler_ ? spellHandler_->isChanneling() : false; }
+    bool isRestoring() const { return spellHandler_ ? spellHandler_->isRestoring() : false; }
     bool isGameObjectInteractionCasting() const {
         return spellHandler_ ? spellHandler_->isGameObjectInteractionCasting() : false;
     }
@@ -810,6 +818,11 @@ public:
     void cancelCraftQueue();
     int getCraftQueueRemaining() const;
     uint32_t getCraftQueueSpellId() const;
+
+    // Crafting window (opened client-side by casting a profession spell)
+    bool isCraftingWindowOpen() const { return spellHandler_ ? spellHandler_->isCraftingWindowOpen() : false; }
+    uint32_t getCraftingSkillLine() const { return spellHandler_ ? spellHandler_->getCraftingSkillLine() : 0; }
+    void closeCraftingWindow() { if (spellHandler_) spellHandler_->closeCraftingWindow(); }
 
     // 400ms spell-queue window: next spell to cast when current finishes
     uint32_t getQueuedSpellId() const;
@@ -864,10 +877,12 @@ public:
 
     // Talent DBC access
     const TalentEntry* getTalentEntry(uint32_t talentId) const {
+        if (spellHandler_) return spellHandler_->getTalentEntry(talentId);
         auto it = talentCache_.find(talentId);
         return (it != talentCache_.end()) ? &it->second : nullptr;
     }
     const TalentTabEntry* getTalentTabEntry(uint32_t tabId) const {
+        if (spellHandler_) return spellHandler_->getTalentTabEntry(tabId);
         auto it = talentTabCache_.find(tabId);
         return (it != talentTabCache_.end()) ? &it->second : nullptr;
     }
@@ -875,14 +890,14 @@ public:
     const std::unordered_map<uint32_t, TalentTabEntry>& getAllTalentTabs() const;
     void loadTalentDbc();
 
-    // Action bar — 4 bars × 12 slots = 48 total
-    // Bar 0 (slots  0-11): main bottom bar (1-0, -, =)
-    // Bar 1 (slots 12-23): second bar above main (Shift+1 ... Shift+=)
-    // Bar 2 (slots 24-35): right side vertical bar
-    // Bar 3 (slots 36-47): left side vertical bar
+    // Action bar — 12 pages × 12 slots = 144 total.
+    // The first 6 pages match FrameXML action pages:
+    // Page 1: main bar, pages 2-6: scrollable main pages / fixed multi-bars.
+    // TBC sends 132 slots; WotLK sends 144.  Keep the full WotLK-sized array so
+    // later pages are not discarded when loading server action buttons.
     static constexpr int SLOTS_PER_BAR    = 12;
-    static constexpr int ACTION_BARS      = 4;
-    static constexpr int ACTION_BAR_SLOTS = SLOTS_PER_BAR * ACTION_BARS;   // 48
+    static constexpr int ACTION_BARS      = 12;
+    static constexpr int ACTION_BAR_SLOTS = SLOTS_PER_BAR * ACTION_BARS;   // 144
     std::array<ActionBarSlot, ACTION_BAR_SLOTS>& getActionBar() { return actionBar; }
     const std::array<ActionBarSlot, ACTION_BAR_SLOTS>& getActionBar() const { return actionBar; }
     void setActionBarSlot(int slot, ActionBarSlot::Type type, uint32_t id);
@@ -920,6 +935,15 @@ public:
     using NpcDeathCallback = std::function<void(uint64_t guid)>;
     void setNpcDeathCallback(NpcDeathCallback cb) { npcDeathCallback_ = std::move(cb); }
 
+    // Resolves a unit GUID to its CharacterRenderer instance id (0 = not
+    // rendered). Wired by AnimationCallbackHandler; used to bone-attach spell
+    // visuals to the actual caster instead of the local player.
+    using UnitRenderInstanceResolver = std::function<uint32_t(uint64_t guid)>;
+    void setUnitRenderInstanceResolver(UnitRenderInstanceResolver cb) { unitRenderInstanceResolver_ = std::move(cb); }
+    uint32_t resolveUnitRenderInstance(uint64_t guid) const {
+        return unitRenderInstanceResolver_ ? unitRenderInstanceResolver_(guid) : 0;
+    }
+
     using NpcAggroCallback = std::function<void(uint64_t guid, const glm::vec3& position)>;
     void setNpcAggroCallback(NpcAggroCallback cb) { npcAggroCallback_ = std::move(cb); }
 
@@ -931,6 +955,13 @@ public:
     // standState: 0=stand, 1-6=sit variants, 7=dead, 8=kneel
     using StandStateCallback = std::function<void(uint8_t standState)>;
     void setStandStateCallback(StandStateCallback cb) { standStateCallback_ = std::move(cb); }
+
+    // Logout complete callback — fired when SMSG_LOGOUT_COMPLETE says the character
+    // is out of the world. exiting is true for /quit and /exit (leave the game),
+    // false for /logout and /camp (back to character select).
+    using LogoutCompleteCallback = std::function<void(bool exiting)>;
+    void setLogoutCompleteCallback(LogoutCompleteCallback cb) { logoutCompleteCallback_ = std::move(cb); }
+    auto& logoutCompleteCallbackRef() { return logoutCompleteCallback_; }
 
     // Appearance changed callback — fired when PLAYER_BYTES or facial features update (barber shop, etc.)
     using AppearanceChangedCallback = std::function<void()>;
@@ -1176,6 +1207,10 @@ public:
     bool hasServerTransportUpdate(uint64_t guid) const { return entityController_->hasServerTransportUpdate(guid); }
     glm::vec3 getComposedWorldPosition();  // Compose transport transform * local offset
     TransportManager* getTransportManager() { return transportManager_.get(); }
+    // Client-side M2 transport (trams, lifts) board/disembark check by proximity to the
+    // transport's live position. Call once per tick with the player's current canonical
+    // world position; safe to call whether or not any M2 transports are registered.
+    void updateM2TransportBoarding(const glm::vec3& playerCanonical);
     void setPlayerOnTransport(uint64_t transportGuid, const glm::vec3& localOffset) {
         // Validate transport is registered before attaching player
         // (defer if transport not yet registered to prevent desyncs)
@@ -1258,7 +1293,8 @@ public:
     // Barber shop
     bool isBarberShopOpen() const { return barberShopOpen_; }
     void closeBarberShop() { barberShopOpen_ = false; fireAddonEvent("BARBER_SHOP_CLOSE", {}); }
-    void sendAlterAppearance(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair);
+    void sendAlterAppearance(uint32_t hairStyleEntry, uint32_t hairColor,
+                             uint32_t facialHairEntry, uint32_t skinColorEntry);
 
     // Instance difficulty (0=5N, 1=5H, 2=25N, 3=25H for WotLK)
     uint32_t getInstanceDifficulty() const;
@@ -1271,7 +1307,7 @@ public:
     float getCorpseReclaimDelaySec() const;
     /** Distance (yards) from ghost to corpse, or -1 if no corpse data. */
     float getCorpseDistance() const {
-        if (corpseMapId_ == 0 || currentMapId_ != corpseMapId_) return -1.0f;
+        if (!corpsePositionValid_ || currentMapId_ != corpseMapId_) return -1.0f;
         // movementInfo is canonical (x=north=server_y, y=west=server_x);
         // corpse coords are raw server (x=west, y=north) — swap to compare.
         float dx = movementInfo.x - corpseY_;
@@ -1282,7 +1318,7 @@ public:
     /** Corpse position in canonical WoW coords (X=north, Y=west).
      *  Returns false if no corpse data or on a different map. */
     bool getCorpseCanonicalPos(float& outX, float& outY) const {
-        if (corpseMapId_ == 0 || currentMapId_ != corpseMapId_) return false;
+        if (!corpsePositionValid_ || currentMapId_ != corpseMapId_) return false;
         outX = corpseY_;  // server Y = canonical X (north)
         outY = corpseX_;  // server X = canonical Y (west)
         return true;
@@ -1300,8 +1336,8 @@ public:
     void leaveGroup();
     void convertToRaid();
     void sendSetLootMethod(uint32_t method, uint32_t threshold, uint64_t masterLooterGuid);
-    bool isInGroup() const { return !partyData.isEmpty(); }
-    const GroupListData& getPartyData() const { return partyData; }
+    bool isInGroup() const;
+    const GroupListData& getPartyData() const;
     const std::vector<ContactEntry>& getContacts() const { return contacts_; }
     bool hasPendingGroupInvite() const;
     const std::string& getPendingInviterName() const;
@@ -1454,6 +1490,13 @@ public:
     void lootTarget(uint64_t guid);
     void lootItem(uint8_t slotIndex);
     void closeLoot();
+    void scheduleGameObjectLootOpen(uint64_t guid, float delaySeconds = 0.35f, uint8_t attempts = 1);
+    void clearPendingGameObjectLootOpen(uint64_t guid);
+    bool hasPendingGameObjectLootOpen(uint64_t guid) const;
+    bool isGatherGameObject(uint64_t guid) const;
+    void despawnGameObjectLocally(uint64_t guid);
+    /// Remove a creature corpse client-side once it has been looted empty.
+    void despawnCreatureLocally(uint64_t guid);
     void activateSpiritHealer(uint64_t npcGuid);
     bool isLootWindowOpen() const;
     const LootResponseData& getCurrentLoot() const;
@@ -1488,6 +1531,7 @@ public:
     // NPC Gossip
     void interactWithNpc(uint64_t guid);
     void interactWithGameObject(uint64_t guid);
+    uint64_t getHookedFishingBobberGuid() const { return hookedFishingBobberGuid_; }
     void selectGossipOption(uint32_t optionId);
     void selectGossipQuest(uint32_t questId);
     void acceptQuest();
@@ -1498,6 +1542,7 @@ public:
     uint64_t getBagItemGuid(int bagIndex, int slotIndex) const;
     bool isGossipWindowOpen() const;
     const GossipMessageData& getCurrentGossip() const;
+    const std::string& getNpcText(uint32_t textId) const;
     bool isQuestDetailsOpen();
     const QuestDetailsData& getQuestDetails() const;
 
@@ -1520,6 +1565,9 @@ public:
     // Quest log
     using QuestLogEntry = QuestHandler::QuestLogEntry;
     const std::vector<QuestLogEntry>& getQuestLog() const;
+    int getMaxQuestLogSlots() const;
+    // QuestSort.dbc name for negative ZoneOrSort values (class/profession/seasonal)
+    const std::string& getQuestSortName(uint32_t sortId) const;
     int getSelectedQuestLogIndex() const;
     void setSelectedQuestLogIndex(int idx) { selectedQuestLogIndex_ = idx; }
     void abandonQuest(uint32_t questId);
@@ -1527,11 +1575,22 @@ public:
     bool requestQuestQuery(uint32_t questId, bool force = false);
     bool isQuestTracked(uint32_t questId) const { return trackedQuestIds_.count(questId) > 0; }
     void setQuestTracked(uint32_t questId, bool tracked) {
-        if (tracked) trackedQuestIds_.insert(questId);
-        else trackedQuestIds_.erase(questId);
-        saveCharacterConfig();
+        const bool changed = tracked ? trackedQuestIds_.insert(questId).second
+                                     : trackedQuestIds_.erase(questId) > 0;
+        if (changed) saveCharacterConfig();
     }
     const std::unordered_set<uint32_t>& getTrackedQuestIds() const;
+    bool isQuestShownOnMap(uint32_t questId) const {
+        return mapVisibleQuestIds_.count(questId) > 0;
+    }
+    void setQuestShownOnMap(uint32_t questId, bool shown) {
+        const bool changed = shown ? mapVisibleQuestIds_.insert(questId).second
+                                   : mapVisibleQuestIds_.erase(questId) > 0;
+        if (changed) saveCharacterConfig();
+    }
+    const std::unordered_set<uint32_t>& getMapVisibleQuestIds() const {
+        return mapVisibleQuestIds_;
+    }
     bool isQuestQueryPending(uint32_t questId) const {
         return pendingQuestQueryIds_.count(questId) > 0;
     }
@@ -1552,10 +1611,34 @@ public:
         int32_t scale    = 0;     // +1 = counting up, -1 = counting down
         bool    paused   = false;
         bool    active   = false;
+        float   pendingMs = 0.0f; // sub-millisecond carry for the local countdown
     };
     const MirrorTimer& getMirrorTimer(int type) const {
         static MirrorTimer empty;
         return (type >= 0 && type < 3) ? mirrorTimers_[type] : empty;
+    }
+    /**
+     * Count the mirror timers (breath, fatigue, feign death) down locally.
+     *
+     * The server sends SMSG_START_MIRROR_TIMER once with the remaining time and a
+     * scale, then only speaks again when something changes — so without this the
+     * breath bar just sits at whatever value it was handed and never moves.
+     * scale is ms of timer per ms of real time: -1 while drowning, +1 while the
+     * bar refills at the surface.
+     */
+    void tickMirrorTimers(float dt) {
+        if (dt <= 0.0f) return;
+        const float elapsedMs = dt * 1000.0f;
+        for (auto& t : mirrorTimers_) {
+            if (!t.active || t.paused || t.scale == 0 || t.maxValue <= 0) continue;
+            // Carry the sub-millisecond remainder: truncating each frame would lose
+            // most of a 144fps frame's 6.94ms and run the timer visibly slow.
+            t.pendingMs += elapsedMs;
+            const int32_t wholeMs = static_cast<int32_t>(t.pendingMs);
+            if (wholeMs == 0) continue;
+            t.pendingMs -= static_cast<float>(wholeMs);
+            t.value = std::clamp(t.value + t.scale * wholeMs, 0, t.maxValue);
+        }
     }
 
     // Combo points
@@ -1842,6 +1925,9 @@ public:
             if (auto* mgr = (ac->*getter)()) cb(mgr);
         }
     }
+    // Play the player character's spoken error response ("Not enough mana", ...)
+    // using the active character's race/gender. Gated by the Character Speech setting.
+    void playErrorSpeech(audio::PlayerErrorSpeech type);
 
     // Reputation change toast: factionName, delta, new standing
     using RepChangeCallback = std::function<void(const std::string& factionName, int32_t delta, int32_t standing)>;
@@ -1874,6 +1960,22 @@ public:
     // Taxi orientation callback (for mount rotation: yaw, pitch, roll in radians)
     using TaxiOrientationCallback = std::function<void(float yaw, float pitch, float roll)>;
     void setTaxiOrientationCallback(TaxiOrientationCallback cb) { taxiOrientationCallback_ = std::move(cb); }
+
+    // Taxi landing position correction callback (canonical x, y, z). Application's
+    // per-frame render-position sync only pulls from game state while onTaxi (see
+    // its "Sync character render position" block) - once finishClientTaxiFlight()
+    // clears onTaxiFlight_/taxiMountActive_, that sync stops, so a position
+    // correction applied only to movementInfo/the entity (e.g. snapping to the
+    // known-correct TaxiNodes.dbc position instead of a short-landed spline) never
+    // reaches the renderer, which then stays authoritative at its last (wrong)
+    // value. Live-confirmed: the landing clamp reads renderer->getCharacterPosition()
+    // directly and kept computing from the pre-correction position even after
+    // finishClientTaxiFlight() had already fixed movementInfo/the entity. This
+    // callback lets MovementHandler push the corrected position straight to the
+    // renderer at the same moment, without MovementHandler needing direct access
+    // to rendering types.
+    using TaxiLandingPositionCallback = std::function<void(float x, float y, float z)>;
+    void setTaxiLandingPositionCallback(TaxiLandingPositionCallback cb) { taxiLandingPositionCallback_ = std::move(cb); }
 
     // Callback for when taxi flight is about to start (after mounting delay, before movement begins)
     using TaxiFlightStartCallback = std::function<void()>;
@@ -1938,11 +2040,7 @@ public:
     using TaxiPathEdge = MovementHandler::TaxiPathEdge;
     using TaxiPathNode = MovementHandler::TaxiPathNode;
     const std::unordered_map<uint32_t, TaxiNode>& getTaxiNodes() const;
-    bool isKnownTaxiNode(uint32_t nodeId) const {
-        if (nodeId == 0 || nodeId > 384) return false;
-        uint32_t idx = nodeId - 1;
-        return (knownTaxiMask_[idx / 32] & (1u << (idx % 32))) != 0;
-    }
+    bool isKnownTaxiNode(uint32_t nodeId) const;
     uint32_t getTaxiCostTo(uint32_t destNodeId) const;
     bool taxiNpcHasRoutes(uint64_t guid) const {
         auto it = taxiNpcHasRoutes_.find(guid);
@@ -1965,6 +2063,7 @@ public:
         uint64_t itemGuid = 0;
         ItemDef item;
         uint32_t count = 1;
+        uint32_t wireSlot = 0;
     };
     void buyBackItem(uint32_t buybackSlot);
     void repairItem(uint64_t vendorGuid, uint64_t itemGuid);
@@ -1975,9 +2074,19 @@ public:
     void autoEquipItemInBag(int bagIndex, int slotIndex);
     void useItemBySlot(int backpackIndex);
     void useItemInBag(int bagIndex, int slotIndex);
+
+    // Item-targeted item use: sharpening stones, weightstones and weapon oils enchant
+    // another item, so using one arms a targeting cursor instead of casting immediately.
+    bool isAwaitingItemTarget() const;
+    uint32_t getPendingItemTargetSourceItemId() const;
+    void cancelItemTargeting();
+    void completeItemUseOnItem(uint64_t targetItemGuid);
+
     // CMSG_OPEN_ITEM — for locked containers (lockboxes); server checks keyring automatically
     void openItemBySlot(int backpackIndex);
     void openItemInBag(int bagIndex, int slotIndex);
+    void readItemBySlot(int backpackIndex);
+    void readItemInBag(int bagIndex, int slotIndex);
     void destroyItem(uint8_t bag, uint8_t slot, uint8_t count = 1);
     void splitItem(uint8_t srcBag, uint8_t srcSlot, uint8_t count);
     void swapContainerItems(uint8_t srcBag, uint8_t srcSlot, uint8_t dstBag, uint8_t dstSlot);
@@ -2079,6 +2188,12 @@ public:
     const std::string& getSpellRank(uint32_t spellId) const;
     /// Returns the tooltip/description text from Spell.dbc (empty if unknown or has no text).
     const std::string& getSpellDescription(uint32_t spellId) const;
+    // SpellFocusObject.dbc name ("Anvil", "Cooking Fire", ...) for
+    // requires-spell-focus cast failures; empty if unknown.
+    const std::string& getSpellFocusName(uint32_t focusId) const;
+    // TotemCategory.dbc name ("Blacksmith Hammer", "Mining Pick", ...) for
+    // totem-category cast failures; empty if unknown.
+    const std::string& getTotemCategoryName(uint32_t categoryId) const;
     const int32_t* getSpellEffectBasePoints(uint32_t spellId) const;
     float getSpellDuration(uint32_t spellId) const;
     std::string getEnchantName(uint32_t enchantId) const;
@@ -2092,6 +2207,9 @@ public:
     /// (0x01=Physical, 0x02=Holy, 0x04=Fire, 0x08=Nature, 0x10=Frost, 0x20=Shadow, 0x40=Arcane).
     /// Returns 0 if unknown.
     uint32_t getSpellSchoolMask(uint32_t spellId) const;
+    /// Returns the Spell.dbc Targets bitmask (SpellCastTargetFlags) for the spell.
+    /// 0x10 = TARGET_FLAG_ITEM, meaning the spell must be cast onto another item.
+    uint32_t getSpellTargetFlags(uint32_t spellId) const;
 
     struct TrainerTab {
         std::string name;
@@ -2323,6 +2441,7 @@ public:
     // ── Corpse & Home Bind ───────────────────────────────────────────
     auto& corpseGuidRef() { return corpseGuid_; }
     auto& corpseMapIdRef() { return corpseMapId_; }
+    auto& corpsePositionValidRef() { return corpsePositionValid_; }
     auto& corpseReclaimAvailableMsRef() { return corpseReclaimAvailableMs_; }
     auto& corpseXRef() { return corpseX_; }
     auto& corpseYRef() { return corpseY_; }
@@ -2442,6 +2561,7 @@ public:
     auto& stunStateCallbackRef() { return stunStateCallback_; }
     auto& taxiFlightStartCallbackRef() { return taxiFlightStartCallback_; }
     auto& taxiOrientationCallbackRef() { return taxiOrientationCallback_; }
+    auto& taxiLandingPositionCallbackRef() { return taxiLandingPositionCallback_; }
     auto& taxiPrecacheCallbackRef() { return taxiPrecacheCallback_; }
     auto& transportMoveCallbackRef() { return transportMoveCallback_; }
     auto& unitAnimHintCallbackRef() { return unitAnimHintCallback_; }
@@ -2465,6 +2585,7 @@ public:
     void rebuildOnlineInventory();
     void maybeDetectVisibleItemLayout();
     void updateOtherPlayerVisibleItems(uint64_t guid, const FlatFieldMap& fields);
+    void cacheInspectedPlayerEquipment(uint64_t guid, const std::array<uint32_t, 19>& itemEntries);
     void detectInventorySlotBases(const FlatFieldMap& fields);
     bool applyInventoryFields(const FlatFieldMap& fields);
     void extractContainerFields(uint64_t containerGuid, const FlatFieldMap& fields);
@@ -2503,12 +2624,27 @@ public:
         uint8_t remainingRetries = 0;
         bool sendLoot = false;
     };
+    struct SpellReagent { uint32_t itemId = 0; uint32_t count = 0; };
     struct SpellNameEntry {
         std::string name; std::string rank; std::string description;
         uint32_t schoolMask = 0; uint8_t dispelType = 0; uint32_t attrEx = 0;
+        // Spell.dbc Targets bitmask (SpellCastTargetFlags) — 0x10 = TARGET_FLAG_ITEM
+        uint32_t targetFlags = 0;
+        // Spell.dbc RangeIndex resolved against SpellRange.dbc. A max range of 0
+        // means "Self Only" (shouts, self-buffs); negative means SpellRange.dbc
+        // was unavailable, so callers should not infer anything from it.
+        float maxRange = -1.0f;
         int32_t effectBasePoints[3] = {0, 0, 0};
+        uint32_t effectIds[3] = {0, 0, 0};
         float durationSec = 0.0f;
         uint32_t spellVisualId = 0;
+        uint32_t recoveryMs = 0;
+        uint32_t categoryRecoveryMs = 0;
+        uint32_t createdItemId = 0;
+        SpellReagent reagents[8] = {};
+        uint32_t trivialSkillHigh = 0;
+        uint32_t trivialSkillLow = 0;
+        uint32_t minSkillRank = 0;
     };
     static constexpr size_t PLAYER_EXPLORED_ZONES_COUNT = 128;
     std::string getAreaName(uint32_t areaId) const;
@@ -2934,6 +3070,9 @@ private:
     uint32_t armorProficiency_  = 0;  // bitmask from SMSG_SET_PROFICIENCY itemClass=4
     std::vector<MinimapPing> minimapPings_;
     uint64_t pendingGameObjectInteractGuid_ = 0;
+    // Owned fishing bobber whose bite animation has fired. Keeping this explicit
+    // lets the UI target/reel it even while GAMEOBJECT_QUERY metadata is pending.
+    uint64_t hookedFishingBobberGuid_ = 0;
 
     // Talents (dual-spec support)
     uint8_t activeTalentSpec_ = 0;                              // Currently active spec (0 or 1)
@@ -2952,6 +3091,10 @@ private:
     float areaTriggerCheckTimer_ = 0.0f;
     bool areaTriggerSuppressFirst_ = false;  // suppress first check after map transfer
     float areaTriggerCooldown_ = 0.0f;       // seconds remaining — suppress ALL triggers
+
+    // Craft queue: seconds the expired cast bar has waited for SMSG_SPELL_GO
+    // (which re-casts the next queued item) before giving up
+    float craftCastGoGraceSec_ = 0.0f;
 
     std::array<ActionBarSlot, ACTION_BAR_SLOTS> actionBar{};
     std::unordered_map<uint32_t, std::string> macros_;  // client-side macro text (persisted in char config)
@@ -3135,6 +3278,7 @@ private:
     struct PendingLootOpen {
         uint64_t guid = 0;
         float timer = 0.0f;
+        uint8_t remainingAttempts = 1;
     };
     std::vector<PendingLootOpen> pendingGameObjectLootOpens_;
     // Tracks the last GO we sent CMSG_GAMEOBJ_USE to; used in handleSpellGo
@@ -3186,8 +3330,7 @@ private:
     uint32_t pendingTurnInQuestId_ = 0;
     uint64_t pendingTurnInNpcGuid_ = 0;
     bool pendingTurnInRewardRequest_ = false;
-    std::unordered_map<uint32_t, float> pendingQuestAcceptTimeouts_;
-    std::unordered_map<uint32_t, uint64_t> pendingQuestAcceptNpcGuids_;
+    // (pending quest accept timeout state lives in QuestHandler)
     bool questOfferRewardOpen_ = false;
     QuestOfferRewardData currentQuestOfferReward_;
 
@@ -3196,6 +3339,7 @@ private:
     int selectedQuestLogIndex_ = 0;
     std::unordered_set<uint32_t> pendingQuestQueryIds_;
     std::unordered_set<uint32_t> trackedQuestIds_;
+    std::unordered_set<uint32_t> mapVisibleQuestIds_;
     bool pendingLoginQuestResync_ = false;
     float pendingLoginQuestResyncTimeout_ = 0.0f;
 
@@ -3233,8 +3377,6 @@ private:
     bool taxiRecoverPending_ = false;
     uint32_t taxiRecoverMapId_ = 0;
     glm::vec3 taxiRecoverPos_{0.0f};
-    uint32_t knownTaxiMask_[12] = {};  // Track previously known nodes for discovery alerts
-    bool taxiMaskInitialized_ = false; // First SMSG_SHOWTAXINODES seeds mask without alerts
     std::unordered_map<uint32_t, uint32_t> taxiCostMap_; // destNodeId -> total cost in copper
     uint32_t nextMovementTimestampMs();
     void updateClientTaxi(float deltaTime);
@@ -3270,7 +3412,6 @@ private:
     AuctionListResult auctionOwnerResults_;
     AuctionListResult auctionBidderResults_;
     int auctionActiveTab_ = 0;  // 0=Browse, 1=Bids, 2=Auctions
-    float auctionSearchDelayTimer_ = 0.0f;
     // Last search params for re-query (pagination, auto-refresh after bid/buyout)
     struct AuctionSearchParams {
         std::string name;
@@ -3335,8 +3476,9 @@ private:
     mutable bool areaNameCacheLoaded_ = false;
     void loadAreaNameCache() const;
 
-    // Map name cache (lazy-loaded from Map.dbc; maps mapId → localized display name)
+    // Map metadata cache (lazy-loaded from Map.dbc).
     mutable std::unordered_map<uint32_t, std::string> mapNameCache_;
+    mutable std::unordered_map<uint32_t, uint32_t> mapInstanceTypeCache_;
     mutable bool mapNameCacheLoaded_ = false;
     void loadMapNameCache() const;
 
@@ -3409,9 +3551,11 @@ private:
     void applyPackedKillCountsFromFields(QuestLogEntry& quest);
 
     NpcDeathCallback npcDeathCallback_;
+    UnitRenderInstanceResolver unitRenderInstanceResolver_;
     NpcAggroCallback npcAggroCallback_;
     NpcRespawnCallback npcRespawnCallback_;
     StandStateCallback standStateCallback_;
+    LogoutCompleteCallback logoutCompleteCallback_;
     AppearanceChangedCallback appearanceChangedCallback_;
     GhostStateCallback ghostStateCallback_;
     MeleeSwingCallback meleeSwingCallback_;
@@ -3442,6 +3586,7 @@ private:
     MountCallback mountCallback_;
     TaxiPrecacheCallback taxiPrecacheCallback_;
     TaxiOrientationCallback taxiOrientationCallback_;
+    TaxiLandingPositionCallback taxiLandingPositionCallback_;
     TaxiFlightStartCallback taxiFlightStartCallback_;
     OpenLfgCallback openLfgCallback_;
     uint32_t currentMountDisplayId_ = 0;
@@ -3458,6 +3603,7 @@ private:
     bool playerDead_ = false;
     bool releasedSpirit_ = false;
     uint32_t corpseMapId_ = 0;
+    bool corpsePositionValid_ = false;
     float corpseX_ = 0.0f, corpseY_ = 0.0f, corpseZ_ = 0.0f;
     uint64_t corpseGuid_ = 0;
     // Absolute time (ms since epoch) when PvP corpse-reclaim delay expires.
@@ -3476,13 +3622,9 @@ private:
     bool resurrectRequestPending_ = false;
     bool selfResAvailable_ = false;  // SMSG_PRE_RESURRECT received — Reincarnation/Twisting Nether
     // ---- Talent wipe confirm dialog ----
-    bool talentWipePending_ = false;
-    uint64_t talentWipeNpcGuid_ = 0;
-    uint32_t talentWipeCost_ = 0;
+    // (talent wipe confirm state lives in SpellHandler)
     // ---- Pet talent respec confirm dialog ----
-    bool petUnlearnPending_ = false;
-    uint64_t petUnlearnGuid_ = 0;
-    uint32_t petUnlearnCost_ = 0;
+    // (pet unlearn confirm state lives in SpellHandler)
     bool resurrectIsSpiritHealer_ = false;  // true = SMSG_SPIRIT_HEALER_CONFIRM, false = SMSG_RESURRECT_REQUEST
     uint64_t resurrectCasterGuid_ = 0;
     std::string resurrectCasterName_;

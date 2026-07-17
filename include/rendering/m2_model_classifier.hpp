@@ -50,7 +50,9 @@ struct M2ClassificationResult {
     bool isSmoke            = false; ///< Smoke model (UV scroll animation)
     bool isWaterfall        = false; ///< Waterfall model (ambient sound + splash particles)
     bool isBrazierOrFire    = false; ///< Brazier / campfire / bonfire model
+    bool isGroundFire       = false; ///< Ground fire whose halo follows its lowest flame emitter
     bool isTorch            = false; ///< Wall-mounted or standing torch
+    bool isSkyBird          = false; ///< Flying bird/bat doodad (hide until animation range)
 
     // --- Ambient emitter type (for sound system) ---
     AmbientEmitterType ambientEmitterType = AmbientEmitterType::None;
@@ -95,6 +97,7 @@ struct M2BatchTexClassification {
     bool hasGlowCardToken    = false; ///< glow / flamelick / lensflare / t_vfx / lightbeam / glowball / genericglow
     bool likelyFlame         = false; ///< fire / flame / torch
     bool lanternFamily       = false; ///< lantern / lamp / elf / silvermoon / quel / thalas
+    bool softGlowSurface     = false; ///< Lit glass surface that keeps its mesh beneath a soft halo
     int  glowTint            = 0;     ///< 0 = neutral, 1 = cool (blue/arcane), 2 = warm (red/scarlet)
 };
 

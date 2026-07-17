@@ -123,6 +123,8 @@ public:
     // Brightness (1.0 = default, <1 darkens, >1 brightens)
     void setBrightness(float b) { brightness_ = b; }
     float getBrightness() const { return brightness_; }
+    void setIntoxication(float amount) { intoxication_ = glm::clamp(amount, 0.0f, 1.0f); }
+    float getIntoxication() const { return intoxication_; }
 
 private:
     VkContext* vkCtx_ = nullptr;
@@ -134,6 +136,9 @@ private:
 
     // Brightness
     float brightness_ = 1.0f;
+    float intoxication_ = 0.0f;
+
+    bool needsFXAAPass() const { return fxaa_.enabled || intoxication_ > 0.001f; }
 
     // FSR 1.0 upscaling state
     struct FSRState {

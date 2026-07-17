@@ -14,8 +14,6 @@ static AnimCapabilitySet makeLocoCaps() {
     caps.resolvedRun = anim::RUN;
     caps.resolvedSprint = anim::SPRINT;
     caps.resolvedWalkBackwards = anim::WALK_BACKWARDS;
-    caps.resolvedStrafeLeft = anim::SHUFFLE_LEFT;
-    caps.resolvedStrafeRight = anim::SHUFFLE_RIGHT;
     caps.resolvedJumpStart = anim::JUMP_START;
     caps.resolvedJump = anim::JUMP;
     caps.resolvedJumpEnd = anim::JUMP_END;

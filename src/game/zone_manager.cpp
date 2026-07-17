@@ -154,7 +154,8 @@ void ZoneManager::initialize() {
         "Sound\\Music\\ZoneMusic\\HauntedForest\\HauntedForest02.mp3",
         "Sound\\Music\\ZoneMusic\\HauntedForest\\HauntedForest03.mp3",
     };
-    if (!omBoneCollector.empty()) duskwood.musicPaths.push_back(omBoneCollector);
+    // Keep Duskwood on its original haunted-forest score; custom tracks are
+    // too upbeat for the zone's persistent dark ambience.
     zones[10] = duskwood;
 
     // Burning Steppes (zone 46)
@@ -326,10 +327,14 @@ void ZoneManager::initialize() {
         tileToZone[tx * 100 + 53] = 1;
     }
 
-    // Duskwood tiles (south of Elwynn)
-    for (int tx = 33; tx <= 36; tx++) {
-        tileToZone[tx * 100 + 52] = 10;
-        tileToZone[tx * 100 + 53] = 10;
+    // Conservative Duskwood interior fallback. The northern bank shares ADTs
+    // with southern Elwynn and is resolved from AreaTable parentage instead.
+    for (int tx = 0; tx < 64; tx++) {
+        for (int ty = 0; ty < 64; ty++) {
+            if (isDuskwoodAdtTile(tx, ty)) {
+                tileToZone[tx * 100 + ty] = 10;
+            }
+        }
     }
 
     // Tirisfal Glades tiles (northern Eastern Kingdoms)
@@ -429,6 +434,20 @@ uint32_t ZoneManager::getZoneId(int tileX, int tileY) const {
     return 0;  // Unknown zone
 }
 
+uint32_t ZoneManager::resolveAreaZoneId(uint32_t areaId) const {
+    uint32_t current = areaId;
+    // AreaTable parent chains are shallow; cap traversal to tolerate malformed
+    // or cyclic custom DBC records without hanging the render/audio update.
+    for (int depth = 0; current != 0 && depth < 16; ++depth) {
+        auto it = areaParents_.find(current);
+        if (it == areaParents_.end() || it->second == 0 || it->second == current) {
+            return current;
+        }
+        current = it->second;
+    }
+    return current != 0 ? current : areaId;
+}
+
 const ZoneInfo* ZoneManager::getZoneInfo(uint32_t zoneId) const {
     auto it = zones.find(zoneId);
     if (it != zones.end()) {
@@ -498,6 +517,23 @@ void ZoneManager::enrichFromDBC(pipeline::AssetManager* assets) {
         LOG_WARNING("ZoneManager::enrichFromDBC: AreaTable.dbc not available");
         return;
     }
+
+    const uint32_t numAreas = areaDbc->getRecordCount();
+    const uint32_t areaFields = areaDbc->getFieldCount();
+    if (areaFields < 3) {
+        LOG_WARNING("ZoneManager::enrichFromDBC: AreaTable.dbc has too few fields (", areaFields, ")");
+        return;
+    }
+
+    // ID, ContinentID, ParentAreaNum are the first three fields in the client
+    // layouts supported here. Preserve this relationship even when the music
+    // DBCs are absent: renderer and ambience classification depend on it.
+    areaParents_.clear();
+    for (uint32_t i = 0; i < numAreas; ++i) {
+        const uint32_t areaId = areaDbc->getUInt32(i, 0);
+        if (areaId != 0) areaParents_[areaId] = areaDbc->getUInt32(i, 2);
+    }
+
     if (!zoneMusicDbc || !zoneMusicDbc->isLoaded()) {
         LOG_WARNING("ZoneManager::enrichFromDBC: ZoneMusic.dbc not available");
         return;
@@ -525,8 +561,6 @@ void ZoneManager::enrichFromDBC(pipeline::AssetManager* assets) {
         return paths;
     };
 
-    const uint32_t numAreas = areaDbc->getRecordCount();
-    const uint32_t areaFields = areaDbc->getFieldCount();
     if (areaFields < 9) {
         LOG_WARNING("ZoneManager::enrichFromDBC: AreaTable.dbc has too few fields (", areaFields, ")");
         return;

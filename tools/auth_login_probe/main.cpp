@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
             if (crcA == CrcAFormat::BigEndian) {
                 std::reverse(crcABytes.begin(), crcABytes.end());
             }
-            if (auth::computeIntegrityHashWin32WithExe(checksumSalt, crcABytes, miscDir, integrityExe, crcHash, err)) {
+            if (auth::computeIntegrityHashWin32WithExe(checksumSalt, crcABytes, miscDir, integrityExe, static_cast<uint16_t>(build), crcHash, err)) {
                 crcHashPtr = &crcHash;
                 std::cerr << "Computed integrity hash using " << miscDir << " (" << integrityExe << ")\n";
             } else {

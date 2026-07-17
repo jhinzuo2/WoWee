@@ -43,7 +43,6 @@ ADTTerrain ADTLoader::load(const std::vector<uint8_t>& adtData) {
     int chunkIndex = 0;
 
     // Parse chunks
-    int totalChunks = 0;
     while (offset < adtData.size()) {
         ChunkHeader header;
         if (!readChunkHeader(adtData.data(), offset, adtData.size(), header)) {
@@ -52,8 +51,6 @@ ADTTerrain ADTLoader::load(const std::vector<uint8_t>& adtData) {
 
         const uint8_t* chunkData = adtData.data() + offset + 8;
         size_t chunkSize = header.size;
-
-        totalChunks++;
 
         // Parse based on chunk type
         if (header.magic == MVER) {
@@ -293,6 +290,7 @@ void ADTLoader::parseMCNK(const uint8_t* data, size_t size, int chunkIndex, ADTT
     chunk.flags = readUInt32(data, 0);
     chunk.indexX = readUInt32(data, 4);
     chunk.indexY = readUInt32(data, 8);
+    chunk.areaId = readUInt32(data, 52);
 
     // Read holes mask (at offset 0x3C = 60 in MCNK header)
     // Each bit represents a 2x2 block of the 8x8 quad grid

@@ -7,7 +7,6 @@
       "features": [ "vulkan" ]
     },
     "openssl",
-    "glew",
     "glm",
     "zlib",
     "ffmpeg",

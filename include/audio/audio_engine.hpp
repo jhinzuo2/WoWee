@@ -57,7 +57,10 @@ public:
                      float volume = 1.0f, float pitch = 1.0f, float maxDistance = 100.0f);
 
     // Music streaming (for background music)
-    bool playMusic(const std::vector<uint8_t>& musicData, float volume = 1.0f, bool loop = true);
+    // Retains shared ownership: the decoder streams directly from encoded tracks that
+    // run to several MB, so cached music must not be copied for every playback.
+    bool playMusic(std::shared_ptr<const std::vector<uint8_t>> musicData,
+                   float volume = 1.0f, bool loop = true);
     void stopMusic();
     bool isMusicPlaying() const;
     void setMusicVolume(float volume);
@@ -83,7 +86,7 @@ private:
     // Music track state
     ma_sound* musicSound_ = nullptr;
     void* musicDecoder_ = nullptr;  // ma_decoder* - Keep decoder alive for streaming
-    std::vector<uint8_t> musicData_;  // Keep encoded music data alive
+    std::shared_ptr<const std::vector<uint8_t>> musicData_;  // Keep encoded music data alive
     float musicVolume_ = 1.0f;
 
     bool initialized_ = false;

@@ -1,9 +1,22 @@
 // M2 struct layout and field tests (header-only, no loader source)
 #include <catch_amalgamated.hpp>
 #include "pipeline/m2_loader.hpp"
+#include "rendering/m2_model_classifier.hpp"
 #include <cstring>
 
 using namespace wowee::pipeline;
+
+TEST_CASE("Foliage asset paths never block player movement", "[m2][collision]") {
+    const auto grass = wowee::rendering::classifyM2Model(
+        "World\\NoDXT\\Detail\\ElwynnGrass01.m2",
+        glm::vec3(-1.0f), glm::vec3(1.0f), 100, 0);
+    REQUIRE(grass.collisionNoBlock);
+
+    const auto herb = wowee::rendering::classifyM2Model(
+        "World\\SkillActivated\\TradeskillNodes\\Bush_Magebloom01.m2",
+        glm::vec3(-1.0f), glm::vec3(1.0f), 100, 0);
+    REQUIRE(herb.collisionNoBlock);
+}
 
 TEST_CASE("M2Sequence fields are default-initialized", "[m2]") {
     M2Sequence seq{};

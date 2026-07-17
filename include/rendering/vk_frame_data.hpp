@@ -8,6 +8,8 @@
 namespace wowee {
 namespace rendering {
 
+static constexpr uint32_t MAX_LOCAL_LIGHTS = 64;
+
 // Must match the PerFrame UBO layout in all shaders (std140 alignment)
 struct GPUPerFrameData {
     glm::mat4 view;
@@ -20,6 +22,9 @@ struct GPUPerFrameData {
     glm::vec4 fogColor;       // xyz = color, w = unused
     glm::vec4 fogParams;      // x = fogStart, y = fogEnd, z = time, w = unused
     glm::vec4 shadowParams;   // x = enabled(0/1), y = strength, z = unused, w = unused
+    glm::vec4 localLightPosRadius[MAX_LOCAL_LIGHTS];       // xyz = position, w = radius
+    glm::vec4 localLightColorIntensity[MAX_LOCAL_LIGHTS];  // rgb = color, w = intensity
+    glm::ivec4 localLightMeta;                             // x = active light count
 };
 
 // Push constants for the model matrix (most common case)
