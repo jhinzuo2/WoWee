@@ -54,6 +54,13 @@ public:
         return pool;
     }
 
+    // Small, separate pool for blocking filesystem work. Keeping it distinct from
+    // frameWorkers prevents a slow disk read from occupying render/update workers.
+    static ThreadPool& ioWorkers() {
+        static ThreadPool pool(2);
+        return pool;
+    }
+
     // Schedule fn on a worker thread. The returned future carries fn's result
     // or any exception it threw (same semantics as std::async).
     template <typename F>

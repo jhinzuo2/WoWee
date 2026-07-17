@@ -3219,11 +3219,15 @@ void SocialHandler::setStandState(uint8_t standState) {
     LOG_INFO("Changed stand state to: ", static_cast<int>(standState));
 }
 
-void SocialHandler::sendAlterAppearance(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair) {
+void SocialHandler::sendAlterAppearance(uint32_t hairStyleEntry, uint32_t hairColor,
+                                        uint32_t facialHairEntry, uint32_t skinColorEntry) {
     if (!owner_.isInWorld()) return;
-    auto pkt = AlterAppearancePacket::build(hairStyle, hairColor, facialHair);
+    auto pkt = AlterAppearancePacket::build(hairStyleEntry, hairColor,
+                                            facialHairEntry, skinColorEntry);
     owner_.getSocket()->send(pkt);
-    LOG_INFO("sendAlterAppearance: hair=", hairStyle, " color=", hairColor, " facial=", facialHair);
+    LOG_INFO("sendAlterAppearance: hairEntry=", hairStyleEntry,
+             " color=", hairColor, " facialEntry=", facialHairEntry,
+             " skinEntry=", skinColorEntry);
 }
 
 void SocialHandler::deleteGmTicket() {

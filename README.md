@@ -9,6 +9,12 @@ A native C++ World of Warcraft client with a custom Vulkan renderer.
 [![Sponsor](https://img.shields.io/github/sponsors/Kelsidavis?label=Sponsor&logo=GitHub)](https://github.com/sponsors/Kelsidavis)
 [![Discord](https://img.shields.io/discord/1?label=Discord&logo=discord)](https://discord.gg/PSdMPS8uje)
 
+## Latest Demonstration
+
+[![Watch the latest WoWee demonstration](https://img.youtube.com/vi/1Ax1jeNV_GU/maxresdefault.jpg)](https://youtu.be/1Ax1jeNV_GU?si=a6yT7C51Np-NP7IQ)
+
+### Previous Demonstrations
+
 [![Watch the video](https://img.youtube.com/vi/B-jtpPmiXGM/maxresdefault.jpg)](https://youtu.be/B-jtpPmiXGM)
 
 [![Watch the video](https://img.youtube.com/vi/Pd9JuYYxu0o/maxresdefault.jpg)](https://youtu.be/Pd9JuYYxu0o)

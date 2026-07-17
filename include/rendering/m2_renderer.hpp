@@ -184,6 +184,7 @@ struct M2Instance {
 
     // Animation state
     float animTime = 0.0f;       // Current animation time (ms)
+    float globalSequenceTime = 0.0f; // Independent clock for global animation tracks
     float animSpeed = 1.0f;      // Animation playback speed
     int currentSequenceIndex = 0;// Index into sequences array
     float animDuration = 0.0f;   // Duration of current animation (ms)
@@ -773,8 +774,8 @@ private:
     // Thread count for parallel bone animation
     uint32_t numAnimThreads_ = 1;
 
-    float interpFloat(const pipeline::M2AnimationTrack& track, float animTime, int seqIdx,
-                      const std::vector<pipeline::M2Sequence>& seqs,
+    float interpFloat(const pipeline::M2AnimationTrack& track, float animTime,
+                      float globalTime, int seqIdx,
                       const std::vector<uint32_t>& globalSeqDurations);
     float interpFBlockFloat(const pipeline::M2FBlock& fb, float lifeRatio);
     glm::vec3 interpFBlockVec3(const pipeline::M2FBlock& fb, float lifeRatio);

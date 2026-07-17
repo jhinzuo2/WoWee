@@ -1,6 +1,7 @@
 #pragma once
 
 #include "game/character.hpp"
+#include <glm/glm.hpp>
 #include <vulkan/vulkan.h>
 #include <vk_mem_alloc.h>
 #include <memory>
@@ -39,6 +40,8 @@ public:
     void update(float deltaTime);
     void render();
     void rotate(float yawDelta);
+    void zoom(float wheelDelta);
+    void resetView();
 
     // Off-screen composite pass — call from Renderer::beginFrame() before main render pass
     void compositePass(VkCommandBuffer cmd, uint32_t frameIndex);
@@ -78,6 +81,7 @@ private:
     void attachWeaponEnchantVisual(uint32_t attachmentId, uint32_t itemVisualId);
     // Load the race's glue scene (Stormwind for humans, Orgrimmar for orcs, ...) as a backdrop.
     void loadRacialBackdrop(game::Race race);
+    void applyPreviewView();
 
     pipeline::AssetManager* assetManager_ = nullptr;
     VkContext* vkCtx_ = nullptr;
@@ -128,6 +132,15 @@ private:
     bool compositeRequested_ = false;
     bool compositeRendered_ = false;  // True after first successful compositePass
     float modelYaw_ = 90.0f;
+
+    // Character-creation portrait rig. The full-body distance is recomputed for
+    // each race; wheel zoom interpolates its focus upward toward the face.
+    float zoomLevel_ = 0.0f;
+    float fullBodyDistance_ = 4.5f;
+    float modelBoundMinZ_ = 0.0f;
+    float modelBoundMaxZ_ = 2.0f;
+    glm::vec3 previewStandPosition_{0.0f};
+    glm::vec3 previewViewDirection_{0.0f, 1.0f, 0.0f};
 
     // Cached info from loadCharacter() for later recompositing.
     game::Race race_ = game::Race::HUMAN;

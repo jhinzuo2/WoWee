@@ -11,6 +11,7 @@
 #include "pipeline/m2_loader.hpp"
 #include "pipeline/wmo_loader.hpp"
 #include "rendering/animation/animation_ids.hpp"
+#include "rendering/animation/emote_registry.hpp"
 #include "pipeline/dbc_loader.hpp"
 #include "pipeline/asset_manager.hpp"
 #include "pipeline/dbc_layout.hpp"
@@ -121,6 +122,8 @@ void EntitySpawner::shutdown() {
     // Clear all instances
     creatureInstances_.clear();
     creatureModelIds_.clear();
+    creatureDisplayIds_.clear();
+    requestedCreatureDisplayIds_.clear();
     creatureRenderPosCache_.clear();
     creatureWasMoving_.clear();
     creatureWasSwimming_.clear();
@@ -129,6 +132,7 @@ void EntitySpawner::shutdown() {
     creatureSwimmingState_.clear();
     creatureWalkingState_.clear();
     creatureFlyingState_.clear();
+    creatureActiveEmotes_.clear();
     creatureWasStealthed_.clear();
     creatureWeaponsAttached_.clear();
     creatureWeaponAttachAttempts_.clear();
@@ -155,6 +159,8 @@ void EntitySpawner::resetAllState() {
     // Clear all instance tracking
     creatureInstances_.clear();
     creatureModelIds_.clear();
+    creatureDisplayIds_.clear();
+    requestedCreatureDisplayIds_.clear();
     creatureRenderPosCache_.clear();
     playerInstances_.clear();
     onlinePlayerAppearance_.clear();
@@ -168,6 +174,7 @@ void EntitySpawner::resetAllState() {
     creatureSwimmingState_.clear();
     creatureWalkingState_.clear();
     creatureFlyingState_.clear();
+    creatureActiveEmotes_.clear();
     creatureWeaponsAttached_.clear();
     creatureWeaponAttachAttempts_.clear();
     modelIdIsWolfLike_.clear();
@@ -243,7 +250,17 @@ void EntitySpawner::updateTransportRegistration(uint64_t guid, uint32_t displayI
 void EntitySpawner::queueCreatureSpawn(uint64_t guid, uint32_t displayId,
                                         float x, float y, float z, float orientation, float scale) {
     if (creatureInstances_.count(guid)) return;
-    if (pendingCreatureSpawnGuids_.count(guid)) return;
+    requestedCreatureDisplayIds_[guid] = displayId;
+    if (pendingCreatureSpawnGuids_.count(guid)) {
+        // Replace any not-yet-started request. An older async result can still
+        // finish later; processAsyncCreatureResults rejects it against the map.
+        pendingCreatureSpawns_.erase(
+            std::remove_if(pendingCreatureSpawns_.begin(), pendingCreatureSpawns_.end(),
+                           [guid](const PendingCreatureSpawn& spawn) {
+                               return spawn.guid == guid;
+                           }),
+            pendingCreatureSpawns_.end());
+    }
     pendingCreatureSpawns_.push_back({guid, displayId, x, y, z, orientation, scale});
     pendingCreatureSpawnGuids_.insert(guid);
 }
@@ -273,7 +290,8 @@ void EntitySpawner::queuePlayerEquipment(uint64_t guid,
 void EntitySpawner::clearAllQueues() {
     pendingCreatureSpawns_.clear();
     pendingCreatureSpawnGuids_.clear();
-    creatureSpawnRetryCounts_.clear();
+    requestedCreatureDisplayIds_.clear();
+    creatureSpawnRetryDeadlines_.clear();
     creaturePermanentFailureGuids_.clear();
     deadCreatureGuids_.clear();
     pendingPlayerSpawns_.clear();
@@ -465,6 +483,23 @@ bool EntitySpawner::tryAttachCreatureVirtualWeapons(uint64_t guid, uint32_t inst
     charRenderer->detachWeapon(instanceId, 2);
     // Success if main-hand attached when there was at least one candidate.
     return hadWeaponCandidate && attachedMain;
+}
+
+bool EntitySpawner::retryCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId,
+                                                uint8_t maxAttempts) {
+    if (creatureWeaponsAttached_.count(guid)) return false;
+    const auto attemptIt = creatureWeaponAttachAttempts_.find(guid);
+    const uint8_t attempts = attemptIt != creatureWeaponAttachAttempts_.end()
+        ? attemptIt->second : 0;
+    if (attempts >= maxAttempts) return false;
+
+    if (tryAttachCreatureVirtualWeapons(guid, instanceId)) {
+        creatureWeaponsAttached_.insert(guid);
+        creatureWeaponAttachAttempts_.erase(guid);
+    } else {
+        creatureWeaponAttachAttempts_[guid] = static_cast<uint8_t>(attempts + 1);
+    }
+    return true;
 }
 
 
@@ -2275,7 +2310,21 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
         uint32_t npcEmoteAnim = npcEmote != 0
             ? rendering::AnimationController::getEmoteAnimByEmotesId(npcEmote)
             : 0;
+        if (npcEmoteAnim == 0) {
+            auto activeIt = creatureActiveEmotes_.find(guid);
+            if (activeIt != creatureActiveEmotes_.end()) {
+                npcEmoteAnim = activeIt->second;
+            }
+        }
+        if (npcEmoteAnim != 0) {
+            const uint32_t stateAnim =
+                rendering::EmoteRegistry::instance().getStateVariant(npcEmoteAnim);
+            if (stateAnim != 0 && charRenderer->hasAnimation(instanceId, stateAnim)) {
+                npcEmoteAnim = stateAnim;
+            }
+        }
         if (npcEmoteAnim != 0 && charRenderer->hasAnimation(instanceId, npcEmoteAnim)) {
+            creatureActiveEmotes_[guid] = npcEmoteAnim;
             charRenderer->playAnimation(instanceId, npcEmoteAnim, true);
         } else if (charRenderer->hasAnimation(instanceId, rendering::anim::BIRTH)) {
             // Play birth animation (one-shot) — will return to STAND after
@@ -2291,6 +2340,7 @@ void EntitySpawner::spawnOnlineCreature(uint64_t guid, uint32_t displayId, float
     // Track instance
     creatureInstances_[guid] = instanceId;
     creatureModelIds_[guid] = modelId;
+    creatureDisplayIds_[guid] = displayId;
     creatureRenderPosCache_[guid] = renderPos;
     if (weaponsAttachedNow) {
         creatureWeaponsAttached_.insert(guid);

@@ -22,25 +22,10 @@ namespace rendering {
 // --- M2 Particle Emitter Helpers ---
 
 float M2Renderer::interpFloat(const pipeline::M2AnimationTrack& track, float animTime,
-                                int seqIdx, const std::vector<pipeline::M2Sequence>& /*seqs*/,
+                                float globalTime, int seqIdx,
                                 const std::vector<uint32_t>& globalSeqDurations) {
-    if (!track.hasData()) return 0.0f;
-    int si; float t;
-    resolveTrackTime(track, seqIdx, animTime, globalSeqDurations, si, t);
-    if (si < 0 || si >= static_cast<int>(track.sequences.size())) return 0.0f;
-    const auto& keys = track.sequences[si];
-    if (keys.timestamps.empty() || keys.floatValues.empty()) return 0.0f;
-    if (keys.floatValues.size() == 1) return keys.floatValues[0];
-    int idx = findKeyframeIndex(keys.timestamps, t);
-    if (idx < 0) return 0.0f;
-    size_t i0 = static_cast<size_t>(idx);
-    size_t i1 = std::min(i0 + 1, keys.floatValues.size() - 1);
-    if (i0 == i1) return keys.floatValues[i0];
-    float t0 = static_cast<float>(keys.timestamps[i0]);
-    float t1 = static_cast<float>(keys.timestamps[i1]);
-    float dur = t1 - t0;
-    float frac = (dur > 0.0f) ? glm::clamp((t - t0) / dur, 0.0f, 1.0f) : 0.0f;
-    return glm::mix(keys.floatValues[i0], keys.floatValues[i1], frac);
+    return m2_track::sampleFloat(track, seqIdx, animTime, globalTime,
+                                 globalSeqDurations, 0.0f);
 }
 
 // Interpolate an M2 FBlock (particle lifetime curve) at a given life ratio [0..1].
@@ -111,10 +96,10 @@ void M2Renderer::emitParticles(M2Instance& inst, const M2ModelGPU& gpu, float dt
         const auto& em = gpu.particleEmitters[ei];
         if (!em.enabled) continue;
 
-        float rate = interpFloat(em.emissionRate, inst.animTime, inst.currentSequenceIndex,
-                                  gpu.sequences, gpu.globalSequenceDurations);
-        float life = interpFloat(em.lifespan, inst.animTime, inst.currentSequenceIndex,
-                                  gpu.sequences, gpu.globalSequenceDurations);
+        float rate = interpFloat(em.emissionRate, inst.animTime, inst.globalSequenceTime,
+                                 inst.currentSequenceIndex, gpu.globalSequenceDurations);
+        float life = interpFloat(em.lifespan, inst.animTime, inst.globalSequenceTime,
+                                 inst.currentSequenceIndex, gpu.globalSequenceDurations);
         if (rate <= 0.0f || life <= 0.0f) continue;
 
         inst.emitterAccumulators[ei] += rate * dt;
@@ -138,12 +123,12 @@ void M2Renderer::emitParticles(M2Instance& inst, const M2ModelGPU& gpu, float dt
             p.position = worldPos;
 
             // Velocity: emission speed in upward direction + random spread
-            float speed = interpFloat(em.emissionSpeed, inst.animTime, inst.currentSequenceIndex,
-                                       gpu.sequences, gpu.globalSequenceDurations);
-            float vRange = interpFloat(em.verticalRange, inst.animTime, inst.currentSequenceIndex,
-                                        gpu.sequences, gpu.globalSequenceDurations);
-            float hRange = interpFloat(em.horizontalRange, inst.animTime, inst.currentSequenceIndex,
-                                        gpu.sequences, gpu.globalSequenceDurations);
+            float speed = interpFloat(em.emissionSpeed, inst.animTime, inst.globalSequenceTime,
+                                      inst.currentSequenceIndex, gpu.globalSequenceDurations);
+            float vRange = interpFloat(em.verticalRange, inst.animTime, inst.globalSequenceTime,
+                                       inst.currentSequenceIndex, gpu.globalSequenceDurations);
+            float hRange = interpFloat(em.horizontalRange, inst.animTime, inst.globalSequenceTime,
+                                       inst.currentSequenceIndex, gpu.globalSequenceDurations);
 
             // Base direction: up in model space, transformed to world
             glm::vec3 dir(0.0f, 0.0f, 1.0f);
@@ -231,12 +216,12 @@ void M2Renderer::updateParticles(M2Instance& inst, float dt) {
         for (size_t e = 0; e < numEm; ++e) {
             const auto& pem = gpu.particleEmitters[e];
             float grav = interpFloat(pem.gravity,
-                                      inst.animTime, inst.currentSequenceIndex,
-                                      gpu.sequences, gpu.globalSequenceDurations);
+                                      inst.animTime, inst.globalSequenceTime,
+                                      inst.currentSequenceIndex, gpu.globalSequenceDurations);
             if (grav == 0.0f && !gpu.isFireflyEffect) {
                 float emSpeed = interpFloat(pem.emissionSpeed,
-                                             inst.animTime, inst.currentSequenceIndex,
-                                             gpu.sequences, gpu.globalSequenceDurations);
+                                             inst.animTime, inst.globalSequenceTime,
+                                             inst.currentSequenceIndex, gpu.globalSequenceDurations);
                 grav = (std::abs(emSpeed) > 0.1f) ? 4.0f : 1.5f;
             }
             emitterGrav[e] = grav;

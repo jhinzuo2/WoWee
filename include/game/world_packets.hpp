@@ -2895,11 +2895,13 @@ public:
     static network::Packet build(int32_t titleBit);
 };
 
-/** CMSG_ALTER_APPEARANCE – barber shop: change hair style, color, facial hair.
- *  Payload: uint32 hairStyle, uint32 hairColor, uint32 facialHair. */
+/** CMSG_ALTER_APPEARANCE – WotLK barber shop.
+ *  Hair/facial/skin are BarberShopStyle.dbc entry IDs; color is the raw
+ *  CharSections hair-color ID. */
 class AlterAppearancePacket {
 public:
-    static network::Packet build(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair);
+    static network::Packet build(uint32_t hairStyleEntry, uint32_t hairColor,
+                                 uint32_t facialHairEntry, uint32_t skinColorEntry);
 };
 
 } // namespace game

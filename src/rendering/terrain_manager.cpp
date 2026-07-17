@@ -485,6 +485,21 @@ std::shared_ptr<PendingTile> TerrainManager::prepareTile(int x, int y) {
     terrainPtr->coord.x = x;
     terrainPtr->coord.y = y;
 
+    // The stock Azeroth ADT leaves two terrain-hole cells exposed along the
+    // exterior edge of the Westfall lumbermill. The original client hides the
+    // mask beneath the building footprint, but our WMO floor ends just short
+    // of it, producing a small textureless strip between the inn/prison camp
+    // and lumber yard. Repair only this confirmed exterior seam; other ADT
+    // holes remain intact for caves and below-ground WMO entrances.
+    if (toLowerCopy(mapName) == "azeroth" && x == 29 && y == 51) {
+        auto& lumbermillChunk = terrainPtr->chunks[15 * 16 + 14];
+        if (lumbermillChunk.indexX == 14 && lumbermillChunk.indexY == 15 &&
+            lumbermillChunk.holes == 0x0044) {
+            lumbermillChunk.holes = 0;
+            LOG_INFO("Repaired Westfall lumbermill terrain seam in tile [29,51]");
+        }
+    }
+
     // Generate mesh
     pipeline::TerrainMesh mesh = pipeline::TerrainMeshGenerator::generate(*terrainPtr);
     if (mesh.validChunkCount == 0) {
@@ -535,6 +550,7 @@ std::shared_ptr<PendingTile> TerrainManager::prepareTile(int x, int y) {
             auto wom = pipeline::WoweeModelLoader::tryLoadByGamePath(m2Path, extraPrefixes);
             if (wom.isValid()) {
                 auto m2Model = pipeline::WoweeModelLoader::toM2(wom);
+                m2Model.name = m2Path;
                 pending->m2Models.push_back({modelId, std::move(m2Model), {}});
                 preparedModelIds.insert(modelId);
                 LOG_INFO("Loaded WOM model: ", m2Path, " (v", wom.version,
@@ -550,9 +566,9 @@ std::shared_ptr<PendingTile> TerrainManager::prepareTile(int x, int y) {
         }
 
         pipeline::M2Model m2Model = pipeline::M2Loader::load(m2Data);
-        if (m2Model.name.empty()) {
-            m2Model.name = m2Path;
-        }
+        // The asset path carries foliage semantics; embedded names frequently
+        // do not. Always classify ADT doodads using the path.
+        m2Model.name = m2Path;
         std::string skinPath = m2Path.substr(0, m2Path.size() - 3) + "00.skin";
         std::vector<uint8_t> skinData = assetManager->readFileOptional(skinPath);
         if (!skinData.empty() && m2Model.version >= 264) {
@@ -789,9 +805,7 @@ std::shared_ptr<PendingTile> TerrainManager::prepareTile(int x, int y) {
                             if (m2Data.empty()) continue;
 
                             m2Model = pipeline::M2Loader::load(m2Data);
-                            if (m2Model.name.empty()) {
-                                m2Model.name = m2Path;
-                            }
+                            m2Model.name = m2Path;
                             std::string skinPath = m2Path.substr(0, m2Path.size() - 3) + "00.skin";
                             std::vector<uint8_t> skinData = assetManager->readFile(skinPath);
                             if (!skinData.empty() && m2Model.version >= 264) {
@@ -1949,9 +1963,7 @@ void TerrainManager::generateGroundClutterPlacements(std::shared_ptr<PendingTile
         }
 
         pipeline::M2Model m2Model = pipeline::M2Loader::load(m2Data);
-        if (m2Model.name.empty()) {
-            m2Model.name = m2Path;
-        }
+        m2Model.name = m2Path;
         std::string skinPath = m2Path.substr(0, m2Path.size() - 3) + "00.skin";
         std::vector<uint8_t> skinData = assetManager->readFileOptional(skinPath);
         if (!skinData.empty() && m2Model.version >= 264) {

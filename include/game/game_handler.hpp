@@ -318,7 +318,10 @@ public:
     }
 
     // Emote animation callback: (entityGuid, animationId)
-    using EmoteAnimCallback = std::function<void(uint64_t, uint32_t)>;
+    // guid, animId, isState. isState marks persistent STATE_ emotes (from
+    // UNIT_NPC_EMOTESTATE or state-type SMSG_EMOTE) that loop until cleared;
+    // one-shots play once and return to the prior state.
+    using EmoteAnimCallback = std::function<void(uint64_t, uint32_t, bool)>;
     void setEmoteAnimCallback(EmoteAnimCallback cb) { emoteAnimCallback_ = std::move(cb); }
 
     /**
@@ -799,6 +802,7 @@ public:
 
     bool isCasting() const { return spellHandler_ ? spellHandler_->isCasting() : false; }
     bool isChanneling() const { return spellHandler_ ? spellHandler_->isChanneling() : false; }
+    bool isRestoring() const { return spellHandler_ ? spellHandler_->isRestoring() : false; }
     bool isGameObjectInteractionCasting() const {
         return spellHandler_ ? spellHandler_->isGameObjectInteractionCasting() : false;
     }
@@ -1287,7 +1291,8 @@ public:
     // Barber shop
     bool isBarberShopOpen() const { return barberShopOpen_; }
     void closeBarberShop() { barberShopOpen_ = false; fireAddonEvent("BARBER_SHOP_CLOSE", {}); }
-    void sendAlterAppearance(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair);
+    void sendAlterAppearance(uint32_t hairStyleEntry, uint32_t hairColor,
+                             uint32_t facialHairEntry, uint32_t skinColorEntry);
 
     // Instance difficulty (0=5N, 1=5H, 2=25N, 3=25H for WotLK)
     uint32_t getInstanceDifficulty() const;
@@ -1524,6 +1529,7 @@ public:
     // NPC Gossip
     void interactWithNpc(uint64_t guid);
     void interactWithGameObject(uint64_t guid);
+    uint64_t getHookedFishingBobberGuid() const { return hookedFishingBobberGuid_; }
     void selectGossipOption(uint32_t optionId);
     void selectGossipQuest(uint32_t questId);
     void acceptQuest();
@@ -2627,6 +2633,7 @@ public:
         // was unavailable, so callers should not infer anything from it.
         float maxRange = -1.0f;
         int32_t effectBasePoints[3] = {0, 0, 0};
+        uint32_t effectIds[3] = {0, 0, 0};
         float durationSec = 0.0f;
         uint32_t spellVisualId = 0;
         uint32_t recoveryMs = 0;

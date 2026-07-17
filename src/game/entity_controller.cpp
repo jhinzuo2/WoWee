@@ -488,6 +488,7 @@ void EntityController::syncPreWotlkAurasFromFields(const std::shared_ptr<Entity>
         }
     }
     LOG_DEBUG("[pre-WotLK] Rebuilt playerAuras from UNIT_FIELD_AURAS");
+    owner_.getSpellHandler()->refreshRestorationState();
     pendingEvents_.emit("UNIT_AURA", {"player"});
 }
 
@@ -983,7 +984,9 @@ EntityController::UnitFieldUpdateResult EntityController::applyUnitFieldsOnUpdat
             if (val != oldEmote && owner_.emoteAnimCallbackRef()) {
                 uint32_t animId = val != 0 ? rendering::AnimationController::getEmoteAnimByEmotesId(val) : 0;
                 if (val == 0 || animId != 0) {
-                    owner_.emoteAnimCallbackRef()(block.guid, animId);
+                    // UNIT_NPC_EMOTESTATE is persistent by definition — a zero
+                    // here genuinely clears the state loop.
+                    owner_.emoteAnimCallbackRef()(block.guid, animId, /*isState=*/true);
                 } else {
                     LOG_DEBUG("UNIT_NPC_EMOTESTATE emoteId=", val, " had no Emotes.dbc animation mapping");
                 }

@@ -671,12 +671,15 @@ network::Packet SetTitlePacket::build(int32_t titleBit) {
     return p;
 }
 
-network::Packet AlterAppearancePacket::build(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair) {
-    // CMSG_ALTER_APPEARANCE: uint32 hairStyle + uint32 hairColor + uint32 facialHair
+network::Packet AlterAppearancePacket::build(uint32_t hairStyleEntry, uint32_t hairColor,
+                                              uint32_t facialHairEntry, uint32_t skinColorEntry) {
+    // WotLK: BarberShopStyle hair entry + raw color + BarberShopStyle facial
+    // entry + optional BarberShopStyle skin entry (zero means unchanged).
     network::Packet p(wireOpcode(Opcode::CMSG_ALTER_APPEARANCE));
-    p.writeUInt32(hairStyle);
+    p.writeUInt32(hairStyleEntry);
     p.writeUInt32(hairColor);
-    p.writeUInt32(facialHair);
+    p.writeUInt32(facialHairEntry);
+    p.writeUInt32(skinColorEntry);
     return p;
 }
 

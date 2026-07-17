@@ -455,7 +455,7 @@ std::string readString(const std::vector<uint8_t>& data, uint32_t offset, uint32
     return std::string(reinterpret_cast<const char*>(&data[offset]), actualLen);
 }
 
-enum class TrackType { VEC3, QUAT_COMPRESSED, FLOAT };
+enum class TrackType { VEC3, QUAT_COMPRESSED, FLOAT, FIXED16 };
 
 // M2 sequence flag: when set, keyframe data is embedded in the M2 file.
 // When clear, data lives in an external .anim file and the M2 offsets are
@@ -509,6 +509,7 @@ void parseAnimTrack(const std::vector<uint8_t>& data,
         // Validate key data offset
         size_t keyElementSize;
         if (type == TrackType::FLOAT) keyElementSize = sizeof(float);
+        else if (type == TrackType::FIXED16) keyElementSize = sizeof(int16_t);
         else if (type == TrackType::VEC3) keyElementSize = sizeof(float) * 3;
         else keyElementSize = sizeof(int16_t) * 4;
         if (keyOffset + keyCount * keyElementSize > data.size()) {
@@ -520,6 +521,14 @@ void parseAnimTrack(const std::vector<uint8_t>& data,
         if (type == TrackType::FLOAT) {
             auto values = readArray<float>(data, keyOffset, keyCount);
             track.sequences[i].floatValues = std::move(values);
+        } else if (type == TrackType::FIXED16) {
+            // fixed16: int16 where 0x7FFF = 1.0 (color/transparency alpha tracks)
+            auto raw = readArray<int16_t>(data, keyOffset, keyCount);
+            track.sequences[i].floatValues.reserve(raw.size());
+            for (int16_t v : raw) {
+                track.sequences[i].floatValues.push_back(
+                    std::clamp(static_cast<float>(v) / 32767.0f, 0.0f, 1.0f));
+            }
         } else if (type == TrackType::VEC3) {
             // Translation/scale: float[3] per key
             struct Vec3Disk { float x, y, z; };
@@ -582,6 +591,7 @@ void parseAnimTrackVanilla(const std::vector<uint8_t>& data,
     // vanilla = float[4] (16 bytes), TBC = compressed int16[4] (8 bytes).
     size_t keySize;
     if (type == TrackType::FLOAT) keySize = sizeof(float);
+    else if (type == TrackType::FIXED16) keySize = sizeof(int16_t);
     else if (type == TrackType::VEC3) keySize = sizeof(float) * 3;
     else keySize = compressedQuat ? sizeof(int16_t) * 4 : sizeof(float) * 4;
     if (disk.ofsKeys + disk.nKeys * keySize > data.size()) return;
@@ -610,6 +620,12 @@ void parseAnimTrackVanilla(const std::vector<uint8_t>& data,
     std::vector<CompressedQuat> allCompQuatKeys;
     if (type == TrackType::FLOAT) {
         allFloatKeys = readArray<float>(data, disk.ofsKeys, disk.nKeys);
+    } else if (type == TrackType::FIXED16) {
+        auto raw = readArray<int16_t>(data, disk.ofsKeys, disk.nKeys);
+        allFloatKeys.reserve(raw.size());
+        for (int16_t v : raw) {
+            allFloatKeys.push_back(std::clamp(static_cast<float>(v) / 32767.0f, 0.0f, 1.0f));
+        }
     } else if (type == TrackType::VEC3) {
         allVec3Keys = readArray<Vec3Disk>(data, disk.ofsKeys, disk.nKeys);
     } else if (compressedQuat) {
@@ -639,7 +655,7 @@ void parseAnimTrackVanilla(const std::vector<uint8_t>& data,
         uint32_t keyEnd = std::min(end, disk.nKeys);
         uint32_t keyCount = keyEnd - start;
 
-        if (type == TrackType::FLOAT) {
+        if (type == TrackType::FLOAT || type == TrackType::FIXED16) {
             track.sequences[i].floatValues.assign(
                 allFloatKeys.begin() + start, allFloatKeys.begin() + start + keyCount);
         } else if (type == TrackType::VEC3) {
@@ -1081,30 +1097,42 @@ M2Model M2Loader::load(const std::vector<uint8_t>& m2Data) {
         model.textureLookup = readArray<uint16_t>(m2Data, header.ofsTexLookup, header.nTexLookup);
     }
 
-    // Parse color animation alpha values (M2Color: vec3 color track + fixed16 alpha track).
-    // Each M2Color is two M2TrackDisk headers (20+20 = 40 bytes).
-    // We only need the alpha track (at offset 20) — controls per-batch opacity.
+    // Parse color animation alpha tracks (M2Color: vec3 color track + fixed16 alpha track).
+    // WotLK: two 20-byte M2TrackDisk headers (40 bytes/color).
+    // Vanilla/TBC (<264): two 28-byte M2TrackDiskVanilla headers (56 bytes/color).
+    // The alpha track gates per-batch visibility per animation — e.g. the peasant
+    // lumberjack's carry model has two wood-bundle submeshes, and only one is
+    // alpha-1 in any given animation.
     if (header.nColors > 0 && header.ofsColors > 0 && header.nColors < 4096) {
-        static constexpr uint32_t M2COLOR_SIZE = 40; // 20-byte color track + 20-byte alpha track
+        std::vector<uint32_t> seqFlags;
+        seqFlags.reserve(model.sequences.size());
+        for (const auto& seq : model.sequences) seqFlags.push_back(seq.flags);
+
+        const bool wotlk = header.version >= 264;
+        const uint32_t colorSize = wotlk ? 40u : 56u;   // 2 track headers per color
+        const uint32_t alphaOfs  = wotlk ? 20u : 28u;   // skip the vec3 color track
         model.colorAlphas.reserve(header.nColors);
+        model.colorAlphaTracks.resize(header.nColors);
         for (uint32_t ci = 0; ci < header.nColors; ci++) {
-            uint32_t alphaTrackOfs = header.ofsColors + ci * M2COLOR_SIZE + 20; // skip vec3 track
-            if (alphaTrackOfs + sizeof(M2TrackDisk) > m2Data.size()) {
-                model.colorAlphas.push_back(1.0f);
-                continue;
+            uint32_t alphaTrackOfs = header.ofsColors + ci * colorSize + alphaOfs;
+            M2AnimationTrack& track = model.colorAlphaTracks[ci];
+            if (wotlk) {
+                if (alphaTrackOfs + sizeof(M2TrackDisk) <= m2Data.size()) {
+                    M2TrackDisk td = readValue<M2TrackDisk>(m2Data, alphaTrackOfs);
+                    parseAnimTrack(m2Data, td, track, TrackType::FIXED16, seqFlags);
+                }
+            } else {
+                if (alphaTrackOfs + sizeof(M2TrackDiskVanilla) <= m2Data.size()) {
+                    M2TrackDiskVanilla td = readValue<M2TrackDiskVanilla>(m2Data, alphaTrackOfs);
+                    parseAnimTrackVanilla(m2Data, td, track, TrackType::FIXED16);
+                }
             }
-            M2TrackDisk td = readValue<M2TrackDisk>(m2Data, alphaTrackOfs);
+            // At-rest alpha (first key of the first sequence with data) — used by
+            // renderers that don't evaluate the track per frame.
             float alpha = 1.0f;
-            if (td.nKeys > 0 && td.ofsKeys > 0 && td.nKeys < 4096) {
-                for (uint32_t si = 0; si < td.nKeys; si++) {
-                    uint32_t hdOfs = td.ofsKeys + si * 8;
-                    if (hdOfs + 8 > m2Data.size()) break;
-                    uint32_t count  = readValue<uint32_t>(m2Data, hdOfs);
-                    uint32_t offset = readValue<uint32_t>(m2Data, hdOfs + 4);
-                    if (count == 0 || offset == 0) continue;
-                    if (offset + sizeof(uint16_t) > m2Data.size()) continue;
-                    uint16_t rawVal = readValue<uint16_t>(m2Data, offset);
-                    alpha = std::min(1.0f, rawVal / 32767.0f);
+            for (const auto& seq : track.sequences) {
+                if (!seq.floatValues.empty()) {
+                    alpha = seq.floatValues[0];
                     break;
                 }
             }

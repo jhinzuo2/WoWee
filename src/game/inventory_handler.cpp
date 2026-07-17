@@ -1333,6 +1333,7 @@ void InventoryHandler::autoEquipItemInBag(int bagIndex, int slotIndex) {
 void InventoryHandler::dispatchUseItem(uint8_t wowBag, uint8_t wowSlot, uint64_t itemGuid,
                                        const ItemDef& item) {
     if (owner_.getState() != WorldState::IN_WORLD || !owner_.getSocket()) return;
+    if (owner_.isRestoring()) owner_.cancelCast();
     if (itemGuid == 0) {
         LOG_WARNING("useItem: itemGuid=0 for item='", item.name, "' entry=", item.itemId,
                     " — cannot use");

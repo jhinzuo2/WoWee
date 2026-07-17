@@ -228,6 +228,8 @@ static std::vector<std::string> getUsedDbcNamesForExpansion(const std::string& e
         "CharSections",
         "CharHairGeosets",
         "CharacterFacialHairStyles",
+        "BarberShopStyle",
+        "gtBarberShopCostBase",
         "CreatureDisplayInfo",
         "CreatureDisplayInfoExtra",
         "CreatureModelData",

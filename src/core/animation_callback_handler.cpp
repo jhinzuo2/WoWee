@@ -8,9 +8,13 @@
 #include "rendering/camera_controller.hpp"
 #include "rendering/animation_controller.hpp"
 #include "rendering/animation/animation_ids.hpp"
+#include "rendering/animation/emote_registry.hpp"
 #include "game/game_handler.hpp"
+#include "game/spell_classification.hpp"
 #include "game/world_packets.hpp"
+#include "audio/audio_coordinator.hpp"
 #include "audio/audio_engine.hpp"
+#include "audio/ui_sound_manager.hpp"
 
 #include <cmath>
 #include <algorithm>
@@ -329,25 +333,60 @@ void AnimationCallbackHandler::setupCallbacks() {
     });
 
     // Emote animation callback — play server-driven emote animations on NPCs and other players.
-    // When emoteAnim is 0, the NPC's emote state was cleared → revert to STAND.
-    // Non-zero values from UNIT_NPC_EMOTESTATE updates are persistent (played looping).
-    gameHandler_.setEmoteAnimCallback([this](uint64_t guid, uint32_t emoteAnim) {
+    // isState marks persistent STATE_ emotes (UNIT_NPC_EMOTESTATE or state-type
+    // SMSG_EMOTE): they loop until cleared and are retained across model
+    // reloads. One-shots play once and resume the retained state loop.
+    gameHandler_.setEmoteAnimCallback([this](uint64_t guid, uint32_t emoteAnim, bool isState) {
         auto* cr = renderer_.getCharacterRenderer();
         if (!cr) return;
+        auto entity = gameHandler_.getEntityManager().getEntity(guid);
+        const bool isCreature = entity && entity->getType() == game::ObjectType::UNIT;
+        auto& activeEmotes = entitySpawner_.getCreatureActiveEmotes();
+        if (isCreature && isState) {
+            // State emotes can arrive while the creature's model is still loading.
+            // Retain the raw animation so spawnOnlineCreature can apply it once the
+            // correct display is instantiated.
+            if (emoteAnim == 0) activeEmotes.erase(guid);
+            else                activeEmotes[guid] = emoteAnim;
+        }
         // Look up creature instance first, then online players
         uint32_t emoteInstanceId = entitySpawner_.getCreatureInstanceId(guid);
         if (emoteInstanceId != 0) {
             if (emoteAnim == 0) {
-                // Emote state cleared → return to idle
-                cr->playAnimation(emoteInstanceId, rendering::anim::STAND, true);
+                // A state clear returns to idle. A one-shot cancel (SMSG_EMOTE 0)
+                // must not stomp a persistent UNIT_NPC_EMOTESTATE work loop —
+                // resume it instead (Westfall woodworkers hammer through these).
+                if (isState) activeEmotes.erase(guid);
+                auto retained = activeEmotes.find(guid);
+                uint32_t resumeAnim = rendering::anim::STAND;
+                if (retained != activeEmotes.end() &&
+                    cr->hasAnimation(emoteInstanceId, retained->second)) {
+                    resumeAnim = retained->second;
+                }
+                cr->playAnimation(emoteInstanceId, resumeAnim, true);
+            } else if (isState) {
+                const uint32_t stateAnim =
+                    rendering::EmoteRegistry::instance().getStateVariant(emoteAnim);
+                const uint32_t persistentAnim =
+                    stateAnim != 0 && cr->hasAnimation(emoteInstanceId, stateAnim)
+                        ? stateAnim : emoteAnim;
+                activeEmotes[guid] = persistentAnim;
+                cr->playAnimation(emoteInstanceId, persistentAnim, true);
             } else {
-                cr->playAnimation(emoteInstanceId, emoteAnim, false);
+                // One-shot: play once, then resume the retained state loop (or Stand).
+                auto retained = activeEmotes.find(guid);
+                uint32_t resumeAnim = 0;
+                if (retained != activeEmotes.end() &&
+                    cr->hasAnimation(emoteInstanceId, retained->second)) {
+                    resumeAnim = retained->second;
+                }
+                cr->playAnimation(emoteInstanceId, emoteAnim, false, resumeAnim);
             }
             return;
         }
         emoteInstanceId = entitySpawner_.getPlayerInstanceId(guid);
         if (emoteInstanceId != 0) {
-            cr->playAnimation(emoteInstanceId, emoteAnim, false);
+            cr->playAnimation(emoteInstanceId, emoteAnim, isState);
         }
     });
 
@@ -384,13 +423,8 @@ void AnimationCallbackHandler::setupCallbacks() {
         const bool isArea     = (castType == game::SpellCastType::AREA);
 
         if (start) {
-            // Detect fishing spells (channeled) — use FISHING_LOOP instead of generic cast
-            auto isFishingSpell = [](uint32_t spellId) {
-                return spellId == 7620 || spellId == 7731 || spellId == 7732 ||
-                       spellId == 18248 || spellId == 33095 || spellId == 51294;
-            };
             uint32_t currentSpell = isLocalPlayer ? gameHandler_.getCurrentCastSpellId() : 0;
-            bool isFishing = isChannel && isFishingSpell(currentSpell);
+            bool isFishing = isChannel && game::spellclass::isFishingCast(currentSpell);
 
             // Helper: pick first animation the model supports from a list
             auto pickFirst = [&](std::initializer_list<uint32_t> ids) -> uint32_t {
@@ -402,11 +436,16 @@ void AnimationCallbackHandler::setupCallbacks() {
             bool isBandage = false;
             bool isMining = false;
             bool isGathering = false;
+            game::spellclass::RestChannelKind restChannel =
+                game::spellclass::RestChannelKind::NONE;
             if (isLocalPlayer && currentSpell != 0) {
                 gameHandler_.loadSpellNameCache();
                 auto it = gameHandler_.spellNameCacheRef().find(currentSpell);
                 isBandage = (it != gameHandler_.spellNameCacheRef().end() &&
                              it->second.name.find("Bandage") != std::string::npos);
+                if (it != gameHandler_.spellNameCacheRef().end()) {
+                    restChannel = game::spellclass::classifyRestChannel(it->second.name);
+                }
                 if (!isBandage && !isFishing && it != gameHandler_.spellNameCacheRef().end()) {
                     const auto& nm = it->second.name;
                     isMining = (nm == "Mining" || nm == "Smelting");
@@ -418,7 +457,45 @@ void AnimationCallbackHandler::setupCallbacks() {
                 }
             }
 
-            if (isMining) {
+            if (restChannel != game::spellclass::RestChannelKind::NONE) {
+                if (auto* ac = renderer_.getAnimationController()) {
+                    if (restChannel == game::spellclass::RestChannelKind::POTION ||
+                        restChannel == game::spellclass::RestChannelKind::ALCOHOL) {
+                        // Potions/alcohol are drunk standing: one EmoteEat swig.
+                        uint32_t swigAnim = pickFirst({rendering::anim::EMOTE_EAT});
+                        if (swigAnim != 0) {
+                            ac->startSpellCast(0, swigAnim, false, 0);
+                        }
+                    } else {
+                        // Weapons go straight to the back before the sit — the real
+                        // client auto-sheathes on consume with no sheath animation
+                        // (playing one here would fight the FSM's sit-down one-shot).
+                        if (!appearanceComposer_.isWeaponsSheathed()) {
+                            appearanceComposer_.setWeaponsSheathed(true);
+                            appearanceComposer_.loadEquippedWeapons();
+                        }
+                        // Food and water keep the player seated (UNIT_FIELD_BYTES_1)
+                        // with the plain seated idle, exactly like the real client:
+                        // player models ship NO seated eating animation — EmoteEat is
+                        // authored standing (root bone stays at stand height) and
+                        // looping it while seated pops the model upright. Only
+                        // override the seated idle for models that truly have the
+                        // dedicated EatingLoop sequence.
+                        ac->setSeatedLoopAnimation(
+                            pickFirst({rendering::anim::EATING_LOOP}));
+                    }
+                }
+                // Food/water consume sounds repeat from SpellHandler::updateTimers
+                // for the whole aura; potions get their single swig sound here.
+                if (restChannel == game::spellclass::RestChannelKind::POTION ||
+                    restChannel == game::spellclass::RestChannelKind::ALCOHOL) {
+                    if (auto* audio = gameHandler_.services().audioCoordinator) {
+                        if (auto* ui = audio->getUiSoundManager()) {
+                            ui->playDrinking();
+                        }
+                    }
+                }
+            } else if (isMining) {
                 appearanceComposer_.showMiningPick(true);
                 uint32_t mineAnim = pickFirst({
                     rendering::anim::ATTACK_1H,
@@ -450,10 +527,21 @@ void AnimationCallbackHandler::setupCallbacks() {
                     ac->startSpellCast(useStart, useLoop ? useLoop : rendering::anim::STAND, true, useEnd);
                 }
             } else if (isFishing && cr->hasAnimation(instanceId, rendering::anim::FISHING_LOOP)) {
-                // Fishing: use FISHING_LOOP (looping idle) for the channel duration
+                // Fishing is a one-shot pole cast followed by the channel idle. If the
+                // player had weapons sheathed, move the equipped pole into their hand
+                // before starting so the cast animation actually swings it.
                 if (isLocalPlayer) {
+                    if (appearanceComposer_.isWeaponsSheathed()) {
+                        appearanceComposer_.setWeaponsSheathed(false);
+                        appearanceComposer_.loadEquippedWeapons();
+                    }
+                    appearanceComposer_.showFishingPole(true);
                     auto* ac = renderer_.getAnimationController();
-                    if (ac) ac->startSpellCast(0, rendering::anim::FISHING_LOOP, true, 0);
+                    if (ac) {
+                        uint32_t castAnim = cr->hasAnimation(instanceId, rendering::anim::FISHING_CAST)
+                            ? rendering::anim::FISHING_CAST : 0;
+                        ac->startSpellCast(castAnim, rendering::anim::FISHING_LOOP, true, 0);
+                    }
                 } else {
                     cr->playAnimation(instanceId, rendering::anim::FISHING_LOOP, true);
                 }
@@ -554,8 +642,12 @@ void AnimationCallbackHandler::setupCallbacks() {
             // Cast/channel ended — plays finalization anim completely then returns to idle
             if (isLocalPlayer) {
                 appearanceComposer_.showMiningPick(false);
+                appearanceComposer_.showFishingPole(false);
                 auto* ac = renderer_.getAnimationController();
-                if (ac) ac->stopSpellCast();
+                if (ac) {
+                    ac->setSeatedLoopAnimation(0);
+                    ac->stopSpellCast();
+                }
             } else if (isChannel) {
                 cr->playAnimation(instanceId, rendering::anim::STAND, true);
             }
@@ -597,6 +689,15 @@ void AnimationCallbackHandler::setupCallbacks() {
         }
 
         ac->setStandState(standState);
+        // Restoration food/water is an aura rather than MSG_CHANNEL_START on
+        // supported realms. The aura update starts its loop; standing up ends it.
+        // Only stop the cast presentation while restoring — the server also
+        // stands a seated player when a real cast begins, and stopping there
+        // would kill that cast's animation as it starts.
+        if (standState == AC::STAND_STATE_STAND) {
+            ac->setSeatedLoopAnimation(0);
+            if (gameHandler_.isRestoring()) ac->stopSpellCast();
+        }
     });
 
     // Loot window callback — play kneel/loot animation while looting

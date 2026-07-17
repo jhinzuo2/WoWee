@@ -73,6 +73,25 @@ void WorldEntryCallbackHandler::clearStuckMovement() {
     gameHandler_.sendMovement(game::Opcode::MSG_MOVE_HEARTBEAT);
 }
 
+void WorldEntryCallbackHandler::clearMountForUnstuck() {
+    // Unstuck changes the character's position independently of the normal
+    // mount aura update path. Dismount first so the server and client agree,
+    // then remove any already-orphaned local instance left by an older reset.
+    const bool hasRenderedMount =
+        (entitySpawner_ && entitySpawner_->getMountInstanceId() != 0) ||
+        (renderer_.getAnimationController() && renderer_.getAnimationController()->isMounted());
+    if (gameHandler_.isMounted() || hasRenderedMount) {
+        gameHandler_.dismount();
+    }
+    if (entitySpawner_) {
+        entitySpawner_->clearMountState();
+    }
+    if (auto* animation = renderer_.getAnimationController();
+        animation && animation->isMounted()) {
+        animation->clearMount();
+    }
+}
+
 // Sync teleported render position to server
 void WorldEntryCallbackHandler::syncTeleportedPositionToServer(const glm::vec3& renderPos) {
     glm::vec3 canonical = core::coords::renderToCanonical(renderPos);
@@ -243,6 +262,7 @@ void WorldEntryCallbackHandler::setupCallbacks() {
     // /unstuck — nudge player forward and snap to floor at destination.
     gameHandler_.setUnstuckCallback([this]() {
         if (!renderer_.getCameraController()) return;
+        clearMountForUnstuck();
         worldEntryMovementGraceTimer_ = std::max(worldEntryMovementGraceTimer_, 1.5f);
         taxiLandingClampTimer_ = 0.0f;
         lastTaxiFlight_ = false;
@@ -279,6 +299,7 @@ void WorldEntryCallbackHandler::setupCallbacks() {
     // /unstuckgy — stronger recovery: safe/home position, then sampled floor fallback.
     gameHandler_.setUnstuckGyCallback([this]() {
         if (!renderer_.getCameraController()) return;
+        clearMountForUnstuck();
         worldEntryMovementGraceTimer_ = std::max(worldEntryMovementGraceTimer_, 1.5f);
         taxiLandingClampTimer_ = 0.0f;
         lastTaxiFlight_ = false;
@@ -345,6 +366,8 @@ void WorldEntryCallbackHandler::setupCallbacks() {
             return;
         }
 
+        clearMountForUnstuck();
+
         worldEntryMovementGraceTimer_ = 10.0f;  // long grace — terrain load check will clear it
         taxiLandingClampTimer_ = 0.0f;
         lastTaxiFlight_ = false;
@@ -376,6 +399,7 @@ void WorldEntryCallbackHandler::setupCallbacks() {
                 return;
             }
             if (!renderer_.getCameraController()) return;
+            clearMountForUnstuck();
             auto* cc = renderer_.getCameraController();
 
             // Last resort: teleport to map entry point (terrain guaranteed loaded here)

@@ -96,3 +96,13 @@ TEST_CASE("CMSG_USE_ITEM keeps unit/self targeting when no item target", "[use_i
         REQUIRE(mask == 0x00);
     }
 }
+
+TEST_CASE("CMSG_ALTER_APPEARANCE uses the WotLK four-field payload", "[barber]") {
+    auto packet = AlterAppearancePacket::build(101, 7, 205, 309);
+    REQUIRE(packet.getData().size() == 16);
+    REQUIRE(packet.readUInt32() == 101);
+    REQUIRE(packet.readUInt32() == 7);
+    REQUIRE(packet.readUInt32() == 205);
+    REQUIRE(packet.readUInt32() == 309);
+    REQUIRE_FALSE(packet.hasData());
+}

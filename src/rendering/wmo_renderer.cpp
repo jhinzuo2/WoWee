@@ -2197,16 +2197,23 @@ void WMORenderer::getVisibleGroupsViaPortals(const ModelData& model,
     constexpr uint32_t WMO_GROUP_FLAG_OUTDOOR = 0x8;
     constexpr uint32_t WMO_GROUP_FLAG_INDOOR = 0x2000;
 
+    auto addExteriorGroups = [&]() {
+        for (size_t gi = 0; gi < model.groups.size(); ++gi) {
+            const uint32_t flags = model.groups[gi].groupFlags;
+            if (!(flags & WMO_GROUP_FLAG_INDOOR) || (flags & WMO_GROUP_FLAG_OUTDOOR)) {
+                outVisibleGroups.insert(static_cast<uint32_t>(gi));
+            }
+        }
+    };
+
     // Find camera's containing group
     int cameraGroup = findContainingGroup(model, cameraLocalPos);
 
     // If camera is outside all groups, fall back to frustum culling only
     if (cameraGroup < 0) {
-        // Camera outside WMO - mark all groups as potentially visible
-        // (will still be frustum culled in render)
-        for (size_t gi = 0; gi < model.groups.size(); gi++) {
-            outVisibleGroups.insert(static_cast<uint32_t>(gi));
-        }
+        // An exterior viewer has no valid interior traversal origin. Keep the WMO
+        // shell/facades visible without opening every interior group.
+        addExteriorGroups();
         return;
     }
 
@@ -2218,9 +2225,8 @@ void WMORenderer::getVisibleGroupsViaPortals(const ModelData& model,
         const bool isIndoor = (gFlags & WMO_GROUP_FLAG_INDOOR) != 0;
         const bool isOutdoor = (gFlags & WMO_GROUP_FLAG_OUTDOOR) != 0;
         if (!isIndoor || isOutdoor) {
-            for (size_t gi = 0; gi < model.groups.size(); gi++) {
-                outVisibleGroups.insert(static_cast<uint32_t>(gi));
-            }
+            addExteriorGroups();
+            outVisibleGroups.insert(static_cast<uint32_t>(cameraGroup));
             return;
         }
         // Best-fit group is indoor-only, but the position might also be inside an
@@ -2234,22 +2240,20 @@ void WMORenderer::getVisibleGroupsViaPortals(const ModelData& model,
             if (cameraLocalPos.x >= g.boundingBoxMin.x && cameraLocalPos.x <= g.boundingBoxMax.x &&
                 cameraLocalPos.y >= g.boundingBoxMin.y && cameraLocalPos.y <= g.boundingBoxMax.y &&
                 cameraLocalPos.z >= g.boundingBoxMin.z && cameraLocalPos.z <= g.boundingBoxMax.z) {
-                for (size_t gj = 0; gj < model.groups.size(); gj++) {
-                    outVisibleGroups.insert(static_cast<uint32_t>(gj));
-                }
+                addExteriorGroups();
+                outVisibleGroups.insert(static_cast<uint32_t>(cameraGroup));
                 return;
             }
         }
     }
 
-    // If the camera group has no portal refs, it's a dead-end group (utility/transition group).
-    // Fall back to showing all groups to avoid the rest of the WMO going invisible.
+    // If the camera group has no portal refs, it's a dead-end group
+    // (utility/transition group). Keep that room and the exterior shell visible.
     if (cameraGroup < static_cast<int>(model.groupPortalRefs.size())) {
-        auto [portalStart, portalCount] = model.groupPortalRefs[cameraGroup];
+        const uint16_t portalCount = model.groupPortalRefs[cameraGroup].second;
         if (portalCount == 0) {
-            for (size_t gi = 0; gi < model.groups.size(); gi++) {
-                outVisibleGroups.insert(static_cast<uint32_t>(gi));
-            }
+            addExteriorGroups();
+            outVisibleGroups.insert(static_cast<uint32_t>(cameraGroup));
             return;
         }
     }
@@ -2260,27 +2264,17 @@ void WMORenderer::getVisibleGroupsViaPortals(const ModelData& model,
     // start then hides the whole city. Portal traversal below only decides
     // interior-only groups; streets and facades always draw (distance culling
     // still bounds them).
-    for (size_t gi = 0; gi < model.groups.size(); ++gi) {
-        const uint32_t f = model.groups[gi].groupFlags;
-        if (!(f & WMO_GROUP_FLAG_INDOOR) || (f & WMO_GROUP_FLAG_OUTDOOR))
-            outVisibleGroups.insert(static_cast<uint32_t>(gi));
-    }
+    addExteriorGroups();
 
-    // BFS through portals from the viewer's group plus every always-visible
-    // exterior group, so interiors seen through open doors still draw even
-    // when the viewer's containing group was misclassified.
+    // Traverse from the actual viewer group only. Exterior groups remain visible,
+    // but using every facade/street group as an additional BFS root effectively
+    // opened the entire portal graph and defeated interior culling.
     std::vector<bool> visited(model.groups.size(), false);
     std::vector<uint32_t> queue;
     queue.reserve(model.groups.size());
     queue.push_back(static_cast<uint32_t>(cameraGroup));
     visited[cameraGroup] = true;
     outVisibleGroups.insert(static_cast<uint32_t>(cameraGroup));
-    for (uint32_t gi : outVisibleGroups) {
-        if (!visited[gi]) {
-            visited[gi] = true;
-            queue.push_back(gi);
-        }
-    }
 
     size_t queueIdx = 0;
     while (queueIdx < queue.size()) {
@@ -3380,14 +3374,21 @@ bool WMORenderer::checkWallCollision(const glm::vec3& from, const glm::vec3& to,
                 float triHeight = tb.maxZ - tb.minZ;
                 if (triHeight < 1.0f && tb.maxZ <= localFeetZ + 1.2f) continue;
 
-                // Use MOPY flags to filter wall collision.
-                // Collide with triangles that have the collision flag (0x08) or no flags at all.
-                // Skip detail/decorative (0x04) and render-only (0x20 without 0x08) surfaces.
+                // Use MOPY flags to filter wall collision. Blocking set is the
+                // union of both flag conventions seen in the assets:
+                //  - explicit collision hulls (0x08), rendered or not — tunnel
+                //    walls rely on invisible hulls;
+                //  - rendered geometry (0x20) that is not detail (0x04) — the
+                //    Deeprun Tram gates carry render flags without 0x08 and
+                //    were walk-through when only 0x08 blocked.
+                // Detail/decorative (0x04: gears, railings, webs) never blocks.
                 uint32_t triIdx = triStart / 3;
                 if (!group.triMopyFlags.empty() && triIdx < group.triMopyFlags.size()) {
                     uint8_t mopy = group.triMopyFlags[triIdx];
                     if (mopy != 0) {
-                        if ((mopy & 0x04) || !(mopy & 0x08)) continue;
+                        const bool collisionHull = (mopy & 0x08) != 0;
+                        const bool renderedSolid = (mopy & 0x20) != 0 && !(mopy & 0x04);
+                        if (!collisionHull && !renderedSolid) continue;
                     }
                 }
 

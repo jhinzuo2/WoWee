@@ -344,8 +344,33 @@ bool TransportPathRepository::loadTransportAnimationDBC(pipeline::AssetManager* 
                        " [", mid2, "] t=", sortedWaypoints[mid2].first, " raw=(", sortedWaypoints[mid2].second.x, ",", sortedWaypoints[mid2].second.y, ",", sortedWaypoints[mid2].second.z, ")");
         }
 
+        // Deeprun tram frame normalization (data-driven, not expansion-gated):
+        // vanilla/TBC author the tram's local path along +X ([0, +2482]), which
+        // the identity mapping below was tuned against. WotLK re-exported the
+        // same paths along -Y ([-2482, 0], X≈0), which made the cars drive
+        // perpendicular to the tunnel. Detect the travel axis from the data
+        // extents and rotate the Y-major variant into the X-major frame.
+        bool tramYMajor = false;
+        if (isDeeprunTramPath(transportEntry)) {
+            glm::vec3 mn = sortedWaypoints.front().second;
+            glm::vec3 mx = mn;
+            for (const auto& wp : sortedWaypoints) {
+                mn = glm::min(mn, wp.second);
+                mx = glm::max(mx, wp.second);
+            }
+            tramYMajor = (mx.y - mn.y) > (mx.x - mn.x);
+            if (tramYMajor) {
+                LOG_INFO("Tram entry ", transportEntry,
+                         " uses Y-major local frame (WotLK export) — rotating to X-major");
+            }
+        }
+        auto tramNormalize = [tramYMajor](const glm::vec3& p) {
+            return tramYMajor ? glm::vec3(-p.y, p.x, p.z) : p;
+        };
+
         for (size_t idx = 0; idx < sortedWaypoints.size(); idx++) {
-            const auto& [tMs, pos] = sortedWaypoints[idx];
+            const auto& [tMs, rawPos] = sortedWaypoints[idx];
+            const glm::vec3 pos = tramNormalize(rawPos);
 
             glm::vec3 canonical = transportAnimationOffsetToCanonical(transportEntry, pos);
 
@@ -393,7 +418,7 @@ bool TransportPathRepository::loadTransportAnimationDBC(pipeline::AssetManager* 
 
         // Add duplicate first point at end with wrap duration
         // This makes the wrap segment (last → first) have proper duration
-        const auto& fp = sortedWaypoints.front().second;
+        const glm::vec3 fp = tramNormalize(sortedWaypoints.front().second);
         glm::vec3 firstCanonical = transportAnimationOffsetToCanonical(transportEntry, fp);
         keys.push_back({lastTimeMs + wrapMs, firstCanonical});
 

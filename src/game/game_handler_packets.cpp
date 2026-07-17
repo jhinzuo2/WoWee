@@ -18,6 +18,8 @@
 #include "game/update_field_table.hpp"
 #include "game/expansion_profile.hpp"
 #include "rendering/renderer.hpp"
+#include "rendering/camera_controller.hpp"
+#include "rendering/post_process_pipeline.hpp"
 #include "rendering/spell_visual_system.hpp"
 #include "audio/audio_coordinator.hpp"
 #include "audio/activity_sound_manager.hpp"
@@ -436,11 +438,27 @@ void GameHandler::registerOpcodeHandlers() {
         addSystemChatMessage("Your corpse is outside this instance. Release spirit to retrieve it.");
     };
     dispatchTable_[Opcode::SMSG_CROSSED_INEBRIATION_THRESHOLD] = [this](network::Packet& packet) {
-        if (packet.hasRemaining(12)) {
+        if (packet.hasRemaining(16)) {
             uint64_t guid      = packet.readUInt64();
             uint32_t threshold = packet.readUInt32();
-            if (guid == playerGuid && threshold > 0) addSystemChatMessage("You feel rather drunk.");
-            LOG_DEBUG("SMSG_CROSSED_INEBRIATION_THRESHOLD: guid=0x", std::hex, guid, std::dec, " threshold=", threshold);
+            uint32_t itemId    = packet.readUInt32();
+            if (guid == playerGuid) {
+                const float amount = static_cast<float>(std::min(threshold, 3u)) / 3.0f;
+                if (threshold == 1) addSystemChatMessage("You feel tipsy.");
+                else if (threshold == 2) addSystemChatMessage("You feel drunk.");
+                else if (threshold >= 3) addSystemChatMessage("You feel completely smashed.");
+                else addSystemChatMessage("You feel sober again.");
+                if (auto* renderer = services_.renderer) {
+                    if (auto* camera = renderer->getCameraController()) {
+                        camera->setIntoxication(amount);
+                    }
+                    if (auto* post = renderer->getPostProcessPipeline()) {
+                        post->setIntoxication(amount);
+                    }
+                }
+            }
+            LOG_DEBUG("SMSG_CROSSED_INEBRIATION_THRESHOLD: guid=0x", std::hex, guid,
+                      std::dec, " threshold=", threshold, " itemId=", itemId);
         }
     };
     dispatchTable_[Opcode::SMSG_CLEAR_FAR_SIGHT_IMMEDIATE] = [](network::Packet& /*packet*/) {
@@ -452,7 +470,7 @@ void GameHandler::registerOpcodeHandlers() {
             uint64_t animGuid = packet.readPackedGuid();
             if (packet.hasRemaining(4)) {
                 uint32_t animId = packet.readUInt32();
-                if (emoteAnimCallback_) emoteAnimCallback_(animGuid, animId);
+                if (emoteAnimCallback_) emoteAnimCallback_(animGuid, animId, /*isState=*/false);
             }
         }
     };
@@ -914,31 +932,34 @@ void GameHandler::registerOpcodeHandlers() {
         if (packet.getSize() < 12) return;
         uint64_t guid = packet.readUInt64();
         uint32_t animId = packet.readUInt32();
-        if (gameObjectCustomAnimCallback_)
-            gameObjectCustomAnimCallback_(guid, animId);
-        if (animId == 0) {
-            auto goEnt = entityController_->getEntityManager().getEntity(guid);
-            if (goEnt && goEnt->getType() == ObjectType::GAMEOBJECT) {
-                auto go = std::static_pointer_cast<GameObject>(goEnt);
-                // Only show fishing message if the bobber belongs to us
-                // OBJECT_FIELD_CREATED_BY is a uint64 at field indices 6-7
-                uint64_t createdBy = static_cast<uint64_t>(go->getField(6))
-                                   | (static_cast<uint64_t>(go->getField(7)) << 32);
-                if (createdBy == playerGuid) {
-                    auto* info = getCachedGameObjectInfo(go->getEntry());
-                    // The bite can arrive before GAMEOBJECT_QUERY_RESPONSE. An
-                    // owned GO with unknown metadata is safe to remember here;
-                    // once metadata exists, still require FISHINGNODE (type 17).
-                    if (!info || info->type == 17) {
-                        hookedFishingBobberGuid_ = guid;
-                        setTarget(guid);
-                        addUIError("A fish is on your line! Right-click to reel it in.");
-                        addSystemChatMessage("A fish is on your line! Right-click to reel it in.");
-                        withSoundManager(&audio::AudioCoordinator::getUiSoundManager, [](auto* sfx) { sfx->playQuestUpdate(); });
-                    }
-                }
+        bool ownedFishingBite = false;
+        auto goEnt = entityController_->getEntityManager().getEntity(guid);
+        if (goEnt && goEnt->getType() == ObjectType::GAMEOBJECT) {
+            auto go = std::static_pointer_cast<GameObject>(goEnt);
+            // Only treat custom animation as a bite when this is our bobber.
+            // AzerothCore sends the GO's animation progress (normally 100), not
+            // M2 animation id 0, so the packet payload itself cannot identify it.
+            uint64_t createdBy = static_cast<uint64_t>(go->getField(6))
+                               | (static_cast<uint64_t>(go->getField(7)) << 32);
+            auto* info = getCachedGameObjectInfo(go->getEntry());
+            ownedFishingBite = createdBy == playerGuid && (!info || info->type == 17);
+            if (ownedFishingBite) {
+                hookedFishingBobberGuid_ = guid;
+                // G_FishingBobber.m2 sequence 153 is its authored 1.33s bite/splash
+                // animation; sequence 0 is the normal three-second idle bob.
+                constexpr uint32_t kFishingBobberBiteAnimation = 153;
+                if (gameObjectCustomAnimCallback_)
+                    gameObjectCustomAnimCallback_(guid, kFishingBobberBiteAnimation);
+                addUIError("A fish is on your line! Right-click to reel it in.");
+                addSystemChatMessage("A fish is on your line! Right-click to reel it in.");
+                withSoundManager(&audio::AudioCoordinator::getUiSoundManager,
+                                 [](auto* sfx) { sfx->playFishingBite(); });
+                LOG_WARNING("Fishing bite ready: guid=0x", std::hex, guid, std::dec,
+                            " serverAnimProgress=", animId);
             }
         }
+        if (!ownedFishingBite && gameObjectCustomAnimCallback_)
+            gameObjectCustomAnimCallback_(guid, animId);
     };
 
     // Item refund / socket gems / item time
@@ -1223,7 +1244,7 @@ void GameHandler::registerOpcodeHandlers() {
 
     // ---- SMSG_BARBER_SHOP_RESULT ----
     dispatchTable_[Opcode::SMSG_BARBER_SHOP_RESULT] = [this](network::Packet& packet) {
-        // uint32 result (0 = success, 1 = no money, 2 = not barber, 3 = sitting)
+        // uint32 result: 0=success, 1/3=not enough money, 2=not seated at barber
         if (packet.hasRemaining(4)) {
             uint32_t result = packet.readUInt32();
             if (result == 0) {
@@ -1231,9 +1252,8 @@ void GameHandler::registerOpcodeHandlers() {
                 barberShopOpen_ = false;
                 fireAddonEvent("BARBER_SHOP_CLOSE", {});
             } else {
-                const char* msg = (result == 1) ? "Not enough money for new hairstyle."
+                const char* msg = (result == 1 || result == 3) ? "Not enough money for new hairstyle."
                                 : (result == 2) ? "You are not at a barber shop."
-                                : (result == 3) ? "You must stand up to use the barber shop."
                                 : "Barber shop unavailable.";
                 addUIError(msg);
                 addSystemChatMessage(msg);

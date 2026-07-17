@@ -12,6 +12,7 @@
 #include "core/application.hpp"
 #include "core/logger.hpp"
 #include "rendering/renderer.hpp"
+#include "rendering/character_preview.hpp"
 #include "rendering/vk_context.hpp"
 #include "core/window.hpp"
 #include "game/game_handler.hpp"
@@ -77,6 +78,8 @@ namespace {
 
 namespace wowee {
 namespace ui {
+
+WindowManager::~WindowManager() = default;
 
 void WindowManager::renderLootWindow(game::GameHandler& gameHandler,
                               InventoryScreen& inventoryScreen,
@@ -1974,30 +1977,186 @@ void WindowManager::renderBarberShopWindow(game::GameHandler& gameHandler) {
     const auto* ch = gameHandler.getActiveCharacter();
     if (!ch) return;
 
-    uint8_t race = static_cast<uint8_t>(ch->race);
-    game::Gender gender = ch->gender;
-    game::Race raceEnum = ch->race;
+    const uint32_t raceId = static_cast<uint32_t>(ch->race);
+    const uint32_t sexId = (ch->gender == game::Gender::FEMALE || ch->useFemaleModel) ? 1u : 0u;
 
-    // Initialize sliders from current appearance
+    auto selectedAppearance = [](const std::vector<BarberStyleOption>& options, int index,
+                                 uint8_t fallback) {
+        return index >= 0 && index < static_cast<int>(options.size())
+            ? options[static_cast<size_t>(index)].appearanceId : fallback;
+    };
+    auto selectedEntry = [](const std::vector<BarberStyleOption>& options, int index) {
+        return index >= 0 && index < static_cast<int>(options.size())
+            ? options[static_cast<size_t>(index)].entryId : 0u;
+    };
+
+    auto rebuildHairColors = [&](uint8_t hairStyle, uint8_t preferredColor) {
+        barberHairColors_.clear();
+        if (services_.assetManager) {
+            auto dbc = services_.assetManager->loadDBC("CharSections.dbc");
+            if (dbc && dbc->isLoaded()) {
+                const auto* layout = pipeline::getActiveDBCLayout()
+                    ? pipeline::getActiveDBCLayout()->getLayout("CharSections") : nullptr;
+                const auto fields = pipeline::detectCharSectionsFields(dbc.get(), layout);
+                for (uint32_t row = 0; row < dbc->getRecordCount(); ++row) {
+                    if (dbc->getUInt32(row, fields.raceId) != raceId ||
+                        dbc->getUInt32(row, fields.sexId) != sexId ||
+                        dbc->getUInt32(row, fields.baseSection) != 3 ||
+                        dbc->getUInt32(row, fields.variationIndex) != hairStyle) {
+                        continue;
+                    }
+                    const uint32_t color = dbc->getUInt32(row, fields.colorIndex);
+                    if (color <= 255) barberHairColors_.push_back(static_cast<uint8_t>(color));
+                }
+            }
+        }
+        std::sort(barberHairColors_.begin(), barberHairColors_.end());
+        barberHairColors_.erase(std::unique(barberHairColors_.begin(), barberHairColors_.end()),
+                                barberHairColors_.end());
+        const auto preferred = std::find(barberHairColors_.begin(), barberHairColors_.end(),
+                                         preferredColor);
+        barberHairColor_ = preferred == barberHairColors_.end()
+            ? (barberHairColors_.empty() ? -1 : 0)
+            : static_cast<int>(std::distance(barberHairColors_.begin(), preferred));
+        barberColorsForHairStyle_ = hairStyle;
+    };
+
+    // BarberShopStyle IDs, rather than the visible appearance numbers, are the
+    // wire values expected by a WotLK server. Build the race/sex-specific lists
+    // once each time the chair opens.
     if (!barberInitialized_) {
-        barberOrigHairStyle_ = static_cast<int>((ch->appearanceBytes >> 16) & 0xFF);
-        barberOrigHairColor_ = static_cast<int>((ch->appearanceBytes >> 24) & 0xFF);
-        barberOrigFacialHair_ = static_cast<int>(ch->facialFeatures);
-        barberHairStyle_ = barberOrigHairStyle_;
-        barberHairColor_ = barberOrigHairColor_;
-        barberFacialHair_ = barberOrigFacialHair_;
+        barberOrigSkinColor_ = static_cast<uint8_t>(ch->appearanceBytes & 0xFF);
+        barberOrigHairStyle_ = static_cast<uint8_t>((ch->appearanceBytes >> 16) & 0xFF);
+        barberOrigHairColor_ = static_cast<uint8_t>((ch->appearanceBytes >> 24) & 0xFF);
+        barberOrigFacialHair_ = ch->facialFeatures;
+        barberHairStyles_.clear();
+        barberFacialStyles_.clear();
+        barberSkinStyles_.clear();
+        // Entry zero tells the server to retain the existing skin.
+        barberSkinStyles_.push_back({0, barberOrigSkinColor_, "Current"});
+
+        if (services_.assetManager) {
+            auto dbc = services_.assetManager->loadDBC("BarberShopStyle.dbc");
+            if (dbc && dbc->isLoaded() && dbc->getFieldCount() >= 40) {
+                for (uint32_t row = 0; row < dbc->getRecordCount(); ++row) {
+                    if (dbc->getUInt32(row, 37) != raceId || dbc->getUInt32(row, 38) != sexId)
+                        continue;
+                    const uint32_t appearance = dbc->getUInt32(row, 39);
+                    if (appearance > 255) continue;
+                    std::string name;
+                    for (uint32_t field = 2; field <= 17 && name.empty(); ++field)
+                        name = dbc->getString(row, field);
+                    if (name.empty()) name = "Style " + std::to_string(appearance);
+                    BarberStyleOption option{dbc->getUInt32(row, 0),
+                                             static_cast<uint8_t>(appearance), std::move(name)};
+                    switch (dbc->getUInt32(row, 1)) {
+                        case 0: barberHairStyles_.push_back(std::move(option)); break;
+                        case 2: barberFacialStyles_.push_back(std::move(option)); break;
+                        case 3: barberSkinStyles_.push_back(std::move(option)); break;
+                        default: break;
+                    }
+                }
+            } else {
+                LOG_WARNING("Barber Shop: WotLK BarberShopStyle.dbc is unavailable or malformed");
+            }
+
+            auto baseCost = services_.assetManager->loadDBC("gtBarberShopCostBase.dbc");
+            if (baseCost && baseCost->isLoaded() && baseCost->getRecordCount() > 0) {
+                const uint32_t level = std::max<uint32_t>(1, ch->level);
+                const uint32_t row = std::min(level, baseCost->getRecordCount()) - 1;
+                barberBaseCost_ = baseCost->getFloat(row, 0);
+            } else {
+                barberBaseCost_ = 0.0f;
+            }
+        }
+
+        auto normalizeOptions = [](std::vector<BarberStyleOption>& options) {
+            std::sort(options.begin(), options.end(), [](const auto& a, const auto& b) {
+                return a.appearanceId != b.appearanceId
+                    ? a.appearanceId < b.appearanceId : a.entryId < b.entryId;
+            });
+            options.erase(std::unique(options.begin(), options.end(), [](const auto& a, const auto& b) {
+                return a.appearanceId == b.appearanceId;
+            }), options.end());
+        };
+        normalizeOptions(barberHairStyles_);
+        normalizeOptions(barberFacialStyles_);
+        if (barberSkinStyles_.size() > 1) {
+            std::sort(barberSkinStyles_.begin() + 1, barberSkinStyles_.end(),
+                      [](const auto& a, const auto& b) { return a.appearanceId < b.appearanceId; });
+            barberSkinStyles_.erase(std::unique(barberSkinStyles_.begin() + 1,
+                                                barberSkinStyles_.end(),
+                                                [](const auto& a, const auto& b) {
+                                                    return a.appearanceId == b.appearanceId;
+                                                }), barberSkinStyles_.end());
+        }
+
+        auto findAppearance = [](const std::vector<BarberStyleOption>& options, uint8_t id) {
+            const auto it = std::find_if(options.begin(), options.end(),
+                                         [id](const auto& option) { return option.appearanceId == id; });
+            return it == options.end() ? -1 : static_cast<int>(std::distance(options.begin(), it));
+        };
+        barberHairStyle_ = findAppearance(barberHairStyles_, barberOrigHairStyle_);
+        barberFacialHair_ = findAppearance(barberFacialStyles_, barberOrigFacialHair_);
+        barberSkinColor_ = 0;
+        rebuildHairColors(barberOrigHairStyle_, barberOrigHairColor_);
+        barberPreviewSkin_ = barberPreviewHairStyle_ = barberPreviewHairColor_ =
+            barberPreviewFacialHair_ = -1;
+
+        if (!barberPreview_ && services_.assetManager && services_.renderer) {
+            barberPreview_ = std::make_unique<rendering::CharacterPreview>();
+            if (barberPreview_->initialize(services_.assetManager)) {
+                services_.renderer->registerPreview(barberPreview_.get());
+                barberPreview_->resetView();
+            } else {
+                LOG_WARNING("Barber Shop: failed to initialize character preview");
+                barberPreview_.reset();
+            }
+        }
         barberInitialized_ = true;
     }
 
-    int maxHairStyle = static_cast<int>(game::getMaxHairStyle(raceEnum, gender));
-    int maxHairColor = static_cast<int>(game::getMaxHairColor(raceEnum, gender));
-    int maxFacialHair = static_cast<int>(game::getMaxFacialFeature(raceEnum, gender));
+    const uint8_t hairStyle = selectedAppearance(barberHairStyles_, barberHairStyle_,
+                                                  barberOrigHairStyle_);
+    if (hairStyle != barberColorsForHairStyle_) {
+        const uint8_t previousColor = barberHairColor_ >= 0 &&
+                                      barberHairColor_ < static_cast<int>(barberHairColors_.size())
+            ? barberHairColors_[static_cast<size_t>(barberHairColor_)] : barberOrigHairColor_;
+        rebuildHairColors(hairStyle, previousColor);
+    }
+    const uint8_t hairColor = barberHairColor_ >= 0 &&
+                              barberHairColor_ < static_cast<int>(barberHairColors_.size())
+        ? barberHairColors_[static_cast<size_t>(barberHairColor_)] : barberOrigHairColor_;
+    const uint8_t facial = selectedAppearance(barberFacialStyles_, barberFacialHair_,
+                                               barberOrigFacialHair_);
+    const uint8_t skin = selectedAppearance(barberSkinStyles_, barberSkinColor_,
+                                             barberOrigSkinColor_);
+
+    if (barberPreview_ && (barberPreviewSkin_ != skin ||
+                           barberPreviewHairStyle_ != hairStyle ||
+                           barberPreviewHairColor_ != hairColor ||
+                           barberPreviewFacialHair_ != facial)) {
+        const uint8_t face = static_cast<uint8_t>((ch->appearanceBytes >> 8) & 0xFF);
+        if (barberPreview_->loadCharacter(ch->race, ch->gender, skin, face, hairStyle,
+                                          hairColor, facial, ch->useFemaleModel)) {
+            barberPreview_->applyEquipment(ch->equipment);
+        }
+        barberPreviewSkin_ = skin;
+        barberPreviewHairStyle_ = hairStyle;
+        barberPreviewHairColor_ = hairColor;
+        barberPreviewFacialHair_ = facial;
+    }
+    if (barberPreview_) {
+        barberPreview_->update(ImGui::GetIO().DeltaTime);
+        barberPreview_->render();
+        barberPreview_->requestComposite();
+    }
 
     auto* window = services_.window;
     float screenW = window ? static_cast<float>(window->getWidth()) : 1280.0f;
     float screenH = window ? static_cast<float>(window->getHeight()) : 720.0f;
-    float winW = 300.0f;
-    float winH = 220.0f;
+    float winW = 720.0f;
+    float winH = 520.0f;
     ImGui::SetNextWindowPos(ImVec2((screenW - winW) / 2.0f, (screenH - winH) / 2.0f), ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(ImVec2(winW, winH), ImGuiCond_Appearing);
 
@@ -2008,57 +2167,123 @@ void WindowManager::renderBarberShopWindow(game::GameHandler& gameHandler) {
         ImGui::Separator();
         ImGui::Spacing();
 
+        const float previewW = 300.0f;
+        ImGui::BeginChild("##BarberPreview", ImVec2(previewW, 410.0f), true);
+        if (barberPreview_ && barberPreview_->getTextureId()) {
+            const float imageW = ImGui::GetContentRegionAvail().x;
+            const float imageH = imageW * static_cast<float>(barberPreview_->getHeight()) /
+                                 static_cast<float>(barberPreview_->getWidth());
+            ImGui::Image(reinterpret_cast<ImTextureID>(barberPreview_->getTextureId()),
+                         ImVec2(imageW, std::min(imageH, 365.0f)));
+            if (ImGui::IsItemHovered() && ImGui::IsMouseDragging(ImGuiMouseButton_Left))
+                barberPreview_->rotate(ImGui::GetIO().MouseDelta.x * 0.2f);
+            if (ImGui::IsItemHovered() && ImGui::GetIO().MouseWheel != 0.0f)
+                barberPreview_->zoom(ImGui::GetIO().MouseWheel);
+            ImGui::TextDisabled("Drag to rotate - Scroll to zoom");
+        } else {
+            ImGui::TextDisabled("Preview unavailable");
+        }
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+        ImGui::BeginChild("##BarberControls", ImVec2(0, 410.0f), false);
         ImGui::PushItemWidth(-1);
 
-        // Hair Style
-        ImGui::Text("Hair Style");
-        ImGui::SliderInt("##HairStyle", &barberHairStyle_, 0, maxHairStyle,
-                         "%d");
+        auto styleCombo = [](const char* label, int& selected,
+                             const std::vector<BarberStyleOption>& options) {
+            const char* preview = selected >= 0 && selected < static_cast<int>(options.size())
+                ? options[static_cast<size_t>(selected)].name.c_str() : "Unavailable";
+            if (ImGui::BeginCombo(label, preview)) {
+                for (int i = 0; i < static_cast<int>(options.size()); ++i) {
+                    const bool active = i == selected;
+                    if (ImGui::Selectable(options[static_cast<size_t>(i)].name.c_str(), active))
+                        selected = i;
+                    if (active) ImGui::SetItemDefaultFocus();
+                }
+                ImGui::EndCombo();
+            }
+        };
+        styleCombo("Hair Style", barberHairStyle_, barberHairStyles_);
 
-        // Hair Color
-        ImGui::Text("Hair Color");
-        ImGui::SliderInt("##HairColor", &barberHairColor_, 0, maxHairColor,
-                         "%d");
+        const char* colorPreview = "Unavailable";
+        std::string colorLabel;
+        if (barberHairColor_ >= 0 && barberHairColor_ < static_cast<int>(barberHairColors_.size())) {
+            colorLabel = "Color " + std::to_string(hairColor);
+            colorPreview = colorLabel.c_str();
+        }
+        if (ImGui::BeginCombo("Hair Color", colorPreview)) {
+            for (int i = 0; i < static_cast<int>(barberHairColors_.size()); ++i) {
+                const std::string label = "Color " + std::to_string(barberHairColors_[i]);
+                const bool active = i == barberHairColor_;
+                if (ImGui::Selectable(label.c_str(), active)) barberHairColor_ = i;
+                if (active) ImGui::SetItemDefaultFocus();
+            }
+            ImGui::EndCombo();
+        }
 
-        // Facial Hair / Piercings / Markings
-        const char* facialLabel = (gender == game::Gender::FEMALE) ? "Piercings" : "Facial Hair";
-        // Some races use "Markings" or "Tusks" etc.
-        if (race == 8 || race == 6) facialLabel = "Features"; // Trolls, Tauren
-        ImGui::Text("%s", facialLabel);
-        ImGui::SliderInt("##FacialHair", &barberFacialHair_, 0, maxFacialHair,
-                         "%d");
-
+        const char* facialLabel = sexId == 1 ? "Piercings / Features" : "Facial Hair / Features";
+        styleCombo(facialLabel, barberFacialHair_, barberFacialStyles_);
+        if (barberSkinStyles_.size() > 1)
+            styleCombo("Skin Color", barberSkinColor_, barberSkinStyles_);
         ImGui::PopItemWidth();
 
         ImGui::Spacing();
         ImGui::Separator();
 
-        // Show whether anything changed
-        bool changed = (barberHairStyle_ != barberOrigHairStyle_ ||
-                        barberHairColor_ != barberOrigHairColor_ ||
-                        barberFacialHair_ != barberOrigFacialHair_);
+        const bool valid = barberHairStyle_ >= 0 && barberFacialHair_ >= 0 &&
+                           barberHairColor_ >= 0;
+        const bool changed = valid && (hairStyle != barberOrigHairStyle_ ||
+                                       hairColor != barberOrigHairColor_ ||
+                                       facial != barberOrigFacialHair_ ||
+                                       skin != barberOrigSkinColor_);
+        float costFloat = 0.0f;
+        if (hairStyle != barberOrigHairStyle_) costFloat += barberBaseCost_;
+        else if (hairColor != barberOrigHairColor_) costFloat += barberBaseCost_ * 0.5f;
+        if (facial != barberOrigFacialHair_) costFloat += barberBaseCost_ * 0.75f;
+        if (skin != barberOrigSkinColor_) costFloat += barberBaseCost_ * 0.75f;
+        const uint32_t cost = static_cast<uint32_t>(costFloat);
+        const bool canAfford = gameHandler.getMoneyCopper() >= cost;
+
+        ImGui::Text("Price:");
+        ImGui::SameLine();
+        if (!canAfford) ImGui::PushStyleColor(ImGuiCol_Text, kColorRed);
+        renderCoinsFromCopper(cost);
+        if (!canAfford) ImGui::PopStyleColor();
+        if (!valid)
+            ImGui::TextColored(kColorRed, "No valid barber styles were found for this character.");
+        ImGui::EndChild();
 
         // OK / Reset / Cancel buttons
         float btnW = 80.0f;
         float totalW = btnW * 3 + ImGui::GetStyle().ItemSpacing.x * 2;
         ImGui::SetCursorPosX((ImGui::GetWindowWidth() - totalW) / 2.0f);
 
-        if (!changed) ImGui::BeginDisabled();
+        if (!changed || !canAfford) ImGui::BeginDisabled();
         if (ImGui::Button("OK", ImVec2(btnW, 0))) {
             gameHandler.sendAlterAppearance(
-                static_cast<uint32_t>(barberHairStyle_),
-                static_cast<uint32_t>(barberHairColor_),
-                static_cast<uint32_t>(barberFacialHair_));
+                selectedEntry(barberHairStyles_, barberHairStyle_),
+                hairColor,
+                selectedEntry(barberFacialStyles_, barberFacialHair_),
+                selectedEntry(barberSkinStyles_, barberSkinColor_));
             // Keep window open — server will respond with SMSG_BARBER_SHOP_RESULT
         }
-        if (!changed) ImGui::EndDisabled();
+        if (!changed || !canAfford) ImGui::EndDisabled();
 
         ImGui::SameLine();
         if (!changed) ImGui::BeginDisabled();
         if (ImGui::Button("Reset", ImVec2(btnW, 0))) {
-            barberHairStyle_ = barberOrigHairStyle_;
-            barberHairColor_ = barberOrigHairColor_;
-            barberFacialHair_ = barberOrigFacialHair_;
+            auto findAppearance = [](const std::vector<BarberStyleOption>& options, uint8_t id) {
+                const auto it = std::find_if(options.begin(), options.end(),
+                                             [id](const auto& option) {
+                                                 return option.appearanceId == id;
+                                             });
+                return it == options.end() ? -1
+                    : static_cast<int>(std::distance(options.begin(), it));
+            };
+            barberHairStyle_ = findAppearance(barberHairStyles_, barberOrigHairStyle_);
+            barberFacialHair_ = findAppearance(barberFacialStyles_, barberOrigFacialHair_);
+            barberSkinColor_ = 0;
+            rebuildHairColors(barberOrigHairStyle_, barberOrigHairColor_);
         }
         if (!changed) ImGui::EndDisabled();
 

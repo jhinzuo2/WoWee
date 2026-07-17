@@ -58,13 +58,24 @@ public:
     float getSpellCooldown(uint32_t spellId) const;
 
     // Cast state
-    bool isCasting() const { return casting_; }
-    bool isChanneling() const { return casting_ && castIsChannel_; }
+    bool isCasting() const { return casting_ || restorationActive_; }
+    bool isChanneling() const { return casting_ ? castIsChannel_ : restorationActive_; }
+    bool isRestoring() const { return restorationActive_; }
     bool isGameObjectInteractionCasting() const;
-    uint32_t getCurrentCastSpellId() const { return currentCastSpellId_; }
-    float getCastProgress() const { return castTimeTotal_ > 0 ? (castTimeTotal_ - castTimeRemaining_) / castTimeTotal_ : 0.0f; }
-    float getCastTimeRemaining() const { return castTimeRemaining_; }
-    float getCastTimeTotal() const { return castTimeTotal_; }
+    uint32_t getCurrentCastSpellId() const {
+        return casting_ ? currentCastSpellId_ : restorationSpellId_;
+    }
+    float getCastProgress() const {
+        const float total = casting_ ? castTimeTotal_ : restorationTimeTotal_;
+        const float remaining = casting_ ? castTimeRemaining_ : restorationTimeRemaining_;
+        return total > 0.0f ? (total - remaining) / total : 0.0f;
+    }
+    float getCastTimeRemaining() const {
+        return casting_ ? castTimeRemaining_ : restorationTimeRemaining_;
+    }
+    float getCastTimeTotal() const {
+        return casting_ ? castTimeTotal_ : restorationTimeTotal_;
+    }
 
     // Repeat-craft queue
     void startCraftQueue(uint32_t spellId, int count);
@@ -252,6 +263,7 @@ public:
 
     // Update per-frame timers (call from GameHandler::update)
     void updateTimers(float dt);
+    void refreshRestorationState() { refreshRestorationFromPlayerAuras(); }
 
     // Packet handlers dispatched from GameHandler's opcode table
     void handlePetSpells(network::Packet& packet);
@@ -323,6 +335,8 @@ private:
     // Play the impact visual effect at the target's position.
     void triggerImpactVisual(uint32_t spellId, uint64_t targetGuid);
     void launchRangedWeaponProjectile(uint32_t spellId, uint64_t targetGuid);
+    void refreshRestorationFromPlayerAuras();
+    void stopRestorationPresentation();
 
     // --- handleSpellLogExecute per-effect parsers (extracted to reduce nesting) ---
     void parseEffectPowerDrain(network::Packet& packet, uint32_t effectLogCount,
@@ -360,6 +374,12 @@ private:
     uint32_t currentCastSpellId_ = 0;
     float castTimeRemaining_ = 0.0f;
     float castTimeTotal_ = 0.0f;
+    bool restorationActive_ = false;
+    uint32_t restorationSpellId_ = 0;
+    bool restorationIsFood_ = false;
+    float restorationTimeRemaining_ = 0.0f;
+    float restorationTimeTotal_ = 0.0f;
+    float restorationSoundTimer_ = 0.0f; // repeats the consume sound while active
 
     // Repeat-craft queue
     uint32_t craftQueueSpellId_ = 0;

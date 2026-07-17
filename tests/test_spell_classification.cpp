@@ -87,6 +87,40 @@ TEST_CASE("Ranged weapon auto-attacks ignore placeholder DBC resource costs",
     REQUIRE_FALSE(isRangedWeaponAutoAttack(19434)); // Aimed Shot still uses real costs
 }
 
+TEST_CASE("Fishing ranks use targetless server-placed casts", "[spell][fishing]") {
+    for (uint32_t spellId : {7620u, 7731u, 7732u, 18248u, 33095u, 51294u}) {
+        REQUIRE(isFishingCast(spellId));
+    }
+
+    REQUIRE_FALSE(isFishingCast(0));
+    REQUIRE_FALSE(isFishingCast(2366));  // Herbalism
+    REQUIRE_FALSE(isFishingCast(2575));  // Mining
+}
+
+TEST_CASE("Only restoration food and drink spells use the seated consumption loop",
+          "[spell][consumable]") {
+    REQUIRE(classifyRestChannel("Food") == RestChannelKind::FOOD);
+    REQUIRE(classifyRestChannel("Drink") == RestChannelKind::DRINK);
+
+    // Potions use the same drinking motion, but unrelated quest-item actions do not.
+    REQUIRE(classifyRestChannel("Drink Potion") == RestChannelKind::POTION);
+    REQUIRE(classifyRestChannel("Drink Minor Potion") == RestChannelKind::POTION);
+    REQUIRE(classifyRestChannel("Drink Eye Potion") == RestChannelKind::POTION);
+    REQUIRE(classifyRestChannel("Healing Potion") == RestChannelKind::POTION);
+    REQUIRE(classifyRestChannel("Minor Mana Potion") == RestChannelKind::POTION);
+    REQUIRE(classifyRestChannel("Swiftness Potion") == RestChannelKind::POTION);
+    REQUIRE(classifyRestChannel("Create Fervor Potion") == RestChannelKind::NONE);
+    REQUIRE(classifyRestChannel("Potion Toss") == RestChannelKind::NONE);
+    REQUIRE(classifyRestChannel("Drink Disease Bottle") == RestChannelKind::NONE);
+    REQUIRE(classifyRestChannel("Food (TEST)") == RestChannelKind::NONE);
+    REQUIRE(classifyRestChannel("") == RestChannelKind::NONE);
+
+    const uint32_t alcoholEffects[3] = {0, 100, 0};
+    const uint32_t ordinaryEffects[3] = {6, 10, 0};
+    REQUIRE(hasInebriateEffect(alcoholEffects, 3));
+    REQUIRE_FALSE(hasInebriateEffect(ordinaryEffects, 3));
+}
+
 // ---------------------------------------------------------------------------
 // Rank strings
 // ---------------------------------------------------------------------------

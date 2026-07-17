@@ -12,12 +12,15 @@
 #include <string>
 #include <unordered_map>
 #include <functional>
+#include <memory>
+#include <vector>
 #include <imgui.h>
 #include <vulkan/vulkan.h>
 
 namespace wowee {
 namespace game { class GameHandler; }
 namespace pipeline { class AssetManager; }
+namespace rendering { class CharacterPreview; }
 namespace ui {
 
 class ChatPanel;
@@ -27,6 +30,9 @@ class SpellbookScreen;
 
 class WindowManager {
 public:
+    WindowManager() = default;
+    ~WindowManager();
+
     // Callback type for resolving spell icons (spellId, assetMgr) → VkDescriptorSet
     using SpellIconFn = std::function<VkDescriptorSet(uint32_t, pipeline::AssetManager*)>;
 
@@ -147,12 +153,30 @@ public:
     bool vendorBagsOpened_ = false;
 
     // Barber shop
+    struct BarberStyleOption {
+        uint32_t entryId = 0;       // BarberShopStyle.dbc ID sent to the server
+        uint8_t appearanceId = 0;   // CharSections/geoset variation used by preview
+        std::string name;
+    };
+    std::vector<BarberStyleOption> barberHairStyles_;
+    std::vector<BarberStyleOption> barberFacialStyles_;
+    std::vector<BarberStyleOption> barberSkinStyles_;
+    std::vector<uint8_t> barberHairColors_;
     int barberHairStyle_ = 0;
     int barberHairColor_ = 0;
     int barberFacialHair_ = 0;
-    int barberOrigHairStyle_ = 0;
-    int barberOrigHairColor_ = 0;
-    int barberOrigFacialHair_ = 0;
+    int barberSkinColor_ = 0;
+    uint8_t barberOrigHairStyle_ = 0;
+    uint8_t barberOrigHairColor_ = 0;
+    uint8_t barberOrigFacialHair_ = 0;
+    uint8_t barberOrigSkinColor_ = 0;
+    uint8_t barberColorsForHairStyle_ = 0xFF;
+    float barberBaseCost_ = 0.0f;
+    int barberPreviewSkin_ = -1;
+    int barberPreviewHairStyle_ = -1;
+    int barberPreviewHairColor_ = -1;
+    int barberPreviewFacialHair_ = -1;
+    std::unique_ptr<rendering::CharacterPreview> barberPreview_;
     bool barberInitialized_ = false;
 
     // Trainer

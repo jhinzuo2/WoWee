@@ -240,6 +240,11 @@ struct M2Model {
     // Value 0=transparent, 1=opaque. Independent from textureWeights.
     std::vector<float> colorAlphas;
 
+    // Full per-sequence alpha keyframes for the same color slots. Evaluated at
+    // render time to hide batches whose alpha animates to 0 in the current
+    // animation (e.g. the lumberjack carry model's alternate wood bundle).
+    std::vector<M2AnimationTrack> colorAlphaTracks;
+
     // Attachment points (for weapon/effect anchoring)
     std::vector<M2Attachment> attachments;
     std::vector<M2Camera> cameras;

@@ -127,7 +127,7 @@ void CombatHandler::registerOpcodes(DispatchTable& table) {
                 addCombatText(CombatTextEntry::RESIST, static_cast<int32_t>(envRes), 0, false, 0, 0, victimGuid);
             // Drowning damage → play DROWN one-shot on player
             if (envType == 1 && dmg > 0 && owner_.emoteAnimCallbackRef())
-                owner_.emoteAnimCallbackRef()(victimGuid, 131); // anim::DROWN
+                owner_.emoteAnimCallbackRef()(victimGuid, 131, /*isState=*/false); // anim::DROWN
         }
         packet.skipAll();
     };

@@ -6,6 +6,7 @@
 // (a physical-school self-buff read as melee) and every Hunter shot past 8 yards.
 
 #include <cstdint>
+#include <cstddef>
 #include <functional>
 #include <string>
 #include <unordered_set>
@@ -43,6 +44,53 @@ inline bool isRangedWeaponAutoAttack(uint32_t spellId) {
     return spellId == 75 ||    // Auto Shot
            spellId == 5019 ||  // Shoot (wand)
            spellId == 2764;    // Throw
+}
+
+/// The learnable Fishing casts across Classic, TBC, and WotLK.
+///
+/// Fishing is unusual: it has no explicit unit target. The server chooses a point in
+/// a narrow cone in front of the caster and validates water depth there. Keeping this
+/// classification explicit prevents a selected creature from leaking into the cast
+/// packet and lets the client select the pole-specific animation sequence.
+inline bool isFishingCast(uint32_t spellId) {
+    return spellId == 7620 ||   // Fishing (Apprentice)
+           spellId == 7731 ||   // Fishing (Journeyman)
+           spellId == 7732 ||   // Fishing (Expert)
+           spellId == 18248 ||  // Fishing (Artisan)
+           spellId == 33095 ||  // Fishing (Master)
+           spellId == 51294;    // Fishing (Grand Master)
+}
+
+/// Restoration food/water and instant potions use the dedicated consumption
+/// animation. Match canonical Food/Drink names and actual potion-use suffixes
+/// without classifying recipe spells that create potions.
+enum class RestChannelKind {
+    NONE,
+    FOOD,
+    DRINK,
+    POTION,
+    ALCOHOL
+};
+
+inline RestChannelKind classifyRestChannel(const std::string& spellName) {
+    if (spellName == "Food") return RestChannelKind::FOOD;
+    if (spellName == "Drink") return RestChannelKind::DRINK;
+    constexpr const char* potionSuffix = "Potion";
+    if (spellName.size() >= 6 &&
+        spellName.compare(spellName.size() - 6, 6, potionSuffix) == 0 &&
+        spellName.rfind("Create ", 0) != 0) {
+        return RestChannelKind::POTION;
+    }
+    return RestChannelKind::NONE;
+}
+
+inline bool hasInebriateEffect(const uint32_t* effectIds, size_t count) {
+    constexpr uint32_t kSpellEffectInebriate = 100;
+    if (!effectIds) return false;
+    for (size_t i = 0; i < count; ++i) {
+        if (effectIds[i] == kSpellEffectInebriate) return true;
+    }
+    return false;
 }
 
 /// Spell.dbc stores the rank as a display string ("Rank 3"). Rankless spells sort as 0.

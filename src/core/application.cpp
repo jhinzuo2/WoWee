@@ -102,7 +102,8 @@ bool envFlagEnabled(const char* key, bool defaultValue = false) {
 }
 
 std::optional<float> movingEntityFloor(rendering::Renderer* renderer,
-                                        const glm::vec3& renderPos) {
+                                        const glm::vec3& renderPos,
+                                        const std::optional<glm::vec3>& previousRenderPos) {
     if (!renderer) return std::nullopt;
 
     // Server movement Z is the reference surface.  In WMO overlap regions the
@@ -135,6 +136,19 @@ std::optional<float> movingEntityFloor(rendering::Renderer* renderer,
     }
     if (auto* m2 = renderer->getM2Renderer()) {
         consider(m2->getFloorHeight(renderPos.x, renderPos.y, probeZ));
+    }
+
+    // A broader floor candidate is useful on stairs and uneven terrain, but it is
+    // ambiguous near overlapping shells or non-collidable authored props. Require
+    // continuity with the last rendered ground position before accepting it. This
+    // preserves server-authored waypoint height without creature-entry exceptions.
+    if (best && std::abs(*best - renderPos.z) > 0.35f) {
+        if (!previousRenderPos) return std::nullopt;
+        const glm::vec2 planarDelta = glm::vec2(renderPos) - glm::vec2(*previousRenderPos);
+        const float maxContinuousStep = 0.35f + glm::length(planarDelta) * 1.5f;
+        if (std::abs(*best - previousRenderPos->z) > maxContinuousStep) {
+            return std::nullopt;
+        }
     }
     return best;
 }
@@ -1340,7 +1354,27 @@ void Application::update(float deltaTime) {
             updateCheckpoint = "in_game: auto-unsheathe";
             if (gameHandler) {
                 const bool autoAttacking = gameHandler->isAutoAttacking();
-                if (autoAttacking && !wasAutoAttacking_ && appearanceComposer_ && appearanceComposer_->isWeaponsSheathed()) {
+                // Keep the attachment state consistent with the ongoing attack, not
+                // just the initial false -> true transition. Z can be pressed after
+                // combat has already started, and pre-WotLK servers briefly send
+                // ATTACKSTOP while the client retains attack intent for a retry.
+                const bool attackWeaponNeeded = autoAttacking || gameHandler->hasAutoAttackIntent();
+                const auto& inventory = gameHandler->getInventory();
+                const auto& mainHand = inventory.getEquipSlot(game::EquipSlot::MAIN_HAND);
+                const auto& offHand = inventory.getEquipSlot(game::EquipSlot::OFF_HAND);
+                const auto& ranged = inventory.getEquipSlot(game::EquipSlot::RANGED);
+                const bool hasOffHandWeapon = !offHand.empty() &&
+                    offHand.item.inventoryType == game::InvType::ONE_HAND;
+                const bool hasRangedWeapon = !ranged.empty() &&
+                    (ranged.item.inventoryType == game::InvType::RANGED_BOW ||
+                     ranged.item.inventoryType == game::InvType::RANGED_GUN ||
+                     ranged.item.inventoryType == game::InvType::THROWN);
+                const bool hasDrawableWeapon = !mainHand.empty() || hasOffHandWeapon || hasRangedWeapon;
+                if (attackWeaponNeeded && hasDrawableWeapon && appearanceComposer_ &&
+                    appearanceComposer_->isWeaponsSheathed()) {
+                    if (renderer && renderer->getAnimationController()) {
+                        renderer->getAnimationController()->playWeaponSheathAnimation(false);
+                    }
                     appearanceComposer_->setWeaponsSheathed(false);
                     appearanceComposer_->loadEquippedWeapons();
                 }
@@ -1912,14 +1946,13 @@ void Application::update(float deltaTime) {
                 }
                 const float syncRadiusSq = 320.0f * 320.0f;
                 auto& _creatureInstances = entitySpawner_->getCreatureInstances();
-                auto& _creatureWeaponsAttached = entitySpawner_->getCreatureWeaponsAttached();
-                auto& _creatureWeaponAttachAttempts = entitySpawner_->getCreatureWeaponAttachAttempts();
                 auto& _creatureModelIds = entitySpawner_->getCreatureModelIds();
                 auto& _modelIdIsWolfLike = entitySpawner_->getModelIdIsWolfLike();
                 auto& _creatureRenderPosCache = entitySpawner_->getCreatureRenderPosCache();
                 auto& _creatureSwimmingState = entitySpawner_->getCreatureSwimmingState();
                 auto& _creatureWalkingState = entitySpawner_->getCreatureWalkingState();
                 auto& _creatureFlyingState = entitySpawner_->getCreatureFlyingState();
+                auto& _creatureActiveEmotes = entitySpawner_->getCreatureActiveEmotes();
                 auto& _creatureWasMoving = entitySpawner_->getCreatureWasMoving();
                 auto& _creatureWasSwimming = entitySpawner_->getCreatureWasSwimming();
                 auto& _creatureWasFlying = entitySpawner_->getCreatureWasFlying();
@@ -1929,19 +1962,9 @@ void Application::update(float deltaTime) {
                     if (!entity || entity->getType() != game::ObjectType::UNIT) continue;
 
                     if (npcWeaponRetryTick &&
-                        weaponAttachesThisTick < EntitySpawner::MAX_WEAPON_ATTACHES_PER_TICK &&
-                        !_creatureWeaponsAttached.count(guid)) {
-                        uint8_t attempts = 0;
-                        auto itAttempts = _creatureWeaponAttachAttempts.find(guid);
-                        if (itAttempts != _creatureWeaponAttachAttempts.end()) attempts = itAttempts->second;
-                        if (attempts < 30) {
+                        weaponAttachesThisTick < EntitySpawner::MAX_WEAPON_ATTACHES_PER_TICK) {
+                        if (entitySpawner_->retryCreatureVirtualWeapons(guid, instanceId, 30)) {
                             weaponAttachesThisTick++;
-                            if (entitySpawner_->tryAttachCreatureVirtualWeapons(guid, instanceId)) {
-                                _creatureWeaponsAttached.insert(guid);
-                                _creatureWeaponAttachAttempts.erase(guid);
-                            } else {
-                                _creatureWeaponAttachAttempts[guid] = static_cast<uint8_t>(attempts + 1);
-                            }
                         }
                     }
 
@@ -1969,6 +1992,11 @@ void Application::update(float deltaTime) {
                         inOverrun ? entity->getLatestY() : entity->getY(),
                         inOverrun ? entity->getLatestZ() : entity->getZ());
                     glm::vec3 renderPos = core::coords::canonicalToRender(canonical);
+                    auto posIt = _creatureRenderPosCache.find(guid);
+                    const std::optional<glm::vec3> previousRenderPos =
+                        posIt != _creatureRenderPosCache.end()
+                            ? std::optional<glm::vec3>(posIt->second)
+                            : std::nullopt;
 
                     // Ground-moving entities need client floor projection between server
                     // spline points. Use the floor nearest server Z so outdoor terrain
@@ -1976,7 +2004,8 @@ void Application::update(float deltaTime) {
                     const bool groundCreature = !_creatureFlyingState.count(guid) &&
                                                 !_creatureSwimmingState.count(guid);
                     if (entity->isActivelyMoving() && groundCreature) {
-                        if (auto floorZ = movingEntityFloor(renderer.get(), renderPos)) {
+                        if (auto floorZ = movingEntityFloor(renderer.get(), renderPos,
+                                                            previousRenderPos)) {
                             renderPos.z = *floorZ;
                         }
                     }
@@ -2046,7 +2075,6 @@ void Application::update(float deltaTime) {
                         }
                     }
 
-                    auto posIt = _creatureRenderPosCache.find(guid);
                     if (posIt == _creatureRenderPosCache.end()) {
                         charRenderer->setInstancePosition(instanceId, renderPos);
                         _creatureRenderPosCache[guid] = renderPos;
@@ -2123,7 +2151,18 @@ void Application::update(float deltaTime) {
                                 } else {
                                     if (isFlyingNow)        targetAnim = rendering::anim::FLY_IDLE;
                                     else if (isSwimmingNow) targetAnim = rendering::anim::SWIM_IDLE;
-                                    else                    targetAnim = rendering::anim::STAND;
+                                    else {
+                                        // Resume a retained state emote (work/chop loop),
+                                        // but only if this model ships the animation —
+                                        // display swaps can land on models without it
+                                        // (the log-carrying peasant has no chop anim).
+                                        targetAnim = rendering::anim::STAND;
+                                        auto emoteIt = _creatureActiveEmotes.find(guid);
+                                        if (emoteIt != _creatureActiveEmotes.end() &&
+                                            charRenderer->hasAnimation(instanceId, emoteIt->second)) {
+                                            targetAnim = emoteIt->second;
+                                        }
+                                    }
                                 }
                                 charRenderer->playAnimation(instanceId, targetAnim, /*loop=*/true);
                             }
@@ -2185,18 +2224,23 @@ void Application::update(float deltaTime) {
                         inOverrun ? entity->getLatestY() : entity->getY(),
                         inOverrun ? entity->getLatestZ() : entity->getZ());
                     glm::vec3 renderPos = core::coords::canonicalToRender(canonical);
+                    auto posIt = _pCreatureRenderPosCache.find(guid);
+                    const std::optional<glm::vec3> previousRenderPos =
+                        posIt != _pCreatureRenderPosCache.end()
+                            ? std::optional<glm::vec3>(posIt->second)
+                            : std::nullopt;
 
                     // Match creature projection: terrain alone is not a valid floor in
                     // WMO overlap regions (tunnels, buildings, bridges).
                     const bool groundPlayer = !_pCreatureFlyingState.count(guid) &&
                                               !_pCreatureSwimmingState.count(guid);
                     if (entity->isActivelyMoving() && groundPlayer) {
-                        if (auto floorZ = movingEntityFloor(renderer.get(), renderPos)) {
+                        if (auto floorZ = movingEntityFloor(renderer.get(), renderPos,
+                                                            previousRenderPos)) {
                             renderPos.z = *floorZ;
                         }
                     }
 
-                    auto posIt = _pCreatureRenderPosCache.find(guid);
                     if (posIt == _pCreatureRenderPosCache.end()) {
                         charRenderer->setInstancePosition(instanceId, renderPos);
                         _pCreatureRenderPosCache[guid] = renderPos;

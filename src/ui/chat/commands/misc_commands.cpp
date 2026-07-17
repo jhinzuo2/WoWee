@@ -4,12 +4,11 @@
 // Moved from ChatPanel::sendChatMessage() if/else chain (Phase 3).
 #include "ui/chat/i_chat_command.hpp"
 #include "ui/chat_panel.hpp"
-#include "core/appearance_composer.hpp"
 #include "game/game_handler.hpp"
+#include "game/transport_manager.hpp"
 #include "game/entity.hpp"
 #include "rendering/renderer.hpp"
 #include <algorithm>
-#include <sstream>
 #include <cctype>
 #include <cstdio>
 #include <limits>
@@ -41,38 +40,41 @@ inline std::string getEntityName(const std::shared_ptr<game::Entity>& entity) {
 
 } // anon namespace
 
-// --- /sheathtune ---
-// Live-tunes the 2H back-sheath placement so weapon position can be iterated
-// in game instead of rebuild-per-guess. Settled values get baked into
-// AppearanceComposer::SheathTuning defaults.
-class SheathTuneCommand : public IChatCommand {
+// --- /transportinfo ---
+// Dumps active transport state (entry, path, clock mode, position) so
+// stationary/invisible transports can be diagnosed live instead of guessing.
+class TransportInfoCommand : public IChatCommand {
 public:
     ChatCommandResult execute(ChatCommandContext& ctx) override {
-        auto& st = core::AppearanceComposer::sheathTuning();
-        float* fields[5] = {&st.tx, &st.ty, &st.tz, &st.cantDeg, &st.rollDeg};
-        std::istringstream in(ctx.args);
-        int parsed = 0;
-        float v;
-        while (parsed < 5 && (in >> v)) *fields[parsed++] = v;
-        if (parsed > 0 && ctx.services.appearanceComposer)
-            ctx.services.appearanceComposer->loadEquippedWeapons();
-
-        char buf[224];
-        snprintf(buf, sizeof(buf),
-                 "Sheath: tx=%.3f ty=%.3f tz=%.3f cant=%.1f roll=%.1f%s",
-                 st.tx, st.ty, st.tz, st.cantDeg, st.rollDeg,
-                 parsed ? "" : "  (usage: /sheathtune <tx> <ty> <tz> [cant] [roll])");
-        game::MessageChatData sysMsg;
-        sysMsg.type = game::ChatType::SYSTEM;
-        sysMsg.language = game::ChatLanguage::UNIVERSAL;
-        sysMsg.message = buf;
-        ctx.gameHandler.addLocalChatMessage(sysMsg);
+        auto say = [&ctx](const std::string& text) {
+            game::MessageChatData m;
+            m.type = game::ChatType::SYSTEM;
+            m.language = game::ChatLanguage::UNIVERSAL;
+            m.message = text;
+            ctx.gameHandler.addLocalChatMessage(m);
+        };
+        auto* tm = ctx.gameHandler.getTransportManager();
+        if (!tm) { say("Transport manager unavailable."); return {}; }
+        const auto& transports = tm->getTransports();
+        say("Active transports: " + std::to_string(transports.size()));
+        for (const auto& [guid, t] : transports) {
+            char buf[256];
+            snprintf(buf, sizeof(buf),
+                     "entry=%u disp=%u path=%u pos=(%.1f, %.1f, %.1f) %s clock=%s updates=%d inst=%u%s",
+                     t.entry, t.displayId, t.pathId,
+                     t.position.x, t.position.y, t.position.z,
+                     t.isM2 ? "M2" : "WMO",
+                     t.useClientAnimation ? (t.hasServerClock ? "client+sync" : "client")
+                                          : "server",
+                     t.serverUpdateCount,
+                     t.wmoInstanceId,
+                     t.wmoInstanceId == 0 ? " (NO RENDER INSTANCE)" : "");
+            say(buf);
+        }
         return {};
     }
-    std::vector<std::string> aliases() const override { return {"sheathtune"}; }
-    std::string helpText() const override {
-        return "Tune 2H back-sheath placement: /sheathtune <tx> <ty> <tz> [cant] [roll]";
-    }
+    std::vector<std::string> aliases() const override { return {"transportinfo"}; }
+    std::string helpText() const override { return "List active transports and their state"; }
 };
 
 // --- /time ---
@@ -434,7 +436,7 @@ void registerMiscCommands(ChatCommandRegistry& reg) {
     reg.registerCommand(std::make_unique<UnstuckGyCommand>());
     reg.registerCommand(std::make_unique<UnstuckHearthCommand>());
     reg.registerCommand(std::make_unique<TransportBoardCommand>());
-    reg.registerCommand(std::make_unique<SheathTuneCommand>());
+    reg.registerCommand(std::make_unique<TransportInfoCommand>());
 }
 
 } // namespace ui

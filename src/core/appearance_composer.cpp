@@ -55,12 +55,12 @@ glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
         // important: rotating around X cannot change an X-aligned blade.
         // The final innermost roll spins the blade about its own long axis so
         // the flat rests against the back instead of the sharp edge.
-        // All values live-tunable via /sheathtune.
-        const auto& st = AppearanceComposer::sheathTuning();
-        transform = glm::translate(transform, glm::vec3(st.tx, st.ty, st.tz));
-        transform = glm::rotate(transform, glm::radians(st.cantDeg), glm::vec3(1, 0, 0));
+        // Values tuned against the live attachment frame. Its Z axis moves the
+        // weapon laterally rather than vertically.
+        transform = glm::translate(transform, glm::vec3(-0.03f, -0.10f, 0.0f));
+        transform = glm::rotate(transform, glm::radians(33.0f), glm::vec3(1, 0, 0));
         transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(0, 1, 0));
-        transform = glm::rotate(transform, glm::radians(st.rollDeg), glm::vec3(1, 0, 0));
+        transform = glm::rotate(transform, glm::radians(90.0f), glm::vec3(1, 0, 0));
     } else {
         // Hip-sheathed one-handers have the same X-aligned long axis. Rotate it
         // onto -Z so the blade points down alongside the leg.
@@ -70,11 +70,6 @@ glm::mat4 weaponLocalTransform(bool sheathed, game::EquipSlot /*slot*/,
 }
 
 } // namespace
-
-AppearanceComposer::SheathTuning& AppearanceComposer::sheathTuning() {
-    static SheathTuning tuning;
-    return tuning;
-}
 
 AppearanceComposer::AppearanceComposer(rendering::Renderer* renderer,
                                        pipeline::AssetManager* assetManager,
@@ -681,6 +676,87 @@ void AppearanceComposer::showMiningPick(bool show) {
         LOG_INFO("Mining pick attached at right hand: ", m2Path);
     } else {
         // Do not leave the player empty-handed if the temporary model failed.
+        loadEquippedWeapons();
+    }
+}
+
+void AppearanceComposer::showFishingPole(bool show) {
+    if (show == showingFishingPole_) return;
+
+    if (!show) {
+        showingFishingPole_ = false;
+        loadEquippedWeapons();
+        return;
+    }
+    if (!renderer_ || !renderer_->getCharacterRenderer() || !gameHandler_ ||
+        !assetManager_ || !assetManager_->isInitialized() || !entitySpawner_) {
+        return;
+    }
+
+    const auto isFishingPole = [this](const game::ItemSlot& slot) {
+        if (slot.empty()) return false;
+        if (slot.item.subclassName == "Fishing Pole") return true;
+        const auto* info = gameHandler_->getItemInfo(slot.item.itemId);
+        return info && info->valid && info->itemClass == 2 && info->subClass == 20;
+    };
+
+    const game::ItemSlot* pole = nullptr;
+    const auto& inventory = gameHandler_->getInventory();
+    const auto& mainHand = inventory.getEquipSlot(game::EquipSlot::MAIN_HAND);
+    if (isFishingPole(mainHand)) pole = &mainHand;
+    for (int i = 0; !pole && i < inventory.getBackpackSize(); ++i) {
+        const auto& slot = inventory.getBackpackSlot(i);
+        if (isFishingPole(slot)) pole = &slot;
+    }
+    for (int bag = 0; !pole && bag < game::Inventory::NUM_BAG_SLOTS; ++bag) {
+        for (int slotIndex = 0; !pole && slotIndex < inventory.getBagSize(bag); ++slotIndex) {
+            const auto& slot = inventory.getBagSlot(bag, slotIndex);
+            if (isFishingPole(slot)) pole = &slot;
+        }
+    }
+    if (!pole || pole->item.displayInfoId == 0) {
+        LOG_WARNING("showFishingPole: no fishing pole with display data found in inventory");
+        return;
+    }
+
+    auto displayInfoDbc = assetManager_->loadDBC("ItemDisplayInfo.dbc");
+    if (!displayInfoDbc) return;
+    const int32_t recIdx = displayInfoDbc->findRecordById(pole->item.displayInfoId);
+    if (recIdx < 0) return;
+
+    const auto* idiL = pipeline::getActiveDBCLayout()
+        ? pipeline::getActiveDBCLayout()->getLayout("ItemDisplayInfo") : nullptr;
+    std::string modelName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModel"] : 1);
+    std::string textureName = displayInfoDbc->getString(
+        static_cast<uint32_t>(recIdx), idiL ? (*idiL)["LeftModelTexture"] : 3);
+    if (modelName.empty()) return;
+
+    const size_t dotPos = modelName.rfind('.');
+    const std::string modelFile = dotPos == std::string::npos
+        ? modelName + ".m2" : modelName.substr(0, dotPos) + ".m2";
+    std::string m2Path = "Item\\ObjectComponents\\Weapon\\" + modelFile;
+    pipeline::M2Model poleModel;
+    if (!loadWeaponM2(m2Path, poleModel)) return;
+
+    std::string texturePath;
+    if (!textureName.empty()) {
+        texturePath = "Item\\ObjectComponents\\Weapon\\" + textureName + ".blp";
+    }
+
+    auto* charRenderer = renderer_->getCharacterRenderer();
+    const uint32_t charInstanceId = renderer_->getCharacterInstanceId();
+    if (charInstanceId == 0) return;
+    charRenderer->detachWeapon(charInstanceId, kAttachRightHand);
+    const uint32_t modelId = entitySpawner_->allocateWeaponModelId();
+    if (charRenderer->attachWeapon(charInstanceId, kAttachRightHand, poleModel,
+                                   modelId, texturePath)) {
+        showingFishingPole_ = true;
+        showingRanged_ = false;
+        if (renderer_->getAnimationController())
+            renderer_->getAnimationController()->setRangedWeaponActive(false);
+        LOG_INFO("Fishing pole attached at right hand: ", m2Path);
+    } else {
         loadEquippedWeapons();
     }
 }

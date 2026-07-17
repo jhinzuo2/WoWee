@@ -57,6 +57,9 @@ private:
     /// Clear stuck movement state on player
     void clearStuckMovement();
 
+    /// Dismount and remove the local mount before an unstuck teleport.
+    void clearMountForUnstuck();
+
     /// Sync teleported render position to server
     void syncTeleportedPositionToServer(const glm::vec3& renderPos);
 

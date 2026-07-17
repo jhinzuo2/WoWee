@@ -32,9 +32,10 @@ void TransportAnimator::evaluateAndApply(
     // overshoot without touching the keyframe values themselves. Z has its own
     // clampZOffset() below for the same underlying spline behavior.
     bool xyClamped = false;
+    // Populated for tram entries below; also decides the 176085 mirror.
+    glm::vec3 keyMin(std::numeric_limits<float>::max());
+    glm::vec3 keyMax(std::numeric_limits<float>::lowest());
     if (TransportManager::isDeeprunTramTransport(transport) && !spline.keys().empty()) {
-        glm::vec3 keyMin(std::numeric_limits<float>::max());
-        glm::vec3 keyMax(std::numeric_limits<float>::lowest());
         for (const auto& key : spline.keys()) {
             keyMin = glm::min(keyMin, key.position);
             keyMax = glm::max(keyMax, key.position);
@@ -61,7 +62,12 @@ void TransportAnimator::evaluateAndApply(
     // this one entry's local path back into the same real-world direction as its
     // siblings, without needing a general per-transport reverse/mirror flag for what's
     // so far a single-entry data quirk.
-    if (transport.entry == 176085u) {
+    // Only mirror when this entry's data actually uses the negative-X
+    // convention (vanilla/TBC). WotLK's re-export gives 176085 the same
+    // positive-X frame as its siblings (after the loader's Y-major rotation),
+    // so an unconditional entry check would drive it off-tunnel there.
+    const bool tramMirroredData = keyMin.x < -100.0f && keyMax.x < 100.0f;
+    if (transport.entry == 176085u && tramMirroredData) {
         pathOffset.x = -pathOffset.x;
     }
 
@@ -96,7 +102,7 @@ void TransportAnimator::evaluateAndApply(
         glm::vec3 tangent = result.tangent;
         // Mirror the tangent's X to match the position mirror above, so facing
         // direction stays consistent with this entry's (corrected) direction of travel.
-        if (transport.entry == 176085u) {
+        if (transport.entry == 176085u && tramMirroredData) {
             tangent.x = -tangent.x;
         }
         // orientationFromTangent orients along the full 3D tangent, pitching/banking to

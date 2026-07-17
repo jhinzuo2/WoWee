@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <array>
+#include <chrono>
 #include <optional>
 #include <future>
 #include <mutex>
@@ -104,8 +105,10 @@ public:
     std::string getGameObjectModelPathForDisplayId(uint32_t displayId) const;
     audio::VoiceType detectVoiceTypeFromDisplayId(uint32_t displayId) const;
 
-    // Weapon attachment for NPC virtual weapons
-    bool tryAttachCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId);
+    // Attempts one deferred attachment and owns retry bookkeeping. Returns true
+    // only when this call consumed the caller's per-frame attachment budget.
+    bool retryCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId,
+                                     uint8_t maxAttempts);
 
     // Mount
     void setMountDisplayId(uint32_t displayId) { pendingMountDisplayId_ = displayId; }
@@ -145,6 +148,7 @@ public:
     std::unordered_map<uint64_t, uint32_t>& getCreatureInstances() { return creatureInstances_; }
     const std::unordered_map<uint64_t, uint32_t>& getCreatureInstances() const { return creatureInstances_; }
     std::unordered_map<uint64_t, uint32_t>& getCreatureModelIds() { return creatureModelIds_; }
+    const std::unordered_map<uint64_t, uint32_t>& getCreatureDisplayIds() const { return creatureDisplayIds_; }
     std::unordered_map<uint64_t, glm::vec3>& getCreatureRenderPosCache() { return creatureRenderPosCache_; }
     std::unordered_map<uint64_t, bool>& getCreatureWasMoving() { return creatureWasMoving_; }
     std::unordered_map<uint64_t, bool>& getCreatureWasSwimming() { return creatureWasSwimming_; }
@@ -153,8 +157,7 @@ public:
     std::unordered_map<uint64_t, bool>& getCreatureSwimmingState() { return creatureSwimmingState_; }
     std::unordered_map<uint64_t, bool>& getCreatureWalkingState() { return creatureWalkingState_; }
     std::unordered_map<uint64_t, bool>& getCreatureFlyingState() { return creatureFlyingState_; }
-    std::unordered_set<uint64_t>& getCreatureWeaponsAttached() { return creatureWeaponsAttached_; }
-    std::unordered_map<uint64_t, uint8_t>& getCreatureWeaponAttachAttempts() { return creatureWeaponAttachAttempts_; }
+    std::unordered_map<uint64_t, uint32_t>& getCreatureActiveEmotes() { return creatureActiveEmotes_; }
     std::unordered_map<uint32_t, bool>& getModelIdIsWolfLike() { return modelIdIsWolfLike_; }
 
     // Player instance accessors (for movement sync in Application::update)
@@ -215,6 +218,7 @@ private:
     // CharFacialHairStyles.dbc: key = (raceId<<16)|(sexId<<8)|variationId → {geoset100, geoset300, geoset200}
     std::unordered_map<uint32_t, FacialHairGeosets> facialHairGeosetMap_;
     bool creatureLookupsBuilt_ = false;
+    bool tryAttachCreatureVirtualWeapons(uint64_t guid, uint32_t instanceId);
 
     // CharSections.dbc lookup cache
     std::unordered_map<uint64_t, std::string> charSectionsCache_;
@@ -233,8 +237,15 @@ private:
     void buildGameObjectDisplayLookups();
 
     // --- Creature instances and tracking ---
+    // Drop the pending-spawn marker for guid unless a queue entry still references it.
+    void erasePendingGuidIfUnqueued(uint64_t guid);
+
     std::unordered_map<uint64_t, uint32_t> creatureInstances_;  // guid → render instanceId
     std::unordered_map<uint64_t, uint32_t> creatureModelIds_;   // guid → loaded modelId
+    std::unordered_map<uint64_t, uint32_t> creatureDisplayIds_; // guid → active displayId
+    // Latest server-requested display, including creatures whose async model load
+    // has not completed yet. This prevents an older queued display from winning.
+    std::unordered_map<uint64_t, uint32_t> requestedCreatureDisplayIds_;
     std::unordered_map<uint64_t, glm::vec3> creatureRenderPosCache_; // guid → last synced render position
     std::unordered_map<uint64_t, bool> creatureWasMoving_;
     std::unordered_map<uint64_t, bool> creatureWasSwimming_;
@@ -243,6 +254,9 @@ private:
     std::unordered_map<uint64_t, bool> creatureSwimmingState_;
     std::unordered_map<uint64_t, bool> creatureWalkingState_;
     std::unordered_map<uint64_t, bool> creatureFlyingState_;
+    // Server waypoint scripts hold work/chop emotes for many seconds. Locomotion
+    // temporarily overrides them, then the idle transition restores this loop.
+    std::unordered_map<uint64_t, uint32_t> creatureActiveEmotes_;
     std::unordered_map<uint64_t, bool> creatureWasStealthed_;
     uint32_t stealthSyncFrameCounter_ = 0;  // throttles syncCreatureStealthVisuals()
     std::unordered_set<uint64_t> creatureWeaponsAttached_;
@@ -312,9 +326,10 @@ private:
     std::deque<PendingCreatureSpawn> pendingCreatureSpawns_;
     static constexpr int MAX_SPAWNS_PER_FRAME = 3;
     static constexpr int MAX_NEW_CREATURE_MODELS_PER_FRAME = 1;
-    static constexpr uint16_t MAX_CREATURE_SPAWN_RETRIES = 300;
+    static constexpr auto CREATURE_SPAWN_RETRY_WINDOW = std::chrono::seconds(5);
     std::unordered_set<uint64_t> pendingCreatureSpawnGuids_;
-    std::unordered_map<uint64_t, uint16_t> creatureSpawnRetryCounts_;
+    std::unordered_map<uint64_t, std::chrono::steady_clock::time_point>
+        creatureSpawnRetryDeadlines_;
     std::unordered_set<uint32_t> nonRenderableCreatureDisplayIds_;
     std::unordered_set<uint64_t> creaturePermanentFailureGuids_;
     void processCreatureSpawnQueue(bool unlimited = false);
@@ -411,6 +426,7 @@ private:
         uint32_t entry = 0;
         uint32_t displayId = 0;
         float x = 0.0f, y = 0.0f, z = 0.0f, orientation = 0.0f;
+        int retryFrames = 0;  // waiting for the GO's render instance to spawn
     };
     std::unordered_map<uint64_t, PendingTransportMove> pendingTransportMoves_;
     std::deque<PendingTransportRegistration> pendingTransportRegistrations_;
@@ -471,7 +487,12 @@ private:
     uint64_t spawnedPlayerGuid_ = 0;
 
     // --- Weapon model ID counter ---
-    uint32_t nextWeaponModelId_ = 1000;
+    // Weapon model ids share CharacterRenderer's models map with NPC
+    // composites, which are keyed by creature displayId (1..~35000). Starting
+    // at 1000 collided with loaded NPC models once enough weapon reloads
+    // advanced the counter — attachWeapon then instanced an NPC mesh as the
+    // weapon. Reserve a range no displayId can reach.
+    uint32_t nextWeaponModelId_ = 0x40000000u;
 
     // --- Spawn internal methods ---
     void spawnOnlineCreature(uint64_t guid, uint32_t displayId,

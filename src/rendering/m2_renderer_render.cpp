@@ -377,6 +377,7 @@ void M2Renderer::update(float deltaTime, const glm::vec3& cameraPos, const glm::
     // This is a tight loop touching only one float per instance — no hash lookups.
     for (auto& instance : instances) {
         instance.animTime += dtMs;
+        instance.globalSequenceTime += dtMs;
     }
     // Wrap animTime for particle-only instances so emission rate tracks keep looping.
     // 3333ms chosen as a safe wrap period: long enough to cover the longest known M2
@@ -1256,7 +1257,7 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     if (hasBatchTexAnim && instanceDataCount_ + groupSize <= MAX_INSTANCE_DATA) {
                         drawOffset = instanceDataCount_;
                         // Hoist per-batch lookups: the transform pointer is fixed for
-                        // every instance in this group; only the interpVec3 result
+                        // every instance in this group; only the sampled translation
                         // varies (per-instance animTime).
                         const pipeline::M2TextureTransform* tt = nullptr;
                         if (batch.textureAnimIndex != 0xFFFF && model.hasTextureAnimation) {
@@ -1273,9 +1274,10 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                             auto& inst = instances[p.instanceIdx];
                             glm::vec2 uvOffset(0.0f);
                             if (tt) {
-                                glm::vec3 trans = interpVec3(tt->translation,
-                                    inst.currentSequenceIndex, inst.animTime,
-                                    glm::vec3(0.0f), model.globalSequenceDurations);
+                                glm::vec3 trans = m2_track::sampleVec3(
+                                    tt->translation, inst.currentSequenceIndex,
+                                    inst.animTime, inst.globalSequenceTime,
+                                    model.globalSequenceDurations, glm::vec3(0.0f));
                                 uvOffset = glm::vec2(trans.x, trans.y);
                             }
                             if (model.isLavaModel && uvOffset == glm::vec2(0.0f)) {
@@ -1484,9 +1486,10 @@ void M2Renderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet, const 
                     uint16_t transformIdx = model.textureTransformLookup[lookupIdx];
                     if (transformIdx < model.textureTransforms.size()) {
                         const auto& tt = model.textureTransforms[transformIdx];
-                        glm::vec3 trans = interpVec3(tt.translation,
-                            instance.currentSequenceIndex, instance.animTime,
-                            glm::vec3(0.0f), model.globalSequenceDurations);
+                        glm::vec3 trans = m2_track::sampleVec3(
+                            tt.translation, instance.currentSequenceIndex,
+                            instance.animTime, instance.globalSequenceTime,
+                            model.globalSequenceDurations, glm::vec3(0.0f));
                         uvOffset = glm::vec2(trans.x, trans.y);
                     }
                 }
@@ -1769,8 +1772,6 @@ void M2Renderer::renderShadow(VkCommandBuffer cmd, const glm::mat4& lightSpaceMa
     if (!shadowPipeline_ || !shadowParamsSet_) return;
     if (instances.empty() || models.empty()) return;
 
-    const float shadowRadiusSq = shadowRadius * shadowRadius;
-
     // Reset this frame slot's texture descriptor pool (safe: fence was waited on in beginFrame)
     const uint32_t frameIdx = vkCtx_->getCurrentFrame();
     VkDescriptorPool curShadowTexPool = shadowTexPool_[frameIdx];
@@ -1849,12 +1850,24 @@ void M2Renderer::renderShadow(VkCommandBuffer cmd, const glm::mat4& lightSpaceMa
             // Use cached flags to skip early without hash lookup
             if (!instance.cachedIsValid || instance.cachedIsSmoke || instance.cachedIsInvisibleTrap) continue;
 
-            // Distance cull against shadow frustum
-            glm::vec3 diff = instance.position - shadowCenter;
-            if (glm::dot(diff, diff) > shadowRadiusSq) continue;
-
             if (!instance.cachedModel) continue;
             const M2ModelGPU& model = *instance.cachedModel;
+
+            // Cull casters against the light-space ortho footprint, not a
+            // world-space sphere around the player. The shadow frustum extends
+            // ~2000 units toward the sun, so a distant tree can legitimately
+            // cast across the whole view while sitting far outside any player
+            // sphere — sphere culling made such shadows pop on/off at the cull
+            // boundary as the player moved (large-area flicker at low sun).
+            {
+                const glm::vec4 clip = lightSpaceMatrix * glm::vec4(instance.position, 1.0f);
+                // Orthographic projection: w == 1, NDC directly comparable.
+                // Inflate by the model's bounding sphere converted to NDC
+                // (shadowRadius ≈ frustum half-extent; overshoot is harmless).
+                const float margin = (model.boundRadius * instance.scale) / shadowRadius * 1.5f;
+                if (std::abs(clip.x) > 1.0f + margin || std::abs(clip.y) > 1.0f + margin) continue;
+                if (clip.z < -margin || clip.z > 1.0f + margin) continue;
+            }
 
             // Filter: only draw foliage models in foliage pass, non-foliage in non-foliage pass
             if (model.shadowWindFoliage != foliagePass) continue;

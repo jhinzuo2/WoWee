@@ -451,8 +451,9 @@ void MovementHandler::sendMovement(Opcode opcode) {
                                static_cast<uint32_t>(MovementFlags::STRAFE_RIGHT);
     const bool wasMoving = (movementInfo.flags & kMoveMask) != 0;
 
-    // Cancel any timed (non-channeled) cast the moment the player starts moving.
-    if (owner_.isCasting() && !owner_.isChanneling()) {
+    // Cancel any timed non-channel cast, plus food/water restoration, the moment
+    // the player starts moving. Other channels retain their normal behavior.
+    if (owner_.isCasting() && (!owner_.isChanneling() || owner_.isRestoring())) {
         const bool isPositionalMove =
             opcode == Opcode::MSG_MOVE_START_FORWARD  ||
             opcode == Opcode::MSG_MOVE_START_BACKWARD ||
@@ -791,12 +792,19 @@ void MovementHandler::forceClearTaxiAndMovementState() {
     taxiStartGrace_ = 0.0f;
     onTaxiFlight_ = false;
 
-    if (taxiMountActive_ && owner_.mountCallbackRef()) {
+    const bool clearingTaxiMount = taxiMountActive_;
+    if (clearingTaxiMount && owner_.mountCallbackRef()) {
         owner_.mountCallbackRef()(0);
     }
     taxiMountActive_ = false;
     taxiMountDisplayId_ = 0;
-    owner_.currentMountDisplayIdRef() = 0;
+    // A normal mount is owned by its aura/update-field path. Do not silently
+    // zero it here without firing the mount callback: that leaves the rendered
+    // mount behind and reconciliation spawns a duplicate. Unstuck explicitly
+    // dismounts normal mounts before calling this movement reset.
+    if (clearingTaxiMount) {
+        owner_.currentMountDisplayIdRef() = 0;
+    }
     owner_.vehicleIdRef() = 0;
     // Death/resurrect state is intentionally NOT cleared here.
     // Previously this method reset 10 death-related fields despite being named
@@ -3022,6 +3030,35 @@ void MovementHandler::checkAreaTriggers() {
     const float checkedPy = movementInfo.y;
     const float checkedPz = movementInfo.z;
 
+    // Swept-path samples: also test points between the previous check position
+    // and the current one, so fast (mounted) movement cannot step across a
+    // small portal box between 0.25s polls — the Deeprun entrance trigger only
+    // fired intermittently when ridden into at mount speed.
+    glm::vec3 sweepSamples[10];
+    int sweepCount = 0;
+    {
+        const glm::vec3 cur(checkedPx, checkedPy, checkedPz);
+        const bool sameMap = lastAreaTriggerCheckValid_ &&
+                             lastAreaTriggerCheckMapId_ == owner_.currentMapIdRef();
+        if (sameMap) {
+            const glm::vec3 d = cur - lastAreaTriggerCheckPos_;
+            const float movedSq = d.x * d.x + d.y * d.y + d.z * d.z;
+            // Skip sweep on teleport-sized jumps; only bridge normal movement.
+            if (movedSq > 1.0f && movedSq < 50.0f * 50.0f) {
+                const float moved = std::sqrt(movedSq);
+                const int steps = std::min(8, static_cast<int>(moved));
+                for (int s = 1; s <= steps; ++s) {
+                    const float t = static_cast<float>(s) / static_cast<float>(steps + 1);
+                    sweepSamples[sweepCount++] = lastAreaTriggerCheckPos_ + d * t;
+                }
+            }
+        }
+        sweepSamples[sweepCount++] = cur;
+        lastAreaTriggerCheckPos_ = cur;
+        lastAreaTriggerCheckMapId_ = owner_.currentMapIdRef();
+        lastAreaTriggerCheckValid_ = true;
+    }
+
     // Time-based cooldown after teleport/world entry — suppress ALL trigger
     // firing (not just the first check) to prevent re-entry from immediately
     // sending us to a wrong destination.
@@ -3037,35 +3074,39 @@ void MovementHandler::checkAreaTriggers() {
     for (const auto& at : owner_.areaTriggersRef()) {
         if (at.mapId != owner_.currentMapIdRef()) continue;
 
+        auto insideTrigger = [&at](float qx, float qy, float qz) -> bool {
+            if (at.radius > 0.0f) {
+                // Sphere trigger — use actual DBC radius
+                float dx = qx - at.x;
+                float dy = qy - at.y;
+                float dz = qz - at.z;
+                float distSq = dx * dx + dy * dy + dz * dz;
+                return distSq <= at.radius * at.radius;
+            }
+            if (at.boxLength > 0.0f || at.boxWidth > 0.0f || at.boxHeight > 0.0f) {
+                // Box trigger. AreaTrigger.dbc stores box axes in server-space
+                // X/Y. The trigger center is cached in canonical space, so swap
+                // deltas back to server-space before applying length/width/yaw.
+                float serverDx = qy - at.y;
+                float serverDy = qx - at.x;
+                float dz = qz - at.z;
+
+                // Rotate into box-local space
+                float cosYaw = std::cos(-at.boxYaw);
+                float sinYaw = std::sin(-at.boxYaw);
+                float localX = serverDx * cosYaw - serverDy * sinYaw;
+                float localY = serverDx * sinYaw + serverDy * cosYaw;
+
+                return std::abs(localX) <= at.boxLength * 0.5f &&
+                       std::abs(localY) <= at.boxWidth * 0.5f &&
+                       std::abs(dz) <= at.boxHeight * 0.5f;
+            }
+            return false;
+        };
+
         bool inside = false;
-        if (at.radius > 0.0f) {
-            // Sphere trigger — use actual DBC radius
-            float dx = checkedPx - at.x;
-            float dy = checkedPy - at.y;
-            float dz = checkedPz - at.z;
-            float distSq = dx * dx + dy * dy + dz * dz;
-            inside = (distSq <= at.radius * at.radius);
-        } else if (at.boxLength > 0.0f || at.boxWidth > 0.0f || at.boxHeight > 0.0f) {
-            // Box trigger. AreaTrigger.dbc stores box axes in server-space
-            // X/Y. The trigger center is cached in canonical space, so swap
-            // deltas back to server-space before applying length/width/yaw.
-            float effLength = at.boxLength;
-            float effWidth = at.boxWidth;
-            float effHeight = at.boxHeight;
-
-            float serverDx = checkedPy - at.y;
-            float serverDy = checkedPx - at.x;
-            float dz = checkedPz - at.z;
-
-            // Rotate into box-local space
-            float cosYaw = std::cos(-at.boxYaw);
-            float sinYaw = std::sin(-at.boxYaw);
-            float localX = serverDx * cosYaw - serverDy * sinYaw;
-            float localY = serverDx * sinYaw + serverDy * cosYaw;
-
-            inside = (std::abs(localX) <= effLength * 0.5f &&
-                      std::abs(localY) <= effWidth * 0.5f &&
-                      std::abs(dz) <= effHeight * 0.5f);
+        for (int s = 0; s < sweepCount && !inside; ++s) {
+            inside = insideTrigger(sweepSamples[s].x, sweepSamples[s].y, sweepSamples[s].z);
         }
 
         if (inside) {

@@ -151,6 +151,7 @@ public:
     bool isDescending() const { return wasDescending_; }
     void setHoverActive(bool active) { hoverActive_ = active; }
     void setMounted(bool m) { mounted_ = m; }
+    void setIntoxication(float amount) { intoxication_ = std::clamp(amount, 0.0f, 1.0f); }
     void setMountHeightOffset(float offset) { mountHeightOffset_ = offset; }
     void setExternalFollow(bool enabled) { externalFollow_ = enabled; }
     void setExternalMoving(bool moving) { externalMoving_ = moving; }
@@ -259,6 +260,8 @@ private:
     static constexpr float CROUCH_EYE_HEIGHT = 0.6f; // Crouching eye height
     float eyeHeight = STAND_EYE_HEIGHT;
     float lastGroundZ = 0.0f;  // Last known ground height (fallback when no terrain)
+    glm::vec3 lastGroundedPos_{0.0f};  // Last position that had ground under it (void recovery)
+    bool hasLastGroundedPos_ = false;
     static constexpr float GRAVITY = -30.0f;
     static constexpr float JUMP_VELOCITY = 15.0f;
     float jumpBufferTimer = 0.0f;   // Time since space was pressed
@@ -460,6 +463,10 @@ private:
     float shakeDuration_  = 0.0f;
     float shakeMagnitude_ = 0.0f;
     float shakeFrequency_ = 0.0f;
+
+    // Server-authored drunkenness (0 sober, 1 smashed).
+    float intoxication_ = 0.0f;
+    float intoxicationTime_ = 0.0f;
 };
 
 } // namespace rendering

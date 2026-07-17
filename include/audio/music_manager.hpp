@@ -3,6 +3,7 @@
 #include <string>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <vector>
@@ -46,12 +47,13 @@ private:
     // The read happens on a worker; update() hands the bytes to the AudioEngine once
     // they land, keeping every miniaudio call on the main thread.
     struct PendingFileLoad {
-        std::future<std::vector<uint8_t>> future;
+        std::future<std::shared_ptr<const std::vector<uint8_t>>> future;
         std::string path;
         bool loop = true;
         float fadeInMs = 0.0f;
     };
     std::optional<PendingFileLoad> pendingFileLoad_;
+    void cancelPendingFileLoad();
     void pollPendingFileLoad();
 
     pipeline::AssetManager* assetManager = nullptr;
@@ -77,7 +79,7 @@ private:
     float fadeOutDuration = 0.0f;
     float fadeOutStartVolume = 0.0f;
 
-    std::unordered_map<std::string, std::vector<uint8_t>> musicDataCache_;
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<uint8_t>>> musicDataCache_;
 };
 
 } // namespace audio

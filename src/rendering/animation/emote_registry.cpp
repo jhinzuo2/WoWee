@@ -114,6 +114,12 @@ static std::unordered_map<uint32_t, uint32_t> makeFallbackEmotesIdMap() {
     };
 }
 
+// Emotes.dbc IDs with EmoteSpecProc != 0 (persistent STATE_ emotes) that appear
+// in the fallback map above. Used only when Emotes.dbc is unavailable.
+static std::unordered_set<uint32_t> makeFallbackStateEmoteIds() {
+    return {10, 12, 13, 26, 28, 64, 65, 68, 69, 173, 213, 214, 233, 234, 379, 383};
+}
+
 static std::string replacePlaceholders(const std::string& text, const std::string* targetName) {
     if (text.empty()) return text;
     std::string out;
@@ -170,12 +176,20 @@ void EmoteRegistry::loadFromDbc() {
 
     std::unordered_map<uint32_t, uint32_t> emoteIdToAnim;
     animByEmotesId_.clear();
+    stateEmoteIds_.clear();
     if (auto emotesDbc = assetManager->loadDBC("Emotes.dbc"); emotesDbc && emotesDbc->isLoaded()) {
         emoteIdToAnim.reserve(emotesDbc->getRecordCount());
         animByEmotesId_.reserve(emotesDbc->getRecordCount());
+        // EmoteSpecProc: 0 = one-shot, 1 = stand-state change, 2 = looping state
+        // anim. Column 4 in every expansion's Emotes.dbc.
+        uint32_t specField = emL ? (*emL)["EmoteSpecProc"] : 4;
+        if (specField == 0xFFFFFFFF) specField = 4;
         for (uint32_t r = 0; r < emotesDbc->getRecordCount(); ++r) {
             uint32_t emoteId = emotesDbc->getUInt32(r, emL ? (*emL)["ID"] : 0);
             uint32_t animId = emotesDbc->getUInt32(r, emL ? (*emL)["AnimID"] : 2);
+            if (emotesDbc->getUInt32(r, specField) != 0) {
+                stateEmoteIds_.insert(emoteId);
+            }
             if (animId != 0) {
                 emoteIdToAnim[emoteId] = animId;
                 animByEmotesId_[emoteId] = animId;
@@ -260,6 +274,7 @@ void EmoteRegistry::loadFromDbc() {
     }
     if (animByEmotesId_.empty()) {
         animByEmotesId_ = makeFallbackEmotesIdMap();
+        stateEmoteIds_ = makeFallbackStateEmoteIds();
     }
 
     buildDbcIdIndex();
@@ -268,6 +283,7 @@ void EmoteRegistry::loadFromDbc() {
 void EmoteRegistry::loadFallbackEmotes() {
     if (!emoteTable_.empty()) return;
     animByEmotesId_ = makeFallbackEmotesIdMap();
+    stateEmoteIds_ = makeFallbackStateEmoteIds();
     emoteTable_ = {
         {"wave",    {anim::EMOTE_WAVE,    0, false, "You wave.", "You wave at %s.", "%s waves.", "%s waves at %s.", "wave"}},
         {"bow",     {anim::EMOTE_BOW,     0, false, "You bow down graciously.", "You bow down before %s.", "%s bows down graciously.", "%s bows down before %s.", "bow"}},
@@ -326,6 +342,10 @@ uint32_t EmoteRegistry::animByDbcId(uint32_t dbcId) const {
 uint32_t EmoteRegistry::animByEmotesId(uint32_t emoteId) const {
     auto it = animByEmotesId_.find(emoteId);
     return it != animByEmotesId_.end() ? it->second : 0;
+}
+
+bool EmoteRegistry::isStateEmote(uint32_t emoteId) const {
+    return stateEmoteIds_.count(emoteId) != 0;
 }
 
 uint32_t EmoteRegistry::getStateVariant(uint32_t oneShotAnimId) const {

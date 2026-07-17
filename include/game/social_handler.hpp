@@ -232,7 +232,8 @@ public:
     void toggleHelm();
     void toggleCloak();
     void setStandState(uint8_t standState);
-    void sendAlterAppearance(uint32_t hairStyle, uint32_t hairColor, uint32_t facialHair);
+    void sendAlterAppearance(uint32_t hairStyleEntry, uint32_t hairColor,
+                             uint32_t facialHairEntry, uint32_t skinColorEntry);
     void deleteGmTicket();
     void requestGmTicket();
 

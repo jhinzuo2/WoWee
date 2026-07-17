@@ -74,6 +74,9 @@ public:
                                            const std::string* targetName = nullptr);
     static uint32_t getEmoteAnimByDbcId(uint32_t dbcId);
     static uint32_t getEmoteAnimByEmotesId(uint32_t emoteId);
+    /// True if the Emotes.dbc entry is a persistent STATE_ emote (loops until
+    /// cleared) rather than a one-shot.
+    static bool isStateEmoteById(uint32_t emoteId);
 
     // ── Targeting / combat ─────────────────────────────────────────────────
     void setTargetPosition(const glm::vec3* pos);
@@ -116,6 +119,7 @@ public:
                         uint32_t finalizeAnimId = 0);
     /// Leave spell cast animation state → plays finalization anim then idle.
     void stopSpellCast();
+    void setSeatedLoopAnimation(uint32_t animationId);
 
     // ── Loot animation ─────────────────────────────────────────────────────
     void startLooting();

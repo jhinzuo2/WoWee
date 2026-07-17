@@ -15,6 +15,7 @@
  * the original WoW Model Viewer (charcontrol.h, REGION_FAC=2).
  */
 #include "rendering/character_renderer.hpp"
+#include "rendering/m2_track_sampler.hpp"
 #include "rendering/animation/animation_ids.hpp"
 #include "core/thread_pool.hpp"
 #include "rendering/vk_context.hpp"
@@ -184,6 +185,23 @@ static bool sceneDiagEnabled() {
         return v && v[0] != '\0' && v[0] != '0';
     }();
     return enabled;
+}
+
+// Evaluate a batch's M2 color-alpha track at the given animation sequence/time.
+// Returns 1.0 when the batch has no color slot or the track has no usable data.
+// Global-sequence-timed tracks are not culled (they run on a different clock and
+// typically drive pulsing glows, not visibility gating).
+static float evalBatchColorAlpha(const pipeline::M2Model& model,
+                                 const pipeline::M2Batch& batch,
+                                 int sequenceIndex, float animationTimeMs,
+                                 float globalTimeMs) {
+    if (batch.colorIndex == 0xFFFF ||
+        batch.colorIndex >= model.colorAlphaTracks.size()) {
+        return 1.0f;
+    }
+    return m2_track::sampleFloat(model.colorAlphaTracks[batch.colorIndex],
+                                 sequenceIndex, animationTimeMs, globalTimeMs,
+                                 model.globalSequenceDurations, 1.0f);
 }
 
 // CharMaterial UBO layout (matches character.frag.glsl set=1 binding=1)
@@ -1802,7 +1820,8 @@ uint32_t CharacterRenderer::createInstance(uint32_t modelId, const glm::vec3& po
     return id;
 }
 
-void CharacterRenderer::playAnimation(uint32_t instanceId, uint32_t animationId, bool loop) {
+void CharacterRenderer::playAnimation(uint32_t instanceId, uint32_t animationId, bool loop,
+                                      uint32_t oneShotReturnAnim) {
     auto it = instances.find(instanceId);
     if (it == instances.end()) {
         core::Logger::getInstance().warning("Cannot play animation: instance ", instanceId, " not found");
@@ -1811,6 +1830,7 @@ void CharacterRenderer::playAnimation(uint32_t instanceId, uint32_t animationId,
 
     auto& instance = it->second;
     auto& model = models[instance.modelId].data;
+    instance.oneShotReturnAnim = loop ? 0 : oneShotReturnAnim;
 
     // Track death state for preventing movement while dead
     if (animationId == 1) {
@@ -1925,9 +1945,12 @@ void CharacterRenderer::update(float deltaTime, const glm::vec3& cameraPos) {
                         inst.animationTime -= static_cast<float>(seq.duration);
                     }
                 } else {
-                    // One-shot animation finished: return to Stand unless dead
+                    // One-shot animation finished: return to the caller-specified
+                    // resume anim (NPC state emote) or Stand, unless dead
                     if (inst.currentAnimationId != anim::DEATH) {
-                        playAnimation(pair.first, anim::STAND, true);
+                        const uint32_t resumeAnim =
+                            inst.oneShotReturnAnim != 0 ? inst.oneShotReturnAnim : anim::STAND;
+                        playAnimation(pair.first, resumeAnim, true);
                     } else {
                         // Stay on last frame of death
                         inst.animationTime = static_cast<float>(seq.duration);
@@ -2136,110 +2159,6 @@ void CharacterRenderer::updateAnimation(CharacterInstance& instance, float delta
     calculateBoneMatrices(instance);
 }
 
-// --- Keyframe interpolation helpers ---
-
-int CharacterRenderer::findKeyframeIndex(const std::vector<uint32_t>& timestamps, float time) {
-    if (timestamps.empty()) return -1;
-    if (timestamps.size() == 1) return 0;
-
-    // Binary search using float comparison to match original semantics exactly
-    auto it = std::upper_bound(timestamps.begin(), timestamps.end(), time,
-        [](float t, uint32_t ts) { return t < static_cast<float>(ts); });
-    if (it == timestamps.begin()) return 0;
-    size_t idx = static_cast<size_t>(it - timestamps.begin()) - 1;
-    return static_cast<int>(std::min(idx, timestamps.size() - 2));
-}
-
-// Resolve sequence index and time for a track, handling global sequences.
-// globalSeqTime is a separate accumulating timer that is NOT wrapped at the
-// current animation's sequence duration, so global sequences get full range.
-static void resolveTrackTime(const pipeline::M2AnimationTrack& track,
-                              int seqIdx, float animTime, float globalSeqTime,
-                              const std::vector<uint32_t>& globalSeqDurations,
-                              int& outSeqIdx, float& outTime) {
-    if (track.globalSequence >= 0 &&
-        static_cast<size_t>(track.globalSequence) < globalSeqDurations.size()) {
-        outSeqIdx = 0;
-        float dur = static_cast<float>(globalSeqDurations[track.globalSequence]);
-        if (dur > 0.0f) {
-            outTime = std::fmod(globalSeqTime, dur);
-            if (outTime < 0.0f) outTime += dur;
-        } else {
-            outTime = 0.0f;
-        }
-    } else {
-        outSeqIdx = seqIdx;
-        outTime = animTime;
-    }
-}
-
-glm::vec3 CharacterRenderer::interpolateVec3(const pipeline::M2AnimationTrack& track,
-                                              int seqIdx, float time, const glm::vec3& defaultVal) {
-    if (!track.hasData()) return defaultVal;
-    if (seqIdx < 0 || seqIdx >= static_cast<int>(track.sequences.size())) return defaultVal;
-
-    const auto& keys = track.sequences[seqIdx];
-    if (keys.timestamps.empty() || keys.vec3Values.empty()) return defaultVal;
-
-    auto safeVec3 = [&](const glm::vec3& v) -> glm::vec3 {
-        if (std::isnan(v.x) || std::isnan(v.y) || std::isnan(v.z)) return defaultVal;
-        return v;
-    };
-
-    if (keys.vec3Values.size() == 1) return safeVec3(keys.vec3Values[0]);
-
-    int idx = findKeyframeIndex(keys.timestamps, time);
-    if (idx < 0) return defaultVal;
-
-    size_t i0 = static_cast<size_t>(idx);
-    size_t i1 = std::min(i0 + 1, keys.vec3Values.size() - 1);
-
-    if (i0 == i1) return safeVec3(keys.vec3Values[i0]);
-
-    float t0 = static_cast<float>(keys.timestamps[i0]);
-    float t1 = static_cast<float>(keys.timestamps[i1]);
-    float duration = t1 - t0;
-    float t = (duration > 0.0f) ? glm::clamp((time - t0) / duration, 0.0f, 1.0f) : 0.0f;
-
-    return safeVec3(glm::mix(keys.vec3Values[i0], keys.vec3Values[i1], t));
-}
-
-glm::quat CharacterRenderer::interpolateQuat(const pipeline::M2AnimationTrack& track,
-                                              int seqIdx, float time) {
-    glm::quat identity(1.0f, 0.0f, 0.0f, 0.0f);
-    if (!track.hasData()) return identity;
-    if (seqIdx < 0 || seqIdx >= static_cast<int>(track.sequences.size())) return identity;
-
-    const auto& keys = track.sequences[seqIdx];
-    if (keys.timestamps.empty() || keys.quatValues.empty()) return identity;
-
-    auto safeQuat = [&](const glm::quat& q) -> glm::quat {
-        float lenSq = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
-        if (lenSq < 0.000001f || std::isnan(lenSq)) return identity;
-        return q;
-    };
-
-    if (keys.quatValues.size() == 1) return safeQuat(keys.quatValues[0]);
-
-    int idx = findKeyframeIndex(keys.timestamps, time);
-    if (idx < 0) return identity;
-
-    size_t i0 = static_cast<size_t>(idx);
-    size_t i1 = std::min(i0 + 1, keys.quatValues.size() - 1);
-
-    if (i0 == i1) return safeQuat(keys.quatValues[i0]);
-
-    glm::quat q0 = safeQuat(keys.quatValues[i0]);
-    glm::quat q1 = safeQuat(keys.quatValues[i1]);
-
-    float t0 = static_cast<float>(keys.timestamps[i0]);
-    float t1 = static_cast<float>(keys.timestamps[i1]);
-    float duration = t1 - t0;
-    float t = (duration > 0.0f) ? glm::clamp((time - t0) / duration, 0.0f, 1.0f) : 0.0f;
-
-    return glm::slerp(q0, q1, t);
-}
-
 // --- Bone transform calculation ---
 
 constexpr int32_t kKeyBoneSpineLow = 4;
@@ -2322,15 +2241,15 @@ glm::mat4 CharacterRenderer::getBoneTransform(const pipeline::M2Bone& bone, floa
     // Resolve global sequences: bones with globalSequence >= 0 use sequence 0
     // with time wrapped at the global sequence duration, independent of the
     // character's current animation.
-    int tSeq, rSeq, sSeq;
-    float tTime, rTime, sTime;
-    resolveTrackTime(bone.translation, sequenceIndex, animTime, globalSeqTime, globalSeqDurations, tSeq, tTime);
-    resolveTrackTime(bone.rotation, sequenceIndex, animTime, globalSeqTime, globalSeqDurations, rSeq, rTime);
-    resolveTrackTime(bone.scale, sequenceIndex, animTime, globalSeqTime, globalSeqDurations, sSeq, sTime);
-
-    glm::vec3 translation = interpolateVec3(bone.translation, tSeq, tTime, glm::vec3(0.0f));
-    glm::quat rotation = interpolateQuat(bone.rotation, rSeq, rTime);
-    glm::vec3 scale = interpolateVec3(bone.scale, sSeq, sTime, glm::vec3(1.0f));
+    glm::vec3 translation = m2_track::sampleVec3(
+        bone.translation, sequenceIndex, animTime, globalSeqTime,
+        globalSeqDurations, glm::vec3(0.0f));
+    glm::quat rotation = m2_track::sampleQuat(
+        bone.rotation, sequenceIndex, animTime, globalSeqTime,
+        globalSeqDurations);
+    glm::vec3 scale = m2_track::sampleVec3(
+        bone.scale, sequenceIndex, animTime, globalSeqTime,
+        globalSeqDurations, glm::vec3(1.0f));
 
     // M2 bone transform: T(pivot) * T(trans) * R(rot) * S(scale) * T(-pivot).
     // Build directly instead of chaining glm::translate/rotate/scale (each of
@@ -2697,6 +2616,20 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                     uint16_t grp = batch.submeshId / 100;
                     if (grp == 17 || grp == 18) continue;
                 }
+                // M2 color-alpha animation gates prop submeshes per animation —
+                // e.g. the peasant lumberjack carry model has two wood-bundle
+                // submeshes and only one is alpha-1 in any given animation.
+                // Opaque batches can't express alpha in the shader, so cull
+                // batches whose track evaluates to ~0 for the current sequence.
+                const float batchColorAlpha = glm::clamp(
+                    evalBatchColorAlpha(gpuModel.data, batch,
+                                        instance.currentSequenceIndex,
+                                        instance.animationTime,
+                                        instance.globalSequenceTime),
+                    0.0f, 1.0f);
+                if (batchColorAlpha <= 0.01f) {
+                    continue;
+                }
                 // Resolve texture for this batch (prefer hair textures for hair geosets).
                 VkTexture* texPtr = resolveBatchTexture(instance, gpuModel, batch);
                 const uint16_t batchGroup = static_cast<uint16_t>(batch.submeshId / 100);
@@ -2797,7 +2730,7 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
                     // declare Mod/alpha blending, which would composite that black
                     // background as an opaque quad — force additive so only the light adds.
                     desiredPipeline = additivePipeline_;
-                } else if (instance.opacity < 0.999f) {
+                } else if (instance.opacity * batchColorAlpha < 0.999f) {
                     // Whole-instance fade (ghost form, spawn fade-in): the opaque and
                     // alpha-test pipelines have blending disabled, so the shader's
                     // texColor.a * opacity output is discarded and only hair (via
@@ -2856,7 +2789,7 @@ void CharacterRenderer::render(VkCommandBuffer cmd, VkDescriptorSet perFrameSet,
 
                 // Create per-batch material UBO
                 CharMaterialUBO matData{};
-                matData.opacity = instance.opacity;
+                matData.opacity = instance.opacity * batchColorAlpha;
                 matData.alphaTest = blendNeedsCutout ? 1 : 0;
                 matData.colorKeyBlack = colorKeyBlack ? 1 : 0;
                 matData.unlit = unlit ? 1 : 0;
@@ -3516,11 +3449,18 @@ void CharacterRenderer::removeInstance(uint32_t instanceId) {
              " remaining=", instances.size() - 1,
              " override=", (void*)renderPassOverride_);
 
-    // Remove child attachments first (helmets/weapons), otherwise they leak as
-    // orphan render instances when the parent creature despawns.
+    // Remove child attachments first (helmets/weapons/enchant effects),
+    // otherwise they leak as orphan render instances when the parent creature
+    // despawns. Their models get a fresh id per attach, so unload those too
+    // once the instances are gone.
     auto attachments = it->second.weaponAttachments;
     for (const auto& wa : attachments) {
+        for (const auto& fx : wa.effects) removeInstance(fx.effectInstanceId);
         removeInstance(wa.weaponInstanceId);
+    }
+    for (const auto& wa : attachments) {
+        unloadModelIfUnused(wa.weaponModelId);
+        for (const auto& fx : wa.effects) unloadModelIfUnused(fx.effectModelId);
     }
 
     // Defer bone buffer destruction — in-flight command buffers may still
@@ -3797,14 +3737,32 @@ void CharacterRenderer::detachWeapon(uint32_t charInstanceId, uint32_t attachmen
 
     for (auto it = attachments.begin(); it != attachments.end(); ++it) {
         if (it->attachmentId == attachmentId) {
-            for (const auto& fx : it->effects) removeInstance(fx.effectInstanceId);
+            // Collect model ids before erasing the attachment, then unload the
+            // ones no instance still uses (each attach allocates a fresh id).
+            std::vector<uint32_t> modelIds;
+            modelIds.push_back(it->weaponModelId);
+            for (const auto& fx : it->effects) {
+                removeInstance(fx.effectInstanceId);
+                modelIds.push_back(fx.effectModelId);
+            }
             removeInstance(it->weaponInstanceId);
             attachments.erase(it);
+            for (uint32_t mid : modelIds) unloadModelIfUnused(mid);
             core::Logger::getInstance().info("Detached weapon from instance ", charInstanceId,
                 " attachment ", attachmentId);
             return;
         }
     }
+}
+
+void CharacterRenderer::unloadModelIfUnused(uint32_t modelId) {
+    auto modelIt = models.find(modelId);
+    if (modelIt == models.end()) return;
+    for (const auto& p : instances) {
+        if (p.second.modelId == modelId) return;
+    }
+    destroyModelGPU(modelIt->second, /*defer=*/true);
+    models.erase(modelIt);
 }
 
 bool CharacterRenderer::attachWeaponEffect(uint32_t charInstanceId, uint32_t attachmentId,

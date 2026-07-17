@@ -57,6 +57,18 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
         it = asyncCreatureLoads_.erase(it);
         asyncCreatureDisplayLoads_.erase(result.displayId);
 
+        auto requested = requestedCreatureDisplayIds_.find(result.guid);
+        if (requested == requestedCreatureDisplayIds_.end() ||
+            requested->second != result.displayId) {
+            // A VALUES update changed the display while this model was loading.
+            // The replacement request is already queued; never instantiate stale
+            // geometry (notably the lumberjack's log-carrying model while chopping).
+            // Release the pending marker unless a replacement queue entry still
+            // holds it — a stranded marker blocks the resync sweep forever.
+            erasePendingGuidIfUnqueued(result.guid);
+            continue;
+        }
+
         // Failures and cache hits need no GPU work — process them even when the
         // upload budget is exhausted. Previously the budget check was above this
         // point, blocking ALL ready futures (including zero-cost ones) after a
@@ -65,12 +77,12 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
             nonRenderableCreatureDisplayIds_.insert(result.displayId);
             creaturePermanentFailureGuids_.insert(result.guid);
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             continue;
         }
         if (!result.valid || !result.model) {
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             continue;
         }
 
@@ -78,7 +90,7 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
         // task was still running; in that case, skip duplicate GPU upload.
         if (displayIdModelCache_.find(result.displayId) != displayIdModelCache_.end()) {
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             if (!creatureInstances_.count(result.guid) &&
                 !creaturePermanentFailureGuids_.count(result.guid)) {
                 PendingCreatureSpawn s{};
@@ -100,7 +112,7 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
             // Re-queue this result — it needs a GPU upload but we're at budget.
             // Push a new pending spawn so it's retried next frame.
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             PendingCreatureSpawn s{};
             s.guid = result.guid;
             s.displayId = result.displayId;
@@ -132,7 +144,7 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
             nonRenderableCreatureDisplayIds_.insert(result.displayId);
             creaturePermanentFailureGuids_.insert(result.guid);
             pendingCreatureSpawnGuids_.erase(result.guid);
-            creatureSpawnRetryCounts_.erase(result.guid);
+            creatureSpawnRetryDeadlines_.erase(result.guid);
             continue;
         }
         charRenderer->setPredecodedBLPCache(nullptr);
@@ -150,7 +162,7 @@ void EntitySpawner::processAsyncCreatureResults(bool unlimited) {
         }
         displayIdModelCache_[result.displayId] = result.modelId;
         pendingCreatureSpawnGuids_.erase(result.guid);
-        creatureSpawnRetryCounts_.erase(result.guid);
+        creatureSpawnRetryDeadlines_.erase(result.guid);
 
         // Re-queue as a normal pending spawn — model is now cached, so sync spawn is fast
         // (only creates instance + applies textures, no file I/O).
@@ -290,9 +302,17 @@ void EntitySpawner::processCreatureSpawnQueue(bool unlimited) {
         PendingCreatureSpawn s = pendingCreatureSpawns_.front();
         pendingCreatureSpawns_.pop_front();
 
+        auto requested = requestedCreatureDisplayIds_.find(s.guid);
+        if (requested == requestedCreatureDisplayIds_.end() ||
+            requested->second != s.displayId) {
+            // Stale entry superseded by a newer display request for this guid.
+            erasePendingGuidIfUnqueued(s.guid);
+            continue;
+        }
+
         if (nonRenderableCreatureDisplayIds_.count(s.displayId)) {
             pendingCreatureSpawnGuids_.erase(s.guid);
-            creatureSpawnRetryCounts_.erase(s.guid);
+            creatureSpawnRetryDeadlines_.erase(s.guid);
             processed++;
             rotationsLeft = pendingCreatureSpawns_.size();
             continue;
@@ -323,7 +343,7 @@ void EntitySpawner::processCreatureSpawnQueue(bool unlimited) {
                 nonRenderableCreatureDisplayIds_.insert(s.displayId);
                 creaturePermanentFailureGuids_.insert(s.guid);
                 pendingCreatureSpawnGuids_.erase(s.guid);
-                creatureSpawnRetryCounts_.erase(s.guid);
+                creatureSpawnRetryDeadlines_.erase(s.guid);
                 processed++;
                 rotationsLeft = pendingCreatureSpawns_.size();
                 continue;
@@ -586,29 +606,28 @@ void EntitySpawner::processCreatureSpawnQueue(bool unlimited) {
         }
         pendingCreatureSpawnGuids_.erase(s.guid);
 
-        // If spawn still failed, retry for a limited number of frames.
+        // If spawn still failed, retry for a bounded wall-clock window. A frame
+        // count made the timeout vary wildly with refresh rate and load stalls.
         if (!creatureInstances_.count(s.guid)) {
             if (creaturePermanentFailureGuids_.erase(s.guid) > 0) {
-                creatureSpawnRetryCounts_.erase(s.guid);
+                creatureSpawnRetryDeadlines_.erase(s.guid);
                 processed++;
                 continue;
             }
-            uint16_t retries = 0;
-            auto it = creatureSpawnRetryCounts_.find(s.guid);
-            if (it != creatureSpawnRetryCounts_.end()) {
-                retries = it->second;
-            }
-            if (retries < MAX_CREATURE_SPAWN_RETRIES) {
-                creatureSpawnRetryCounts_[s.guid] = static_cast<uint16_t>(retries + 1);
+            const auto now = std::chrono::steady_clock::now();
+            const auto deadlineIt = creatureSpawnRetryDeadlines_.try_emplace(
+                s.guid, now + CREATURE_SPAWN_RETRY_WINDOW).first;
+            if (now < deadlineIt->second) {
                 pendingCreatureSpawns_.push_back(s);
                 pendingCreatureSpawnGuids_.insert(s.guid);
             } else {
-                creatureSpawnRetryCounts_.erase(s.guid);
-                LOG_WARNING("Dropping creature spawn after retries: guid=0x", std::hex, s.guid, std::dec,
+                creatureSpawnRetryDeadlines_.erase(s.guid);
+                LOG_WARNING("Dropping creature spawn after retry window: guid=0x",
+                            std::hex, s.guid, std::dec,
                             " displayId=", s.displayId);
             }
         } else {
-            creatureSpawnRetryCounts_.erase(s.guid);
+            creatureSpawnRetryDeadlines_.erase(s.guid);
         }
         rotationsLeft = pendingCreatureSpawns_.size();
         processed++;
@@ -992,7 +1011,19 @@ void EntitySpawner::processPendingTransportRegistrations() {
         const PendingTransportRegistration pending = *it;
         auto goIt = gameObjectInstances_.find(pending.guid);
         if (goIt == gameObjectInstances_.end()) {
-            it = pendingTransportRegistrations_.erase(it);
+            // GO model spawns are budgeted per frame and often land AFTER the
+            // transport registration is queued. Erasing on the first miss
+            // silently raced the spawn queue and left transports (Deeprun
+            // Tram cars) permanently unregistered. Retry until the instance
+            // exists; give up loudly after ~30s (despawned/failed model).
+            if (++it->retryFrames > 1800) {
+                LOG_WARNING("Transport registration dropped: GO render instance never "
+                            "spawned for GUID 0x", std::hex, pending.guid, std::dec,
+                            " entry=", pending.entry, " displayId=", pending.displayId);
+                it = pendingTransportRegistrations_.erase(it);
+            } else {
+                ++it;
+            }
             continue;
         }
 
@@ -1544,6 +1575,13 @@ void EntitySpawner::processPendingMount() {
     LOG_INFO("processPendingMount: DONE displayId=", mountDisplayId, " model=", m2Path, " heightOffset=", heightOffset);
 }
 
+void EntitySpawner::erasePendingGuidIfUnqueued(uint64_t guid) {
+    for (const auto& pending : pendingCreatureSpawns_) {
+        if (pending.guid == guid) return;
+    }
+    pendingCreatureSpawnGuids_.erase(guid);
+}
+
 void EntitySpawner::despawnCreature(uint64_t guid) {
     // If this guid is a PLAYER, it will be tracked in playerInstances_.
     // Route to the correct despawn path so we don't leak instances.
@@ -1553,7 +1591,9 @@ void EntitySpawner::despawnCreature(uint64_t guid) {
     }
 
     pendingCreatureSpawnGuids_.erase(guid);
-    creatureSpawnRetryCounts_.erase(guid);
+    requestedCreatureDisplayIds_.erase(guid);
+    creatureActiveEmotes_.erase(guid);
+    creatureSpawnRetryDeadlines_.erase(guid);
     creaturePermanentFailureGuids_.erase(guid);
     deadCreatureGuids_.erase(guid);
 
@@ -1566,6 +1606,7 @@ void EntitySpawner::despawnCreature(uint64_t guid) {
 
     creatureInstances_.erase(it);
     creatureModelIds_.erase(guid);
+    creatureDisplayIds_.erase(guid);
     creatureRenderPosCache_.erase(guid);
     creatureWeaponsAttached_.erase(guid);
     creatureWeaponAttachAttempts_.erase(guid);

@@ -736,7 +736,7 @@ void WorldLoader::loadOnlineWorldTerrain(uint32_t mapId, float x, float y, float
                                 if (m2Data.empty()) continue;
 
                                 pipeline::M2Model m2Model = pipeline::M2Loader::load(m2Data);
-                                if (m2Model.name.empty()) m2Model.name = m2Path;
+                                m2Model.name = m2Path;
 
                                 std::string skinPath = m2Path.substr(0, m2Path.size() - 3) + "00.skin";
                                 std::vector<uint8_t> skinData = assetManager_->readFile(skinPath);

@@ -199,6 +199,7 @@ void CameraController::update(float deltaTime) {
     }
     // Keep physics integration stable during render hitches to avoid floor tunneling.
     const float physicsDeltaTime = std::min(deltaTime, kMaxPhysicsDelta);
+    intoxicationTime_ += deltaTime;
 
     // During taxi flights, skip movement logic but keep camera orbit/zoom controls.
     if (externalFollow_) {
@@ -477,6 +478,11 @@ void CameraController::update(float deltaTime) {
         facingYaw = yaw;
     }
     float moveYaw = cameraDrivesFacing ? yaw : facingYaw;
+    if (intoxication_ > 0.34f) {
+        // Drunk and smashed characters weave while trying to walk. Keep facing
+        // authoritative; only the travel direction stumbles side to side.
+        moveYaw += std::sin(intoxicationTime_ * 2.1f) * 11.0f * intoxication_;
+    }
     float moveYawRad = glm::radians(moveYaw);
     glm::vec3 forward(std::cos(moveYawRad), std::sin(moveYawRad), 0.0f);
     glm::vec3 right(-std::sin(moveYawRad), std::cos(moveYawRad), 0.0f);
@@ -1124,6 +1130,28 @@ void CameraController::update(float deltaTime) {
                         atTunnelSeam = terrainAboveWmo > 1.2f && terrainAboveWmo < 12.0f &&
                                        wmoDropFromPlayer >= -0.4f && wmoDropFromPlayer < 1.8f;
                     }
+                    // A real tunnel mouth burrows into rising ground: the heightfield
+                    // just ahead climbs above head height (or stops in a hole cut for
+                    // the passage). WMO ramps that merely run beneath flat walkable
+                    // streets must not steal the player from the terrain above them —
+                    // that pulled players through the ground at the Stormwind gate
+                    // ramparts and down ramps into the void. Inside an interior WMO
+                    // group (tram entrance buildings) the heightfield under the city
+                    // is meaningless, so it gets no veto — otherwise entry becomes
+                    // dependent on approach angle.
+                    if (atTunnelSeam && !cachedInsideInteriorWMO && terrainManager) {
+                        glm::vec3 moveDir = targetPos - lastCollisionCheckPos_;
+                        moveDir.z = 0.0f;
+                        const float moveLen = glm::length(moveDir);
+                        if (moveLen < 1e-3f) {
+                            atTunnelSeam = false;  // stationary — nothing to enter
+                        } else {
+                            const glm::vec3 aheadPos = targetPos + moveDir * (2.5f / moveLen);
+                            auto terrainAhead = terrainManager->getHeightAt(aheadPos.x, aheadPos.y);
+                            atTunnelSeam = !terrainAhead ||
+                                           *terrainAhead > targetPos.z + 2.2f;
+                        }
+                    }
 
                     // Reject steep WMO slopes. Tunnel ramps use the more permissive WMO
                     // limit even at the boundary, where isInsideWMO is not reliable yet.
@@ -1257,6 +1285,33 @@ void CameraController::update(float deltaTime) {
                 if (dropFromLast > 1.0f && verticalVelocity > -6.0f) {
                     *groundH = std::max(*groundH, lastGroundZ - 0.20f);
                 }
+            }
+
+            // Void recovery: far beneath the terrain heightfield with no structure
+            // floor anywhere below means a seam heuristic already failed — snap back
+            // to the surface instead of falling forever. Legitimate deep interiors
+            // (tram tube, Stockade) always have a WMO floor under the player, so
+            // this only fires in genuine void.
+            if (!groundH && centerTerrainH && targetPos.z < *centerTerrainH - 60.0f) {
+                LOG_WARNING("Void recovery: player at z=", targetPos.z,
+                            " with terrain at ", *centerTerrainH, " and no floor below");
+                targetPos.z = *centerTerrainH + 0.5f;
+                verticalVelocity = 0.0f;
+                groundH = centerTerrainH;
+            }
+
+            // WMO-only maps (Deeprun Tram, instances) have no heightfield to
+            // recover to. Falling for seconds with no floor of any kind below
+            // means the player escaped the map geometry — put them back on the
+            // last spot that had ground instead of letting them fall to death.
+            if (!groundH && !centerTerrainH && hasLastGroundedPos_ &&
+                noGroundTimer_ > 2.5f && targetPos.z < lastGroundZ - 40.0f) {
+                LOG_WARNING("Void recovery (no heightfield): player at z=", targetPos.z,
+                            " returning to last grounded pos (", lastGroundedPos_.x, ", ",
+                            lastGroundedPos_.y, ", ", lastGroundedPos_.z, ")");
+                targetPos = lastGroundedPos_ + glm::vec3(0.0f, 0.0f, 0.5f);
+                verticalVelocity = 0.0f;
+                groundH = lastGroundedPos_.z;
             }
 
             // 1b. Multi-sample WMO floors when in/near WMO space to avoid
@@ -1424,6 +1479,8 @@ void CameraController::update(float deltaTime) {
             if (groundH) {
                 hasRealGround_ = true;
                 noGroundTimer_ = 0.0f;
+                lastGroundedPos_ = glm::vec3(targetPos.x, targetPos.y, *groundH);
+                hasLastGroundedPos_ = true;
                 float feetZ = targetPos.z;
                 float stepUp = stepUpBudget;
                 stepUp += 0.05f;
@@ -2065,6 +2122,13 @@ void CameraController::update(float deltaTime) {
         if (camera) {
             camera->setPosition(camera->getPosition() + offset);
         }
+    }
+
+    if (intoxication_ > 0.0f && camera) {
+        const float swayYaw = std::sin(intoxicationTime_ * 1.35f) * 2.5f * intoxication_;
+        const float swayPitch = std::sin(intoxicationTime_ * 1.8f + 0.7f) * 1.6f * intoxication_;
+        camera->setRotation(yaw + swayYaw,
+                            glm::clamp(pitch + swayPitch, MIN_PITCH, MAX_PITCH));
     }
 }
 

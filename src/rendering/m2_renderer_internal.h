@@ -3,6 +3,7 @@
 #pragma once
 
 #include "rendering/m2_renderer.hpp"
+#include "rendering/m2_track_sampler.hpp"
 #include "pipeline/m2_loader.hpp"
 #include "core/profiler.hpp"
 #include <glm/gtc/matrix_transform.hpp>
@@ -234,94 +235,6 @@ inline glm::vec3 closestPointOnTriangle(const glm::vec3& p,
 // Defined in m2_renderer_instance.cpp (inline thread_local causes LLD linker
 // errors on Windows ARM64, so the definitions live in the single TU that uses them).
 
-// ---- Bone animation helpers ----
-
-inline int findKeyframeIndex(const std::vector<uint32_t>& timestamps, float time) {
-    if (timestamps.empty()) return -1;
-    if (timestamps.size() == 1) return 0;
-    auto it = std::upper_bound(timestamps.begin(), timestamps.end(), time,
-        [](float t, uint32_t ts) { return t < static_cast<float>(ts); });
-    if (it == timestamps.begin()) return 0;
-    size_t idx = static_cast<size_t>(it - timestamps.begin()) - 1;
-    return static_cast<int>(std::min(idx, timestamps.size() - 2));
-}
-
-inline void resolveTrackTime(const pipeline::M2AnimationTrack& track,
-                              int seqIdx, float time,
-                              const std::vector<uint32_t>& globalSeqDurations,
-                              int& outSeqIdx, float& outTime) {
-    if (track.globalSequence >= 0 &&
-        static_cast<size_t>(track.globalSequence) < globalSeqDurations.size()) {
-        outSeqIdx = 0;
-        float dur = static_cast<float>(globalSeqDurations[track.globalSequence]);
-        if (dur > 0.0f) {
-            outTime = time;
-            while (outTime >= dur) {
-                outTime -= dur;
-            }
-        } else {
-            outTime = 0.0f;
-        }
-    } else {
-        outSeqIdx = seqIdx;
-        outTime = time;
-    }
-}
-
-inline glm::vec3 interpVec3(const pipeline::M2AnimationTrack& track,
-                             int seqIdx, float time, const glm::vec3& def,
-                             const std::vector<uint32_t>& globalSeqDurations) {
-    if (!track.hasData()) return def;
-    int si; float t;
-    resolveTrackTime(track, seqIdx, time, globalSeqDurations, si, t);
-    if (si < 0 || si >= static_cast<int>(track.sequences.size())) return def;
-    const auto& keys = track.sequences[si];
-    if (keys.timestamps.empty() || keys.vec3Values.empty()) return def;
-    auto safe = [&](const glm::vec3& v) -> glm::vec3 {
-        if (std::isnan(v.x) || std::isnan(v.y) || std::isnan(v.z)) return def;
-        return v;
-    };
-    if (keys.vec3Values.size() == 1) return safe(keys.vec3Values[0]);
-    int idx = findKeyframeIndex(keys.timestamps, t);
-    if (idx < 0) return def;
-    size_t i0 = static_cast<size_t>(idx);
-    size_t i1 = std::min(i0 + 1, keys.vec3Values.size() - 1);
-    if (i0 == i1) return safe(keys.vec3Values[i0]);
-    float t0 = static_cast<float>(keys.timestamps[i0]);
-    float t1 = static_cast<float>(keys.timestamps[i1]);
-    float dur = t1 - t0;
-    float frac = (dur > 0.0f) ? glm::clamp((t - t0) / dur, 0.0f, 1.0f) : 0.0f;
-    return safe(glm::mix(keys.vec3Values[i0], keys.vec3Values[i1], frac));
-}
-
-inline glm::quat interpQuat(const pipeline::M2AnimationTrack& track,
-                              int seqIdx, float time,
-                              const std::vector<uint32_t>& globalSeqDurations) {
-    glm::quat identity(1.0f, 0.0f, 0.0f, 0.0f);
-    if (!track.hasData()) return identity;
-    int si; float t;
-    resolveTrackTime(track, seqIdx, time, globalSeqDurations, si, t);
-    if (si < 0 || si >= static_cast<int>(track.sequences.size())) return identity;
-    const auto& keys = track.sequences[si];
-    if (keys.timestamps.empty() || keys.quatValues.empty()) return identity;
-    auto safe = [&](const glm::quat& q) -> glm::quat {
-        float lenSq = q.x*q.x + q.y*q.y + q.z*q.z + q.w*q.w;
-        if (lenSq < 0.000001f || std::isnan(lenSq)) return identity;
-        return q;
-    };
-    if (keys.quatValues.size() == 1) return safe(keys.quatValues[0]);
-    int idx = findKeyframeIndex(keys.timestamps, t);
-    if (idx < 0) return identity;
-    size_t i0 = static_cast<size_t>(idx);
-    size_t i1 = std::min(i0 + 1, keys.quatValues.size() - 1);
-    if (i0 == i1) return safe(keys.quatValues[i0]);
-    float t0 = static_cast<float>(keys.timestamps[i0]);
-    float t1 = static_cast<float>(keys.timestamps[i1]);
-    float dur = t1 - t0;
-    float frac = (dur > 0.0f) ? glm::clamp((t - t0) / dur, 0.0f, 1.0f) : 0.0f;
-    return glm::slerp(safe(keys.quatValues[i0]), safe(keys.quatValues[i1]), frac);
-}
-
 inline void computeBoneMatrices(const M2ModelGPU& model, M2Instance& instance) {
     ZoneScopedN("M2::computeBoneMatrices");
     size_t numBones = std::min(model.bones.size(), size_t(128));
@@ -331,9 +244,15 @@ inline void computeBoneMatrices(const M2ModelGPU& model, M2Instance& instance) {
 
     for (size_t i = 0; i < numBones; i++) {
         const auto& bone = model.bones[i];
-        glm::vec3 trans = interpVec3(bone.translation, instance.currentSequenceIndex, instance.animTime, glm::vec3(0.0f), gsd);
-        glm::quat rot = interpQuat(bone.rotation, instance.currentSequenceIndex, instance.animTime, gsd);
-        glm::vec3 scl = interpVec3(bone.scale, instance.currentSequenceIndex, instance.animTime, glm::vec3(1.0f), gsd);
+        glm::vec3 trans = m2_track::sampleVec3(
+            bone.translation, instance.currentSequenceIndex, instance.animTime,
+            instance.globalSequenceTime, gsd, glm::vec3(0.0f));
+        glm::quat rot = m2_track::sampleQuat(
+            bone.rotation, instance.currentSequenceIndex, instance.animTime,
+            instance.globalSequenceTime, gsd);
+        glm::vec3 scl = m2_track::sampleVec3(
+            bone.scale, instance.currentSequenceIndex, instance.animTime,
+            instance.globalSequenceTime, gsd, glm::vec3(1.0f));
 
         if (scl.x < 0.001f) scl.x = 1.0f;
         if (scl.y < 0.001f) scl.y = 1.0f;

@@ -74,7 +74,11 @@ public:
                            const glm::vec3& rotation = glm::vec3(0.0f),
                            float scale = 1.0f);
 
-    void playAnimation(uint32_t instanceId, uint32_t animationId, bool loop = true);
+    // oneShotReturnAnim: animation to resume (looping) when a non-looping
+    // animation finishes; 0 = Stand. Lets NPC one-shot emotes return to their
+    // persistent work/state loop instead of idling.
+    void playAnimation(uint32_t instanceId, uint32_t animationId, bool loop = true,
+                       uint32_t oneShotReturnAnim = 0);
 
     void update(float deltaTime, const glm::vec3& cameraPos = glm::vec3(0.0f));
 
@@ -119,6 +123,20 @@ public:
 
     /** Detach a weapon from the given attachment point (drops its enchant effects too). */
     void detachWeapon(uint32_t charInstanceId, uint32_t attachmentId);
+
+    // Free a model's GPU buffers and map entry once no instance references it.
+    // For per-instance model ids (weapons/effects/player composites, which get
+    // a fresh id per attach or spawn) — without this every reload or despawn
+    // leaked the model. Do NOT call for displayId-keyed NPC models; those are
+    // cached across despawn/respawn on purpose. Buffers are destroyed via the
+    // frame-fence deferral path; shared textures stay in the cache.
+    void unloadModelIfUnused(uint32_t modelId);
+
+    // Model id an instance renders with (0 if the instance doesn't exist).
+    uint32_t getInstanceModelId(uint32_t instanceId) const {
+        auto it = instances.find(instanceId);
+        return it != instances.end() ? it->second.modelId : 0;
+    }
 
     /**
      * Attach an enchant visual to the weapon at the given attachment point.
@@ -200,6 +218,7 @@ private:
         float animationTime = 0.0f;
         float globalSequenceTime = 0.0f; // Separate timer for global sequences (accumulates without wrapping at sequence duration)
         bool animationLoop = true;
+        uint32_t oneShotReturnAnim = 0; // Anim to resume when a one-shot ends (0 = Stand)
         bool isDead = false;  // Prevents movement while in death state
         std::vector<glm::mat4> boneMatrices;  // Current bone transforms
 
@@ -266,13 +285,6 @@ private:
     glm::mat4 getModelMatrix(const CharacterInstance& instance) const;
     void destroyModelGPU(M2ModelGPU& gpuModel, bool defer = false);
     void destroyInstanceBones(CharacterInstance& inst, bool defer = false);
-
-    // Keyframe interpolation helpers
-    static int findKeyframeIndex(const std::vector<uint32_t>& timestamps, float time);
-    static glm::vec3 interpolateVec3(const pipeline::M2AnimationTrack& track,
-                                      int seqIdx, float time, const glm::vec3& defaultVal);
-    static glm::quat interpolateQuat(const pipeline::M2AnimationTrack& track,
-                                      int seqIdx, float time);
 
     // Attachment point lookup helper — shared by attachWeapon() and getAttachmentTransform()
     bool findAttachmentBone(uint32_t modelId, uint32_t attachmentId,
